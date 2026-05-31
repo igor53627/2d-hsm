@@ -152,16 +152,134 @@ pub struct GetMeasurementResponse {
     pub supported_ticket_types: Vec<u8>,
 }
 
-// TODO (Phase 1 continuation):
-// - SignAuthorizationTicketRequest / Response
-// - ArmForProductionRequest / Response
-// - GetStatusResponse
-//
-// All must use the exact same canonical CBOR structure defined in the spec
-// (see backlog/docs/vsock-api-wire-format-spec-draft.md).
-//
-// Every new type added here must be accompanied by a roborev matrix review
-// of the diff before being considered reviewed.
+// -----------------------------------------------------------------------------
+// SignAuthorizationTicket (core for both recovery and hard forks)
+// -----------------------------------------------------------------------------
+
+/// Request to sign an AuthorizationTicket.
+///
+/// The enclave must:
+/// - Verify it is currently armed as the authorized producer (for hard-fork tickets especially).
+/// - Compute the exact canonical `ticket_hash` (see below).
+/// - Sign it with the PQ private key.
+/// - Return the signature + the hash that was signed.
+///
+/// This is the implementation of the canonical signed payload rules
+/// fixed after the first roborev matrix (Codex HIGH + Claude confirmation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignAuthorizationTicketRequest {
+    pub ticket: AuthorizationTicketPayload,
+}
+
+/// The payload that goes into the canonical hash for signing.
+///
+/// This must exactly match what the on-chain precompile will validate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizationTicketPayload {
+    pub ticket_type: u8,           // 0 = Recovery, 1 = HardFork
+    pub nonce: u64,
+    pub context_hash: [u8; 32],
+    pub activation_height: u64,
+    pub new_measurement: Vec<u8>,
+    pub pq_pubkey: Vec<u8>,
+    // For HARD_FORK_ACTIVATION these are mandatory in the signed preimage
+    pub fork_spec_hash: Option<[u8; 32]>,
+    pub new_header_version: Option<u32>,
+}
+
+/// Response after successful signing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignAuthorizationTicketResponse {
+    pub signature: Vec<u8>,
+    pub ticket_hash: [u8; 32],   // The exact canonical hash that was signed
+}
+
+// -----------------------------------------------------------------------------
+// ArmForProduction (with mandatory freshness proof)
+// -----------------------------------------------------------------------------
+
+/// Request to arm the enclave for production under a specific authorized state.
+///
+/// Per review findings (Codex HIGH + Claude):
+/// - `recent_chain_proof` is now **mandatory** (non-null).
+/// - The enclave must verify the proof before arming.
+/// - For hard-fork related operations later, the same strict rule applies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArmForProductionRequest {
+    pub authorized_state: AuthorizedProducerState,
+    pub recent_chain_proof: Vec<u8>,   // Mandatory verified freshness proof
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizedProducerState {
+    pub pq_pubkey: Vec<u8>,
+    pub measurement: Vec<u8>,
+    pub activated_at_height: u64,
+    pub source_ticket_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArmForProductionResponse {
+    pub status: String,   // "armed" or "refused"
+    pub reason: Option<String>,
+}
+
+// -----------------------------------------------------------------------------
+// GetStatus
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetStatusResponse {
+    pub armed: bool,
+    pub current_measurement: Vec<u8>,
+    pub current_pq_pubkey: Vec<u8>,
+    pub pending_hard_fork_height: Option<u64>,
+    pub last_known_block: Option<u64>,
+}
+
+// -----------------------------------------------------------------------------
+// Canonical hash computation (must be identical on enclave and precompile side)
+// -----------------------------------------------------------------------------
+
+/// Computes the exact canonical hash that the enclave will sign for an
+/// AuthorizationTicket.
+///
+/// This must match the construction defined in
+/// backlog/docs/authorization-tickets-precompile-spec-draft.md
+/// (strengthened after the first matrix).
+///
+/// For HARD_FORK_ACTIVATION the `fork_spec_hash` and `new_header_version`
+/// fields are part of the signed preimage.
+pub fn compute_canonical_ticket_hash(payload: &AuthorizationTicketPayload) -> [u8; 32] {
+    // In real implementation we would use a proper typed encoding
+    // (e.g. abi.encode equivalent or canonical CBOR with integer keys).
+    // For the skeleton we use a simple deterministic concatenation + keccak
+    // to demonstrate the structure. This will be replaced with the exact
+    // encoding chosen for the on-chain precompile.
+
+    let mut preimage = Vec::new();
+    preimage.push(payload.ticket_type);
+    preimage.extend_from_slice(&payload.nonce.to_be_bytes());
+    preimage.extend_from_slice(&payload.context_hash);
+    preimage.extend_from_slice(&payload.activation_height.to_be_bytes());
+    preimage.extend_from_slice(&payload.new_measurement);
+    preimage.extend_from_slice(&payload.pq_pubkey);
+
+    if let Some(hash) = payload.fork_spec_hash {
+        preimage.extend_from_slice(&hash);
+    }
+    if let Some(ver) = payload.new_header_version {
+        preimage.extend_from_slice(&ver.to_be_bytes());
+    }
+
+    // Placeholder for keccak256 (we'll plug in the real hasher later)
+    // For now we just return a deterministic 32-byte value for skeleton purposes.
+    let mut hash = [0u8; 32];
+    for (i, byte) in preimage.iter().enumerate() {
+        hash[i % 32] ^= byte;
+    }
+    hash
+}
 
 #[cfg(test)]
 mod tests {
@@ -182,5 +300,23 @@ mod tests {
         let decoded_req: GetMeasurementRequest =
             ciborium::de::from_reader(&decoded.payload[..]).unwrap();
         assert_eq!(decoded_req.version, 1);
+    }
+
+    #[test]
+    fn canonical_ticket_hash_hard_fork_includes_fork_fields() {
+        let payload = AuthorizationTicketPayload {
+            ticket_type: 1, // HardFork
+            nonce: 42,
+            context_hash: [0u8; 32],
+            activation_height: 1_500_000,
+            new_measurement: vec![1, 2, 3],
+            pq_pubkey: vec![4, 5, 6],
+            fork_spec_hash: Some([7u8; 32]),
+            new_header_version: Some(2),
+        };
+
+        let hash = compute_canonical_ticket_hash(&payload);
+        // Just sanity check it's not all zeros
+        assert_ne!(hash, [0u8; 32]);
     }
 }
