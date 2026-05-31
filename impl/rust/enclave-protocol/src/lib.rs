@@ -14,8 +14,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use ciborium::value::Value;
+// В Phase 1 мы оставляем часть публичных полей без документации,
+// чтобы не раздувать скелет. На более поздних фазах документацию нужно будет довести до высокого уровня.
+#![allow(missing_docs)]
+
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
@@ -50,6 +54,9 @@ pub enum ProtocolError {
 
     #[error("unknown message type: {0}")]
     UnknownMessageType(u8),
+
+    #[error("invalid ticket payload: {0}")]
+    InvalidTicket(&'static str),
 }
 
 /// Wire message types (keep in sync with the spec).
@@ -62,12 +69,35 @@ pub enum MessageType {
     GetStatus = 0x30,
 }
 
+/// Простой диспетчер команд (скелет).
+///
+/// В реальном enclave здесь будет основная логика обработки входящих сообщений
+/// от хоста. Пока оставлено как демонстрация структуры.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Command {
+    GetMeasurement(GetMeasurementRequest),
+    SignAuthorizationTicket(SignAuthorizationTicketRequest),
+    ArmForProduction(ArmForProductionRequest),
+    GetStatus(GetStatusRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Response {
+    GetMeasurement(GetMeasurementResponse),
+    SignAuthorizationTicket(SignAuthorizationTicketResponse),
+    ArmForProduction(ArmForProductionResponse),
+    GetStatus(GetStatusResponse),
+    Error(String),
+}
+
 /// Top-level framed message.
+///
+/// This struct represents a single message on the wire after length-prefix decoding.
 #[derive(Debug, Clone)]
 pub struct FramedMessage {
     pub version: u8,
     pub msg_type: MessageType,
-    pub payload: Vec<u8>, // CBOR-encoded payload
+    pub payload: Vec<u8>,
 }
 
 /// Encode a message with length-prefixed framing.
@@ -228,6 +258,12 @@ pub struct ArmForProductionResponse {
 // GetStatus
 // -----------------------------------------------------------------------------
 
+/// Пустой запрос на статус (пока не несёт полезной нагрузки).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetStatusRequest {
+    pub version: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStatusResponse {
     pub armed: bool,
@@ -241,44 +277,98 @@ pub struct GetStatusResponse {
 // Canonical hash computation (must be identical on enclave and precompile side)
 // -----------------------------------------------------------------------------
 
-/// Computes the exact canonical hash that the enclave will sign for an
-/// AuthorizationTicket.
+/// Domain separation tag for all AuthorizationTicket signatures.
+/// This prevents cross-protocol signature reuse.
+const TICKET_DOMAIN_TAG: &[u8] = b"2D-AUTH-TICKET-v1";
+
+/// Computes the **canonical** hash over an AuthorizationTicket that the
+/// enclave will actually sign.
 ///
-/// This must match the construction defined in
-/// backlog/docs/authorization-tickets-precompile-spec-draft.md
-/// (strengthened after the first matrix).
+/// This implementation addresses the critical issues found in the roborev
+/// matrix on commit 96d2022:
+/// - Uses real Keccak256 instead of XOR placeholder.
+/// - Uses length-prefixed encoding for all variable-length fields.
+/// - Explicit presence byte for optional hard-fork fields.
+/// - Domain separation tag.
 ///
-/// For HARD_FORK_ACTIVATION the `fork_spec_hash` and `new_header_version`
-/// fields are part of the signed preimage.
+/// The resulting 32-byte value is what must be signed with the PQ key.
 pub fn compute_canonical_ticket_hash(payload: &AuthorizationTicketPayload) -> [u8; 32] {
-    // In real implementation we would use a proper typed encoding
-    // (e.g. abi.encode equivalent or canonical CBOR with integer keys).
-    // For the skeleton we use a simple deterministic concatenation + keccak
-    // to demonstrate the structure. This will be replaced with the exact
-    // encoding chosen for the on-chain precompile.
+    let mut hasher = Keccak256::new();
 
-    let mut preimage = Vec::new();
-    preimage.push(payload.ticket_type);
-    preimage.extend_from_slice(&payload.nonce.to_be_bytes());
-    preimage.extend_from_slice(&payload.context_hash);
-    preimage.extend_from_slice(&payload.activation_height.to_be_bytes());
-    preimage.extend_from_slice(&payload.new_measurement);
-    preimage.extend_from_slice(&payload.pq_pubkey);
+    // 1. Domain separation
+    hasher.update(TICKET_DOMAIN_TAG);
 
-    if let Some(hash) = payload.fork_spec_hash {
-        preimage.extend_from_slice(&hash);
-    }
-    if let Some(ver) = payload.new_header_version {
-        preimage.extend_from_slice(&ver.to_be_bytes());
+    // 2. Fixed fields
+    hasher.update([payload.ticket_type]);
+    hasher.update(payload.nonce.to_be_bytes());
+    hasher.update(payload.context_hash);
+    hasher.update(payload.activation_height.to_be_bytes());
+
+    // 3. Variable-length fields with length prefix (u32 BE)
+    hasher.update((payload.new_measurement.len() as u32).to_be_bytes());
+    hasher.update(&payload.new_measurement);
+
+    hasher.update((payload.pq_pubkey.len() as u32).to_be_bytes());
+    hasher.update(&payload.pq_pubkey);
+
+    // 4. Hard-fork specific fields (with explicit presence)
+    match payload.fork_spec_hash {
+        Some(hash) => {
+            hasher.update([1u8]); // present
+            hasher.update(hash);
+        }
+        None => {
+            hasher.update([0u8]); // absent
+        }
     }
 
-    // Placeholder for keccak256 (we'll plug in the real hasher later)
-    // For now we just return a deterministic 32-byte value for skeleton purposes.
-    let mut hash = [0u8; 32];
-    for (i, byte) in preimage.iter().enumerate() {
-        hash[i % 32] ^= byte;
+    match payload.new_header_version {
+        Some(ver) => {
+            hasher.update([1u8]); // present
+            hasher.update(ver.to_be_bytes());
+        }
+        None => {
+            hasher.update([0u8]); // absent
+        }
     }
-    hash
+
+    let result = hasher.finalize();
+    result.into()
+}
+
+/// Validates that a ticket payload is well-formed before hashing/signing.
+///
+/// Returns error for hard-fork tickets that are missing required fields.
+/// This was added to address the MEDIUM finding from the matrix.
+pub fn validate_ticket_payload(payload: &AuthorizationTicketPayload) -> Result<(), ProtocolError> {
+    if payload.ticket_type == 1 {
+        // HARD_FORK_ACTIVATION
+        if payload.fork_spec_hash.is_none() || payload.new_header_version.is_none() {
+            return Err(ProtocolError::InvalidTicket(
+                "Hard-fork tickets must include fork_spec_hash and new_header_version",
+            ));
+        }
+    } else {
+        // Recovery or other types — hard-fork fields must be absent (or we can relax later)
+        if payload.fork_spec_hash.is_some() || payload.new_header_version.is_some() {
+            return Err(ProtocolError::InvalidTicket(
+                "Non-hard-fork tickets must not include hard-fork specific fields",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// High-level helper: validates the payload and returns the canonical hash
+/// that should be signed.
+///
+/// This is the function the TEE signing service will most likely call
+/// before producing a signature over an AuthorizationTicket.
+pub fn prepare_ticket_for_signing(
+    payload: &AuthorizationTicketPayload,
+) -> Result<[u8; 32], ProtocolError> {
+    validate_ticket_payload(payload)?;
+    Ok(compute_canonical_ticket_hash(payload))
 }
 
 #[cfg(test)]
@@ -303,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn canonical_ticket_hash_hard_fork_includes_fork_fields() {
-        let payload = AuthorizationTicketPayload {
-            ticket_type: 1, // HardFork
+    fn canonical_ticket_hash_is_deterministic_and_distinct() {
+        let mut payload = AuthorizationTicketPayload {
+            ticket_type: 1,
             nonce: 42,
             context_hash: [0u8; 32],
             activation_height: 1_500_000,
@@ -315,8 +405,113 @@ mod tests {
             new_header_version: Some(2),
         };
 
-        let hash = compute_canonical_ticket_hash(&payload);
-        // Just sanity check it's not all zeros
-        assert_ne!(hash, [0u8; 32]);
+        let h1 = compute_canonical_ticket_hash(&payload);
+
+        // Changing any field must change the hash
+        payload.nonce = 43;
+        let h2 = compute_canonical_ticket_hash(&payload);
+        assert_ne!(h1, h2);
+
+        // Different hard-fork intent must produce different hash
+        payload.fork_spec_hash = Some([8u8; 32]);
+        let h3 = compute_canonical_ticket_hash(&payload);
+        assert_ne!(h2, h3);
+    }
+
+    #[test]
+    fn hard_fork_validation_rejects_missing_fields() {
+        let bad_payload = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 1,
+            context_hash: [0u8; 32],
+            activation_height: 100,
+            new_measurement: vec![],
+            pq_pubkey: vec![],
+            fork_spec_hash: None,           // missing!
+            new_header_version: None,
+        };
+
+        assert!(validate_ticket_payload(&bad_payload).is_err());
+    }
+
+    #[test]
+    fn different_tickets_produce_different_hashes_even_with_similar_data() {
+        let base = AuthorizationTicketPayload {
+            ticket_type: 0,
+            nonce: 1,
+            context_hash: [0x42; 32],
+            activation_height: 10,
+            new_measurement: vec![1, 2, 3],
+            pq_pubkey: vec![4, 5, 6],
+            fork_spec_hash: None,
+            new_header_version: None,
+        };
+
+        let h1 = compute_canonical_ticket_hash(&base);
+
+        let mut modified = base.clone();
+        modified.pq_pubkey = vec![4, 5, 7]; // меняем один байт
+
+        let h2 = compute_canonical_ticket_hash(&modified);
+
+        assert_ne!(h1, h2, "Changing even one byte in the payload must change the canonical hash");
+    }
+
+    #[test]
+    fn hard_fork_ticket_without_required_fields_is_rejected() {
+        let incomplete = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 99,
+            context_hash: [0xAA; 32],
+            activation_height: 5_000_000,
+            new_measurement: vec![9, 9, 9],
+            pq_pubkey: vec![8; 48],
+            fork_spec_hash: None,           // deliberately missing
+            new_header_version: None,
+        };
+
+        assert!(validate_ticket_payload(&incomplete).is_err());
+        assert!(prepare_ticket_for_signing(&incomplete).is_err());
+    }
+
+    #[test]
+    fn recovery_ticket_with_hard_fork_fields_is_rejected() {
+        let polluted = AuthorizationTicketPayload {
+            ticket_type: 0, // Recovery
+            nonce: 100,
+            context_hash: [0xBB; 32],
+            activation_height: 5_000_001,
+            new_measurement: vec![1],
+            pq_pubkey: vec![2],
+            fork_spec_hash: Some([3; 32]),  // should not be present
+            new_header_version: Some(2),
+        };
+
+        assert!(validate_ticket_payload(&polluted).is_err());
+    }
+
+    #[test]
+    fn hard_fork_and_recovery_with_same_base_data_produce_different_hashes() {
+        let base = AuthorizationTicketPayload {
+            ticket_type: 0,
+            nonce: 777,
+            context_hash: [0x01; 32],
+            activation_height: 3_000_000,
+            new_measurement: vec![10, 20, 30],
+            pq_pubkey: vec![40, 50, 60],
+            fork_spec_hash: None,
+            new_header_version: None,
+        };
+
+        let recovery_hash = compute_canonical_ticket_hash(&base);
+
+        let mut hardfork = base.clone();
+        hardfork.ticket_type = 1;
+        hardfork.fork_spec_hash = Some([0xAA; 32]);
+        hardfork.new_header_version = Some(2);
+
+        let hardfork_hash = compute_canonical_ticket_hash(&hardfork);
+
+        assert_ne!(recovery_hash, hardfork_hash);
     }
 }

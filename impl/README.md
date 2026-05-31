@@ -25,11 +25,21 @@ This rule was established after the first successful matrix on the design specs 
 
 See the phased plan in `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md`.
 
-Current focus: solid framing + the first few commands (`GET_MEASUREMENT`, `SIGN_AUTHORIZATION_TICKET`, `ARM_FOR_PRODUCTION`) with correct canonical payloads and mandatory freshness proofs.
+Current focus: solid framing + первые команды с правильной канонизацией и обязательными проверками.
 
-**First reviewed increment**: commit `0262bd5` (framing + GetMeasurement).
+На данный момент реализовано:
+- Фрейминг (length-prefixed CBOR)
+- `GET_MEASUREMENT`
+- `SignAuthorizationTicket` + `compute_canonical_ticket_hash` (с Keccak256 + length-prefixed преобразом)
+- `ArmForProduction` с **mandatory** `recent_chain_proof`
+- `GetStatus`
+- Валидация тикетов + helper `prepare_ticket_for_signing`
 
-All future changes here will be reviewed via the 3:3 roborev matrix + compact before being considered stable.
+**Важно**: Весь этот код находится под 3:3 roborev-матрицей. Любой значимый дифф перед коммитом должен пройти ревью.
+
+Примеры:
+- `cargo run --example framing_demo`
+- `cargo run --example ticket_signing_demo` (лучше всего показывает текущий прогресс)
 
 ## Building the demo
 
