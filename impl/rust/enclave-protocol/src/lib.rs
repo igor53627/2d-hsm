@@ -341,18 +341,29 @@ pub fn compute_canonical_ticket_hash(payload: &AuthorizationTicketPayload) -> [u
 /// Returns error for hard-fork tickets that are missing required fields.
 /// This was added to address the MEDIUM finding from the matrix.
 pub fn validate_ticket_payload(payload: &AuthorizationTicketPayload) -> Result<(), ProtocolError> {
-    if payload.ticket_type == 1 {
-        // HARD_FORK_ACTIVATION
-        if payload.fork_spec_hash.is_none() || payload.new_header_version.is_none() {
-            return Err(ProtocolError::InvalidTicket(
-                "Hard-fork tickets must include fork_spec_hash and new_header_version",
-            ));
+    match payload.ticket_type {
+        0 => {
+            // Recovery
+            if payload.fork_spec_hash.is_some() || payload.new_header_version.is_some() {
+                return Err(ProtocolError::InvalidTicket(
+                    "Non-hard-fork tickets must not include hard-fork specific fields",
+                ));
+            }
         }
-    } else {
-        // Recovery or other types — hard-fork fields must be absent (or we can relax later)
-        if payload.fork_spec_hash.is_some() || payload.new_header_version.is_some() {
+        1 => {
+            // HARD_FORK_ACTIVATION
+            if payload.fork_spec_hash.is_none() || payload.new_header_version.is_none() {
+                return Err(ProtocolError::InvalidTicket(
+                    "Hard-fork tickets must include fork_spec_hash and new_header_version",
+                ));
+            }
+        }
+        _ => {
+            // Strict allow-list: only 0 and 1 are supported.
+            // This addresses the Medium finding from the matrix on 402fdba
+            // (default-allow for unknown ticket_type values creates a signing oracle risk).
             return Err(ProtocolError::InvalidTicket(
-                "Non-hard-fork tickets must not include hard-fork specific fields",
+                "Unsupported ticket_type (only 0 = Recovery and 1 = HardFork are allowed)",
             ));
         }
     }
@@ -432,6 +443,23 @@ mod tests {
         };
 
         assert!(validate_ticket_payload(&bad_payload).is_err());
+    }
+
+    #[test]
+    fn unknown_ticket_type_is_rejected() {
+        let unknown = AuthorizationTicketPayload {
+            ticket_type: 42,  // undefined type
+            nonce: 1,
+            context_hash: [0u8; 32],
+            activation_height: 100,
+            new_measurement: vec![1],
+            pq_pubkey: vec![2],
+            fork_spec_hash: None,
+            new_header_version: None,
+        };
+
+        assert!(validate_ticket_payload(&unknown).is_err());
+        assert!(prepare_ticket_for_signing(&unknown).is_err());
     }
 
     #[test]
