@@ -1,0 +1,371 @@
+# TEE Signing Service — vsock API + Wire Format Specification (Draft v0.1)
+
+**Task**: TASK-2  
+**Date**: 2026-06-05  
+**Status**: Initial draft — ready for iteration  
+**Goal**: Define the communication protocol between the 2D host (Block Producer) and the minimal post-quantum signing service running inside a TEE (Nitro Enclave / SEV-SNP).
+
+## 1. Why this API exists
+
+The signing service runs inside a TEE. The host (Elixir Block Producer process) is untrusted.
+
+All sensitive operations must happen inside the enclave:
+- Holding and using the long-term PQ Block Producer key.
+- Generating and signing `AuthorizationTicket` (both recovery and hard-fork types).
+- Deciding whether it is allowed to sign blocks at all (network second factor + authorized producer state).
+- Transitioning to a new code measurement during a hard fork.
+
+The only communication channel we trust is **vsock** (AF_VSOCK).
+
+## 2. Design Principles
+
+- Minimal surface. Fewer commands = easier to audit and reason about.
+- Explicit security invariants per command.
+- Support the hard fork flow from day one (not bolted on later).
+- Easy to implement correctly on both sides.
+- Versioned from the beginning.
+- Prefer simple, deterministic encoding over "nice" encoding.
+
+## 3. High-Level Command Groups
+
+We currently foresee four groups:
+
+1. **Identity & Measurement**
+   - Get current TEE measurement + remote attestation.
+   - Get current public key.
+
+2. **Ticket Operations** (core for recovery + hard forks)
+   - Prepare / sign `AuthorizationTicket`.
+
+3. **Production Authorization**
+   - Arm the service for a specific authorized producer state (comes from on-chain).
+   - Check current authorization status.
+   - (Future) Request network freshness proof before arming.
+
+4. **Hard Fork Transition**
+   - Announce / prepare for upcoming hard fork (new measurement + scheduled block).
+   - Switch active measurement at the scheduled height.
+
+## 4. Proposed Command Set (v0.1)
+
+All communication is request → response over a single vsock connection (or one connection per logical session).
+
+### Encoding choice (to be decided in this task)
+
+Options under consideration (in order of current preference):
+- **Length-prefixed CBOR** (good balance of simplicity, determinism, and tooling).
+- Simple binary (u32 length + tag + payload).
+- JSON (only for very early prototyping — not recommended for production).
+
+We will pick one and justify it in this document.
+
+### Commands
+
+#### 1. `GET_MEASUREMENT`
+
+Request:
+```cbor
+{
+  "cmd": "get_measurement",
+  "version": 1
+}
+```
+
+Response:
+```cbor
+{
+  "measurement": h'....',           // raw SEV-SNP measurement or Nitro PCRs
+  "attestation": h'....',           // full attestation document
+  "pq_pubkey": h'....',             // current Dilithium/ML-DSA public key
+  "supported_ticket_types": [0, 1]  // 0=recovery, 1=hard_fork
+}
+```
+
+Security invariant: The enclave must only return a measurement + key that are bound together in the attestation.
+
+#### 2. `SIGN_AUTHORIZATION_TICKET`
+
+This is the most important command for both recovery and hard forks.
+
+Request:
+```cbor
+{
+  "cmd": "sign_authorization_ticket",
+  "version": 1,
+  "ticket": {
+    "ticket_type": 0 | 1,           // 0 = PRODUCER_RECOVERY, 1 = HARD_FORK_ACTIVATION
+    "nonce": 123,
+    "context_hash": h'...',
+    "activation_height": 1234567,
+    "new_measurement": h'...',
+    "pq_pubkey": h'...',
+    "fork_spec_hash": h'...' | null,   // required for hard fork
+    "new_header_version": 2 | null,    // for hard fork + header versioning
+    "governance_ref": h'...' | null
+  }
+}
+```
+
+Response (on success):
+```cbor
+{
+  "signature": h'...',
+  "ticket_hash": h'...'   // the hash that was actually signed
+}
+```
+
+On error: structured error with reason.
+
+**Security rules the enclave must enforce** (this is critical):
+- For `ticket_type == 1` (Hard Fork): the enclave must currently be armed as the active producer, or at least the `pq_pubkey` in the ticket must match the one it holds.
+- The enclave may refuse to sign a hard fork ticket if it has not seen a valid network state proving that the current on-chain authorized producer matches its key (network second factor).
+- The enclave should refuse to sign a hard fork ticket with `activation_height` in the past.
+
+#### 3. `ARM_FOR_PRODUCTION`
+
+Tells the enclave "from now on you are allowed to sign blocks as the authorized producer with this state".
+
+Request:
+```cbor
+{
+  "cmd": "arm_for_production",
+  "version": 1,
+  "authorized_producer": {
+    "pq_pubkey": h'...',
+    "measurement": h'...',
+    "activated_at_height": 1234560,
+    "source_ticket_hash": h'...'
+  },
+  "recent_chain_state": { ... }   // proof or recent headers (for second factor)
+}
+```
+
+Response:
+```cbor
+{ "status": "armed" | "refused", "reason": "..." }
+```
+
+#### 4. `GET_STATUS`
+
+Simple liveness + current mode.
+
+Response includes:
+- Current armed state
+- Current measurement + pubkey
+- Whether it has seen a pending hard fork announcement
+- Last known on-chain authorized producer (if it tracks it)
+
+#### 5. `PREPARE_HARD_FORK` (optional but useful)
+
+Allows the current producer to tell the enclave in advance about an upcoming hard fork.
+
+This lets the enclave start refusing to sign blocks after a certain height unless it has transitioned, etc.
+
+## 5. Hard Fork Flow using this API (end-to-end sketch)
+
+1. Current producer decides to do a hard fork at block 1_500_000.
+2. Host calls `PREPARE_HARD_FORK` (or directly `SIGN_AUTHORIZATION_TICKET` with type=1).
+3. Enclave signs the `HARD_FORK_ACTIVATION` ticket (after checking it is still the authorized producer and has fresh enough chain view).
+4. Host submits the ticket on-chain via the precompile.
+5. When the chain approaches block 1_500_000:
+   - Host calls `ARM_FOR_PRODUCTION` again with the new measurement (or the enclave switches internally).
+6. After the scheduled height, the enclave only signs blocks if the header version matches the one announced in the ticket + it is using the new measurement.
+
+## 6. Encoding Decision (A — done 2026-06-05)
+
+**Chosen encoding: Length-prefixed CBOR with explicit protocol version**
+
+### Rationale
+
+- **Deterministic encoding** — critical because some payloads (especially tickets) may be hashed or have security implications.
+- **Good tooling on both sides**:
+  - Rust: `ciborium` + `serde` (very mature, used in many TEE projects).
+  - Elixir: `cbor` or `ex_cbor` libraries exist and are usable.
+- **Self-describing enough** for debugging, while still compact.
+- **Easy to version** at the top level.
+- Better than raw custom binary for auditability (readers can use standard CBOR tools).
+- Better than JSON for production (smaller, faster, no string escaping issues, deterministic when using canonical CBOR).
+
+**Rejected alternatives**:
+- Pure custom binary → higher risk of subtle bugs in parsing.
+- JSON → too verbose, non-deterministic by default, slower.
+- MessagePack → similar to CBOR but less standardized in the TEE/attestation world.
+
+### Framing (updated after Claude-code design review on commit 0262bd5, 2026-06-05)
+
+Every message on the vsock is:
+
+```
+[ u32 total_length (big-endian) ]   // length of the bytes *following* this field
+[ u8  protocol_version (currently 1) ]
+[ u8  message_type ]
+[ CBOR payload ]
+```
+
+- `total_length = 2 + payload.len()` (version + type + payload).
+- This is the convention actually implemented in the reference crate (`enclave-protocol`).
+- The previous wording ("includes the 6-byte header") was incorrect and has been aligned with the implementation to avoid interop breakage.
+
+We will use **canonical CBOR** (RFC 7049 section 3.9) for all payloads where determinism matters.
+
+---
+
+## 7. Detailed Message Schemas (v1)
+
+All CBOR payloads use integer keys for compactness and to avoid string comparison issues (maps with integer keys).
+
+### Common types
+
+```cbor
+; Common error shape returned on failure
+Error = {
+  1: int,      ; error_code
+  2: tstr      ; human readable reason (for logs only, not for logic)
+}
+```
+
+### Command: GET_MEASUREMENT (message_type = 0x01)
+
+**Request:**
+```cbor
+{ 1: 1 }   ; version
+```
+
+**Success Response:**
+```cbor
+{
+  1: 1,                    ; version
+  2: bytes,                ; measurement (raw SEV-SNP measurement or equivalent)
+  3: bytes,                ; attestation document (full, as returned by the platform)
+  4: bytes,                ; pq_pubkey (current Dilithium/ML-DSA public key)
+  5: [int]                 ; supported_ticket_types (e.g. [0, 1])
+}
+```
+
+**Error Response:** standard Error map.
+
+**Security note:** The enclave must ensure that `measurement` + `pq_pubkey` are bound together in the attestation document.
+
+---
+
+### Command: SIGN_AUTHORIZATION_TICKET (message_type = 0x10)
+
+This is the most security-sensitive command.
+
+**Request:**
+```cbor
+{
+  1: 1,                    ; protocol version
+  2: {                     ; ticket
+    1: int,                ; ticket_type (0 = PRODUCER_RECOVERY, 1 = HARD_FORK_ACTIVATION)
+    2: uint,               ; nonce
+    3: bytes,              ; context_hash
+    4: uint,               ; activation_height
+    5: bytes,              ; new_measurement
+    6: bytes,              ; pq_pubkey (the one that should sign this ticket)
+    7: bytes / null,       ; fork_spec_hash (required when ticket_type=1)
+    8: int / null,         ; new_header_version (recommended when ticket_type=1)
+    9: bytes / null        ; governance_ref (currently ignored in v1 hard fork path)
+  }
+}
+```
+
+**Success Response:**
+```cbor
+{
+  1: 1,
+  2: bytes,                ; signature (over the canonical ticket hash)
+  3: bytes                 ; ticket_hash (the exact value that was signed)
+}
+```
+
+**Error Response:** standard Error + possibly additional fields (e.g. `current_armed_producer`).
+
+**Critical Security Invariants (enclave MUST enforce):**
+
+For `ticket_type == 1` (Hard Fork):
+- The enclave **must** currently be armed as an authorized producer.
+- `pq_pubkey` in the request **must** match the currently armed key.
+- The enclave **should** have reasonably fresh on-chain view (network second factor) before signing a hard fork announcement.
+- `activation_height` must be strictly greater than the last known block the enclave has seen.
+- `fork_spec_hash` must be non-null.
+
+For both types:
+- The enclave must never sign a ticket where `pq_pubkey` does not match the key it actually controls.
+
+---
+
+### Command: ARM_FOR_PRODUCTION (message_type = 0x20)
+
+**Request:**
+```cbor
+{
+  1: 1,
+  2: {                     ; authorized_state
+    1: bytes,              ; pq_pubkey
+    2: bytes,              ; measurement
+    3: uint,               ; activated_at_height
+    4: bytes               ; source_ticket_hash
+  },
+  3: bytes                 ; recent_chain_proof (mandatory non-null verified freshness proof)
+}
+```
+
+**Success Response:**
+```cbor
+{ 1: "armed" }
+```
+
+**Error Response:**
+```cbor
+{
+  1: int,                  ; error_code
+  2: tstr,
+  3: { ... } / null        ; optional diagnostic info (e.g. current on-chain state the enclave saw)
+}
+```
+
+**Security Invariants (updated after Codex security review + Claude-code design review, 2026-06-05):**
+- The enclave **must** verify that the `pq_pubkey` + `measurement` combination is consistent with its own attestation.
+- `recent_chain_proof` **MUST NOT be null** for `ARM_FOR_PRODUCTION` (and for signing hard-fork tickets). A compromised host must not be able to arm the enclave or obtain signatures under a stale or attacker-chosen view.
+- The enclave **must** reject (fail closed) if the proof is absent, stale, not properly rooted, or does not prove the expected authorization state.
+- For HARD_FORK_ACTIVATION specifically: the enclave **must currently be armed** as the active producer **and** the `pq_pubkey` in the request **must** match the armed key (strong AND, not OR).
+
+This is the concrete enforcement of "network as cryptographic second factor". The previous weaker wording was identified as a HIGH contradiction during reviews.
+
+---
+
+### Command: GET_STATUS (message_type = 0x30)
+
+**Request:** `{ 1: 1 }`
+
+**Response:**
+```cbor
+{
+  1: 1,
+  2: bool,                 ; armed
+  3: bytes,                ; current_measurement
+  4: bytes,                ; current_pq_pubkey
+  5: int / null,           ; pending_hard_fork_height (if a hard fork ticket was already signed)
+  6: int / null            ; last_known_block (rough freshness)
+}
+```
+
+This command is relatively safe and can be called frequently for monitoring.
+
+---
+
+## 8. Next Steps (still in A)
+
+- Finalize all error codes.
+- Add `PREPARE_HARD_FORK_TRANSITION` command (or decide to do everything through `SIGN_AUTHORIZATION_TICKET` + later `ARM_FOR_PRODUCTION`).
+- Write concrete CBOR test vectors for the three most important messages.
+- Start minimal Rust + Elixir skeletons that can at least do GET_MEASUREMENT roundtrip.
+
+Ready to continue with detailed hard fork flow (item B) after we lock the schemas above.
+
+---
+
+This document will be the single source of truth for the vsock protocol while we implement TASK-2.
+
+Start working on choosing the encoding and writing the detailed command schemas.

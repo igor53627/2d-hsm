@@ -27,6 +27,10 @@ See the phased plan in `backlog/docs/implementation-plan-vsock-api-and-hard-fork
 
 Current focus: solid framing + the first few commands (`GET_MEASUREMENT`, `SIGN_AUTHORIZATION_TICKET`, `ARM_FOR_PRODUCTION`) with correct canonical payloads and mandatory freshness proofs.
 
+**First reviewed increment**: commit `0262bd5` (framing + GetMeasurement).
+
+All future changes here will be reviewed via the 3:3 roborev matrix + compact before being considered stable.
+
 ## Building the demo
 
 ```bash

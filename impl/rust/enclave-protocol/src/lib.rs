@@ -21,8 +21,14 @@ use thiserror::Error;
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Maximum allowed message size (64 MiB). Protects against DoS from the host.
-pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
+/// Maximum allowed message size (1 MiB).
+/// 
+/// Reduced from 64 MiB after Gemini security review on 2026-06-05:
+/// In a TEE (Nitro Enclaves / SEV-SNP) memory is strictly limited.
+/// A 64 MiB limit allows an untrusted host to force large allocations
+/// via the length prefix, leading to resource exhaustion / OOM.
+/// 1 MiB is more than sufficient for PQ signatures, attestations and tickets.
+pub const MAX_MESSAGE_SIZE: u32 = 1 * 1024 * 1024;
 
 /// Errors that can occur while (de)serializing or framing messages.
 #[derive(Debug, Error)]
