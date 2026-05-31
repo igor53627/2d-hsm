@@ -1,0 +1,20 @@
+[package]
+name = "enclave-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical vsock wire protocol between 2D host and TEE signing service (high-risk component)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+ciborium = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+hex = "0.4"
+# For future property testing of canonical encoding
+
+[features]
+default = []
+# Add "std" if we need std in the future (enclave may be no_std later)
