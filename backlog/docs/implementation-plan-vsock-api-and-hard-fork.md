@@ -109,18 +109,29 @@ Following user choice of **Option A** (2026-06-05):
 Previous steps (initial framing, first skeletons, post-matrix fixes up to 394b73a) are considered complete.
 
 **Current status (2026-06-05, evening)**: 
-- Entered **Option A**: "Lock Canonical Preimage in spec first".
-- Normative definition of the preimage (`keccak256(abi.encode(ticketType, nonce, contextHash, activationHeight, newMeasurement, pqPubkey, forkSpecHash, newHeaderVersion))`) + `newHeaderVersion` field added to the struct.
-- Light 3:3 matrix launched on the dirty spec change (codex security, gemini security, claude-code design, fast mode).
+- Option A ("Lock Canonical Preimage in spec first") completed for this cycle.
+- The preimage is now internally consistent and normative (`keccak256(abi.encode(...))` including `newHeaderVersion` as a real field).
+- Light matrices on the locking commits came back clean / Pass.
+- Hardened implementation + robust Forge JSON-exchange automation (with proper ignored test vectors) committed as `e2ee43e`.
+- Fresh full 3x3 roborev matrix launched on e2ee43e (codex security, gemini security, claude-code design).
 
-Awaiting results of the light review before proceeding to implementation in the Rust crate.
+This commit includes the polished `compute_canonical_ticket_hash` now matching the locked spec, plus reliable automated cross-checks.
 
-**Update (same day):** 
-- The Medium finding from the 402fdba matrix ("non-strict ticket_type validation") was fixed immediately.
-- Targeted fix committed as `394b73a`.
-- Fresh 3:3 matrix launched on 394b73a (codex security, gemini security, claude-code design).
+We are now waiting for the matrix results on this commit before deciding on the next increment or further fixes.
 
-We are now waiting for the results of this new matrix.
+**Post-matrix update (same day):** 
+- The 3:3 matrix on `e2ee43e` (codex security + gemini security + claude-code design) returned **Fail**.
+- Two independent HIGH findings (identical root cause):
+  1. `compute_canonical_ticket_hash` emitted only 7 head words; the second dynamic offset for `pqPubkey` was missing → Rust preimage could never match the normative `abi.encode` in the spec / Solidity script.
+  2. The automated cross-check helper (`compute_hash_via_forge`) did not compile (`output.stderr` referenced after `.status()` call) so the headline verification feature was dead + the entire test target was broken.
+- Both HIGHs were fixed immediately in a targeted follow-up (this commit):
+  - Correct 8-word ABI head with proper dynamic offsets + type-aware 0-forcing for recovery (to match the ground-truth script exactly).
+  - Switched to `.output()` for proper stderr capture on Forge failures.
+  - The Solidity harness (`CanonicalTicketHash.s.sol` + foundry.toml + README) is now committed so the cross-check is reproducible.
+- Fresh 3:3 matrix launched on the fix commit.
+- The automated vectors now have a real chance of passing once `cd impl/solidity && forge install foundry-rs/forge-std --no-commit` is run (one-time).
+
+This demonstrates the process working as intended: commit → matrix → immediate fix → re-matrix.
 
 ## Success Criteria for Moving to "Real" Implementation
 

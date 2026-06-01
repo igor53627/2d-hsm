@@ -291,66 +291,92 @@ pub struct GetStatusResponse {
 pub fn compute_canonical_ticket_hash(payload: &AuthorizationTicketPayload) -> [u8; 32] {
     let mut hasher = Keccak256::new();
 
-    // --- Head (static part, 8 × 32 bytes) ---
+    // --- Head (static part, exactly 8 × 32 bytes for the 8-tuple) ---
+    //
+    // Tuple: (uint8, uint64, bytes32, uint64, bytes, bytes, bytes32, uint32)
+    // This must produce bit-for-bit identical preimage to Solidity's
+    // `abi.encode(...)` + `keccak256` as defined in the normative spec.
+    //
+    // Head layout (words 0-7):
+    // 0: ticketType
+    // 1: nonce
+    // 2: contextHash
+    // 3: activationHeight
+    // 4: offset(newMeasurement) = 256
+    // 5: offset(pqPubkey) = 256 + 32 + padded(newMeasurement)
+    // 6: forkSpecHash (0 for recovery per script)
+    // 7: newHeaderVersion (0 for recovery per script)
 
-    // 1. ticketType as uint8 (right-padded to 32 bytes)
+    // 0. ticketType as uint8 (right-padded to 32 bytes)
     let mut word = [0u8; 32];
     word[31] = payload.ticket_type;
     hasher.update(word);
 
-    // 2. nonce as uint64
+    // 1. nonce as uint64
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&payload.nonce.to_be_bytes());
     hasher.update(word);
 
-    // 3. contextHash (bytes32)
+    // 2. contextHash (bytes32)
     hasher.update(payload.context_hash);
 
-    // 4. activationHeight as uint64
+    // 3. activationHeight as uint64
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&payload.activation_height.to_be_bytes());
     hasher.update(word);
 
-    // 5 & 6. Offsets for the two dynamic `bytes` fields (newMeasurement and pqPubkey)
-    // Head is 8 words = 256 bytes. Data section starts at offset 256.
-    // First dynamic: at 256
+    // 4. offset for first dynamic (newMeasurement): always 256 (after 8-word head)
     let mut word = [0u8; 32];
-    word[24..32].copy_from_slice(&(256u64).to_be_bytes()); // offset for newMeasurement
+    word[24..32].copy_from_slice(&(256u64).to_be_bytes());
     hasher.update(word);
 
-    // Second dynamic will start after the first dynamic's data.
-    // We calculate the offsets properly below.
+    // 5. offset for second dynamic (pqPubkey)
+    // Data for newMeasurement starts at 256, consists of: 32-byte length word + data + padding
+    let meas_len = payload.new_measurement.len() as u64;
+    let meas_data_padded = 32 + ((32 - (meas_len % 32)) % 32);
+    let pq_offset: u64 = 256 + meas_data_padded;
+    let mut word = [0u8; 32];
+    word[24..32].copy_from_slice(&pq_offset.to_be_bytes());
+    hasher.update(word);
 
-    // 7. forkSpecHash (bytes32) — always present in the struct now
-    let fork_hash = payload.fork_spec_hash.unwrap_or([0u8; 32]);
+    // 6. forkSpecHash — for recovery (type 0) the canonical script forces bytes32(0)
+    // even if the JSON had a value; for hard-fork use the provided value.
+    let fork_hash = if payload.ticket_type == 0 {
+        [0u8; 32]
+    } else {
+        payload.fork_spec_hash.unwrap_or([0u8; 32])
+    };
     hasher.update(fork_hash);
 
-    // 8. newHeaderVersion as uint32
+    // 7. newHeaderVersion — same rule: 0 for recovery, real value for hard-fork.
+    let ver = if payload.ticket_type == 0 {
+        0u32
+    } else {
+        payload.new_header_version.unwrap_or(0)
+    };
     let mut word = [0u8; 32];
-    word[28..32].copy_from_slice(&payload.new_header_version.unwrap_or(0).to_be_bytes());
+    word[28..32].copy_from_slice(&ver.to_be_bytes());
     hasher.update(word);
 
-    // --- Tail (dynamic data) ---
+    // --- Tail (dynamic data section, in declaration order) ---
 
-    // newMeasurement (bytes)
-    let len = payload.new_measurement.len() as u64;
+    // newMeasurement (bytes): length word + data + right-zero padding to 32
     let mut word = [0u8; 32];
-    word[24..32].copy_from_slice(&len.to_be_bytes());
+    word[24..32].copy_from_slice(&meas_len.to_be_bytes());
     hasher.update(word);
     hasher.update(&payload.new_measurement);
-    // pad to 32 bytes
-    let padding = (32 - (len % 32)) % 32;
+    let padding = (32 - (meas_len % 32)) % 32;
     if padding > 0 {
         hasher.update(&[0u8; 32][..padding as usize]);
     }
 
-    // pqPubkey (bytes)
-    let len = payload.pq_pubkey.len() as u64;
+    // pqPubkey (bytes): length word + data + padding
+    let pq_len = payload.pq_pubkey.len() as u64;
     let mut word = [0u8; 32];
-    word[24..32].copy_from_slice(&len.to_be_bytes());
+    word[24..32].copy_from_slice(&pq_len.to_be_bytes());
     hasher.update(word);
     hasher.update(&payload.pq_pubkey);
-    let padding = (32 - (len % 32)) % 32;
+    let padding = (32 - (pq_len % 32)) % 32;
     if padding > 0 {
         hasher.update(&[0u8; 32][..padding as usize]);
     }
@@ -677,7 +703,8 @@ mod tests {
             .nth(3)
             .unwrap_or(&manifest_dir);
 
-        let script_path = repo_root.join("impl/solidity/CanonicalTicketHash.s.sol");
+        let solidity_dir = repo_root.join("impl/solidity");
+        let script_path = solidity_dir.join("CanonicalTicketHash.s.sol");
         if !script_path.exists() {
             return None;
         }
@@ -701,22 +728,16 @@ mod tests {
 
         fs::write(&input_path, serde_json::to_string_pretty(&input_json).ok()?).ok()?;
 
-        // Run the script with environment variables
-        let solidity_dir = repo_root.join("impl/solidity");
-        let script_path = solidity_dir.join("CanonicalTicketHash.s.sol");
-        if !script_path.exists() {
-            return None;
-        }
-
-        let status = Command::new("forge")
-            .current_dir(&solidity_dir) // Run from impl/solidity (where foundry.toml lives)
+        // Run the script with environment variables (from the solidity dir so foundry.toml is found)
+        let output = Command::new("forge")
+            .current_dir(&solidity_dir)
             .env("INPUT_JSON", &input_path)
             .env("OUTPUT_JSON", &output_path)
             .args(["script", "CanonicalTicketHash.s.sol", "--silent"])
-            .status()
+            .output()
             .ok()?;
 
-        if !status.success() {
+        if !output.status.success() {
             eprintln!("Forge script failed while computing canonical hash for test vector.");
             eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
             eprintln!("\nOne-time setup (run once):");
