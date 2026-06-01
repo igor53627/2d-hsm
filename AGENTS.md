@@ -39,18 +39,66 @@ For every high-risk change:
 - Lenses: security + design (add concurrency when state machines for arming/hard-fork transitions are implemented)
 - Config lives in `.roborev.toml` at repo root
 
+### Reduced vs Full Matrix — Decision Rules
+
+For high-risk work we distinguish two levels of review:
+
+**Reduced Matrix** (default practical 3-review set)
+- security + codex
+- security + gemini
+- design + claude-code
+
+This is the normal operating mode for incremental work inside an already-reviewed direction.
+
+**Full Matrix** (more complete coverage)
+- The three reviews above, plus:
+  - At least one review with the **concurrency** lens
+  - Optionally design + cursor-codex-gemini for additional architectural perspective
+
+**When Full Matrix is required (mandatory):**
+- First introduction of significant state / state machine logic (e.g., `EnclaveState`, arming state, freshness tracking).
+- The change meaningfully touches **two or more lenses** at the same time (security + design + concurrency concerns).
+- Previous matrix on the same topic found HIGH findings (or multiple MEDIUMs that create doubt).
+- We are making changes to core authorization / gating behavior (who can sign what, under which conditions, with which proof).
+- Concurrency or ordering issues are material (e.g., interaction between `ARM_FOR_PRODUCTION`, `SIGN_AUTHORIZATION_TICKET`, and `GET_STATUS`).
+
+**When Reduced Matrix is acceptable:**
+- Small follow-up fixes or polish inside a direction that already passed a Full Matrix.
+- Purely additive changes with narrow impact (e.g., adding a new test vector or improving an error message).
+- The change is low-risk by nature and previous matrices on the area were clean.
+
+**Rule of thumb:** When in doubt, run Full. The cost of one extra review is much lower than the cost of a missed HIGH on TEE signing or hard-fork logic.
+
+After any matrix (Reduced or Full), the consolidation step (`roborev compact` or equivalent) + explicit resolution of findings remains mandatory.
+
 ### How to Run a Review
 
-```bash
-# Review uncommitted changes (typical during design/implementation)
-roborev review --dirty --type security --agent codex --repo .
+See the "Reduced vs Full Matrix" section above for when to use which level.
 
-# Full matrix (recommended for high-risk)
+**Typical Reduced Matrix (most common):**
+```bash
+roborev review --dirty --type security --agent codex
+roborev review --dirty --type security --agent gemini
+roborev review --dirty --type design --agent claude-code
+```
+
+**Full Matrix (when required by the rules above):**
+```bash
+# Core three
 roborev review --dirty --type security --agent codex
 roborev review --dirty --type security --agent gemini
 roborev review --dirty --type design --agent claude-code
 
-# Consolidate findings
+# Add concurrency lens
+roborev review --dirty --type concurrency --agent codex
+roborev review --dirty --type concurrency --agent gemini
+
+# Optional: additional architectural perspective
+roborev review --dirty --type design --agent cursor-codex-gemini
+```
+
+After the matrix, always run consolidation:
+```bash
 roborev compact --wait
 ```
 
@@ -84,11 +132,14 @@ This demonstrated the value of the multi-agent process even at the pure design/s
 
 ## Review Matrix Configuration (3:3)
 
-See `.roborev.toml`:
-- Agents: `codex`, `gemini`, `cursor-codex-gemini` (reviews executed through Cursor IDE for the third viewpoint)
-- Lenses: `security`, `design`, `concurrency` (the latter is activated for state-machine and freshness-proof logic)
+See `.roborev.toml` for the full agent and lens list.
 
-Any modification to the vsock protocol, ticket canonicalization, arming logic, hard-fork transition, or TEE key decisions is automatically high-risk and requires a full matrix before being considered reviewed.
+In practice we distinguish two operating modes (see "Reduced vs Full Matrix — Decision Rules" above):
+
+- **Reduced Matrix** (the practical default for most incremental high-risk work)
+- **Full Matrix** (required for first introduction of state machines, changes touching multiple lenses, after HIGH findings, etc.)
+
+Any modification to the vsock protocol, ticket canonicalization, arming logic, hard-fork transition, or TEE key decisions is automatically high-risk and requires a matrix (Reduced or Full, per the rules) before being considered reviewed.
 
 ## Consolidation Process (Compact)
 

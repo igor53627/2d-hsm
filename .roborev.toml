@@ -23,6 +23,24 @@ agents = ["codex", "gemini", "cursor-codex-gemini"]
 # scheduled hard-fork transitions, etc.).
 review_types = ["security", "design", "concurrency"]
 
+# Matrix execution policy (Reduced vs Full)
+#
+# See AGENTS.md → "Reduced vs Full Matrix — Decision Rules" for the full criteria.
+#
+# Reduced Matrix (default for most incremental high-risk work):
+#   - security + codex
+#   - security + gemini
+#   - design + claude-code
+#
+# Full Matrix (mandatory when any of the following apply):
+#   - First introduction of significant state / state machine (e.g. EnclaveState, arming logic)
+#   - Change meaningfully touches two or more lenses at once
+#   - Previous matrix on the topic found HIGH (or multiple concerning MEDIUMs)
+#   - Changes to core authorization/gating behavior (who can sign what, under what conditions)
+#   - Concurrency/ordering concerns are material (Arm ↔ Sign ↔ GetStatus interactions, freshness proofs, scheduled transitions)
+#
+# When Full is required, add at minimum one concurrency lens review (and optionally design + cursor-codex-gemini).
+
 # High-risk surface definition for this project (used by hooks / CI / humans
 # to decide when to force the full matrix + consolidation + human gate).
 # Any change under these paths or touching these concepts is treated as
