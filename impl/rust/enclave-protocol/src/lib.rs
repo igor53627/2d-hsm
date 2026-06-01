@@ -355,6 +355,41 @@ pub struct ArmForProductionResponse {
     pub reason: Option<String>,
 }
 
+// -----------------------------------------------------------------------------
+// Enclave State (for AC #7 - ArmForProduction with actual state tracking)
+// -----------------------------------------------------------------------------
+
+/// Represents the state of the enclave after a successful `ARM_FOR_PRODUCTION`.
+///
+/// This is a minimal skeleton type used in Phase 1 to track authorization state.
+/// In a real TEE implementation this information would be sealed inside the
+/// enclave, protected by the TEE, and never exposed to the untrusted host
+/// except through carefully controlled queries (e.g. `GET_STATUS`).
+#[derive(Debug, Clone)]
+pub struct EnclaveArmedState {
+    /// The `RecentChainProof` that was successfully validated during arming.
+    pub proof: RecentChainProof,
+
+    /// The height at which the arming occurred.
+    /// This can be used later to enforce freshness requirements when signing
+    /// hard-fork tickets.
+    pub armed_at_height: u64,
+}
+
+/// Current authorization state of the enclave.
+///
+/// This enum allows the skeleton (and future real enclave) to track whether
+/// it has been successfully armed for production and with which proof.
+#[derive(Debug, Clone, Default)]
+pub enum EnclaveState {
+    /// The enclave has not yet been armed (or has been reset).
+    #[default]
+    Unarmed,
+
+    /// The enclave is currently armed with a validated proof.
+    Armed(EnclaveArmedState),
+}
+
 /// Validates a `RecentChainProof` against the `AuthorizedProducerState` that
 /// the caller wishes to arm the enclave with.
 ///
@@ -454,6 +489,37 @@ pub fn validate_recent_chain_proof(
     }
 
     Ok(())
+}
+
+/// Attempts to arm (or re-arm) the enclave with the provided authorization.
+///
+/// This is the core pure function for AC #7. It:
+/// - Validates the supplied `RecentChainProof` against the claimed `AuthorizedProducerState`
+/// - On success, produces a new `EnclaveState::Armed(...)`
+///
+/// In a real enclave this function would be called by the vsock handler,
+/// and the resulting state would be sealed inside the TEE.
+///
+/// Phase 1 note: This currently relies on `validate_recent_chain_proof`,
+/// which is explicitly a structural precheck only (see its documentation).
+pub fn arm_for_production(
+    _current_state: &EnclaveState,
+    req: ArmForProductionRequest,
+) -> Result<EnclaveState, ProtocolError> {
+    // Note: `_current_state` is accepted for future policy decisions
+    // (e.g. "can we re-arm?", "is the new proof fresher than current?", etc.).
+    // It is intentionally unused in this minimal Phase 1 implementation.
+
+    // Validate the proof using the existing (honest) Phase 1 validator.
+    validate_recent_chain_proof(&req.recent_chain_proof, &req.authorized_state)?;
+
+    let armed_state = EnclaveArmedState {
+        proof: req.recent_chain_proof,
+        armed_at_height: req.authorized_state.activated_at_height,
+    };
+
+    // For the skeleton we allow re-arming. A stricter policy can be added later.
+    Ok(EnclaveState::Armed(armed_state))
 }
 
 // -----------------------------------------------------------------------------
@@ -765,6 +831,55 @@ pub fn dispatch_command(cmd: Command) -> Response {
     }
 }
 
+/// Stateful version of the dispatcher (recommended for real usage).
+///
+/// This is the version that should be used when the caller maintains
+/// `EnclaveState`. It properly handles `ARM_FOR_PRODUCTION` by calling
+/// `arm_for_production` and updating the state on success.
+pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Response {
+    match cmd {
+        Command::SignAuthorizationTicket(req) => {
+            match handle_sign_authorization_ticket(req) {
+                Ok(resp) => Response::SignAuthorizationTicket(resp),
+                Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
+            }
+        }
+        Command::GetMeasurement(_req) => {
+            Response::GetMeasurement(GetMeasurementResponse {
+                measurement: b"enclave-measurement-placeholder".to_vec(),
+                attestation: b"attestation-placeholder".to_vec(),
+                pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
+                supported_ticket_types: vec![0],
+            })
+        }
+        Command::ArmForProduction(req) => {
+            match arm_for_production(state, req) {
+                Ok(new_state) => {
+                    *state = new_state;
+                    Response::ArmForProduction(ArmForProductionResponse {
+                        status: "armed".to_string(),
+                        reason: None,
+                    })
+                }
+                Err(e) => Response::ArmForProduction(ArmForProductionResponse {
+                    status: "refused".to_string(),
+                    reason: Some(e.to_string()),
+                }),
+            }
+        }
+        Command::GetStatus(_req) => {
+            let armed = matches!(state, EnclaveState::Armed(_));
+            Response::GetStatus(GetStatusResponse {
+                armed,
+                current_measurement: vec![],
+                current_pq_pubkey: vec![],
+                pending_hard_fork_height: None,
+                last_known_block: None,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +963,72 @@ mod tests {
 
         let err = validate_recent_chain_proof(&bad, &state).unwrap_err();
         assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
+    }
+
+    #[test]
+    fn arm_for_production_transitions_state_on_valid_proof() {
+        // Basic test for the new arm_for_production function (AC #7)
+        let initial = EnclaveState::Unarmed;
+
+        let req = ArmForProductionRequest {
+            authorized_state: AuthorizedProducerState {
+                pq_pubkey: vec![1; 48],
+                measurement: b"meas".to_vec(),
+                activated_at_height: 100,
+                source_ticket_hash: [0xAA; 32],
+            },
+            recent_chain_proof: RecentChainProof {
+                finalized_height: 150,
+                finalized_header_hash: [0xFE; 32],
+                recovery_history_tail: vec![[0xAA; 32]],
+                proof_data: vec![],
+                signature_from_recent_producer: None,
+            },
+        };
+
+        let new_state = arm_for_production(&initial, req).expect("arming should succeed");
+
+        match new_state {
+            EnclaveState::Armed(s) => {
+                assert_eq!(s.armed_at_height, 100);
+            }
+            EnclaveState::Unarmed => panic!("expected Armed state"),
+        }
+    }
+
+    #[test]
+    fn dispatch_arm_for_production_updates_state() {
+        // Demonstrates using the stateful dispatcher (the new recommended path)
+        let mut state = EnclaveState::Unarmed;
+
+        let req = ArmForProductionRequest {
+            authorized_state: AuthorizedProducerState {
+                pq_pubkey: vec![1; 48],
+                measurement: b"meas".to_vec(),
+                activated_at_height: 100,
+                source_ticket_hash: [0xAA; 32],
+            },
+            recent_chain_proof: RecentChainProof {
+                finalized_height: 150,
+                finalized_header_hash: [0xFE; 32],
+                recovery_history_tail: vec![[0xAA; 32]],
+                proof_data: vec![],
+                signature_from_recent_producer: None,
+            },
+        };
+
+        let cmd = Command::ArmForProduction(req);
+        let resp = dispatch_command_with_state(cmd, &mut state);
+
+        match resp {
+            Response::ArmForProduction(r) => {
+                assert_eq!(r.status, "armed");
+            }
+            _ => panic!("expected ArmForProduction response"),
+        }
+
+        // State should now be armed
+        assert!(matches!(state, EnclaveState::Armed(_)));
     }
 
     #[test]
