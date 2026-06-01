@@ -196,15 +196,14 @@ pub struct GetMeasurementResponse {
 ///
 /// The enclave must:
 /// - Verify it is currently armed as the authorized producer (for hard-fork tickets especially).
-/// - **Additionally (Track B coupling)**: for `ticket_type == 1` (HARD_FORK_ACTIVATION)
-///   the enclave **must only sign** if it was previously successfully armed via
-///   `ARM_FOR_PRODUCTION` **with a RecentChainProof that passed
-///   `validate_recent_chain_proof`** and whose `finalized_height` is recent
-///   relative to the ticket's `activation_height`.
 ///
-///   This is the "network as second factor" requirement:
-///   a compromised host must not be able to obtain a hard-fork signature from
-///   an enclave that has only an old/stale view of who the authorized producer is.
+///   **Phase 1 reality check (post 3:3 matrix on 5a0e3e2):**
+///   In this skeleton, hard-fork (type=1) tickets are **explicitly rejected**
+///   by `handle_sign_authorization_ticket`. Real enforcement of "must only sign
+///   when armed with a validated RecentChainProof" will be implemented when
+///   the actual enclave state machine + ARM_FOR_PRODUCTION handler exists.
+///
+///   Recovery tickets (type 0) are currently allowed (bootstrap path).
 ///
 /// - Compute the exact canonical `ticket_hash` (see below).
 /// - Sign it with the PQ private key.
@@ -268,12 +267,12 @@ pub struct SignAuthorizationTicketResponse {
 /// - Convince the enclave that a hard-fork or recovery action is fresh when
 ///   the on-chain reality has moved on (long-range / replay attacks).
 ///
-/// Therefore `ARM_FOR_PRODUCTION` **mandates** a cryptographically fresh proof
-/// that the claimed `AuthorizedProducerState` is consistent with a recent
-/// finalized prefix of the canonical chain.
+/// Therefore in a real implementation `ARM_FOR_PRODUCTION` should require a
+/// cryptographically fresh proof that the claimed `AuthorizedProducerState`
+/// is consistent with a recent finalized prefix of the canonical chain.
 ///
-/// The enclave **must** call `validate_recent_chain_proof` and refuse to arm
-/// (fail-closed) on any failure.
+/// In Phase 1 the current `validate_recent_chain_proof` provides only
+/// structural sanity checks (see its docstring for the explicit warning).
 ///
 /// Fields are intentionally minimal for Phase 1. A real light-client proof
 /// (e.g. Tendermint/Beacon chain header + validator signatures, or 2D-specific
@@ -316,12 +315,16 @@ pub struct RecentChainProof {
 
 /// Request to arm the enclave for production under a specific authorized state.
 ///
-/// Per review findings (Codex HIGH + Claude, 2026-06-05):
+/// Per review findings (Codex HIGH + Claude + Gemini, 5a0e3e2 matrix):
 /// - `recent_chain_proof` is now **mandatory** and **typed** (not raw bytes).
-/// - The enclave **must** successfully validate the proof via
-///   `validate_recent_chain_proof` **before** transitioning to the armed state.
-/// - This is the concrete realization of "network as cryptographic second factor".
-///   The enclave never trusts the host-provided `AuthorizedProducerState` alone.
+/// - In the real enclave, `validate_recent_chain_proof` (or its future
+///   cryptographic successor) **must** be called before arming.
+///
+///   **Phase 1 reality:** The current `validate_recent_chain_proof` is
+///   explicitly documented as a **structural precheck only** (see its
+///   docstring). It does NOT provide cryptographic freshness or "network as
+///   second factor" guarantees. Real enforcement will come with the full
+///   implementation of ARM_FOR_PRODUCTION + cryptographic verification.
 ///
 /// After a successful arming the enclave records that it has seen a fresh proof.
 /// Subsequent `SIGN_AUTHORIZATION_TICKET` for type=1 (HARD_FORK) **must** only
@@ -355,6 +358,24 @@ pub struct ArmForProductionResponse {
 /// Validates a `RecentChainProof` against the `AuthorizedProducerState` that
 /// the caller wishes to arm the enclave with.
 ///
+/// ========================================================================
+/// PHASE 1 — STRUCTURAL PRECHECK ONLY (post 3:3 matrix on 5a0e3e2)
+/// ========================================================================
+///
+/// THIS FUNCTION IS **NOT** A SECURITY GATE.
+///
+/// - It performs **only structural and basic monotonicity checks**.
+/// - It does **NOT** perform cryptographic verification of `proof_data`.
+/// - It does **NOT** enforce "network as cryptographic second factor".
+/// - Returning `Ok(())` from this function **MUST NOT** be interpreted as
+///   proof that the proof is fresh or authentic.
+///
+/// If you are calling this expecting a real freshness guarantee — you are
+/// using it incorrectly. The real cryptographic gate will be implemented
+/// later (full light-client / aggregate signature verification).
+///
+/// ========================================================================
+///
 /// ## Security Invariants (MUST hold — fail closed on any violation)
 ///
 /// 1. The proof must demonstrate that the chain has progressed at least to the
@@ -362,9 +383,9 @@ pub struct ArmForProductionResponse {
 ///    arming the enclave with an ancient "authorized producer" that has long
 ///    been replaced on-chain.
 /// 2. Structural sanity: heights positive, header hash non-zero, etc.
-/// 3. The `source_ticket_hash` from the authorized state should appear in (or
-///    be consistent with) the `recovery_history_tail`. This is the primary
-///    defense against replay of old RECOVERY tickets.
+/// 3. If `recovery_history_tail` is non-empty, the `source_ticket_hash` from
+///    the authorized state **must** appear in it. Failure to contain it when
+///    the tail is non-empty is now a hard error (see code below).
 /// 4. In a real implementation the `proof_data` (and optionally the
 ///    `signature_from_recent_producer`) would be subjected to full light-client
 ///    or aggregate signature verification rooted in a trusted genesis or
@@ -384,6 +405,9 @@ pub struct ArmForProductionResponse {
 /// gating on hard-fork tickets.
 ///
 /// Returns `Ok(())` only when all implemented checks pass.
+///
+/// **WARNING:** Do not treat `Ok(())` as "this proof is fresh and trustworthy".
+/// It only means "this proof is not obviously malformed on the structural level".
 pub fn validate_recent_chain_proof(
     proof: &RecentChainProof,
     current_authorized: &AuthorizedProducerState,
@@ -406,16 +430,17 @@ pub fn validate_recent_chain_proof(
         ));
     }
 
-    // Basic anti-replay: source_ticket_hash should be present in the recent tail
-    // (or the tail can be empty on first arming — acceptable).
+    // Basic anti-replay: if the tail is non-empty, the claimed source ticket
+    // must be present in it. This is now a hard error (post-matrix fix).
     if !proof.recovery_history_tail.is_empty() {
         let source_in_tail = proof
             .recovery_history_tail
             .iter()
             .any(|h| h == &current_authorized.source_ticket_hash);
         if !source_in_tail {
-            // Not a hard failure in Phase 1 (tail may be truncated),
-            // but we log the situation. Real policy can be stricter later.
+            return Err(ProtocolError::RecentChainProofValidation(
+                "recovery_history_tail is non-empty but does not contain the claimed source_ticket_hash (possible replay or superseded state)",
+            ));
         }
     }
 
@@ -673,6 +698,23 @@ pub fn handle_sign_authorization_ticket(
     req: SignAuthorizationTicketRequest,
 ) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
     // === THE ONLY ALLOWED SIGNING PATH FOR AUTHORIZATION TICKETS ===
+    //
+    // Phase 1 safety rule (post 3:3 matrix on 5a0e3e2):
+    // Hard-fork activation tickets (type 1) MUST NOT be signed from this
+    // stateless handler. Real signing for type=1 must only happen after the
+    // enclave has been successfully armed via ARM_FOR_PRODUCTION with a
+    // validated RecentChainProof (see Track B).
+    //
+    // Until the real enclave state machine exists, we fail closed here.
+    if req.ticket.ticket_type == 1 {
+        return Err(ProtocolError::InvalidTicket(
+            "Hard-fork (type=1) ticket signing is not allowed in this skeleton. \
+             It requires a real armed state with a fresh RecentChainProof \
+             (see ARM_FOR_PRODUCTION and validate_recent_chain_proof). \
+             This is a deliberate Phase 1 safety measure after 3:3 roborev review.",
+        ));
+    }
+
     let ticket_hash = prepare_ticket_for_signing(&req.ticket)?;
 
     // In the real enclave this will be a real PQ signature with the
@@ -694,7 +736,11 @@ pub fn dispatch_command(cmd: Command) -> Response {
         Command::SignAuthorizationTicket(req) => {
             match handle_sign_authorization_ticket(req) {
                 Ok(resp) => Response::SignAuthorizationTicket(resp),
-                Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
+                Err(e) => Response::Error(format!(
+                    "sign_authorization_ticket failed: {}. \
+                     Note: Hard-fork (type=1) signing is intentionally disabled in this skeleton.",
+                    e
+                )),
             }
         }
         Command::GetMeasurement(_req) => {
@@ -910,6 +956,8 @@ mod tests {
 
     #[test]
     fn roundtrip_sign_via_framing_and_dispatch_hardfork() {
+        // In Phase 1 (post 5a0e3e2 matrix), hard-fork tickets are intentionally rejected
+        // at the handler level until real armed state + freshness proof is implemented.
         let payload = AuthorizationTicketPayload {
             ticket_type: 1,
             nonce: 0x2222,
@@ -921,7 +969,7 @@ mod tests {
             new_header_version: Some(3),
         };
 
-        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload.clone() });
+        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload });
 
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&cmd, &mut bytes).unwrap();
@@ -933,10 +981,10 @@ mod tests {
         let resp = dispatch_command(received_cmd);
 
         match resp {
-            Response::SignAuthorizationTicket(r) => {
-                assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&payload));
+            Response::Error(msg) => {
+                assert!(msg.contains("Hard-fork (type=1) ticket signing is not allowed"));
             }
-            _ => panic!("expected SignAuthorizationTicket response"),
+            _ => panic!("expected Error response for hard-fork in Phase 1 skeleton"),
         }
     }
 
