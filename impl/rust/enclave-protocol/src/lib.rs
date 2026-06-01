@@ -544,8 +544,15 @@ pub struct GetStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStatusResponse {
     pub armed: bool,
-    pub current_measurement: Vec<u8>,
-    pub current_pq_pubkey: Vec<u8>,
+    /// The measurement that was authorized when the enclave was armed.
+    /// In Phase 1 this is the value captured at arming time.
+    /// Later this may evolve to reflect the "current" live measurement
+    /// (e.g. after a hard fork). For now it represents the authorized one.
+    pub authorized_measurement: Vec<u8>,
+
+    /// The PQ public key that was authorized when the enclave was armed.
+    pub authorized_pq_pubkey: Vec<u8>,
+
     pub pending_hard_fork_height: Option<u64>,
     pub last_known_block: Option<u64>,
 }
@@ -880,15 +887,15 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
             match state {
                 EnclaveState::Armed(s) => Response::GetStatus(GetStatusResponse {
                     armed: true,
-                    current_measurement: s.authorized_measurement.clone(),
-                    current_pq_pubkey: s.authorized_pq_pubkey.clone(),
+                    authorized_measurement: s.authorized_measurement.clone(),
+                    authorized_pq_pubkey: s.authorized_pq_pubkey.clone(),
                     pending_hard_fork_height: None,
                     last_known_block: None,
                 }),
                 EnclaveState::Unarmed => Response::GetStatus(GetStatusResponse {
                     armed: false,
-                    current_measurement: vec![],
-                    current_pq_pubkey: vec![],
+                    authorized_measurement: vec![],
+                    authorized_pq_pubkey: vec![],
                     pending_hard_fork_height: None,
                     last_known_block: None,
                 }),
@@ -1050,6 +1057,12 @@ mod tests {
 
     #[test]
     fn get_status_reflects_armed_state() {
+        // PHASE 1 / SKELETON BEHAVIOR
+        // This test arms the enclave using an empty `proof_data` and no signature.
+        // In Phase 1 this is intentionally allowed (structural precheck only).
+        // When real cryptographic verification of the proof is implemented,
+        // this test (and the arming path it exercises) must be revisited.
+        // Consider adding an ignored/pending test that asserts the desired fail-closed behavior.
         let mut state = EnclaveState::Unarmed;
 
         let req = ArmForProductionRequest {
@@ -1076,8 +1089,8 @@ mod tests {
         };
 
         assert!(status_resp.armed);
-        assert_eq!(status_resp.current_measurement, b"armed-measurement-v1");
-        assert_eq!(status_resp.current_pq_pubkey, vec![0xAA; 48]);
+        assert_eq!(status_resp.authorized_measurement, b"armed-measurement-v1");
+        assert_eq!(status_resp.authorized_pq_pubkey, vec![0xAA; 48]);
     }
 
     #[test]
