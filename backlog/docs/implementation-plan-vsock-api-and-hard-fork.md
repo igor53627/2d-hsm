@@ -128,10 +128,14 @@ We are now waiting for the matrix results on this commit before deciding on the 
   - Correct 8-word ABI head with proper dynamic offsets + type-aware 0-forcing for recovery (to match the ground-truth script exactly).
   - Switched to `.output()` for proper stderr capture on Forge failures.
   - The Solidity harness (`CanonicalTicketHash.s.sol` + foundry.toml + README) is now committed so the cross-check is reproducible.
-- Fresh 3:3 matrix launched on the fix commit.
-- The automated vectors now have a real chance of passing once `cd impl/solidity && forge install foundry-rs/forge-std --no-commit` is run (one-time).
+- Fresh 3:3 matrix launched on the fix commit (8ea2957).
+- The matrix came back with a new HIGH (identical from codex security + gemini security + claude-code design): the `pqPubkey` offset value itself was still wrong (`32 + padding` instead of `32 + meas_len + padding`). This is the same class of DoS (enclave produces unverifiable tickets) as the original bugs on e2ee43e.
+- Immediate 1-line correction committed as `416d889`.
+- Fresh full 3:3 matrix launched on `416d889` (current HEAD).
 
-This demonstrates the process working as intended: commit → matrix → immediate fix → re-matrix.
+The automated vectors now have a real chance of passing once `cd impl/solidity && forge install foundry-rs/forge-std --no-commit` is run (one-time per checkout).
+
+This demonstrates the process working as intended: commit → matrix → immediate fix → re-matrix, with no shortcuts even on "small math" errors.
 
 ## Success Criteria for Moving to "Real" Implementation
 
