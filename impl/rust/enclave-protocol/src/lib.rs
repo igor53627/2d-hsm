@@ -381,6 +381,10 @@ pub struct EnclaveArmedState {
 
     /// The PQ pubkey that was authorized.
     pub authorized_pq_pubkey: Vec<u8>,
+
+    /// The source ticket hash from the AuthorizedProducerState used at arming.
+    /// Useful for auditing and future sign-time anti-replay checks.
+    pub source_ticket_hash: [u8; 32],
 }
 
 /// Current authorization state of the enclave.
@@ -525,6 +529,7 @@ pub fn arm_for_production(
         armed_at_height: req.authorized_state.activated_at_height,
         authorized_measurement: req.authorized_state.measurement,
         authorized_pq_pubkey: req.authorized_state.pq_pubkey,
+        source_ticket_hash: req.authorized_state.source_ticket_hash,
     };
 
     // For the skeleton we allow re-arming. A stricter policy can be added later.
@@ -561,6 +566,12 @@ pub struct GetStatusResponse {
     /// at the moment of arming.
     /// None when unarmed.
     pub proof_finalized_height: Option<u64>,
+
+    /// The source ticket hash from the AuthorizedProducerState that was used
+    /// during this arming. Useful for auditing and for future sign-time
+    /// anti-replay checks (see AC #8).
+    /// None when unarmed.
+    pub source_ticket_hash: Option<[u8; 32]>,
 
     pub pending_hard_fork_height: Option<u64>,
     pub last_known_block: Option<u64>,
@@ -900,6 +911,7 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     authorized_pq_pubkey: s.authorized_pq_pubkey.clone(),
                     armed_at_height: Some(s.armed_at_height),
                     proof_finalized_height: Some(s.proof.finalized_height),
+                    source_ticket_hash: Some(s.source_ticket_hash),
                     pending_hard_fork_height: None,
                     last_known_block: None,
                 }),
@@ -909,6 +921,7 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     authorized_pq_pubkey: vec![],
                     armed_at_height: None,
                     proof_finalized_height: None,
+                    source_ticket_hash: None,
                     pending_hard_fork_height: None,
                     last_known_block: None,
                 }),
@@ -1075,6 +1088,7 @@ mod tests {
         assert!(status.armed);
         assert_eq!(status.armed_at_height, Some(100));
         assert_eq!(status.proof_finalized_height, Some(150));
+        assert_eq!(status.source_ticket_hash, Some([0xAA; 32]));
     }
 
     #[test]
@@ -1115,6 +1129,7 @@ mod tests {
         assert_eq!(status_resp.authorized_pq_pubkey, vec![0xAA; 48]);
         assert_eq!(status_resp.armed_at_height, Some(200));
         assert_eq!(status_resp.proof_finalized_height, Some(250));
+        assert_eq!(status_resp.source_ticket_hash, Some([0xBB; 32]));
     }
 
     #[test]
