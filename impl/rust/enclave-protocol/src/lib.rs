@@ -374,6 +374,13 @@ pub struct EnclaveArmedState {
     /// This can be used later to enforce freshness requirements when signing
     /// hard-fork tickets.
     pub armed_at_height: u64,
+
+    /// The measurement that was authorized during this arming.
+    /// Exposed via GET_STATUS so the host can know what code is considered active.
+    pub authorized_measurement: Vec<u8>,
+
+    /// The PQ pubkey that was authorized.
+    pub authorized_pq_pubkey: Vec<u8>,
 }
 
 /// Current authorization state of the enclave.
@@ -516,6 +523,8 @@ pub fn arm_for_production(
     let armed_state = EnclaveArmedState {
         proof: req.recent_chain_proof,
         armed_at_height: req.authorized_state.activated_at_height,
+        authorized_measurement: req.authorized_state.measurement,
+        authorized_pq_pubkey: req.authorized_state.pq_pubkey,
     };
 
     // For the skeleton we allow re-arming. A stricter policy can be added later.
@@ -868,14 +877,22 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
             }
         }
         Command::GetStatus(_req) => {
-            let armed = matches!(state, EnclaveState::Armed(_));
-            Response::GetStatus(GetStatusResponse {
-                armed,
-                current_measurement: vec![],
-                current_pq_pubkey: vec![],
-                pending_hard_fork_height: None,
-                last_known_block: None,
-            })
+            match state {
+                EnclaveState::Armed(s) => Response::GetStatus(GetStatusResponse {
+                    armed: true,
+                    current_measurement: s.authorized_measurement.clone(),
+                    current_pq_pubkey: s.authorized_pq_pubkey.clone(),
+                    pending_hard_fork_height: None,
+                    last_known_block: None,
+                }),
+                EnclaveState::Unarmed => Response::GetStatus(GetStatusResponse {
+                    armed: false,
+                    current_measurement: vec![],
+                    current_pq_pubkey: vec![],
+                    pending_hard_fork_height: None,
+                    last_known_block: None,
+                }),
+            }
         }
     }
 }
@@ -1029,6 +1046,71 @@ mod tests {
 
         // State should now be armed
         assert!(matches!(state, EnclaveState::Armed(_)));
+    }
+
+    #[test]
+    fn get_status_reflects_armed_state() {
+        let mut state = EnclaveState::Unarmed;
+
+        let req = ArmForProductionRequest {
+            authorized_state: AuthorizedProducerState {
+                pq_pubkey: vec![0xAA; 48],
+                measurement: b"armed-measurement-v1".to_vec(),
+                activated_at_height: 200,
+                source_ticket_hash: [0xBB; 32],
+            },
+            recent_chain_proof: RecentChainProof {
+                finalized_height: 250,
+                finalized_header_hash: [0xCC; 32],
+                recovery_history_tail: vec![[0xBB; 32]],
+                proof_data: vec![],
+                signature_from_recent_producer: None,
+            },
+        };
+
+        let _ = dispatch_command_with_state(Command::ArmForProduction(req), &mut state);
+
+        let status_resp = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state) {
+            Response::GetStatus(r) => r,
+            _ => panic!("expected GetStatus"),
+        };
+
+        assert!(status_resp.armed);
+        assert_eq!(status_resp.current_measurement, b"armed-measurement-v1");
+        assert_eq!(status_resp.current_pq_pubkey, vec![0xAA; 48]);
+    }
+
+    #[test]
+    fn arm_for_production_fails_with_invalid_proof() {
+        let mut state = EnclaveState::Unarmed;
+
+        let bad_req = ArmForProductionRequest {
+            authorized_state: AuthorizedProducerState {
+                pq_pubkey: vec![],
+                measurement: vec![],
+                activated_at_height: 10,
+                source_ticket_hash: [0; 32],
+            },
+            recent_chain_proof: RecentChainProof {
+                finalized_height: 5, // stale
+                finalized_header_hash: [0x11; 32],
+                recovery_history_tail: vec![],
+                proof_data: vec![],
+                signature_from_recent_producer: None,
+            },
+        };
+
+        let resp = dispatch_command_with_state(Command::ArmForProduction(bad_req), &mut state);
+
+        match resp {
+            Response::ArmForProduction(r) => {
+                assert_eq!(r.status, "refused");
+                assert!(r.reason.is_some());
+            }
+            _ => panic!("expected ArmForProduction response"),
+        }
+
+        assert!(matches!(state, EnclaveState::Unarmed));
     }
 
     #[test]
