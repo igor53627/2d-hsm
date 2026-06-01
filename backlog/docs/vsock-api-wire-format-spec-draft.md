@@ -344,12 +344,14 @@ This is the concrete enforcement of "network as cryptographic second factor". Th
 {
   1: 1,
   2: bool,                 ; armed
-  3: bytes,                ; current_measurement
-  4: bytes,                ; current_pq_pubkey
+  3: bytes,                ; authorized_measurement  (value captured at ARM_FOR_PRODUCTION time)
+  4: bytes,                ; authorized_pq_pubkey    (value captured at ARM_FOR_PRODUCTION time)
   5: int / null,           ; pending_hard_fork_height (if a hard fork ticket was already signed)
   6: int / null            ; last_known_block (rough freshness)
 }
 ```
+
+**Phase 1 note:** In the current skeleton these two fields reflect the values authorized at arming time. Future work (measurement transitions after hard forks, etc.) may require additional or renamed fields for "live current" values. The spec will be updated accordingly when that logic is introduced.
 
 This command is relatively safe and can be called frequently for monitoring.
 
