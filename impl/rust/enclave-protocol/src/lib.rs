@@ -736,11 +736,7 @@ pub fn dispatch_command(cmd: Command) -> Response {
         Command::SignAuthorizationTicket(req) => {
             match handle_sign_authorization_ticket(req) {
                 Ok(resp) => Response::SignAuthorizationTicket(resp),
-                Err(e) => Response::Error(format!(
-                    "sign_authorization_ticket failed: {}. \
-                     Note: Hard-fork (type=1) signing is intentionally disabled in this skeleton.",
-                    e
-                )),
+                Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
         Command::GetMeasurement(_req) => {
@@ -751,7 +747,7 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 measurement: b"enclave-measurement-placeholder".to_vec(),
                 attestation: b"attestation-placeholder".to_vec(),
                 pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                supported_ticket_types: vec![0, 1],
+                supported_ticket_types: vec![0], // Phase 1: only recovery is currently signable
             })
         }
         Command::ArmForProduction(_) => {
@@ -830,6 +826,28 @@ mod tests {
         };
 
         assert!(validate_recent_chain_proof(&proof, &state).is_ok());
+    }
+
+    #[test]
+    fn validate_recent_chain_proof_rejects_non_empty_tail_without_source_ticket() {
+        // This is the central anti-replay case that was made a hard error in 5369c3a
+        let state = AuthorizedProducerState {
+            pq_pubkey: vec![],
+            measurement: vec![],
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
+
+        let bad = RecentChainProof {
+            finalized_height: 150,
+            finalized_header_hash: [0xFE; 32],
+            recovery_history_tail: vec![[0x11; 32]], // non-empty but does not contain source
+            proof_data: vec![],
+            signature_from_recent_producer: None,
+        };
+
+        let err = validate_recent_chain_proof(&bad, &state).unwrap_err();
+        assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
     #[test]
@@ -1040,7 +1058,7 @@ mod tests {
         match resp {
             Response::GetMeasurement(r) => {
                 assert!(r.supported_ticket_types.contains(&0));
-                assert!(r.supported_ticket_types.contains(&1));
+                assert!(!r.supported_ticket_types.contains(&1)); // Phase 1: hard-fork signing disabled
                 assert!(!r.measurement.is_empty());
             }
             _ => panic!("expected GetMeasurement response"),
