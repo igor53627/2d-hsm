@@ -544,14 +544,23 @@ pub struct GetStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStatusResponse {
     pub armed: bool,
+
     /// The measurement that was authorized when the enclave was armed.
     /// In Phase 1 this is the value captured at arming time.
-    /// Later this may evolve to reflect the "current" live measurement
-    /// (e.g. after a hard fork). For now it represents the authorized one.
     pub authorized_measurement: Vec<u8>,
 
     /// The PQ public key that was authorized when the enclave was armed.
     pub authorized_pq_pubkey: Vec<u8>,
+
+    /// Height at which the enclave was successfully armed.
+    /// None when unarmed.
+    pub armed_at_height: Option<u64>,
+
+    /// The finalized height from the proof that was used during arming.
+    /// This gives the host visibility into how fresh the chain view was
+    /// at the moment of arming.
+    /// None when unarmed.
+    pub proof_finalized_height: Option<u64>,
 
     pub pending_hard_fork_height: Option<u64>,
     pub last_known_block: Option<u64>,
@@ -889,6 +898,8 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     armed: true,
                     authorized_measurement: s.authorized_measurement.clone(),
                     authorized_pq_pubkey: s.authorized_pq_pubkey.clone(),
+                    armed_at_height: Some(s.armed_at_height),
+                    proof_finalized_height: Some(s.proof.finalized_height),
                     pending_hard_fork_height: None,
                     last_known_block: None,
                 }),
@@ -896,6 +907,8 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     armed: false,
                     authorized_measurement: vec![],
                     authorized_pq_pubkey: vec![],
+                    armed_at_height: None,
+                    proof_finalized_height: None,
                     pending_hard_fork_height: None,
                     last_known_block: None,
                 }),
@@ -1053,6 +1066,15 @@ mod tests {
 
         // State should now be armed
         assert!(matches!(state, EnclaveState::Armed(_)));
+
+        // Also verify via GetStatus
+        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state) {
+            Response::GetStatus(r) => r,
+            _ => panic!("expected GetStatus"),
+        };
+        assert!(status.armed);
+        assert_eq!(status.armed_at_height, Some(100));
+        assert_eq!(status.proof_finalized_height, Some(150));
     }
 
     #[test]
@@ -1091,6 +1113,8 @@ mod tests {
         assert!(status_resp.armed);
         assert_eq!(status_resp.authorized_measurement, b"armed-measurement-v1");
         assert_eq!(status_resp.authorized_pq_pubkey, vec![0xAA; 48]);
+        assert_eq!(status_resp.armed_at_height, Some(200));
+        assert_eq!(status_resp.proof_finalized_height, Some(250));
     }
 
     #[test]
