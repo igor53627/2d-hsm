@@ -20,4 +20,17 @@ serde_json = "1.0"
 
 [features]
 default = []
+enforce-forge-crosscheck = []
+#   When enabled, the automated cross-check tests (that verify
+#   `compute_canonical_ticket_hash` against the Solidity `abi.encode` + keccak256
+#   via `CanonicalTicketHash.s.sol`) will HARD-FAIL instead of gracefully skipping
+#   if forge or the script is unavailable.
+#
+#   Intended for CI gates:
+#     cargo test --features enforce-forge-crosscheck
+#
+#   By default (without the feature) the tests remain CI-friendly and skip with
+#   a loud warning. This preserves the "live contract" verification without
+#   breaking developer machines that lack Foundry.
+#
 # Add "std" if we need std in the future (enclave may be no_std later)

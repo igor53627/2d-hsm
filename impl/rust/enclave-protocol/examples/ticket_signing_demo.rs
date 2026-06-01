@@ -10,8 +10,8 @@
 //! Запуск: cargo run --example ticket_signing_demo
 
 use enclave_protocol::{
-    AuthorizationTicketPayload, Command, FramedMessage, MessageType, Response,
-    prepare_ticket_for_signing, encode_message, decode_message,
+    AuthorizationTicketPayload, Command, MessageType, Response,
+    dispatch_command, encode_message, decode_message,
 };
 use ciborium::ser::into_writer;
 use ciborium::de::from_reader;
@@ -50,7 +50,7 @@ fn main() {
     println!("\n=== Simulation finished ===");
 }
 
-/// Симулирует полный цикл: хост → framed → enclave → обработка → ответ
+/// Симулирует полный цикл: хост → framed → enclave → dispatch → ответ
 fn simulate_signing_flow(payload: &AuthorizationTicketPayload, label: &str) {
     println!("--- {} ---", label);
 
@@ -61,12 +61,12 @@ fn simulate_signing_flow(payload: &AuthorizationTicketPayload, label: &str) {
         },
     );
 
-    // 2. Сериализуем payload команды (в реальности это будет часть Command)
-    let mut payload_bytes = Vec::new();
-    into_writer(&command, &mut payload_bytes).unwrap(); // упрощённо
+    // 2. Сериализуем команду
+    let mut cmd_bytes = Vec::new();
+    into_writer(&command, &mut cmd_bytes).unwrap();
 
     // 3. Упаковываем во фрейм
-    let framed = encode_message(MessageType::SignAuthorizationTicket, &payload_bytes)
+    let framed = encode_message(MessageType::SignAuthorizationTicket, &cmd_bytes)
         .expect("encode failed");
 
     println!("Host → Enclave (framed, {} bytes)", framed.len());
@@ -76,38 +76,31 @@ fn simulate_signing_flow(payload: &AuthorizationTicketPayload, label: &str) {
     assert_eq!(received.msg_type, MessageType::SignAuthorizationTicket);
 
     // 5. Enclave десериализует команду
-    let received_command: enclave_protocol::Command =
+    let received_command: Command =
         from_reader(&received.payload[..]).expect("deserialize command failed");
 
-    let received_ticket = match received_command {
-        enclave_protocol::Command::SignAuthorizationTicket(req) => req,
-        _ => panic!("Unexpected command type"),
-    };
+    // 6. Enclave вызывает реальный диспетчер (Track A)
+    let response = dispatch_command(received_command);
 
-    // 6. Enclave выполняет валидацию + подготовку хэша
-    match prepare_ticket_for_signing(&received_ticket.ticket) {
-        Ok(ticket_hash) => {
-            // 7. "Подписываем" (в скелете просто возвращаем хэш)
-            let response = Response::SignAuthorizationTicket(
-                enclave_protocol::SignAuthorizationTicketResponse {
-                    signature: vec![0xEE; 64], // фейковая подпись
-                    ticket_hash,
-                },
-            );
+    // 7. Сериализуем и фреймим ответ обратно
+    let mut resp_bytes = Vec::new();
+    into_writer(&response, &mut resp_bytes).unwrap();
 
-            // 8. Сериализуем и фреймим ответ обратно
-            let mut resp_bytes = Vec::new();
-            into_writer(&response, &mut resp_bytes).unwrap();
+    let response_framed = encode_message(MessageType::SignAuthorizationTicket, &resp_bytes)
+        .expect("encode response failed");
 
-            let response_framed = encode_message(MessageType::SignAuthorizationTicket, &resp_bytes)
-                .expect("encode response failed");
+    println!("Enclave → Host (response framed, {} bytes)", response_framed.len());
 
-            println!("Enclave → Host (response framed, {} bytes)", response_framed.len());
-            println!("  Ticket hash that would be signed: {}", hex::encode(ticket_hash));
+    // 8. Печатаем полезную информацию
+    match &response {
+        Response::SignAuthorizationTicket(r) => {
+            println!("  Ticket hash that was signed: {}", hex::encode(r.ticket_hash));
+            println!("  Signature length: {}", r.signature.len());
         }
-        Err(e) => {
-            println!("Enclave rejected ticket: {}", e);
+        Response::Error(e) => {
+            println!("  Enclave returned error: {}", e);
         }
+        _ => {}
     }
 
     println!();
