@@ -96,13 +96,31 @@ All future implementation work in this area is classified **High-risk** by defau
 
 ## Immediate Next Actions (Recommended Order)
 
-1. Finish analyzing the remaining matrix cell(s) and perform formal consolidation (`roborev compact` + manual synthesis).
-2. Apply any final spec tweaks and re-run a lightweight matrix on the updated docs.
-3. Update AGENTS.md and this plan with the exact outcome of the consolidation step.
-4. **Done (2026-06-05)** — Initial framing + first command skeletons committed as `0262bd5` ("feat: initial vsock protocol framing skeleton (Phase 1 start)").
-5. Full 3:3 matrix launched on commit 0262bd5 (codex security, gemini security, claude-code design). This is the first real code review under the high-risk process.
+Following user choice of **Option A** (2026-06-05):
 
-Next: After matrix results, address any findings, run `compact`, then expand the crate with SignAuthorizationTicket etc.
+1. **Lock the canonical preimage in the spec first** (current phase).
+   - The exact `keccak256(abi.encode(...))` structure, field order, and treatment of `newHeaderVersion` / `forkSpecHash` for both ticket types has been made normative in `authorization-tickets-precompile-spec-draft.md`.
+   - `newHeaderVersion` field added to the `AuthorizationTicket` struct.
+
+2. Re-run lightweight matrix (or at least security + design cells) on the spec update.
+3. Only after the canonical preimage is locked and reviewed → implement the matching logic in the Rust crate (`enclave-protocol`).
+4. The implementation must produce **bit-for-bit identical** `ticketHash` as the on-chain precompile using the now-normative `abi.encode` construction.
+
+Previous steps (initial framing, first skeletons, post-matrix fixes up to 394b73a) are considered complete.
+
+**Current status (2026-06-05, evening)**: 
+- Entered **Option A**: "Lock Canonical Preimage in spec first".
+- Normative definition of the preimage (`keccak256(abi.encode(ticketType, nonce, contextHash, activationHeight, newMeasurement, pqPubkey, forkSpecHash, newHeaderVersion))`) + `newHeaderVersion` field added to the struct.
+- Light 3:3 matrix launched on the dirty spec change (codex security, gemini security, claude-code design, fast mode).
+
+Awaiting results of the light review before proceeding to implementation in the Rust crate.
+
+**Update (same day):** 
+- The Medium finding from the 402fdba matrix ("non-strict ticket_type validation") was fixed immediately.
+- Targeted fix committed as `394b73a`.
+- Fresh 3:3 matrix launched on 394b73a (codex security, gemini security, claude-code design).
+
+We are now waiting for the results of this new matrix.
 
 ## Success Criteria for Moving to "Real" Implementation
 

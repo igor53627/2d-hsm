@@ -74,20 +74,17 @@ struct AuthorizationTicket {
     // === Metadata ===
     bytes32  forkSpecHash;         // For HARD_FORK only: hash of the fork specification document / EIPs / changes.
                                    // For RECOVERY: set to 0x00...
+    uint32   newHeaderVersion;     // Header version that must be used starting at activationHeight for HARD_FORK.
+                                   // For RECOVERY and pre-fork: 0 or current version.
     uint256  bond;                 // Reserved for future anti-spam. Must be 0 in v1.
 }
 ```
 
-**Canonical Signed Payload (critical for security)**
+**Canonical Signed Payload (normative – single source of truth)**
 
-The value that the enclave signs (`ticketHash`) **must** be a canonical, deterministic encoding of **exactly** the fields that the precompile and verifiers will later use for authorization and state updates for that ticket type.
-
-**This section was strengthened after the first roborev matrix (Codex HIGH + Claude confirmation that the claimed fix was not yet normative in the spec).**
-
-Recommended canonical construction (use this in both the precompile and the enclave):
+The value that the enclave signs (`ticketHash`) **must** be computed as:
 
 ```solidity
-// Strongly preferred: typed, non-malleable encoding
 bytes32 ticketHash = keccak256(
     abi.encode(
         ticketType,
@@ -96,20 +93,22 @@ bytes32 ticketHash = keccak256(
         activationHeight,
         newMeasurement,
         pqPubkey,
-        // HARD_FORK_ACTIVATION specific fields — must be part of the signed preimage
-        forkSpecHash,      // 0 for non-fork tickets
-        newHeaderVersion   // 0 for non-fork tickets
+        forkSpecHash,
+        newHeaderVersion
     )
 );
 ```
 
-Never use `abi.encodePacked` for dynamic-length fields in this hash.
+This is the **definitive** canonical preimage for all `AuthorizationTicket` signatures (both Recovery and Hard-Fork).
 
-`governanceRef` and `bond` are deliberately **not** included in the signed preimage for HARD_FORK_ACTIVATION tickets (they do not affect validity of the fork activation itself).
+- Use `abi.encode` (typed, non-malleable). Never use `abi.encodePacked` for this hash.
+- `governanceRef` and `bond` are **not** part of the signed preimage.
+- For RECOVERY tickets (`ticketType == 0`): `forkSpecHash` and `newHeaderVersion` are set to 0.
+- For HARD_FORK_ACTIVATION (`ticketType == 1`): both fields must be populated and are part of the signed preimage.
 
-The precompile **must** re-compute the hash with exactly the same `abi.encode` expression before accepting the signature. Any divergence is a HIGH severity bug.
+The on-chain precompile **must** re-compute the hash using exactly this `abi.encode` expression. The enclave **must** use the identical preimage construction. Any divergence between the enclave and the precompile is a HIGH severity bug.
 
-This rule is now the single normative statement (the previous weaker "OR" wording in §4 has been superseded by the stronger requirement above).
+This definition supersedes all previous "recommended" wording and is now the binding contract for implementation.
 
 ## 5. Precompile Interface (Solidity ABI)
 
