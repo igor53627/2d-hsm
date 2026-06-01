@@ -75,7 +75,7 @@ struct AuthorizationTicket {
     bytes32  forkSpecHash;         // For HARD_FORK only: hash of the fork specification document / EIPs / changes.
                                    // For RECOVERY: set to 0x00...
     uint32   newHeaderVersion;     // Header version that must be used starting at activationHeight for HARD_FORK.
-                                   // For RECOVERY and pre-fork: 0 or current version.
+                                   // For RECOVERY: set to 0.
     uint256  bond;                 // Reserved for future anti-spam. Must be 0 in v1.
 }
 ```
