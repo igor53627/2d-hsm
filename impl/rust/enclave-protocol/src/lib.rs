@@ -331,9 +331,9 @@ pub fn compute_canonical_ticket_hash(payload: &AuthorizationTicketPayload) -> [u
     hasher.update(word);
 
     // 5. offset for second dynamic (pqPubkey)
-    // Data for newMeasurement starts at 256, consists of: 32-byte length word + data + padding
+    // Data for newMeasurement starts at 256, consists of: 32-byte length word + actual data bytes + right-zero padding to 32
     let meas_len = payload.new_measurement.len() as u64;
-    let meas_data_padded = 32 + ((32 - (meas_len % 32)) % 32);
+    let meas_data_padded = 32 + meas_len + ((32 - (meas_len % 32)) % 32);
     let pq_offset: u64 = 256 + meas_data_padded;
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&pq_offset.to_be_bytes());
