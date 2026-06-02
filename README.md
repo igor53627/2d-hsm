@@ -41,10 +41,9 @@ See `backlog/tasks/` for the full board.
 
 | Task | Status | Summary |
 |------|--------|---------|
-| **TASK-2** | In progress | Vsock API + wire protocol; reference crate `impl/rust/enclave-protocol/` |
+| **TASK-2** | In progress | Vsock API + wire protocol (`impl/rust/enclave-protocol/`); **next:** Elixir shim + real vsock I/O |
 | **TASK-3** | Done | Cryptographic `RecentChainProof` verification (Producer Chain Attestation v1) |
 | **TASK-1** | In progress | ML-DSA-65 + seal v1 staging **merged** (`60eeefc`); platform root in real TEE + prod CI gate next |
-| **TASK-2** | In progress | **Next focus:** Elixir shim + vsock I/O on top of reference `wire.rs` |
 
 **Reference implementation today:** ML-DSA-65 AuthorizationTicket signatures (when sealed signer installed), length-prefixed CBOR framing, canonical ticket hashing, enclave arming / hard-fork gating, Producer Chain Attestation v1. Details: `impl/README.md`, `backlog/docs/vsock-api-wire-format-spec-draft.md`.
 

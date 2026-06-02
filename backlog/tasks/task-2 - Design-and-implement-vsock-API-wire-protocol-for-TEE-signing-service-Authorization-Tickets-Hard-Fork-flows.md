@@ -471,7 +471,7 @@ Next: run 3:3 matrix on this commit.
 - **Wire:** `wire.rs` integer-key CBOR for `GET_STATUS` and `ARM_FOR_PRODUCTION` structured `RecentChainProof`.
 - **Dispatch:** `dispatch_command` = recovery + GET_MEASUREMENT; stateful path required for arm/status/hard-fork.
 - **Docs:** `impl/README.md`, root `README.md`, vsock spec §9.3, implementation plan progress section updated.
-- **56 tests** in `enclave-protocol` (run `cargo test`; demo needs `--features test-support`).
+- **`enclave-protocol` tests:** ~62 default `cargo test`; **70** with `--features ml-dsa-65` (or `ml-dsa-65,pq-seal-provisioning`). Demos need `--features test-support`.
 
 Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transport, integer-key CBOR for all commands.
 

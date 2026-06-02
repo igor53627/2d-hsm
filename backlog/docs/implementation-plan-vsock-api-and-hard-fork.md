@@ -171,7 +171,7 @@ This plan ensures we carry the same rigor that caught the two HIGH issues in the
 
 ## Progress update (2026-06-02)
 
-Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 staging slice** are **in tree** (`enclave-protocol`, 70+ tests with `ml-dsa-65,pq-seal-provisioning`). Merged: `60eeefc` (PR #1). Documentation entry points:
+Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 staging slice** are **in tree** (`enclave-protocol`; **~62** tests default `cargo test`, **70** with `ml-dsa-65` / `pq-seal-provisioning`). Merged: `60eeefc` (PR #1). Documentation entry points:
 
 - `impl/README.md` — build, dispatch APIs, `pq-seal-v1` CLI
 - `backlog/docs/vsock-api-wire-format-spec-draft.md` — §2.1 seal v1 + §8–§9.3 (v0.2)
