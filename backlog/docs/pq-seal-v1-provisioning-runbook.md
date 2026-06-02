@@ -68,7 +68,7 @@ Verify file sizes before sealing.
   --measurement-file ./enclave.measurement \
   --secret-key-file /secure/producer.sk.bin \
   --public-key-file /secure/producer.pk.bin \
-  --provisioning-root-file impl/rust/enclave-protocol/testvectors/seal_v1_provisioning_root.bin \
+  --provisioning-root-file ../enclave-protocol/testvectors/seal_v1_provisioning_root.bin \
   -o /secure/producer-key.sealed
 ```
 
@@ -80,8 +80,10 @@ Expected: **6053** byte output; stderr includes `meas_digest=...`.
 ./target/release/pq-seal-v1 verify \
   --sealed-blob-file /secure/producer-key.sealed \
   --measurement-file ./enclave.measurement \
-  --provisioning-root-file impl/rust/enclave-protocol/testvectors/seal_v1_provisioning_root.bin
+  --provisioning-root-file ../enclave-protocol/testvectors/seal_v1_provisioning_root.bin
 ```
+
+Expected: exit code **0**; stderr `ok: sealed blob verifies for measurement` (proves AEAD decrypt under root + measurement only — not on-chain authorization; see §8).
 
 ### 3.5 Handoff to host
 
