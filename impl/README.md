@@ -12,7 +12,7 @@ This directory contains the reference implementation of the vsock protocol and e
 | `rust/pq-seal-v1/` | Offline `pq-seal-v1` CLI for v1 sealed PQ blobs (provisioning workstation) |
 | `rust/enclave-protocol/src/wire.rs` | Spec-aligned CBOR with **integer map keys** for `GET_STATUS` and `ARM_FOR_PRODUCTION` |
 | `solidity/` | Ground-truth `abi.encode` + keccak for cross-checking `ticketHash` |
-| `elixir-shim/` | Placeholder for the future 2D host client |
+| `elixir-shim/` | Elixir host shim — `GET_MEASUREMENT` roundtrip via `enclave-stdio-bridge` (see `elixir-shim/README.md`) |
 
 **Normative protocol spec:** `backlog/docs/vsock-api-wire-format-spec-draft.md` (§8 wire schemas, §9.1 Producer Chain Attestation, §9.3 trust provisioning).
 
@@ -114,6 +114,6 @@ Quick start: `cd rust/pq-seal-v1 && cargo build --release && ./target/release/pq
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
 - Integer-key CBOR for all commands (only GET_STATUS + ARM request bodies use `wire.rs` today)
-- Elixir host shim and real vsock transport
+- Elixir: ARM / status / sign over stdio or vsock; real vsock transport
 
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` for phased roadmap.

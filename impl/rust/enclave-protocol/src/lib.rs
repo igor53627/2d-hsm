@@ -44,10 +44,13 @@ pub use chain_proof_crypto::{
     reference_test_attestation_signing_key, reference_test_attestation_trust,
 };
 pub use wire::{
-    decode_arm_for_production_request, decode_get_status_request, decode_get_status_response,
+    decode_arm_for_production_request, decode_get_measurement_request,
+    decode_get_measurement_response, decode_get_status_request, decode_get_status_response,
     decode_sign_authorization_ticket_request, decode_sign_authorization_ticket_response,
-    encode_arm_for_production_request, encode_get_status_request, encode_get_status_response,
+    encode_arm_for_production_request, encode_get_measurement_request,
+    encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
     encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
+    encode_wire_error,
 };
 #[cfg(feature = "ml-dsa-65")]
 pub use mldsa65::MlDsa65Signer;
@@ -1054,6 +1057,50 @@ pub fn handle_sign_authorization_ticket_with_state(
     }
 }
 
+/// Process one length-prefixed frame (host ↔ enclave wire path).
+///
+/// Uses integer-key CBOR encoders from [`wire`] for commands that have spec-aligned
+/// helpers. Intended for the stdio bridge and the Elixir host shim.
+pub fn process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let framed = decode_message(frame)?;
+    let (msg_type, payload) = match framed.msg_type {
+        MessageType::GetMeasurement => {
+            let req = decode_get_measurement_request(&framed.payload)?;
+            let body = match dispatch_command(Command::GetMeasurement(req)) {
+                Response::GetMeasurement(resp) => encode_get_measurement_response(&resp)?,
+                Response::Error(msg) => encode_wire_error(1, &msg)?,
+                other => encode_wire_error(
+                    1,
+                    &format!("unexpected dispatch response for GET_MEASUREMENT: {:?}", other),
+                )?,
+            };
+            (MessageType::GetMeasurement, body)
+        }
+        MessageType::SignAuthorizationTicket => {
+            let body = encode_wire_error(
+                1,
+                "SIGN_AUTHORIZATION_TICKET: decode/dispatch via stdio bridge not implemented; use stateful enclave entry",
+            )?;
+            (MessageType::SignAuthorizationTicket, body)
+        }
+        MessageType::ArmForProduction => {
+            let body = encode_wire_error(
+                1,
+                "ARM_FOR_PRODUCTION requires dispatch_command_with_state (not available on stdio bridge)",
+            )?;
+            (MessageType::ArmForProduction, body)
+        }
+        MessageType::GetStatus => {
+            let body = encode_wire_error(
+                1,
+                "GET_STATUS requires dispatch_command_with_state (not available on stdio bridge)",
+            )?;
+            (MessageType::GetStatus, body)
+        }
+    };
+    encode_message(msg_type, &payload)
+}
+
 /// Stateless dispatcher — **recovery tickets (type 0) and GET_MEASUREMENT only**.
 ///
 /// Hard-fork signing, `ARM_FOR_PRODUCTION`, and `GET_STATUS` require
@@ -1264,6 +1311,19 @@ mod tests {
         let decoded_req: GetMeasurementRequest =
             ciborium::de::from_reader(&decoded.payload[..]).unwrap();
         assert_eq!(decoded_req.version, 1);
+    }
+
+    #[test]
+    fn process_framed_get_measurement_wire_roundtrip() {
+        let req_payload = encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
+        let request_frame = encode_message(MessageType::GetMeasurement, &req_payload).unwrap();
+        let response_frame = process_framed_bytes(&request_frame).unwrap();
+        let decoded = decode_message(&response_frame).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::GetMeasurement);
+        let resp = decode_get_measurement_response(&decoded.payload).unwrap();
+        assert_eq!(resp.supported_ticket_types, vec![0, 1]);
+        assert!(!resp.pq_signing_ready);
+        assert!(!resp.measurement.is_empty());
     }
 
     // ---------------------------------------------------------------------

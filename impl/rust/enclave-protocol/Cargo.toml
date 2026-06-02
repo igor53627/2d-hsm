@@ -60,6 +60,10 @@ enforce-forge-crosscheck = []
 #
 # Add "std" if we need std in the future (enclave may be no_std later)
 
+[[bin]]
+name = "enclave-stdio-bridge"
+path = "src/bin/enclave_stdio_bridge.rs"
+
 [[example]]
 name = "ticket_signing_demo"
 required-features = ["test-support", "demo-mock-sign"]
