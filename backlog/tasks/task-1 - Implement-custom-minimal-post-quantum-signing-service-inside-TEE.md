@@ -445,7 +445,7 @@ We are moving from design into actual protocol definition and skeletons.
 - Ticket signing today uses **mock PQ** (`compute_mock_pq_signature`, 64 bytes) — must be replaced.
 
 **Recommended first implementation slice (TASK-1 MVP):**
-1. Align **ML-DSA parameter set** with 2d monorepo + `authorization-tickets-precompile-spec` (single NIST set, e.g. ML-DSA-65 — confirm with 2d before coding).
+1. **ML-DSA-65** (frozen 2026-06 via 2d TASK-122 + theory-378 TASK-92.1.8 hot path) — implement in TEE; sync precompile ABI with 2d.
 2. Replace mock signer in `handle_sign_authorization_ticket*` with real ML-DSA inside enclave boundary (Rust + audited crate, e.g. `pqcrypto-mldsa` / `liboqs` — decide in AC #2).
 3. Extend wire format: real signature sizes (~3 KB+), not 64-byte placeholder; update vsock spec + tests.
 4. Sealed key lifecycle sketch (generate / unseal in TEE — minimal for MVP).
@@ -458,7 +458,9 @@ We are moving from design into actual protocol definition and skeletons.
 
 **Out of scope for first TASK-1 slice:** Elixir shim (TASK-2 Phase 4), real vsock transport, full light client, SLH-DSA, theory-378 iO hybrids.
 
-**Blocked on / needs sync with 2d:** exact ML-DSA parameter set, precompile verify expectations, whether block-header digests use same key as tickets.
+**Dual-path (2d TASK-122 / theory-378 TASK-92.1.8):** This service = **hot path only** (ML-DSA-65 every block + tickets). Optional **slow path** = MAYO-iO in theory-378 (~10 min checkpoints); must not change vsock/ticket wire format. No ML-DSA-in-iO on critical path.
+
+**Blocked on / needs sync with 2d:** precompile verify hook shape; whether block-header digests use same ML-DSA key as tickets (default: yes).
 
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress update (2026-06-02).
 <!-- SECTION:NOTES:END -->
