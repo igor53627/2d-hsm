@@ -1,62 +1,29 @@
 # Repo-specific roborev config for 2d-hsm.
 #
-# This project builds the minimal post-quantum TEE signing service that will
-# hold the long-term Block Producer key and control hard-fork activation.
-# A bug here has extreme blast radius: unauthorized block production,
-# malicious hard fork activation, or key exfiltration from the TEE.
+# TEE signing / hard-fork service — extreme blast radius. See AGENTS.md for
+# Reduced vs Full matrix decision rules.
+#
+# Post-commit hook: Codex + gpt-5.5. For 3×3 vendor sign-off or 2×3
+# concurrency floor, use ~/pse/roborev/pse-review-3x3.sh | pse-review-2x3.sh
+# (CLI has no --type concurrency; use design --reasoning maximum instead).
+
+agent = "codex"
+model = "gpt-5.5"
 
 [ci]
-# Vendor diversity is mandatory for high-risk TEE / consensus code.
-# codex (OpenAI lineage) for logic / API / correctness.
-# gemini (Google lineage) for credential / data-flow / leakage paths.
-# claude-code available as strong third for architecture / contract reviews.
-# 3:3 matrix (expanded after first review cycle on 2026-06-05)
-# We use three distinct viewpoints:
-# - codex (OpenAI lineage via Codex)
-# - gemini (Google lineage)
-# - "codex-gemini via Cursor" — reviews run through Cursor IDE (often labeled "Codex Gemini")
-#   which can provide a hybrid or additional perspective on the same prompts.
-# Reduced matrix uses codex + gemini + claude-code (see AGENTS.md). cursor-codex-gemini is optional extra design perspective.
-agents = ["codex", "gemini", "claude-code", "cursor-codex-gemini"]
+# PR CI: three vendors × two lenses (6 cells). Per-agent models are not
+# configurable on `roborev ci review` — pin gemini/claude locally via scripts.
+agents = ["codex", "gemini", "claude-code"]
+review_types = ["security", "design"]
 
-# Three lenses for high-risk TEE / consensus / hard-fork design:
-# security, design, and concurrency (state machines for arming, freshness proofs,
-# scheduled hard-fork transitions, etc.).
-review_types = ["security", "design", "concurrency"]
+# Soft-degrade: if one agent is unavailable, synthesis runs on responders;
+# re-run manually if a missing cell matters for the change.
 
-# Matrix execution policy (Reduced vs Full)
-#
-# See AGENTS.md → "Reduced vs Full Matrix — Decision Rules" for the full criteria.
-#
-# Reduced Matrix (default for most incremental high-risk work):
-#   - security + codex
-#   - security + gemini
-#   - design + claude-code
-#
-# Full Matrix (mandatory when any of the following apply):
-#   - First introduction of significant state / state machine (e.g. EnclaveState, arming logic)
-#   - Change meaningfully touches two or more lenses at once
-#   - Previous matrix on the topic found HIGH (or multiple concerning MEDIUMs)
-#   - Changes to core authorization/gating behavior (who can sign what, under what conditions)
-#   - Concurrency/ordering concerns are material (Arm ↔ Sign ↔ GetStatus interactions, freshness proofs, scheduled transitions)
-#
-# When Full is required, add at minimum one concurrency lens review (and optionally design + cursor-codex-gemini).
-
-# High-risk surface definition for this project (used by hooks / CI / humans
-# to decide when to force the full matrix + consolidation + human gate).
-# Any change under these paths or touching these concepts is treated as
-# High-risk per the Multi-Agent Code-Review Playbook.
+# High-risk paths — force Full matrix (AGENTS.md) when touched.
 high_risk_paths = [
-  "impl/",                   # reference enclave-protocol + future TEE service code
-  "src/",                    # future standalone TEE service source
-  "backlog/docs/*vsock*",    # vsock API + wire format specs
-  "backlog/docs/*authorization-ticket*",  # ticket format and hard-fork logic
-  "backlog/docs/*hard-fork*"
+  "impl/",
+  "src/",
+  "backlog/docs/*vsock*",
+  "backlog/docs/*authorization-ticket*",
+  "backlog/docs/*hard-fork*",
 ]
-
-# Note: when we have actual Rust/Go code for the enclave, the entire
-# signing service crate will be high-risk by default.
-
-# Soft-degrade policy same as main 2d repo: if one agent is down, synthesize
-# over what responded, but re-run manually if we drop below expected cells
-# for a high-risk change.

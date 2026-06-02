@@ -38,8 +38,8 @@ For every high-risk change:
 
 ### Current Matrix (as of 2026-06)
 - Agents: codex, gemini, claude-code (vendor diversity across lineages)
-- Lenses: security + design (add concurrency when state machines for arming/hard-fork transitions are implemented)
-- Config lives in `.roborev.toml` at repo root
+- Lenses: `security` + `design` (roborev CLI); **concurrency-sensitive** work adds `design` with `--reasoning maximum` (see `~/pse/roborev/pse-review-2x3.sh`)
+- Config lives in `.roborev.toml` at repo root; shared scripts in `~/pse/roborev/`
 
 ### Reduced vs Full Matrix — Decision Rules
 
@@ -53,9 +53,7 @@ For high-risk work we distinguish two levels of review:
 This is the normal operating mode for incremental work inside an already-reviewed direction.
 
 **Full Matrix** (more complete coverage)
-- The three reviews above, plus:
-  - At least one review with the **concurrency** lens
-  - Optionally design + cursor-codex-gemini for additional architectural perspective
+- The three reviews above, plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max), or equivalent manual cells with explicit `--model` per agent
 
 **When Full Matrix is required (mandatory):**
 - First introduction of significant state / state machine logic (e.g., `EnclaveState`, arming state, freshness tracking).
@@ -79,24 +77,16 @@ See the "Reduced vs Full Matrix" section above for when to use which level.
 
 **Typical Reduced Matrix (most common):**
 ```bash
-roborev review --dirty --type security --agent codex
-roborev review --dirty --type security --agent gemini
-roborev review --dirty --type design --agent claude-code
+roborev review --dirty --type security --agent codex --model gpt-5.5
+roborev review --dirty --type security --agent gemini --model gemini-3.1-pro-preview
+roborev review --dirty --type design --agent claude-code --model opus
 ```
 
 **Full Matrix (when required by the rules above):**
 ```bash
-# Core three
-roborev review --dirty --type security --agent codex
-roborev review --dirty --type security --agent gemini
-roborev review --dirty --type design --agent claude-code
-
-# Add concurrency lens
-roborev review --dirty --type concurrency --agent codex
-roborev review --dirty --type concurrency --agent gemini
-
-# Optional: additional architectural perspective
-roborev review --dirty --type design --agent cursor-codex-gemini
+# Reduced three (above), then from repo root:
+~/pse/roborev/pse-review-2x3.sh --dirty   # 2×3 concurrency floor
+~/pse/roborev/pse-review-3x3.sh --dirty   # optional 3×3 vendor sign-off
 ```
 
 After the matrix, always run consolidation:
