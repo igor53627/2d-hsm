@@ -81,7 +81,17 @@ pub enum ProtocolError {
     /// under a stale, replayed, or attacker-supplied view of the chain.
     #[error("recent chain proof validation failed: {0}")]
     RecentChainProofValidation(&'static str),
+
+    #[error("wire protocol error: {0}")]
+    WireProtocol(&'static str),
+
+    #[error("PQ signing unavailable: {0}")]
+    PqSigningUnavailable(&'static str),
 }
+
+/// ML-DSA-65 wire sizes (FIPS 204, vsock spec §2.1).
+pub const ML_DSA65_PUBKEY_LEN: usize = 1952;
+pub const ML_DSA65_SIGNATURE_LEN: usize = 3309;
 
 /// Wire message types (keep in sync with the spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,15 +805,19 @@ pub fn prepare_ticket_for_signing(
 // defined in AGENTS.md / .roborev.toml.
 // =============================================================================
 
-/// Deterministic mock for a post-quantum signature.
-///
-/// This is **not** real cryptography. It exists only so that the vsock
-/// protocol roundtrips and the example can be tested deterministically
-/// without a real PQ implementation.
-///
-/// In the real TEE the private key lives only inside the enclave and
-/// this function will be replaced by a call to the actual PQ signer
-/// (ML-DSA recommended for v1).
+/// Production PQ signature (TASK-1: ML-DSA-65 via mldsa-native inside TEE).
+#[cfg(not(any(test, feature = "test-support")))]
+fn produce_pq_signature(
+    _ticket_hash: &[u8; 32],
+    _nonce: u64,
+) -> Result<Vec<u8>, ProtocolError> {
+    Err(ProtocolError::PqSigningUnavailable(
+        "ML-DSA-65 signing not implemented; enable feature test-support for mock-only demos or complete TASK-1",
+    ))
+}
+
+/// Deterministic mock for a post-quantum signature (tests / `test-support` only).
+#[cfg(any(test, feature = "test-support"))]
 fn compute_mock_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Vec<u8> {
     const MOCK_SECRET: &[u8] = b"2d-hsm-track-a-deterministic-mock-pq-sig-secret--DO-NOT-USE-IN-REAL-ENCLAVE--THIS-IS-ONLY-FOR-TESTING-THE-PROTOCOL-LAYER--";
 
@@ -827,6 +841,11 @@ fn compute_mock_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Vec<u8> {
     sig
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, ProtocolError> {
+    Ok(compute_mock_pq_signature(ticket_hash, nonce))
+}
+
 /// Signs a PRODUCER_RECOVERY ticket (type=0) without requiring armed state.
 ///
 /// HARD_FORK_ACTIVATION (type=1) must use `handle_sign_authorization_ticket_with_state`.
@@ -834,7 +853,7 @@ fn sign_recovery_ticket(
     ticket: &AuthorizationTicketPayload,
 ) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
     let ticket_hash = prepare_ticket_for_signing(ticket)?;
-    let signature = compute_mock_pq_signature(&ticket_hash, ticket.nonce);
+    let signature = produce_pq_signature(&ticket_hash, ticket.nonce)?;
     Ok(SignAuthorizationTicketResponse {
         signature,
         ticket_hash,
@@ -879,7 +898,7 @@ pub fn handle_sign_authorization_ticket_with_state(
             validate_hard_fork_sign_preconditions(&req.ticket, armed)?;
 
             let ticket_hash = prepare_ticket_for_signing(&req.ticket)?;
-            let signature = compute_mock_pq_signature(&ticket_hash, req.ticket.nonce);
+            let signature = produce_pq_signature(&ticket_hash, req.ticket.nonce)?;
 
             armed.pending_hard_fork_height = Some(req.ticket.activation_height);
 

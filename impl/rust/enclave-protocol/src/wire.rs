@@ -7,6 +7,17 @@ use crate::{
     ArmForProductionRequest, AuthorizedProducerState, GetStatusRequest, GetStatusResponse,
     ProtocolError, RecentChainProof, PROTOCOL_VERSION,
 };
+
+fn require_protocol_version(version: u64) -> Result<(), ProtocolError> {
+    let v = u8::try_from(version).map_err(|_| ProtocolError::WireProtocol("version out of range"))?;
+    if v != PROTOCOL_VERSION {
+        return Err(ProtocolError::InvalidVersion {
+            got: v,
+            expected: PROTOCOL_VERSION,
+        });
+    }
+    Ok(())
+}
 use ciborium::value::Value;
 use std::io::Cursor;
 
@@ -17,7 +28,13 @@ fn encode_value(value: &Value) -> Result<Vec<u8>, ProtocolError> {
 }
 
 fn decode_value(bytes: &[u8]) -> Result<Value, ProtocolError> {
-    ciborium::de::from_reader(Cursor::new(bytes)).map_err(ProtocolError::from)
+    let mut cursor = Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor).map_err(ProtocolError::from)?;
+    let consumed = cursor.position() as usize;
+    if consumed != bytes.len() {
+        return Err(ProtocolError::WireProtocol("trailing bytes after CBOR value"));
+    }
+    Ok(value)
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: u64) -> Result<&'a Value, ProtocolError> {
@@ -180,8 +197,10 @@ pub fn decode_get_status_request(bytes: &[u8]) -> Result<GetStatusRequest, Proto
             "GET_STATUS request must be a CBOR map",
         ));
     };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
     Ok(GetStatusRequest {
-        version: value_to_u64(map_get(&map, 1)?)? as u8,
+        version: version as u8,
     })
 }
 
@@ -240,7 +259,8 @@ pub fn decode_get_status_response(bytes: &[u8]) -> Result<GetStatusResponse, Pro
             "GET_STATUS response must be a CBOR map",
         ));
     };
-    let _version = value_to_u64(map_get(&map, 1)?)? as u8;
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
     Ok(GetStatusResponse {
         armed: value_to_bool(map_get(&map, 2)?)?,
         authorized_measurement: value_to_bytes(map_get(&map, 3)?)?,
@@ -281,7 +301,8 @@ pub fn decode_arm_for_production_request(
             "ARM_FOR_PRODUCTION request must be a CBOR map",
         ));
     };
-    let _version = value_to_u64(map_get(&map, 1)?)? as u8;
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
     Ok(ArmForProductionRequest {
         authorized_state: decode_authorized_producer_state(map_get(&map, 2)?)?,
         recent_chain_proof: decode_recent_chain_proof(map_get(&map, 3)?)?,
@@ -343,5 +364,50 @@ mod tests {
         let req = GetStatusRequest { version: 1 };
         let bytes = encode_get_status_request(&req).unwrap();
         assert_eq!(decode_get_status_request(&bytes).unwrap().version, 1);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_cbor_bytes() {
+        let mut bytes = encode_get_status_request(&GetStatusRequest { version: 1 }).unwrap();
+        bytes.push(0xFF);
+        let err = decode_get_status_request(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::WireProtocol("trailing bytes after CBOR value")
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_protocol_version() {
+        let value = Value::Map(vec![(
+            Value::Integer(1.into()),
+            Value::Integer(99.into()),
+        )]);
+        let bytes = encode_value(&value).unwrap();
+        let err = decode_get_status_request(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::InvalidVersion {
+                got: 99,
+                expected: PROTOCOL_VERSION
+            }
+        ));
+    }
+
+    #[test]
+    fn get_status_response_rejects_wrong_version() {
+        let map = vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Bool(false)),
+            (Value::Integer(3.into()), Value::Bytes(vec![])),
+            (Value::Integer(4.into()), Value::Bytes(vec![])),
+            (Value::Integer(5.into()), Value::Null),
+            (Value::Integer(6.into()), Value::Null),
+            (Value::Integer(7.into()), Value::Null),
+            (Value::Integer(8.into()), Value::Null),
+            (Value::Integer(9.into()), Value::Null),
+        ];
+        let bytes = encode_value(&Value::Map(map)).unwrap();
+        assert!(decode_get_status_response(&bytes).is_err());
     }
 }

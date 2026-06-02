@@ -21,7 +21,9 @@ serde_json = "1.0"
 
 [features]
 default = []
+# Mock 64-byte PQ signatures for examples and local dev only (see vsock spec §2.1).
 test-support = []
+# TASK-1 (next): mldsa-native-rs + feature `ml-dsa-65` for real FIPS-204 signing in release builds.
 enforce-forge-crosscheck = []
 #   When enabled, the automated cross-check tests (that verify
 #   `compute_canonical_ticket_hash` against the Solidity `abi.encode` + keccak256

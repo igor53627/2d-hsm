@@ -56,20 +56,50 @@ We will compute them the same way BridgeHalt does:
 We keep the high-level struct from the previous spec, but define a clean **ABI tuple encoding** for the `bytes` field:
 
 ```solidity
-// This is what goes inside the outer `bytes` of submit(bytes)
+// This is what goes inside the outer `bytes` of submit(bytes).
+// Field order matches authorization-tickets-precompile-spec-draft.md §4
+// (canonical ticketHash preimage — NOT optional for hard-fork).
 struct RawTicket {
-    uint8   ticketType;        // 0 or 1
+    uint8   ticketType;        // 0 = PRODUCER_RECOVERY, 1 = HARD_FORK_ACTIVATION
     uint64  nonce;
     bytes32 contextHash;
     uint64  activationHeight;
     bytes   newMeasurement;    // dynamic
-    bytes   pqPubkey;          // dynamic
-    bytes   attestation;       // dynamic
-    bytes   signature;         // dynamic
-    bytes32 governanceRef;
-    uint256 bond;              // for v1 we can ignore or always send 0
+    bytes   pqPubkey;          // dynamic — ML-DSA-65: 1952 bytes (production)
+    bytes   attestation;       // dynamic — TEE remote attestation document
+    bytes   signature;         // dynamic — ML-DSA-65: 3309 bytes (production)
+    bytes32 forkSpecHash;      // HARD_FORK: mandatory non-zero; RECOVERY: bytes32(0)
+    uint32  newHeaderVersion;  // HARD_FORK: mandatory non-zero; RECOVERY: 0
+    bytes32 governanceRef;     // NOT in signed ticketHash — metadata only
+    uint256 bond;              // NOT in signed ticketHash — must be 0 in v1
 }
 ```
+
+**Canonical `ticketHash` (must match enclave + precompile):**
+
+```solidity
+bytes32 ticketHash = keccak256(abi.encode(
+    ticketType,
+    nonce,
+    contextHash,
+    activationHeight,
+    newMeasurement,
+    pqPubkey,
+    forkSpecHash,
+    newHeaderVersion
+));
+```
+
+`governanceRef` and `bond` are **outside** the signed preimage (same as main precompile spec).
+
+**Decoder rules (`decode_and_validate_ticket/1`):**
+
+| `ticketType` | `forkSpecHash` | `newHeaderVersion` |
+|--------------|----------------|---------------------|
+| `0` RECOVERY | must be `bytes32(0)` | must be `0` |
+| `1` HARD_FORK | must be non-zero | must be non-zero |
+
+Reject if hard-fork fields are present on recovery tickets or absent/zero on hard-fork tickets — prevents canonicalization drift vs `AuthorizationTicketPayload` in `enclave-protocol`.
 
 When calling `submit`, the caller ABI-encodes the `RawTicket` as a single `bytes` argument (standard dynamic bytes encoding).
 
@@ -143,7 +173,10 @@ defmodule Chain.Precompiles.AuthorizationTickets do
 
   defp decode_and_validate_ticket(_args) do
     # TODO: real implementation
-    # Use ABI.TypeDecoder.decode(args, types) where types describe the outer bytes + inner tuple
+    # 1. ABI-decode outer `bytes` → RawTicket tuple (all fields above, including forkSpecHash + newHeaderVersion)
+    # 2. Enforce recovery vs hard-fork field rules (table in §4)
+    # 3. ticketHash = keccak256(abi.encode(...)) — eight typed fields only
+    # 4. verify ML-DSA-65 signature over ticketHash
   end
 end
 ```
