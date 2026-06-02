@@ -23,3 +23,5 @@ Thumbs.db
 
 # Other generated
 *.log
+impl/solidity/.forge-crosscheck/
+impl/solidity/out/

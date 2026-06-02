@@ -217,6 +217,20 @@ pub struct GetMeasurementResponse {
     /// when all preconditions are met. Does not reflect current readiness
     /// (e.g. type=1 additionally requires armed state; see `GET_STATUS.armed`).
     pub supported_ticket_types: Vec<u8>,
+    /// ML-DSA-65 signing operational in this build (false in release until TASK-1).
+    pub pq_signing_ready: bool,
+}
+
+/// Whether this build can produce PQ signatures (mock/test vs production ML-DSA).
+pub fn pq_signing_ready() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        true
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -948,6 +962,7 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
                 // Image capability: hard-fork is supported only via the stateful path.
                 supported_ticket_types: vec![0, 1],
+                pq_signing_ready: pq_signing_ready(),
             })
         }
         Command::ArmForProduction(_) => Response::Error(
@@ -983,6 +998,7 @@ pub fn dispatch_command_with_state(
                 attestation: b"attestation-placeholder".to_vec(),
                 pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
                 supported_ticket_types: vec![0, 1],
+                pq_signing_ready: pq_signing_ready(),
             })
         }
         Command::ArmForProduction(req) => {
@@ -1963,6 +1979,7 @@ mod tests {
         match resp {
             Response::GetMeasurement(r) => {
                 assert_eq!(r.supported_ticket_types, vec![0, 1]); // static capability; type=1 needs armed state
+                assert!(r.pq_signing_ready); // cfg(test): mock signing available
                 assert!(!r.measurement.is_empty());
             }
             _ => panic!("expected GetMeasurement response"),
@@ -2185,7 +2202,7 @@ mod tests {
             stay bit-for-bit identical to the on-chain `abi.encode` used by\n\
             the AuthorizationTickets precompile.\n\n\
             One-time setup (run once):\n\
-                cd impl/solidity && forge install foundry-rs/forge-std --no-commit\n\n\
+                cd impl/solidity && forge install foundry-rs/forge-std\n\n\
             To make this check mandatory in CI (fail on skip):\n\
                 cargo test --features enforce-forge-crosscheck\n\
             ============================================================\n",
@@ -2358,6 +2375,9 @@ mod tests {
         use std::fs;
         use std::path::PathBuf;
         use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static FORGE_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
         // Locate repo root
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2372,10 +2392,12 @@ mod tests {
             return None;
         }
 
-        // Create temp files
-        let temp_dir = tempfile::tempdir().ok()?;
-        let input_path = temp_dir.path().join("input.json");
-        let output_path = temp_dir.path().join("output.json");
+        // Keep I/O inside impl/solidity so Forge fs_permissions (foundry.toml) allow read/write.
+        let temp_dir = solidity_dir.join(".forge-crosscheck");
+        fs::create_dir_all(&temp_dir).ok()?;
+        let seq = FORGE_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let input_path = temp_dir.join(format!("input-{seq}.json"));
+        let output_path = temp_dir.join(format!("output-{seq}.json"));
 
         // Build input JSON in the exact format the script expects
         let input_json = serde_json::json!({

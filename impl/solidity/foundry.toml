@@ -3,6 +3,8 @@ src = "."
 out = "out"
 libs = ["lib"]
 remappings = ["forge-std/=lib/forge-std/src/"]
+# Rust cross-check tests write INPUT_JSON / OUTPUT_JSON under this tree.
+fs_permissions = [{ access = "read-write", path = "./" }]
 
 # This folder is used purely for computing canonical test vectors
 # from the Rust side during `cargo test`.

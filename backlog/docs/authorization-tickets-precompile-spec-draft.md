@@ -128,7 +128,12 @@ interface IAuthorizationTickets {
 
     /// @notice Returns the active hard fork (if any) at or after the given height.
     function getActiveForkAt(uint64 height) external view
-        returns (bytes32 forkSpecHash, bytes memory codeMeasurement, uint64 activationHeight);
+        returns (
+            bytes32 forkSpecHash,
+            bytes memory codeMeasurement,
+            uint64 activationHeight,
+            uint32 newHeaderVersion
+        );
 
     /// @notice Check if a specific ticket hash has been accepted.
     function isTicketAccepted(bytes32 ticketHash) external view returns (bool);
@@ -139,7 +144,8 @@ interface IAuthorizationTickets {
         uint8 ticketType,
         bytes indexed pqPubkey,
         bytes newMeasurement,
-        uint64 activationHeight
+        uint64 activationHeight,
+        uint32 newHeaderVersion
     );
 
     event ProducerAuthorized(
@@ -153,10 +159,13 @@ interface IAuthorizationTickets {
         bytes32 indexed forkSpecHash,
         bytes codeMeasurement,
         uint64 activationHeight,
+        uint32 newHeaderVersion,
         bytes32 ticketHash
     );
 }
 ```
+
+**Indexer / verifier note:** `newHeaderVersion` is part of the signed `ticketHash` and **must** be observable on-chain. `TicketSubmitted` and `HardForkActivated` emit it for hard-fork tickets; `getActiveForkAt` returns it so light clients and header builders do not rely on off-chain metadata alone.
 
 ### Proposed Precompile Address
 

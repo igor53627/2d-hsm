@@ -28,11 +28,25 @@ If Forge or the dependencies are not set up, the cross-check tests gracefully sk
 
 ## Manual verification
 
-You can also compute hashes manually:
+Use the JSON-driven `run()` entrypoint (same as automated tests):
 
 ```bash
-forge script CanonicalTicketHash.s.sol --sig "hardForkHash(uint8,uint64,bytes32,uint64,bytes,bytes,bytes32,uint32)" \
-  1 1234 0x... 10000000 0x... 0x... 0x... 2
+cd impl/solidity
+cat > /tmp/ticket-input.json <<'EOF'
+{
+  "ticketType": 1,
+  "nonce": 1234,
+  "contextHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+  "activationHeight": 10000000,
+  "newMeasurement": "0x",
+  "pqPubkey": "0x",
+  "forkSpecHash": "0x00000000000000000000000000000000000000000000000000000000000000ab",
+  "newHeaderVersion": 2
+}
+EOF
+INPUT_JSON=/tmp/ticket-input.json OUTPUT_JSON=/tmp/ticket-output.json \
+  forge script CanonicalTicketHash.s.sol -vv
+cat /tmp/ticket-output.json
 ```
 
 This makes the on-chain encoding the single source of truth and prevents divergence between the enclave and the precompile.

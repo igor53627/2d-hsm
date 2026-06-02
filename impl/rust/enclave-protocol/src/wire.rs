@@ -4,8 +4,9 @@
 //! payloads for commands documented with integer keys must use the helpers here.
 
 use crate::{
-    ArmForProductionRequest, AuthorizedProducerState, GetStatusRequest, GetStatusResponse,
-    ProtocolError, RecentChainProof, PROTOCOL_VERSION,
+    ArmForProductionRequest, AuthorizationTicketPayload, AuthorizedProducerState,
+    GetStatusRequest, GetStatusResponse, ProtocolError, RecentChainProof,
+    SignAuthorizationTicketRequest, SignAuthorizationTicketResponse, PROTOCOL_VERSION,
 };
 
 fn require_protocol_version(version: u64) -> Result<(), ProtocolError> {
@@ -309,6 +310,114 @@ pub fn decode_arm_for_production_request(
     })
 }
 
+fn value_to_optional_u32(v: &Value) -> Result<Option<u32>, ProtocolError> {
+    match v {
+        Value::Null => Ok(None),
+        other => {
+            let n = value_to_u64(other)?;
+            u32::try_from(n).map_err(|_| {
+                ProtocolError::RecentChainProofValidation("new_header_version out of range")
+            })
+            .map(Some)
+        }
+    }
+}
+
+fn decode_authorization_ticket_payload(v: &Value) -> Result<AuthorizationTicketPayload, ProtocolError> {
+    let Value::Map(map) = v else {
+        return Err(ProtocolError::RecentChainProofValidation(
+            "ticket must be a CBOR map",
+        ));
+    };
+    Ok(AuthorizationTicketPayload {
+        ticket_type: value_to_u64(map_get(&map, 1)?)? as u8,
+        nonce: value_to_u64(map_get(&map, 2)?)?,
+        context_hash: value_to_bytes32(map_get(&map, 3)?)?,
+        activation_height: value_to_u64(map_get(&map, 4)?)?,
+        new_measurement: value_to_bytes(map_get(&map, 5)?)?,
+        pq_pubkey: value_to_bytes(map_get(&map, 6)?)?,
+        fork_spec_hash: value_to_optional_bytes32(map_get(&map, 7)?)?,
+        new_header_version: value_to_optional_u32(map_get(&map, 8)?)?,
+    })
+}
+
+/// Encode SIGN_AUTHORIZATION_TICKET request (integer map keys, spec §8).
+pub fn encode_sign_authorization_ticket_request(
+    req: &SignAuthorizationTicketRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    let t = &req.ticket;
+    let fork = t
+        .fork_spec_hash
+        .map(|h| Value::Bytes(h.to_vec()))
+        .unwrap_or(Value::Null);
+    let header_ver = t
+        .new_header_version
+        .map(|v| Value::Integer(v.into()))
+        .unwrap_or(Value::Null);
+    let ticket_map = vec![
+        (Value::Integer(1.into()), Value::Integer(t.ticket_type.into())),
+        (Value::Integer(2.into()), Value::Integer(t.nonce.into())),
+        (Value::Integer(3.into()), Value::Bytes(t.context_hash.to_vec())),
+        (Value::Integer(4.into()), Value::Integer(t.activation_height.into())),
+        (Value::Integer(5.into()), Value::Bytes(t.new_measurement.clone())),
+        (Value::Integer(6.into()), Value::Bytes(t.pq_pubkey.clone())),
+        (Value::Integer(7.into()), fork),
+        (Value::Integer(8.into()), header_ver),
+        (Value::Integer(9.into()), Value::Null),
+    ];
+    let outer = vec![
+        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+        (Value::Integer(2.into()), Value::Map(ticket_map)),
+    ];
+    encode_value(&Value::Map(outer))
+}
+
+/// Decode SIGN_AUTHORIZATION_TICKET request (rejects trailing bytes and wrong version).
+pub fn decode_sign_authorization_ticket_request(
+    bytes: &[u8],
+) -> Result<SignAuthorizationTicketRequest, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::RecentChainProofValidation(
+            "SIGN_AUTHORIZATION_TICKET request must be a CBOR map",
+        ));
+    };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
+    let ticket = decode_authorization_ticket_payload(map_get(&map, 2)?)?;
+    Ok(SignAuthorizationTicketRequest { ticket })
+}
+
+/// Encode SIGN_AUTHORIZATION_TICKET success response (spec §8).
+pub fn encode_sign_authorization_ticket_response(
+    resp: &SignAuthorizationTicketResponse,
+) -> Result<Vec<u8>, ProtocolError> {
+    let map = vec![
+        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+        (Value::Integer(2.into()), Value::Bytes(resp.signature.clone())),
+        (Value::Integer(3.into()), Value::Bytes(resp.ticket_hash.to_vec())),
+    ];
+    encode_value(&Value::Map(map))
+}
+
+/// Decode SIGN_AUTHORIZATION_TICKET success response.
+pub fn decode_sign_authorization_ticket_response(
+    bytes: &[u8],
+) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::RecentChainProofValidation(
+            "SIGN_AUTHORIZATION_TICKET response must be a CBOR map",
+        ));
+    };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
+    Ok(SignAuthorizationTicketResponse {
+        signature: value_to_bytes(map_get(&map, 2)?)?,
+        ticket_hash: value_to_bytes32(map_get(&map, 3)?)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +501,39 @@ mod tests {
                 expected: PROTOCOL_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn sign_authorization_ticket_request_wire_roundtrip() {
+        use crate::SignAuthorizationTicketRequest;
+
+        let req = SignAuthorizationTicketRequest {
+            ticket: AuthorizationTicketPayload {
+                ticket_type: 1,
+                nonce: 42,
+                context_hash: [0x11; 32],
+                activation_height: 9_000_000,
+                new_measurement: b"meas".to_vec(),
+                pq_pubkey: vec![0x22; 48],
+                fork_spec_hash: Some([0x33; 32]),
+                new_header_version: Some(3),
+            },
+        };
+        let bytes = encode_sign_authorization_ticket_request(&req).unwrap();
+        let decoded = decode_sign_authorization_ticket_request(&bytes).unwrap();
+        assert_eq!(decoded.ticket.nonce, 42);
+        assert_eq!(decoded.ticket.new_header_version, Some(3));
+    }
+
+    #[test]
+    fn sign_response_rejects_wrong_protocol_version() {
+        let map = vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Bytes(vec![1])),
+            (Value::Integer(3.into()), Value::Bytes(vec![0u8; 32])),
+        ];
+        let bytes = encode_value(&Value::Map(map)).unwrap();
+        assert!(decode_sign_authorization_ticket_response(&bytes).is_err());
     }
 
     #[test]

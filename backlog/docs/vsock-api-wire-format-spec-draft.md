@@ -33,7 +33,7 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Context `ctx`** | Empty (`len(ctx) = 0`) unless a future spec version defines a non-empty domain string (both enclave and 2d precompile must match) |
 | **RNG** | Hedged signing requires a CSPRNG inside the TEE (platform TRNG / NSM-seeded `getrandom`); silent RNG failure must abort sign (fail closed) |
 | **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
-| **Protocol version** | CBOR `version: 1` until TASK-1 ships ML-DSA-65 on the wire; then bump to **version 2** so hosts reject 64-byte mock PQ peers |
+| **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1** in `encode_message` / `decode_message`); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1** today). Bump **both** to **2** when TASK-1 ships ML-DSA-65 on the wire so peers reject 64-byte mock PQ signatures |
 
 Until TASK-1 lands, the reference crate may return a **64-byte mock** PQ signature for demos only (`test-support`). Hosts and precompiles **must not** treat 64-byte PQ signatures as valid in production.
 
@@ -173,10 +173,10 @@ Response (on success):
 
 On error: structured error with reason.
 
-**Security rules the enclave must enforce** (this is critical):
-- For `ticket_type == 1` (Hard Fork): the enclave must currently be armed as the active producer, or at least the `pq_pubkey` in the ticket must match the one it holds.
-- The enclave may refuse to sign a hard fork ticket if it has not seen a valid network state proving that the current on-chain authorized producer matches its key (network second factor).
-- The enclave should refuse to sign a hard fork ticket with `activation_height` in the past.
+**Security rules the enclave must enforce** (aligned with §8 formal invariants — **AND**, not OR):
+- For `ticket_type == 1` (Hard Fork): the enclave **must** be armed as the authorized producer **and** the request `pq_pubkey` **must** match the armed key (see also line 403).
+- The enclave **must** have validated `RecentChainProof` at arming (network second factor); hard-fork sign **re-runs** that validation on the armed snapshot.
+- `activation_height` **must** be strictly greater than `finalized_height` from the armed `RecentChainProof` (not merely “not in the past” vs wall-clock or chain tip).
 
 #### 3. `ARM_FOR_PRODUCTION`
 
@@ -296,10 +296,13 @@ Error = {
   3: bytes,                ; attestation document (full, as returned by the platform)
   4: bytes,                ; pq_pubkey (ML-DSA-65: 1952 bytes production)
   5: [int]                 ; supported_ticket_types (e.g. [0, 1])
+  6: bool                  ; pq_signing_ready (false until TASK-1 ML-DSA-65 in production builds)
 }
 ```
 
 **Semantics of `supported_ticket_types`:** This is a **static capability list** for the enclave image (which ticket types it can sign when all preconditions are met). It does **not** mean the enclave can sign type=1 right now. Readiness for hard-fork signing requires `GET_STATUS.armed == true` plus the rules in `SIGN_AUTHORIZATION_TICKET` below.
+
+**Semantics of `pq_signing_ready`:** Operational PQ signer available **right now** (ML-DSA-65 in TEE). Until TASK-1, production images set this to **false** even if `supported_ticket_types` includes `1`; hosts must not treat `false` as “ready to produce valid on-chain PQ signatures”.
 
 **Error Response:** standard Error map.
 
