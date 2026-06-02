@@ -1,54 +1,86 @@
 # Implementation Area — 2d-hsm
 
-This directory contains the actual implementation of the vsock protocol and related logic for the TEE signing service.
+This directory contains the reference implementation of the vsock protocol and enclave-side logic for the TEE signing service.
 
-**All code here is High-risk** (see root `AGENTS.md` and `.roborev.toml`).
+**All code here is high-risk** (see root `AGENTS.md` and `.roborev.toml`).
 
-## Current Structure (as of 2026-06-05)
+## Layout (as of 2026-06-02)
 
-- `rust/enclave-protocol/` — Core Rust crate defining the canonical wire format (framing + CBOR message types).
-  - This is the single source of truth for what bytes go over the wire.
-  - Any change to framing, message types, or canonical encoding **must** go through the full 3:3 roborev matrix + `compact` before merge.
+| Path | Role |
+|------|------|
+| `rust/enclave-protocol/` | Canonical wire format, state machine, ticket hashing, `RecentChainProof` crypto (TASK-3) |
+| `rust/enclave-protocol/src/wire.rs` | Spec-aligned CBOR with **integer map keys** for `GET_STATUS` and `ARM_FOR_PRODUCTION` |
+| `solidity/` | Ground-truth `abi.encode` + keccak for cross-checking `ticketHash` |
+| `elixir-shim/` | Placeholder for the future 2D host client |
 
-- `elixir-shim/` — Placeholder for the future clean Elixir client library that will talk to the enclave from the 2D host.
+**Normative protocol spec:** `backlog/docs/vsock-api-wire-format-spec-draft.md` (§7 wire schemas, §8.1 attestation, §8.3 trust provisioning).
 
-## Review Gates (mandatory)
+## What is implemented
 
-1. Every non-trivial diff touching this area requires a 3×3 matrix review (codex + gemini + cursor-codex-gemini × security/design/concurrency).
-2. After the matrix, run `roborev compact --wait`.
-3. Address all High/Critical findings (and relevant Medium ones).
-4. Only then is the increment considered reviewed.
+- Length-prefixed CBOR framing (`encode_message` / `decode_message`)
+- `GET_MEASUREMENT`, `SIGN_AUTHORIZATION_TICKET`, `ARM_FOR_PRODUCTION`, `GET_STATUS`
+- Canonical `ticketHash` (Keccak256 + Solidity-aligned `abi.encode` preimage)
+- Enclave state: `EnclaveState` / `EnclaveArmedState`, `arm_for_production`, re-arm monotonicity
+- **Producer Chain Attestation v1** (TASK-3): Ed25519 over domain-separated preimage; pinned `ProducerAttestationTrust` (not derived from public `pq_pubkey`)
+- Hard-fork gating: armed + crypto proof + pubkey match + one fork per session
+- Wire helpers: `encode_get_status_response`, `encode_arm_for_production_request`, etc.
 
-This rule was established after the first successful matrix on the design specs (which caught two HIGH issues before any code was written).
+## Dispatch surfaces (important)
 
-## Getting Started (Phase 1)
+| API | Use when |
+|-----|----------|
+| `dispatch_command` | **Recovery tickets (type 0)** and `GET_MEASUREMENT` only. Returns explicit errors for arm / status / hard-fork. |
+| `dispatch_command_with_state` | **Arming, GET_STATUS, hard-fork signing.** Requires `ProducerAttestationTrust` loaded **inside the enclave** (sealed config / attested provisioning — never from the host over vsock). |
 
-See the phased plan in `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md`.
+`GET_MEASUREMENT.supported_ticket_types` lists image capabilities `[0, 1]`; type `1` still requires the stateful path and armed state.
 
-Current focus: solid framing + первые команды с правильной канонизацией и обязательными проверками.
+## Review gates
 
-На данный момент реализовано:
-- Фрейминг (length-prefixed CBOR)
-- `GET_MEASUREMENT`
-- `SignAuthorizationTicket` + `compute_canonical_ticket_hash` (с Keccak256 + length-prefixed преобразом)
-- `ArmForProduction` с **mandatory** `recent_chain_proof`
-- `GetStatus`
-- Валидация тикетов + helper `prepare_ticket_for_signing`
-- **TASK-3:** криптографическая верификация `RecentChainProof` (Producer Chain Attestation v1, Ed25519) при arm и hard-fork sign
+Per `AGENTS.md`:
 
-**Важно**: Весь этот код находится под 3:3 roborev-матрицей. Любой значимальный дифф перед коммитом должен пройти ревью.
+1. **Reduced matrix** (default for incremental high-risk work): codex security, gemini security, claude-code design.
+2. **`roborev compact --wait`** after the matrix.
+3. Address High/Critical and relevant Medium findings before treating the increment as reviewed.
 
-Примеры:
-- `cargo run --example framing_demo`
-- `cargo run --example ticket_signing_demo` (лучше всего показывает текущий прогресс)
+Full matrix (+ concurrency lens) is required for first state-machine introduction, core gating changes, or after HIGH findings — see AGENTS.md.
 
-## Building the demo
+TASK-2 / TASK-3 increments on this tree went through reduced matrix + compact (commits `2d136ac`, `fddd3f0`, `6dced02`).
+
+## Building and testing
 
 ```bash
 cd rust/enclave-protocol
-cargo run --example framing_demo
+cargo test
 ```
 
-## Next Steps
+Optional CI gate for Solidity cross-check:
 
-See the Implementation Plan document for the ordered phases and explicit review checkpoints.
+```bash
+cd ../solidity && forge install foundry-rs/forge-std --no-commit
+cd ../rust/enclave-protocol
+cargo test --features enforce-forge-crosscheck
+```
+
+## Examples
+
+```bash
+cd rust/enclave-protocol
+
+# Framing only
+cargo run --example framing_demo
+
+# Full Arm → GetStatus → Sign flow (needs test attestation keys)
+cargo run --example ticket_signing_demo --features test-support
+```
+
+The `test-support` feature exposes `reference_test_attestation_signing_key` / `reference_test_attestation_trust` for local dev only — **do not enable in production enclave builds.**
+
+## Still deferred
+
+- Real ML-DSA / SLH-DSA signing inside the TEE (TASK-1)
+- Live chain-tip refresh between arming and signing (arming-time snapshot only)
+- Full light-client proofs in `proof_data` (format `0x02+`)
+- Integer-key CBOR for all commands (only GET_STATUS + ARM request bodies use `wire.rs` today)
+- Elixir host shim and real vsock transport
+
+See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` for phased roadmap.

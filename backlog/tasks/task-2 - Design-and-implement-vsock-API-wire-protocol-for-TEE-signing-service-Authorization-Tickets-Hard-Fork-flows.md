@@ -57,14 +57,14 @@ The API must support at minimum:
 
 ## Related
 - TASK-1 (parent)
-- **TASK-3** (cryptographic `RecentChainProof` verification — production blocker for AC #8)
+- **TASK-3** (done — cryptographic `RecentChainProof` verification; unblocks AC #8 crypto gate)
 - backlog/docs/authorization-tickets-precompile-spec-draft.md
 - backlog/docs/authorization-tickets-wire-format-and-precompile-skeleton.md
 
 This task is critical because we are doing a real hard fork mechanism, not a toy one. The vsock API is the trust boundary between the untrusted host and the TEE.
 <!-- SECTION:DESCRIPTION:END -->
 
-- [x] #7 Real ArmForProduction handler is implemented with actual enclave state tracking (armed status + the associated validated RecentChainProof). *(Phase 1: structural proof validation only.)*
+- [x] #7 Real ArmForProduction handler is implemented with actual enclave state tracking (armed status + the associated validated RecentChainProof). *(Structural + cryptographic validation — TASK-3 / Producer Chain Attestation v1.)*
 - [x] #8 Hard-fork (type=1) AuthorizationTicket signing is properly gated: it succeeds only after the enclave has been successfully armed via ARM_FOR_PRODUCTION with a fresh, validated RecentChainProof. *(Crypto verification: TASK-3 / Producer Chain Attestation v1.)*
 - [x] #9 Example and tests demonstrate the correct flow (ArmForProduction first, then Sign hard-fork) and negative cases (attempting to sign hard-fork without proper arming or with stale proof).
 <!-- AC:END -->
@@ -459,4 +459,14 @@ Next: run 3:3 matrix on this commit.
 - Do **not** fake-fix with non-empty `proof_data` only.
 
 **Production blocker → TASK-3:** cryptographic `RecentChainProof` verification before treating type=1 signatures as enforcing network second factor. See `task-3 - Implement-cryptographic-RecentChainProof-verification-network-second-factor.md`.
+
+2026-06-02 — TASK-3 landed + doc sync (`2d136ac`, `fddd3f0`, `6dced02`):
+
+- **TASK-3 Done:** Producer Chain Attestation v1 (Ed25519, pinned `ProducerAttestationTrust`, measurement in preimage). AC #7 note updated — no longer structural-only.
+- **Wire:** `wire.rs` integer-key CBOR for `GET_STATUS` and `ARM_FOR_PRODUCTION` structured `RecentChainProof`.
+- **Dispatch:** `dispatch_command` = recovery + GET_MEASUREMENT; stateful path required for arm/status/hard-fork.
+- **Docs:** `impl/README.md`, root `README.md`, vsock spec §8.3, implementation plan progress section updated.
+- **56 tests** in `enclave-protocol` (run `cargo test`; demo needs `--features test-support`).
+
+Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transport, integer-key CBOR for all commands.
 <!-- SECTION:NOTES:END -->

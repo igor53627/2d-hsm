@@ -1,7 +1,7 @@
 # Implementation Plan: vsock API + Hard Fork Support (Post-Spec Phase)
 
-**Date**: 2026-06-05  
-**Status**: Draft plan following the first successful roborev matrix on the design specs  
+**Date**: 2026-06-05 (progress update 2026-06-02)  
+**Status**: Active plan — Phase 1 largely complete in reference crate; Phase 3 MVP (TASK-3) done
 **Parent Tasks**: TASK-1, TASK-2  
 **Governing Process**: Multi-Agent Code-Review Playbook (3:3 matrix + Compact + human gate for high-risk changes)
 
@@ -51,6 +51,17 @@ All future implementation work in this area is classified **High-risk** by defau
 
 **Review gate**: 3:3 matrix on the framing + command implementation diffs (especially the signing and arming paths). `roborev compact` required.
 
+**Progress (2026-06-02) — reference crate `impl/rust/enclave-protocol/`:**
+
+| Item | Status |
+|------|--------|
+| Framing + command handlers | Done |
+| Canonical `ticketHash` + Forge cross-check | Done |
+| `EnclaveState` + `arm_for_production` + `GET_STATUS` observability | Done (TASK-2 AC #7–#9) |
+| Hard-fork gating (armed, pubkey, activation height, one per session) | Done (skeleton) |
+| Structured `RecentChainProof` on the wire (`wire.rs` for ARM + GET_STATUS) | Done |
+| Stateless vs stateful dispatch documented | Done (`6dced02`) |
+
 ### Phase 2 – Hard Fork Specific Flows (First-Class Citizen)
 - End-to-end support for announcing and transitioning on a scheduled hard fork:
   - Signing a HARD_FORK_ACTIVATION ticket with the correct fields (`forkSpecHash`, `newHeaderVersion`).
@@ -62,12 +73,23 @@ All future implementation work in this area is classified **High-risk** by defau
 **Review gate**: Dedicated 3:3 matrix focused on the hard-fork state machine and transition logic. Must include concurrency lens.
 
 ### Phase 3 – Production Authorization & Network Second Factor (Strengthening)
-- Full implementation of freshness proof validation (what formats are accepted, how the enclave verifies recent finalized state or authorization tickets).
-- Rate limiting / replay protection on sensitive commands.
-- Clear arming lifecycle and what happens on proof failure or stale state.
-- Logging / observability that does not leak secrets.
 
-**Review gate**: Full matrix + compact, with emphasis on the proof verification code path.
+**MVP complete (TASK-3, 2026-06-02):**
+
+- Producer Chain Attestation v1: mandatory `proof_data` + Ed25519 `signature_from_recent_producer`
+- Pinned `ProducerAttestationTrust` (not host-supplied; see spec §8.3)
+- Verification at `ARM_FOR_PRODUCTION` and hard-fork sign time; re-arm monotonicity on `finalized_height`
+- Reduced 3:3 matrix + compact on crypto increment; post-matrix fixes (`fddd3f0`, `6dced02`)
+
+**Still open in this phase:**
+
+- Full light-client / validator-set proofs in `proof_data` (format `0x02+`)
+- Live chain-tip refresh between arming and signing
+- Rate limiting / replay protection on sensitive commands beyond current tail checks
+- Sealed persistence of armed state across enclave restart
+- Logging / observability that does not leak secrets
+
+**Review gate**: Full matrix + compact on major extensions to proof verification (light client, live tip).
 
 ### Phase 4 – Elixir Host Shim / Integration Layer (2D side)
 - Clean client library or GenServer in Elixir that speaks the vsock protocol.
@@ -148,4 +170,21 @@ This plan ensures we carry the same rigor that caught the two HIGH issues in the
 
 ---
 
-**Next concrete step for the team**: Confirm the consolidation of the first matrix is complete, then green-light the start of Phase 1 skeletons with the review gates explicitly scheduled.
+## Progress update (2026-06-02)
+
+Phase 1 reference implementation and TASK-3 crypto gate are **in tree** (`enclave-protocol`, 56+ tests). Documentation entry points:
+
+- `impl/README.md` — build, dispatch APIs, `test-support` feature
+- `backlog/docs/vsock-api-wire-format-spec-draft.md` — §7–§8.3
+- `backlog/tasks/task-3` — Done
+
+**Recommended next increments (ordered):**
+
+1. **TASK-1** — replace mock PQ signatures with real ML-DSA (or SLH-DSA) inside the TEE.
+2. **TASK-2 Phase 4** — Elixir host shim using `wire.rs` encoders and stateful session.
+3. **Phase 2** — hard-fork transition state machine beyond ticket signing (measurement switch at height).
+4. **Wire migration** — integer-key CBOR for remaining commands (`SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT`).
+
+---
+
+*Historical note (2026-06-05):* The sections above through "Success Criteria" record the canonical-hash review cycle (`e2ee43e` → `416d889`). That work is complete; Phase 1 code followed and is now summarized in the Phase 1 progress table.
