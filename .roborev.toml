@@ -16,7 +16,8 @@
 # - gemini (Google lineage)
 # - "codex-gemini via Cursor" — reviews run through Cursor IDE (often labeled "Codex Gemini")
 #   which can provide a hybrid or additional perspective on the same prompts.
-agents = ["codex", "gemini", "cursor-codex-gemini"]
+# Reduced matrix uses codex + gemini + claude-code (see AGENTS.md). cursor-codex-gemini is optional extra design perspective.
+agents = ["codex", "gemini", "claude-code", "cursor-codex-gemini"]
 
 # Three lenses for high-risk TEE / consensus / hard-fork design:
 # security, design, and concurrency (state machines for arming, freshness proofs,
@@ -46,7 +47,8 @@ review_types = ["security", "design", "concurrency"]
 # Any change under these paths or touching these concepts is treated as
 # High-risk per the Multi-Agent Code-Review Playbook.
 high_risk_paths = [
-  "src/",                    # all TEE service source
+  "impl/",                   # reference enclave-protocol + future TEE service code
+  "src/",                    # future standalone TEE service source
   "backlog/docs/*vsock*",    # vsock API + wire format specs
   "backlog/docs/*authorization-ticket*",  # ticket format and hard-fork logic
   "backlog/docs/*hard-fork*"

@@ -18,6 +18,7 @@ All changes touching the following are treated as **High-risk**:
 
 - `backlog/docs/*vsock*` (vsock API and wire format)
 - `backlog/docs/*authorization-ticket*` and `backlog/docs/*hard-fork*`
+- `impl/` — reference enclave protocol and signing state machine
 - Any future `src/` code that implements ticket signing, `ARM_FOR_PRODUCTION`, hard fork transition logic, or key lifecycle inside the TEE
 
 See `.roborev.toml` for the machine-readable definition.
@@ -30,8 +31,9 @@ We follow the **Multi-Agent Code-Review Playbook** (see the full playbook at the
 **Independent perspectives before an irreversible step.**
 
 For every high-risk change:
-- Run the full matrix (multiple vendors × security + design lenses) — see `.roborev.toml`
+- Run at least the **Reduced Matrix** (3 reviews: codex security, gemini security, claude-code design) — see "Reduced vs Full Matrix" below and `.roborev.toml`
 - Use `roborev compact` (or equivalent consolidation) before considering the change "reviewed"
+- Run the **Full Matrix** when the decision rules below require it
 - Major or architecture-changing work also gets a human gate
 
 ### Current Matrix (as of 2026-06)

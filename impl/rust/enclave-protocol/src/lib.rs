@@ -19,6 +19,7 @@
 #![allow(missing_docs)]
 
 mod chain_proof_crypto;
+mod wire;
 
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -26,10 +27,17 @@ use thiserror::Error;
 
 pub use chain_proof_crypto::{
     build_proof_data_v1, build_signed_recent_chain_proof, compute_recovery_tail_digest,
-    parse_proof_data_v1, reference_test_attestation_signing_key,
-    reference_test_attestation_trust, sign_recent_chain_proof, verify_recent_chain_proof_crypto,
+    parse_proof_data_v1, sign_recent_chain_proof, verify_recent_chain_proof_crypto,
     ProducerAttestationTrust, ProofDataV1, PRODUCER_ATTESTATION_SIGNATURE_LEN,
     PROOF_DATA_FORMAT_V1, PROOF_DATA_V1_LEN,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use chain_proof_crypto::{
+    reference_test_attestation_signing_key, reference_test_attestation_trust,
+};
+pub use wire::{
+    decode_arm_for_production_request, decode_get_status_request, decode_get_status_response,
+    encode_arm_for_production_request, encode_get_status_request, encode_get_status_response,
 };
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
@@ -887,10 +895,11 @@ pub fn handle_sign_authorization_ticket_with_state(
     }
 }
 
-/// Top-level dispatcher for commands received over vsock.
+/// Stateless dispatcher — **recovery tickets (type 0) and GET_MEASUREMENT only**.
 ///
-/// Real enclave implementations deserialize the framed CBOR into a `Command`
-/// and immediately call this function.
+/// Hard-fork signing, `ARM_FOR_PRODUCTION`, and `GET_STATUS` require
+/// [`dispatch_command_with_state`] with an enclave-held [`ProducerAttestationTrust`]
+/// (see §8.3 in the vsock spec — the host must not choose the trust anchor).
 pub fn dispatch_command(cmd: Command) -> Response {
     match cmd {
         Command::SignAuthorizationTicket(req) => {
@@ -907,29 +916,25 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 measurement: b"enclave-measurement-placeholder".to_vec(),
                 attestation: b"attestation-placeholder".to_vec(),
                 pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                supported_ticket_types: vec![0, 1], // static capability (signing still gated per type)
+                // Image capability: hard-fork is supported only via the stateful path.
+                supported_ticket_types: vec![0, 1],
             })
         }
-        Command::ArmForProduction(_) => {
-            // Real implementation lives in the enclave state machine
-            // (will use validate_recent_chain_proof from Track B).
-            Response::Error(
-                "ArmForProduction handler not yet implemented in this skeleton (Track B)".to_string(),
-            )
-        }
-        Command::GetStatus(_) => {
-            Response::Error(
-                "GetStatus handler not yet implemented in this skeleton".to_string(),
-            )
-        }
+        Command::ArmForProduction(_) => Response::Error(
+            "ARM_FOR_PRODUCTION requires dispatch_command_with_state and an enclave-held ProducerAttestationTrust (host cannot supply the trust anchor)".to_string(),
+        ),
+        Command::GetStatus(_) => Response::Error(
+            "GET_STATUS requires dispatch_command_with_state".to_string(),
+        ),
     }
 }
 
-/// Stateful version of the dispatcher (recommended for real usage).
+/// Stateful dispatcher — **required** for arming, status, and hard-fork signing.
 ///
-/// This is the version that should be used when the caller maintains
-/// `EnclaveState`. It properly handles `ARM_FOR_PRODUCTION` by calling
-/// `arm_for_production` and updating the state on success.
+/// `attestation_trust` must be loaded inside the TEE from sealed configuration or
+/// an attested provisioning channel (PCR/policy-bound manifest). The untrusted
+/// host must **never** pass the trust anchor over vsock; only the enclave binary
+/// or attested bootstrapping code may call this with the pinned verifying key.
 pub fn dispatch_command_with_state(
     cmd: Command,
     state: &mut EnclaveState,
@@ -965,30 +970,33 @@ pub fn dispatch_command_with_state(
                 }),
             }
         }
-        Command::GetStatus(_req) => {
-            match state {
-                EnclaveState::Armed(s) => Response::GetStatus(GetStatusResponse {
-                    armed: true,
-                    authorized_measurement: s.authorized_measurement.clone(),
-                    authorized_pq_pubkey: s.authorized_pq_pubkey.clone(),
-                    authorized_activated_at_height: Some(s.authorized_activated_at_height),
-                    proof_finalized_height: Some(s.proof.finalized_height),
-                    source_ticket_hash: Some(s.source_ticket_hash),
-                    pending_hard_fork_height: s.pending_hard_fork_height,
-                    last_known_block: Some(s.proof.finalized_height),
-                }),
-                EnclaveState::Unarmed => Response::GetStatus(GetStatusResponse {
-                    armed: false,
-                    authorized_measurement: vec![],
-                    authorized_pq_pubkey: vec![],
-                    authorized_activated_at_height: None,
-                    proof_finalized_height: None,
-                    source_ticket_hash: None,
-                    pending_hard_fork_height: None,
-                    last_known_block: None,
-                }),
-            }
-        }
+        Command::GetStatus(_req) => Response::GetStatus(build_get_status_response(state)),
+    }
+}
+
+/// Builds the logical GET_STATUS payload (encode on the wire with [`encode_get_status_response`]).
+pub fn build_get_status_response(state: &EnclaveState) -> GetStatusResponse {
+    match state {
+        EnclaveState::Armed(s) => GetStatusResponse {
+            armed: true,
+            authorized_measurement: s.authorized_measurement.clone(),
+            authorized_pq_pubkey: s.authorized_pq_pubkey.clone(),
+            authorized_activated_at_height: Some(s.authorized_activated_at_height),
+            proof_finalized_height: Some(s.proof.finalized_height),
+            source_ticket_hash: Some(s.source_ticket_hash),
+            pending_hard_fork_height: s.pending_hard_fork_height,
+            last_known_block: Some(s.proof.finalized_height),
+        },
+        EnclaveState::Unarmed => GetStatusResponse {
+            armed: false,
+            authorized_measurement: vec![],
+            authorized_pq_pubkey: vec![],
+            authorized_activated_at_height: None,
+            proof_finalized_height: None,
+            source_ticket_hash: None,
+            pending_hard_fork_height: None,
+            last_known_block: None,
+        },
     }
 }
 
@@ -997,11 +1005,11 @@ mod tests {
     use super::*;
 
     fn test_attestation_signing_key() -> ed25519_dalek::SigningKey {
-        reference_test_attestation_signing_key()
+        crate::chain_proof_crypto::reference_test_attestation_signing_key()
     }
 
     fn test_attestation_trust() -> ProducerAttestationTrust {
-        reference_test_attestation_trust()
+        crate::chain_proof_crypto::reference_test_attestation_trust()
     }
 
     fn signed_recent_chain_proof(
@@ -1018,6 +1026,78 @@ mod tests {
             &test_attestation_signing_key(),
         )
         .expect("test proof signing must succeed")
+    }
+
+    #[test]
+    fn get_status_wire_roundtrip_matches_spec_integer_keys() {
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![0x01; 48],
+            measurement: b"m".to_vec(),
+            activated_at_height: 5,
+            source_ticket_hash: [0x02; 32],
+        };
+        let state = arm_for_production(
+            &EnclaveState::Unarmed,
+            ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: signed_recent_chain_proof(
+                    10,
+                    [0x03; 32],
+                    vec![[0x02; 32]],
+                    &authorized,
+                ),
+            },
+            test_attestation_trust(),
+        )
+        .unwrap();
+        let logical = build_get_status_response(&state);
+        let wire = encode_get_status_response(&logical).unwrap();
+        let decoded = decode_get_status_response(&wire).unwrap();
+        assert!(decoded.armed);
+        assert_eq!(decoded.proof_finalized_height, Some(10));
+    }
+
+    #[test]
+    fn arm_request_wire_roundtrip_structured_recent_chain_proof() {
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![7],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 1,
+            source_ticket_hash: [0x08; 32],
+        };
+        let req = ArmForProductionRequest {
+            authorized_state: authorized.clone(),
+            recent_chain_proof: signed_recent_chain_proof(2, [0x09; 32], vec![], &authorized),
+        };
+        let wire = encode_arm_for_production_request(&req).unwrap();
+        let decoded = decode_arm_for_production_request(&wire).unwrap();
+        assert_eq!(decoded.recent_chain_proof.finalized_height, 2);
+    }
+
+    #[test]
+    fn stateless_dispatch_rejects_arm_with_actionable_error() {
+        let resp = dispatch_command(Command::ArmForProduction(ArmForProductionRequest {
+            authorized_state: AuthorizedProducerState {
+                pq_pubkey: vec![],
+                measurement: vec![],
+                activated_at_height: 0,
+                source_ticket_hash: [0; 32],
+            },
+            recent_chain_proof: RecentChainProof {
+                finalized_height: 1,
+                finalized_header_hash: [1; 32],
+                recovery_history_tail: vec![],
+                proof_data: vec![0x01],
+                signature_from_recent_producer: None,
+            },
+        }));
+        match resp {
+            Response::Error(msg) => {
+                assert!(msg.contains("dispatch_command_with_state"));
+                assert!(msg.contains("ProducerAttestationTrust"));
+            }
+            _ => panic!("expected Error"),
+        }
     }
 
     #[test]

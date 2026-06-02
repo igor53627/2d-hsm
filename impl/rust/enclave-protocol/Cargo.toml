@@ -21,6 +21,7 @@ serde_json = "1.0"
 
 [features]
 default = []
+test-support = []
 enforce-forge-crosscheck = []
 #   When enabled, the automated cross-check tests (that verify
 #   `compute_canonical_ticket_hash` against the Solidity `abi.encode` + keccak256
@@ -35,3 +36,7 @@ enforce-forge-crosscheck = []
 #   breaking developer machines that lack Foundry.
 #
 # Add "std" if we need std in the future (enclave may be no_std later)
+
+[[example]]
+name = "ticket_signing_demo"
+required-features = ["test-support"]

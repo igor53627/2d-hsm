@@ -315,9 +315,17 @@ For both types:
     3: uint,               ; activated_at_height
     4: bytes               ; source_ticket_hash
   },
-  3: bytes                 ; recent_chain_proof (mandatory non-null verified freshness proof)
+  3: {                     ; recent_chain_proof (mandatory structured proof — not opaque bytes)
+    1: uint,               ; finalized_height
+    2: bytes,              ; finalized_header_hash (32 bytes)
+    3: [bytes],            ; recovery_history_tail (32-byte ticket hashes)
+    4: bytes,              ; proof_data (Producer Chain Attestation v1 — see §8.1)
+    5: bytes / null        ; signature_from_recent_producer (64-byte Ed25519)
+  }
 }
 ```
+
+Encode/decode with integer map keys is implemented in `impl/rust/enclave-protocol/src/wire.rs` (`encode_arm_for_production_request` / `decode_arm_for_production_request`).
 
 **Success Response:**
 ```cbor
@@ -371,6 +379,8 @@ This is the concrete enforcement of "network as cryptographic second factor". Th
 
 Future work (measurement transitions after hard forks, live tip tracking) may add or rename fields. This command is relatively safe and can be called frequently for monitoring.
 
+**Reference encoding:** `encode_get_status_response` / `decode_get_status_response` in `wire.rs` (integer keys 1–9, key 1 = protocol version).
+
 ---
 
 ## 8. RecentChainProof — cryptographic MVP (TASK-3, 2026-06-02)
@@ -401,7 +411,7 @@ DOMAIN = "2d-hsm/RecentChainProof/v1\0"
 
 **Verifying key (MVP):** a **pinned producer attestation Ed25519 public key** passed to the enclave as `ProducerAttestationTrust` (sealed config / attested provisioning). It must **not** be derived from public `pq_pubkey` — otherwise any host knowing the pubkey could forge proofs.
 
-**Reference crate:** tests and demos use `reference_test_attestation_trust()`; production enclaves load their own trust anchor.
+**Reference crate:** tests/demos enable the `test-support` feature and use `reference_test_attestation_trust()`; production enclaves load their own trust anchor from sealed config (never from the host over vsock).
 
 **Structural checks (unchanged):** non-zero header hash, `finalized_height >= activated_at_height`, tail anti-replay when non-empty.
 
@@ -415,6 +425,26 @@ DOMAIN = "2d-hsm/RecentChainProof/v1\0"
 2. **Full light-client** / validator-set proofs inside `proof_data` (future format `0x02+`).
 
 PQ ticket signing inside the TEE remains TASK-1; this section only covers the network-second-factor gate.
+
+### 8.3 Producer attestation trust anchor (provisioning)
+
+**Threat model (MVP):** Defends against a **compromised vsock host** that tries to arm the enclave or obtain hard-fork signatures under a fabricated chain view. It does **not** defend against compromise of the block producer entity that holds the attestation signing secret (same principal as production). Full light-client verification is deferred to §8.2.
+
+**Root of trust:** `ProducerAttestationTrust.attestation_verifying_key` — Ed25519 public key.
+
+| Rule | Requirement |
+|------|-------------|
+| Provisioning | Loaded inside the TEE from **sealed storage**, enclave image manifest, or PCR-bound attested config — **never** from an `ARM_FOR_PRODUCTION` CBOR field or other host-controlled vsock payload. |
+| Host role | Host may relay `RecentChainProof` bytes + signatures from the producer side, but cannot choose or override the verifying key passed to `dispatch_command_with_state`. |
+| Rotation | New verifying keys require a new enclave image or an attested re-provisioning event; mid-session re-arm must use the **same** trust anchor bytes as the current armed session. |
+| Restart | In-memory re-arm monotonicity (`finalized_height`) resets when the enclave process restarts; sealed state may persist armed metadata in a future phase. |
+| Reference tests | `reference_test_attestation_*` is behind `cfg(test)` / `test-support` only — must not ship in production binaries. |
+
+**Wire encoding:** `GET_STATUS` and `ARM_FOR_PRODUCTION` request/response bodies for the reference crate use integer CBOR map keys per §7 (`wire.rs`). Other commands may still use serde field names until migrated.
+
+**Dispatch surfaces:**
+- `dispatch_command` — recovery signing + `GET_MEASUREMENT` only; returns explicit errors for arm/status/hard-fork.
+- `dispatch_command_with_state` — arming, status, hard-fork; requires enclave-supplied `ProducerAttestationTrust`.
 
 ---
 
