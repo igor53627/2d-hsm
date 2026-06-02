@@ -56,9 +56,7 @@ pub use pq_signer::{
     SEALED_BLOB_V0_VERSION,
 };
 #[cfg(all(feature = "ml-dsa-65", test))]
-pub use pq_signer::{
-    seal_mldsa65_keypair_v0, seal_mldsa65_secret_key_v0, unseal_mldsa65_keypair_v0,
-};
+pub use pq_signer::{seal_mldsa65_keypair_v0, unseal_mldsa65_keypair_v0};
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -260,19 +258,24 @@ fn active_signing_public_key_bytes() -> Option<Vec<u8>> {
     pq_signer::sealed_signer_public_key_bytes()
 }
 
-/// Ticket `pq_pubkey` must match the enclave signer when a real ML-DSA key is active.
-fn validate_ticket_pq_pubkey_matches_signer(
-    ticket: &AuthorizationTicketPayload,
-) -> Result<(), ProtocolError> {
+/// When a real ML-DSA signer is installed, `pq_pubkey` must match the enclave key (no-op otherwise).
+fn expect_pq_pubkey_matches_active_signer(pq_pubkey: &[u8]) -> Result<(), ProtocolError> {
     let Some(expected) = active_signing_public_key_bytes() else {
         return Ok(());
     };
-    if ticket.pq_pubkey != expected {
+    if pq_pubkey != expected {
         return Err(ProtocolError::InvalidTicket(
             "pq_pubkey must match the enclave PQ signing key",
         ));
     }
     Ok(())
+}
+
+/// Ticket `pq_pubkey` must match the enclave signer when a real ML-DSA key is active.
+fn validate_ticket_pq_pubkey_matches_signer(
+    ticket: &AuthorizationTicketPayload,
+) -> Result<(), ProtocolError> {
+    expect_pq_pubkey_matches_active_signer(&ticket.pq_pubkey)
 }
 
 fn measurement_response() -> GetMeasurementResponse {
@@ -599,13 +602,7 @@ pub fn arm_for_production(
 
     validate_recent_chain_proof(&req.recent_chain_proof, &req.authorized_state, &trust)?;
 
-    if let Some(expected_pk) = active_signing_public_key_bytes() {
-        if req.authorized_state.pq_pubkey != expected_pk {
-            return Err(ProtocolError::InvalidTicket(
-                "authorized_state.pq_pubkey must match the enclave PQ signing key",
-            ));
-        }
-    }
+    expect_pq_pubkey_matches_active_signer(&req.authorized_state.pq_pubkey)?;
 
     let armed_state = EnclaveArmedState {
         proof: req.recent_chain_proof,
@@ -1925,7 +1922,10 @@ mod tests {
         assert_eq!(status.pending_hard_fork_height, Some(10_000_100));
         assert_eq!(status.last_known_block, Some(10_000_050));
         #[cfg(feature = "ml-dsa-65")]
-        pq_signer::end_sealed_signer_test_session();
+        {
+            pq_signer::end_sealed_signer_test_session();
+            drop(_pq_guard);
+        }
     }
 
     #[test]
@@ -2154,6 +2154,11 @@ mod tests {
 
     #[test]
     fn dispatch_get_measurement_works() {
+        #[cfg(feature = "ml-dsa-65")]
+        let _guard = pq_signer::SealedSignerTestGuard::acquire();
+        #[cfg(feature = "ml-dsa-65")]
+        pq_signer::reset_installed_pq_signer_for_tests();
+
         let cmd = Command::GetMeasurement(GetMeasurementRequest { version: 1 });
         let resp = dispatch_command(cmd);
 

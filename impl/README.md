@@ -83,9 +83,11 @@ The `test-support` feature exposes `reference_test_attestation_signing_key` / `r
 |---------|-----|
 | *(default, none)* | No PQ signing; `pq_signing_ready: false` |
 | `ml-dsa-65` | ML-DSA-65 crypto + sealed blob install at enclave boot (production path sketch) |
-| `reference-test-key` | NIST test-vector + v0 seal helpers for **`cargo test` only** |
+| `reference-test-key` | Implies `ml-dsa-65`; NIST test-vector in unit tests only |
 | `test-support` | Reference Ed25519 attestation keys for local dev |
 | `demo-mock-sign` | Enables 64 B mock PQ in `ticket_signing_demo` (`pq_signing_ready` stays false) |
+
+v0 seal/unseal helpers compile only under `cargo test --features ml-dsa-65` (not in standalone binaries).
 
 At boot (production): `install_sealed_pq_signer(sealed_blob, enclave_measurement)` once a **production** seal format exists. v0 XOR + measurement binding in `pq_signer.rs` is **unit-test only** (`cargo test --features ml-dsa-65`).
 

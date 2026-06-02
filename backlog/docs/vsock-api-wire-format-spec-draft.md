@@ -39,6 +39,19 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 
 **Production sealed-key provisioning (TASK-1):** The reference crate's v0 XOR seal is **unit-test only**; `install_sealed_pq_signer` in non-test `ml-dsa-65` builds returns `PqSigningUnavailable` until a real platform seal format ships. Production enclaves must provision ML-DSA-65 at boot via the future seal API (vTPM / SNP VMPL / etc.), not v0.
 
+**Sealed blob v1 (planned, normative sketch):**
+
+| Field | Requirement |
+|---|---|
+| Version byte | `0x01` (`SEALED_BLOB_V1_VERSION`) |
+| Binding | Ciphertext + MAC/AEAD must bind to enclave launch `measurement` and `pq_pubkey` (no host-chosen measurement in cleartext) |
+| Key material | ML-DSA-65 SK + PK; install runs `from_verified_key_bytes` (sign+verify self-test) before accepting |
+| Secrecy | Platform seal secret (vTPM / SNP VMPL / Nitro PCR-derived key) — **not** XOR of public inputs |
+| Install | Once per enclave process; second install without restart returns error (no silent overwrite) |
+| API | Same entrypoint: `install_sealed_pq_signer(sealed_blob, enclave_measurement)` at enclave boot only (not vsock) |
+
+Reference implementation status: `SEALED_BLOB_V1_VERSION` is defined; non-test install returns `PqSigningUnavailable("production PQ seal format (v1) not implemented")` when the blob version byte is `0x01`.
+
 **Scope of ML-DSA-65 inside this enclave:**
 - Canonical block-root / header-digest signing (BlockProducer hot path).
 - All `AuthorizationTicket` signatures (`SIGN_AUTHORIZATION_TICKET`).
