@@ -77,7 +77,7 @@ The `test-support` feature exposes `reference_test_attestation_signing_key` / `r
 
 ## Still deferred
 
-- Real ML-DSA / SLH-DSA signing inside the TEE (TASK-1)
+- Real **ML-DSA-65** signing inside the TEE (TASK-1; vsock spec §2.1 — 1952 B pubkey, 3309 B sig)
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
 - Integer-key CBOR for all commands (only GET_STATUS + ARM request bodies use `wire.rs` today)

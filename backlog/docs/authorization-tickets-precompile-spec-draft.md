@@ -65,11 +65,11 @@ struct AuthorizationTicket {
                                    // For recovery: measurement of the signing service that holds the key
                                    // For hard fork: measurement of the *new* relevant producer code
 
-    bytes    pqPubkey;             // ML-DSA / Dilithium public key that will produce after activation / under new rules.
+    bytes    pqPubkey;             // ML-DSA-65 public key (1952 bytes) — hot path / 2d-hsm TEE (see vsock spec §2.1)
 
     bytes    attestation;          // Full remote attestation document binding newMeasurement + pqPubkey
 
-    bytes    signature;            // Signature by the corresponding pqPrivkey over the canonical ticket hash
+    bytes    signature;            // ML-DSA-65 signature (3309 bytes) over canonical ticketHash by pqPrivkey
 
     // === Metadata ===
     bytes32  forkSpecHash;         // For HARD_FORK only: hash of the fork specification document / EIPs / changes.

@@ -26,13 +26,12 @@ All future implementation work in this area is classified **High-risk** by defau
 ## Proposed Phased Plan
 
 ### Phase 0 – Finalize & Re-Review Specs (Short, 1–3 days)
-- Incorporate any remaining feedback from the full matrix (once the last cell is fully analyzed).
-- Re-run targeted matrix cells (or full 3:3) on the updated spec documents after the Codex HIGH fixes.
-- Run `roborev compact` and record the outcome.
-- Update this plan and AGENTS.md with any new invariants.
-- **Review gate**: Full matrix + compact on the final spec revisions.
+- **v0.2 spec draft (2026-06-02):** `vsock-api-wire-format-spec-draft.md` — §2 ML-DSA-65, dual-path, attestation terminology (TEE vs Producer Chain Ed25519).
+- Run **Reduced roborev matrix** (`security+codex`, `security+gemini`, `design+claude-code`) on dirty `backlog/docs/*vsock*` + `*authorization-ticket*`; then `roborev compact`.
+- Full 3×3 + concurrency deferred until TASK-1 key-handling code unless matrix finds material spec issues.
+- Update this plan and AGENTS.md with any new invariants from compact.
 
-**Deliverable**: "v0.2" of the two main spec files, explicitly marked as reviewed via roborev.
+**Deliverable**: v0.2 spec files marked reviewed via roborev Reduced + compact (record outcome in task notes).
 
 ### Phase 1 – Wire Protocol & Framing Skeletons (Core Foundation)
 - Implement the length-prefixed CBOR framing + protocol version handling (both sides).
@@ -180,7 +179,7 @@ Phase 1 reference implementation and TASK-3 crypto gate are **in tree** (`enclav
 
 **Recommended next increments (ordered):**
 
-1. **TASK-1** — replace mock PQ with **ML-DSA** (primary PQ scheme; align parameter set with 2d + precompile; SLH-DSA stretch only). First slice: enclave signing + wire signature sizes + sealed key sketch. **Full roborev matrix** on key-handling code.
+1. **TASK-1** — replace mock PQ with **ML-DSA-65** (FIPS 204; wire: 1952 B pubkey, 3309 B sig — vsock spec §2.1). **Full roborev matrix** on key-handling code.
 2. **TASK-2 Phase 4** — Elixir host shim (`wire.rs`, `dispatch_command_with_state`, `test-support` for local dev only).
 3. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing (measurement / header version at activation height). Concurrency lens review when implementing.
 4. **Wire migration** — integer-key CBOR for `SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT`.

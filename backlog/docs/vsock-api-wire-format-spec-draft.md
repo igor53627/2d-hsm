@@ -1,9 +1,11 @@
 # TEE Signing Service — vsock API + Wire Format Specification (Draft v0.1)
 
 **Task**: TASK-2  
-**Date**: 2026-06-05  
-**Status**: Initial draft — ready for iteration  
+**Date**: 2026-06-05 (architecture update 2026-06-02)  
+**Status**: Draft **v0.2** — post-TASK-3 crypto gate; ML-DSA-65 + dual-path aligned with 2d TASK-122 / theory-378 TASK-92.1.8  
 **Goal**: Define the communication protocol between the 2D host (Block Producer) and the minimal post-quantum signing service running inside a TEE (Nitro Enclave / SEV-SNP).
+
+**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
 
 ## 1. Why this API exists
 
@@ -17,7 +19,56 @@ All sensitive operations must happen inside the enclave:
 
 The only communication channel we trust is **vsock** (AF_VSOCK).
 
-## 2. Design Principles
+## 2. Cryptography profile and dual-path architecture (2026-06)
+
+### 2.1 Post-quantum signing (hot path — this service)
+
+| Parameter | Value |
+|-----------|--------|
+| **Algorithm** | **ML-DSA** (FIPS 204) |
+| **Parameter set** | **ML-DSA-65** (NIST Level III) — frozen for producer + tickets + on-chain verify (2d TASK-122) |
+| **Implementation (target)** | [mldsa-native](https://github.com/pq-code-package/mldsa-native) / `mldsa-native-rs` inside the TEE (2d-hsm TASK-1) |
+| **Signing mode** | Hedged (FIPS 204 default; not deterministic) |
+| **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
+
+Until TASK-1 lands, the reference crate may return a **64-byte mock** PQ signature for demos only (`test-support`). Hosts and precompiles **must not** treat 64-byte PQ signatures as valid in production.
+
+**Scope of ML-DSA-65 inside this enclave:**
+- Canonical block-root / header-digest signing (BlockProducer hot path).
+- All `AuthorizationTicket` signatures (`SIGN_AUTHORIZATION_TICKET`).
+- `pq_pubkey` returned by `GET_MEASUREMENT` / armed state.
+
+### 2.2 Dual-path policy (hot vs slow)
+
+Production BlockProducer cryptography uses **two paths**. They use **different keys**, **different codebases**, and **different verify hooks**. This vsock API implements **only the hot path**.
+
+| Path | Where | Crypto | Latency |
+|------|-------|--------|---------|
+| **Hot (normative here)** | `2d-hsm` TEE over vsock | ML-DSA-65 + §9 Producer Chain Attestation (Ed25519) | Every block (~2s); every ticket |
+| **Slow (optional)** | `theory-378` GPU / MAYO-iO | **MAYO-iO** checkpoint (~5–10 min) | Bridge / strong finality anchor only |
+
+**Non-goals on the hot path:**
+- **ML-DSA inside iO** or Dilithium hybrid-iO (research in theory-378 only).
+- **SPHINCS+ iO** as default slow path (2d TASK-120 worktree — oversized on-chain signatures).
+- Slow-path artifacts **must not** alter vsock command schemas, `ticketHash` canonicalization, or `ProducerAttestationTrust` provisioning without a spec version bump.
+
+Normative slow-path design: **theory-378 TASK-92.1.8**. Integration with 2d bridge revert policy is out of scope for v0.2 vsock.
+
+### 2.3 Terminology: two different “attestation” concepts
+
+| Term | Mechanism | Used for |
+|------|-----------|----------|
+| **TEE remote attestation** | Platform report (SEV-SNP / Nitro): `measurement` + `attestation` blob in `GET_MEASUREMENT` | Proving **which enclave image** holds `pq_pubkey`; permissionless recovery tickets |
+| **Producer Chain Attestation** | **Ed25519** over §9.1 preimage (`RecentChainProof.signature_from_recent_producer`) | **Network second factor** before `ARM_FOR_PRODUCTION` / hard-fork sign; defends against **untrusted host** forging chain view |
+
+Do **not** conflate them:
+- TEE attestation does **not** prove current chain height or recovery tail.
+- Producer Chain Attestation does **not** replace ML-DSA block or ticket signatures.
+- The Ed25519 verifying key (`ProducerAttestationTrust`) is **not** derived from `pq_pubkey` (see §9.3).
+
+User and bridge transactions on 2d remain **secp256k1** until a separate wallet PQ migration (2d TASK-24). This service does not sign Ethereum-style user txs.
+
+## 3. Design Principles
 
 - Minimal surface. Fewer commands = easier to audit and reason about.
 - Explicit security invariants per command.
@@ -26,7 +77,7 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 - Versioned from the beginning.
 - Prefer simple, deterministic encoding over "nice" encoding.
 
-## 3. High-Level Command Groups
+## 4. High-Level Command Groups
 
 We currently foresee four groups:
 
@@ -46,7 +97,7 @@ We currently foresee four groups:
    - Announce / prepare for upcoming hard fork (new measurement + scheduled block).
    - Switch active measurement at the scheduled height.
 
-## 4. Proposed Command Set (v0.1)
+## 5. Proposed Command Set (v0.1)
 
 All communication is request → response over a single vsock connection (or one connection per logical session).
 
@@ -75,15 +126,15 @@ Response:
 ```cbor
 {
   "measurement": h'....',           // raw SEV-SNP measurement or Nitro PCRs
-  "attestation": h'....',           // full attestation document
-  "pq_pubkey": h'....',             // current Dilithium/ML-DSA public key
+  "attestation": h'....',           // TEE remote attestation document (platform — not §9 Ed25519)
+  "pq_pubkey": h'....',             // ML-DSA-65 public key (1952 bytes in production)
   "supported_ticket_types": [0, 1]  // static capability list (see formal CBOR section)
 }
 ```
 
 `supported_ticket_types` is a static capability list, not current readiness. Type 1 additionally requires armed state (`GET_STATUS`).
 
-Security invariant: The enclave must only return a measurement + key that are bound together in the attestation.
+Security invariant: The enclave must only return a measurement + key that are bound together in the **TEE remote attestation** document (§2.3).
 
 #### 2. `SIGN_AUTHORIZATION_TICKET`
 
@@ -111,7 +162,7 @@ Request:
 Response (on success):
 ```cbor
 {
-  "signature": h'...',
+  "signature": h'...',    // ML-DSA-65: 3309 bytes (production); mock 64 B only with test-support
   "ticket_hash": h'...'   // the hash that was actually signed
 }
 ```
@@ -163,7 +214,7 @@ Allows the current producer to tell the enclave in advance about an upcoming har
 
 This lets the enclave start refusing to sign blocks after a certain height unless it has transitioned, etc.
 
-## 5. Hard Fork Flow using this API (end-to-end sketch)
+## 6. Hard Fork Flow using this API (end-to-end sketch)
 
 1. Current producer decides to do a hard fork at block 1_500_000.
 2. Host calls `PREPARE_HARD_FORK` (or directly `SIGN_AUTHORIZATION_TICKET` with type=1).
@@ -173,7 +224,7 @@ This lets the enclave start refusing to sign blocks after a certain height unles
    - Host calls `ARM_FOR_PRODUCTION` again with the new measurement (or the enclave switches internally).
 6. After the scheduled height, the enclave only signs blocks if the header version matches the one announced in the ticket + it is using the new measurement.
 
-## 6. Encoding Decision (A — done 2026-06-05)
+## 7. Encoding Decision (A — done 2026-06-05)
 
 **Chosen encoding: Length-prefixed CBOR with explicit protocol version**
 
@@ -212,7 +263,7 @@ We will use **canonical CBOR** (RFC 7049 section 3.9) for all payloads where det
 
 ---
 
-## 7. Detailed Message Schemas (v1)
+## 8. Detailed Message Schemas (v1)
 
 All CBOR payloads use integer keys for compactness and to avoid string comparison issues (maps with integer keys).
 
@@ -239,7 +290,7 @@ Error = {
   1: 1,                    ; version
   2: bytes,                ; measurement (raw SEV-SNP measurement or equivalent)
   3: bytes,                ; attestation document (full, as returned by the platform)
-  4: bytes,                ; pq_pubkey (current Dilithium/ML-DSA public key)
+  4: bytes,                ; pq_pubkey (ML-DSA-65: 1952 bytes production)
   5: [int]                 ; supported_ticket_types (e.g. [0, 1])
 }
 ```
@@ -278,7 +329,7 @@ This is the most security-sensitive command.
 ```cbor
 {
   1: 1,
-  2: bytes,                ; signature (over the canonical ticket hash)
+  2: bytes,                ; signature (ML-DSA-65 over canonical ticket hash, 3309 bytes)
   3: bytes                 ; ticket_hash (the exact value that was signed)
 }
 ```
@@ -296,7 +347,7 @@ For `ticket_type == 1` (Hard Fork):
 - At most **one** hard-fork ticket may be signed per armed session; a second attempt must be refused until re-arming with a **strictly fresher** `finalized_height` than the current session proof.
 - At hard-fork sign time the enclave **re-runs** full `RecentChainProof` validation (structural + cryptographic) on the armed proof snapshot.
 
-**TASK-3 (2026-06-02):** The reference `enclave-protocol` crate verifies Producer Chain Attestation v1 at arm and sign time (see §8.1).
+**TASK-3 (2026-06-02):** The reference `enclave-protocol` crate verifies Producer Chain Attestation v1 at arm and sign time (see §9.1).
 
 For both types:
 - The enclave must never sign a ticket where `pq_pubkey` does not match the key it actually controls.
@@ -319,7 +370,7 @@ For both types:
     1: uint,               ; finalized_height
     2: bytes,              ; finalized_header_hash (32 bytes)
     3: [bytes],            ; recovery_history_tail (32-byte ticket hashes)
-    4: bytes,              ; proof_data (Producer Chain Attestation v1 — see §8.1)
+    4: bytes,              ; proof_data (Producer Chain Attestation v1 — see §9.1)
     5: bytes / null        ; signature_from_recent_producer (64-byte Ed25519)
   }
 }
@@ -383,9 +434,11 @@ Future work (measurement transitions after hard forks, live tip tracking) may ad
 
 ---
 
-## 8. RecentChainProof — cryptographic MVP (TASK-3, 2026-06-02)
+## 9. RecentChainProof — cryptographic MVP (TASK-3, 2026-06-02)
 
-### 8.1 Producer Chain Attestation v1 (implemented)
+This section defines **Producer Chain Attestation** (Ed25519). It is independent of **TEE remote attestation** in `GET_MEASUREMENT` (§2.3).
+
+### 9.1 Producer Chain Attestation v1 (implemented)
 
 The reference enclave verifies this format at **`ARM_FOR_PRODUCTION`** and again at **hard-fork sign** time (fail closed).
 
@@ -419,16 +472,16 @@ DOMAIN = "2d-hsm/RecentChainProof/v1\0"
 
 **Host obligation:** hold the attestation **signing** secret (block producer side only); outer CBOR fields must match the signed preimage.
 
-### 8.2 Still deferred (not TASK-3)
+### 9.2 Still deferred (not TASK-3)
 
 1. **Live chain-tip refresh** between arming and signing (arming-time snapshot only).
 2. **Full light-client** / validator-set proofs inside `proof_data` (future format `0x02+`).
 
 PQ ticket signing inside the TEE remains TASK-1; this section only covers the network-second-factor gate.
 
-### 8.3 Producer attestation trust anchor (provisioning)
+### 9.3 Producer attestation trust anchor (provisioning)
 
-**Threat model (MVP):** Defends against a **compromised vsock host** that tries to arm the enclave or obtain hard-fork signatures under a fabricated chain view. It does **not** defend against compromise of the block producer entity that holds the attestation signing secret (same principal as production). Full light-client verification is deferred to §8.2.
+**Threat model (MVP):** Defends against a **compromised vsock host** that tries to arm the enclave or obtain hard-fork signatures under a fabricated chain view. It does **not** defend against compromise of the block producer entity that holds the attestation signing secret (same principal as production). Full light-client verification is deferred to §9.2.
 
 **Root of trust:** `ProducerAttestationTrust.attestation_verifying_key` — Ed25519 public key.
 
@@ -440,7 +493,7 @@ PQ ticket signing inside the TEE remains TASK-1; this section only covers the ne
 | Restart | In-memory re-arm monotonicity (`finalized_height`) resets when the enclave process restarts; sealed state may persist armed metadata in a future phase. |
 | Reference tests | `reference_test_attestation_*` is behind `cfg(test)` / `test-support` only — must not ship in production binaries. |
 
-**Wire encoding:** `GET_STATUS` and `ARM_FOR_PRODUCTION` request/response bodies for the reference crate use integer CBOR map keys per §7 (`wire.rs`). Other commands may still use serde field names until migrated.
+**Wire encoding:** `GET_STATUS` and `ARM_FOR_PRODUCTION` request/response bodies for the reference crate use integer CBOR map keys per §8 (`wire.rs`). Other commands may still use serde field names until migrated.
 
 **Dispatch surfaces:**
 - `dispatch_command` — recovery signing + `GET_MEASUREMENT` only; returns explicit errors for arm/status/hard-fork.
@@ -448,7 +501,10 @@ PQ ticket signing inside the TEE remains TASK-1; this section only covers the ne
 
 ---
 
-## 9. Next Steps (still in A)
+## 10. Next Steps
+
+- Run **roborev Reduced matrix** on this document (v0.2) + `authorization-tickets-precompile-spec-draft.md`, then `roborev compact`.
+- TASK-1: enforce ML-DSA-65 signature lengths in wire decode (reject 64-byte PQ in production builds).
 
 - Finalize all error codes.
 - Add `PREPARE_HARD_FORK_TRANSITION` command (or decide to do everything through `SIGN_AUTHORIZATION_TICKET` + later `ARM_FOR_PRODUCTION`).
