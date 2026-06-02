@@ -77,9 +77,11 @@ Response:
   "measurement": h'....',           // raw SEV-SNP measurement or Nitro PCRs
   "attestation": h'....',           // full attestation document
   "pq_pubkey": h'....',             // current Dilithium/ML-DSA public key
-  "supported_ticket_types": [0, 1]  // 0=recovery, 1=hard_fork
+  "supported_ticket_types": [0, 1]  // static capability list (see formal CBOR section)
 }
 ```
+
+`supported_ticket_types` is a static capability list, not current readiness. Type 1 additionally requires armed state (`GET_STATUS`).
 
 Security invariant: The enclave must only return a measurement + key that are bound together in the attestation.
 
@@ -242,6 +244,8 @@ Error = {
 }
 ```
 
+**Semantics of `supported_ticket_types`:** This is a **static capability list** for the enclave image (which ticket types it can sign when all preconditions are met). It does **not** mean the enclave can sign type=1 right now. Readiness for hard-fork signing requires `GET_STATUS.armed == true` plus the rules in `SIGN_AUTHORIZATION_TICKET` below.
+
 **Error Response:** standard Error map.
 
 **Security note:** The enclave must ensure that `measurement` + `pq_pubkey` are bound together in the attestation document.
@@ -287,8 +291,11 @@ For `ticket_type == 1` (Hard Fork):
 - The enclave **must** currently be armed as an authorized producer.
 - `pq_pubkey` in the request **must** match the currently armed key.
 - The enclave **should** have reasonably fresh on-chain view (network second factor) before signing a hard fork announcement.
-- `activation_height` must be strictly greater than the last known block the enclave has seen.
+- `activation_height` must be strictly greater than the `finalized_height` from the `RecentChainProof` captured at arming (the enclave's last known chain view for this session).
 - `fork_spec_hash` must be non-null.
+- At most **one** hard-fork ticket may be signed per armed session; a second attempt must be refused until re-arming. **Phase 1 caveat:** re-arming is unrestricted and resets this counter; the bound is only meaningful once re-arm requires a cryptographically fresh proof.
+
+**Phase 1 skeleton (2026-06):** The reference implementation enforces armed state, pubkey match, structural proof re-check, activation-height ordering, and single hard-fork per session. **Cryptographic verification of `proof_data` is not yet implemented** — hard-fork signatures from the skeleton are **not production-ready** until that follow-up lands.
 
 For both types:
 - The enclave must never sign a ticket where `pq_pubkey` does not match the key it actually controls.
@@ -346,18 +353,37 @@ This is the concrete enforcement of "network as cryptographic second factor". Th
   2: bool,                 ; armed
   3: bytes,                ; authorized_measurement  (value captured at ARM_FOR_PRODUCTION time)
   4: bytes,                ; authorized_pq_pubkey    (value captured at ARM_FOR_PRODUCTION time)
-  5: int / null,           ; pending_hard_fork_height (if a hard fork ticket was already signed)
-  6: int / null            ; last_known_block (rough freshness)
+  5: int / null,           ; authorized_activated_at_height (on-chain producer activation height at arming)
+  6: int / null,           ; proof_finalized_height (finalized_height from RecentChainProof used at arming)
+  7: bytes / null,         ; source_ticket_hash (32 bytes, from AuthorizedProducerState at arming)
+  8: int / null,           ; pending_hard_fork_height (set after a type=1 ticket is signed this session)
+  9: int / null            ; last_known_block (Phase 1: same as proof_finalized_height — arming snapshot, not live tip)
 }
 ```
 
-**Phase 1 note:** In the current skeleton these two fields reflect the values authorized at arming time. Future work (measurement transitions after hard forks, etc.) may require additional or renamed fields for "live current" values. The spec will be updated accordingly when that logic is introduced.
+**Field semantics (Phase 1 skeleton):**
+- Fields 3–4 and 7 are fixed for the duration of an armed session (until re-arm or reset).
+- Field 5 is the **on-chain authorized producer activation height**, not the chain tip at arming.
+- Field 6 is how fresh the chain view was **at arming** (from `RecentChainProof.finalized_height`).
+- Field 8 is populated after the first successful `SIGN_AUTHORIZATION_TICKET` with `ticket_type == 1` in this session; a second hard-fork sign is refused until re-arming.
+- Field 9 does **not** track a live tip in Phase 1; it mirrors field 6 for host observability.
 
-This command is relatively safe and can be called frequently for monitoring.
+Future work (measurement transitions after hard forks, live tip tracking) may add or rename fields. This command is relatively safe and can be called frequently for monitoring.
 
 ---
 
-## 8. Next Steps (still in A)
+## 8. Phase 1 vs production readiness (2026-06-02)
+
+The reference `enclave-protocol` crate implements the state machine and structural gates for TASK-2 AC #7–#9. The following are **explicitly deferred** and block treating hard-fork signatures as production-safe:
+
+1. Cryptographic verification of `RecentChainProof.proof_data` and `signature_from_recent_producer` at `ARM_FOR_PRODUCTION` and at hard-fork sign time.
+2. Live chain-tip refresh between arming and signing (Phase 1 uses the arming-time proof snapshot only).
+
+Until (1) is implemented, hosts must not treat skeleton hard-fork signatures as enforcing "network as cryptographic second factor" in the full security sense.
+
+---
+
+## 9. Next Steps (still in A)
 
 - Finalize all error codes.
 - Add `PREPARE_HARD_FORK_TRANSITION` command (or decide to do everything through `SIGN_AUTHORIZATION_TICKET` + later `ARM_FOR_PRODUCTION`).

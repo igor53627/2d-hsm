@@ -185,6 +185,9 @@ pub struct GetMeasurementResponse {
     pub measurement: Vec<u8>,
     pub attestation: Vec<u8>,
     pub pq_pubkey: Vec<u8>,
+    /// **Static capability list** — ticket types this enclave image can ever sign
+    /// when all preconditions are met. Does not reflect current readiness
+    /// (e.g. type=1 additionally requires armed state; see `GET_STATUS.armed`).
     pub supported_ticket_types: Vec<u8>,
 }
 
@@ -197,11 +200,13 @@ pub struct GetMeasurementResponse {
 /// The enclave must:
 /// - Verify it is currently armed as the authorized producer (for hard-fork tickets especially).
 ///
-///   **Phase 1 reality check (post 3:3 matrix on 5a0e3e2):**
-///   In this skeleton, hard-fork (type=1) tickets are **explicitly rejected**
-///   by `handle_sign_authorization_ticket`. Real enforcement of "must only sign
-///   when armed with a validated RecentChainProof" will be implemented when
-///   the actual enclave state machine + ARM_FOR_PRODUCTION handler exists.
+///   **Phase 1 reality check:**
+///   Hard-fork (type=1) requires `handle_sign_authorization_ticket_with_state`
+///   after arming. Structural proof checks only — **not production-ready** until
+///   `RecentChainProof` is cryptographically verified. Stateless
+///   `handle_sign_authorization_ticket` still rejects type=1. Cryptographic
+///   verification of `RecentChainProof` at arm and sign time is deferred (tracked
+///   follow-up; see TASK-2 implementation notes).
 ///
 ///   Recovery tickets (type 0) are currently allowed (bootstrap path).
 ///
@@ -370,10 +375,10 @@ pub struct EnclaveArmedState {
     /// The `RecentChainProof` that was successfully validated during arming.
     pub proof: RecentChainProof,
 
-    /// The height at which the arming occurred.
-    /// This can be used later to enforce freshness requirements when signing
-    /// hard-fork tickets.
-    pub armed_at_height: u64,
+    /// On-chain activation height of the authorized producer (from
+    /// `AuthorizedProducerState.activated_at_height` at arming time).
+    /// Not the chain tip height at arming — see `proof.finalized_height` / GET_STATUS.
+    pub authorized_activated_at_height: u64,
 
     /// The measurement that was authorized during this arming.
     /// Exposed via GET_STATUS so the host can know what code is considered active.
@@ -530,14 +535,16 @@ pub fn arm_for_production(
 
     let armed_state = EnclaveArmedState {
         proof: req.recent_chain_proof,
-        armed_at_height: req.authorized_state.activated_at_height,
+        authorized_activated_at_height: req.authorized_state.activated_at_height,
         authorized_measurement: req.authorized_state.measurement,
         authorized_pq_pubkey: req.authorized_state.pq_pubkey,
         source_ticket_hash: req.authorized_state.source_ticket_hash,
         pending_hard_fork_height: None,
     };
 
-    // For the skeleton we allow re-arming. A stricter policy can be added later.
+    // Phase 1: re-arming is unrestricted and clears pending_hard_fork_height.
+    // Until cryptographic proof verification gates re-arm, the "one hard-fork per
+    // session" policy does not cap total signatures across re-arms.
     Ok(EnclaveState::Armed(armed_state))
 }
 
@@ -546,7 +553,7 @@ fn authorized_state_from_armed(armed: &EnclaveArmedState) -> AuthorizedProducerS
     AuthorizedProducerState {
         pq_pubkey: armed.authorized_pq_pubkey.clone(),
         measurement: armed.authorized_measurement.clone(),
-        activated_at_height: armed.armed_at_height,
+        activated_at_height: armed.authorized_activated_at_height,
         source_ticket_hash: armed.source_ticket_hash,
     }
 }
@@ -557,10 +564,19 @@ fn authorized_state_from_armed(armed: &EnclaveArmedState) -> AuthorizedProducerS
 /// Full cryptographic re-verification of `proof_data` is deferred (see
 /// `validate_recent_chain_proof`); we still re-run structural checks and enforce
 /// that the fork is scheduled strictly beyond the proof's finalized height.
+///
+/// **Not production-ready:** a compromised host can pass structural-only proofs.
+/// Real deployments must verify `proof_data` cryptographically before signing type=1.
 fn validate_hard_fork_sign_preconditions(
     ticket: &AuthorizationTicketPayload,
     armed: &EnclaveArmedState,
 ) -> Result<(), ProtocolError> {
+    if armed.pending_hard_fork_height.is_some() {
+        return Err(ProtocolError::InvalidTicket(
+            "only one HARD_FORK_ACTIVATION ticket may be signed per armed session; re-arm to announce another fork",
+        ));
+    }
+
     if ticket.pq_pubkey != armed.authorized_pq_pubkey {
         return Err(ProtocolError::InvalidTicket(
             "pq_pubkey in hard-fork ticket must match the currently armed producer key",
@@ -600,9 +616,9 @@ pub struct GetStatusResponse {
     /// The PQ public key that was authorized when the enclave was armed.
     pub authorized_pq_pubkey: Vec<u8>,
 
-    /// Height at which the enclave was successfully armed.
-    /// None when unarmed.
-    pub armed_at_height: Option<u64>,
+    /// On-chain activation height of the authorized producer captured at arming.
+    /// None when unarmed. Distinct from `proof_finalized_height` (chain view at arm).
+    pub authorized_activated_at_height: Option<u64>,
 
     /// The finalized height from the proof that was used during arming.
     /// This gives the host visibility into how fresh the chain view was
@@ -865,9 +881,9 @@ pub fn handle_sign_authorization_ticket(
 /// Stateful signing entry point — the recommended path for all ticket types.
 ///
 /// - type=0 (recovery): allowed when armed or unarmed.
-/// - type=1 (hard fork): requires `EnclaveState::Armed` with a proof that still
-///   passes structural validation and an `activation_height` beyond the proof's
-///   finalized height (AC #8).
+/// - type=1 (hard fork): requires `EnclaveState::Armed`, structural proof checks,
+///   `activation_height` beyond proof finalized height, and at most one hard-fork
+///   ticket per armed session (AC #8 skeleton — crypto proof verification deferred).
 pub fn handle_sign_authorization_ticket_with_state(
     req: SignAuthorizationTicketRequest,
     state: &mut EnclaveState,
@@ -920,7 +936,7 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 measurement: b"enclave-measurement-placeholder".to_vec(),
                 attestation: b"attestation-placeholder".to_vec(),
                 pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                supported_ticket_types: vec![0], // Phase 1: only recovery is currently signable
+                supported_ticket_types: vec![0, 1], // static capability (signing still gated per type)
             })
         }
         Command::ArmForProduction(_) => {
@@ -980,7 +996,7 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     armed: true,
                     authorized_measurement: s.authorized_measurement.clone(),
                     authorized_pq_pubkey: s.authorized_pq_pubkey.clone(),
-                    armed_at_height: Some(s.armed_at_height),
+                    authorized_activated_at_height: Some(s.authorized_activated_at_height),
                     proof_finalized_height: Some(s.proof.finalized_height),
                     source_ticket_hash: Some(s.source_ticket_hash),
                     pending_hard_fork_height: s.pending_hard_fork_height,
@@ -990,7 +1006,7 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     armed: false,
                     authorized_measurement: vec![],
                     authorized_pq_pubkey: vec![],
-                    armed_at_height: None,
+                    authorized_activated_at_height: None,
                     proof_finalized_height: None,
                     source_ticket_hash: None,
                     pending_hard_fork_height: None,
@@ -1111,7 +1127,7 @@ mod tests {
 
         match new_state {
             EnclaveState::Armed(s) => {
-                assert_eq!(s.armed_at_height, 100);
+                assert_eq!(s.authorized_activated_at_height, 100);
             }
             EnclaveState::Unarmed => panic!("expected Armed state"),
         }
@@ -1157,7 +1173,7 @@ mod tests {
             _ => panic!("expected GetStatus"),
         };
         assert!(status.armed);
-        assert_eq!(status.armed_at_height, Some(100));
+        assert_eq!(status.authorized_activated_at_height, Some(100));
         assert_eq!(status.proof_finalized_height, Some(150));
         assert_eq!(status.source_ticket_hash, Some([0xAA; 32]));
     }
@@ -1198,7 +1214,7 @@ mod tests {
         assert!(status_resp.armed);
         assert_eq!(status_resp.authorized_measurement, b"armed-measurement-v1");
         assert_eq!(status_resp.authorized_pq_pubkey, vec![0xAA; 48]);
-        assert_eq!(status_resp.armed_at_height, Some(200));
+        assert_eq!(status_resp.authorized_activated_at_height, Some(200));
         assert_eq!(status_resp.proof_finalized_height, Some(250));
         assert_eq!(status_resp.source_ticket_hash, Some([0xBB; 32]));
     }
@@ -1209,15 +1225,15 @@ mod tests {
 
         let bad_req = ArmForProductionRequest {
             authorized_state: AuthorizedProducerState {
-                pq_pubkey: vec![],
-                measurement: vec![],
-                activated_at_height: 10,
-                source_ticket_hash: [0; 32],
+                pq_pubkey: vec![1; 48],
+                measurement: b"meas".to_vec(),
+                activated_at_height: 100,
+                source_ticket_hash: [0xAA; 32],
             },
             recent_chain_proof: RecentChainProof {
-                finalized_height: 5, // stale
+                finalized_height: 50, // stale: below activated_at_height
                 finalized_header_hash: [0x11; 32],
-                recovery_history_tail: vec![],
+                recovery_history_tail: vec![[0xAA; 32]],
                 proof_data: vec![],
                 signature_from_recent_producer: None,
             },
@@ -1228,12 +1244,45 @@ mod tests {
         match resp {
             Response::ArmForProduction(r) => {
                 assert_eq!(r.status, "refused");
-                assert!(r.reason.is_some());
+                let reason = r.reason.expect("expected refusal reason");
+                assert!(
+                    reason.contains("finalized_height is older"),
+                    "expected stale-height refusal, got: {}",
+                    reason
+                );
             }
             _ => panic!("expected ArmForProduction response"),
         }
 
         assert!(matches!(state, EnclaveState::Unarmed));
+    }
+
+    #[test]
+    fn stateful_sign_second_hardfork_while_armed_fails() {
+        let pq = vec![0xDE; 48];
+        let mut state = EnclaveState::Unarmed;
+
+        dispatch_command_with_state(
+            Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
+            &mut state,
+        );
+
+        let first = sample_hardfork_ticket(pq.clone(), 10_000_100);
+        let ok = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: first }),
+            &mut state,
+        );
+        assert!(matches!(ok, Response::SignAuthorizationTicket(_)));
+
+        let second = sample_hardfork_ticket(pq, 10_000_200);
+        let resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: second }),
+            &mut state,
+        );
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("only one HARD_FORK_ACTIVATION")),
+            _ => panic!("expected refusal of second hard-fork sign"),
+        }
     }
 
     #[test]
@@ -1615,8 +1664,7 @@ mod tests {
 
         match resp {
             Response::GetMeasurement(r) => {
-                assert!(r.supported_ticket_types.contains(&0));
-                assert!(!r.supported_ticket_types.contains(&1)); // Phase 1: hard-fork signing disabled
+                assert_eq!(r.supported_ticket_types, vec![0, 1]); // static capability; type=1 needs armed state
                 assert!(!r.measurement.is_empty());
             }
             _ => panic!("expected GetMeasurement response"),
