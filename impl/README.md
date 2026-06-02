@@ -80,8 +80,11 @@ The `test-support` feature exposes `reference_test_attestation_signing_key` / `r
 | Feature | Use |
 |---------|-----|
 | *(default, none)* | No PQ signing; `pq_signing_ready: false` |
-| `reference-test-key` or `ml-dsa-65` | CI/protocol tests with NIST test-vector key (3309 B sig) — **not for production** |
+| `ml-dsa-65` | ML-DSA-65 crypto + sealed blob install at enclave boot (production path sketch) |
+| `reference-test-key` | Adds embedded NIST test-vector key for CI — **not for production** |
 | `test-support` | Local demos: 64 B mock PQ + reference Ed25519 attestation keys |
+
+At boot (production sketch): `install_sealed_pq_signer(sealed_blob, enclave_measurement)` — see `pq_signer.rs` and `seal_mldsa65_secret_key_v0` (v0 reference sealing only).
 
 Do not pass `--all-features` (`ml-dsa-65` and `test-support` conflict).
 

@@ -26,6 +26,7 @@ compile_error!(
 mod chain_proof_crypto;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
+mod pq_signer;
 mod wire;
 
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,15 @@ pub use wire::{
     encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
 };
 #[cfg(feature = "ml-dsa-65")]
+pub use mldsa65::MlDsa65Signer;
+#[cfg(feature = "reference-test-key")]
 pub use mldsa65::ReferenceMlDsa65Signer;
+pub use pq_signer::{
+    install_sealed_pq_signer, is_sealed_signer_installed, seal_mldsa65_keypair_v0,
+    unseal_mldsa65_keypair_v0, ML_DSA65_SECRETKEY_LEN, SEALED_BLOB_V0_VERSION,
+};
+#[cfg(any(test, feature = "reference-test-key"))]
+pub use pq_signer::seal_mldsa65_secret_key_v0;
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -234,14 +243,52 @@ pub struct GetMeasurementResponse {
 
 /// Whether this build can produce valid on-chain ML-DSA-65 signatures right now.
 pub fn pq_signing_ready() -> bool {
-    cfg!(all(feature = "ml-dsa-65", not(feature = "test-support")))
+    if cfg!(feature = "test-support") {
+        return false;
+    }
+    pq_signer::is_sealed_signer_installed() || cfg!(feature = "reference-test-key")
+}
+
+/// Active PQ signing public key when operational (sealed install or reference feature).
+fn active_signing_public_key_bytes() -> Option<Vec<u8>> {
+    if cfg!(feature = "test-support") {
+        return None;
+    }
+    if cfg!(test) && !pq_signer::is_sealed_signer_installed() {
+        return None;
+    }
+    if let Some(pk) = pq_signer::sealed_signer_public_key_bytes() {
+        return Some(pk);
+    }
+    #[cfg(feature = "reference-test-key")]
+    {
+        return Some(
+            mldsa65::ReferenceMlDsa65Signer::global()
+                .public_key_bytes_owned(),
+        );
+    }
+    #[cfg(not(feature = "reference-test-key"))]
+    None
+}
+
+/// Ticket `pq_pubkey` must match the enclave signer when a real ML-DSA key is active.
+fn validate_ticket_pq_pubkey_matches_signer(
+    ticket: &AuthorizationTicketPayload,
+) -> Result<(), ProtocolError> {
+    let Some(expected) = active_signing_public_key_bytes() else {
+        return Ok(());
+    };
+    if ticket.pq_pubkey != expected {
+        return Err(ProtocolError::InvalidTicket(
+            "pq_pubkey must match the enclave PQ signing key",
+        ));
+    }
+    Ok(())
 }
 
 fn measurement_response() -> GetMeasurementResponse {
-    #[cfg(all(feature = "ml-dsa-65", not(feature = "test-support")))]
-    let pq_pubkey = mldsa65::ReferenceMlDsa65Signer::global().public_key_bytes_owned();
-    #[cfg(not(all(feature = "ml-dsa-65", not(feature = "test-support"))))]
-    let pq_pubkey = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let pq_pubkey = active_signing_public_key_bytes()
+        .unwrap_or_else(|| vec![0xDE, 0xAD, 0xBE, 0xEF]);
 
     GetMeasurementResponse {
         measurement: b"enclave-measurement-placeholder".to_vec(),
@@ -563,6 +610,14 @@ pub fn arm_for_production(
 
     validate_recent_chain_proof(&req.recent_chain_proof, &req.authorized_state, &trust)?;
 
+    if let Some(expected_pk) = active_signing_public_key_bytes() {
+        if req.authorized_state.pq_pubkey != expected_pk {
+            return Err(ProtocolError::InvalidTicket(
+                "authorized_state.pq_pubkey must match the enclave PQ signing key",
+            ));
+        }
+    }
+
     let armed_state = EnclaveArmedState {
         proof: req.recent_chain_proof,
         attestation_trust: trust,
@@ -849,10 +904,30 @@ pub fn prepare_ticket_for_signing(
 // defined in AGENTS.md / .roborev.toml.
 // =============================================================================
 
-/// Production PQ signature (TASK-1: ML-DSA-65).
+/// Production PQ signature (sealed key or reference-test-key for CI).
 #[cfg(all(feature = "ml-dsa-65", not(feature = "test-support")))]
-fn produce_pq_signature(ticket_hash: &[u8; 32], _nonce: u64) -> Result<Vec<u8>, ProtocolError> {
-    mldsa65::ReferenceMlDsa65Signer::global().sign_ticket_hash(ticket_hash)
+fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, ProtocolError> {
+    if pq_signer::is_sealed_signer_installed() {
+        return pq_signer::sign_ticket_hash_sealed(ticket_hash);
+    }
+    #[cfg(feature = "reference-test-key")]
+    {
+        return mldsa65::ReferenceMlDsa65Signer::global().sign_ticket_hash(ticket_hash);
+    }
+    #[cfg(not(feature = "reference-test-key"))]
+    {
+        #[cfg(test)]
+        {
+            return Ok(compute_mock_pq_signature(ticket_hash, nonce));
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (ticket_hash, nonce);
+            return Err(ProtocolError::PqSigningUnavailable(
+                "ML-DSA-65 signer not provisioned (install sealed key at enclave boot)",
+            ));
+        }
+    }
 }
 
 #[cfg(all(
@@ -865,7 +940,7 @@ fn produce_pq_signature(
     _nonce: u64,
 ) -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
-        "ML-DSA-65 signing disabled (enable feature ml-dsa-65 or sealed production key)",
+        "ML-DSA-65 signing disabled (build with ml-dsa-65 and install sealed key at boot)",
     ))
 }
 
@@ -910,6 +985,7 @@ fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, P
 fn sign_recovery_ticket(
     ticket: &AuthorizationTicketPayload,
 ) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
+    validate_ticket_pq_pubkey_matches_signer(ticket)?;
     let ticket_hash = prepare_ticket_for_signing(ticket)?;
     let signature = produce_pq_signature(&ticket_hash, ticket.nonce)?;
     Ok(SignAuthorizationTicketResponse {
@@ -954,6 +1030,7 @@ pub fn handle_sign_authorization_ticket_with_state(
             };
 
             validate_hard_fork_sign_preconditions(&req.ticket, armed)?;
+            validate_ticket_pq_pubkey_matches_signer(&req.ticket)?;
 
             let ticket_hash = prepare_ticket_for_signing(&req.ticket)?;
             let signature = produce_pq_signature(&ticket_hash, req.ticket.nonce)?;
@@ -1831,7 +1908,7 @@ mod tests {
         match sign_resp {
             Response::SignAuthorizationTicket(r) => {
                 assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&ticket));
-                #[cfg(feature = "ml-dsa-65")]
+                #[cfg(feature = "reference-test-key")]
                 {
                     assert_eq!(r.signature.len(), ML_DSA65_SIGNATURE_LEN);
                     mldsa65::ReferenceMlDsa65Signer::global()
@@ -1992,6 +2069,90 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ml-dsa-65")]
+    fn load_reference_sk_for_seal_tests() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_sk.bin"),
+        )
+        .expect("reference sk testvector")
+    }
+
+    #[cfg(feature = "ml-dsa-65")]
+    fn install_reference_sealed_signer_for_tests() -> pq_signer::SealedSignerTestGuard {
+        let guard = pq_signer::SealedSignerTestGuard::acquire();
+        pq_signer::begin_sealed_signer_test_session();
+        pq_signer::reset_installed_pq_signer_for_tests();
+        let measurement = b"enclave-measurement-placeholder";
+        let sk = load_reference_sk_for_seal_tests();
+        let pk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_pk.bin"),
+        )
+        .expect("reference pk testvector");
+        let blob = pq_signer::seal_mldsa65_keypair_v0(&sk, &pk, measurement).unwrap();
+        pq_signer::install_sealed_pq_signer(&blob, measurement).unwrap();
+        guard
+    }
+
+    #[test]
+    #[cfg(feature = "ml-dsa-65")]
+    fn sealed_signer_sets_pq_signing_ready_and_measurement_pubkey() {
+        let _guard = install_reference_sealed_signer_for_tests();
+        assert!(pq_signing_ready());
+        let resp = dispatch_command(Command::GetMeasurement(GetMeasurementRequest { version: 1 }));
+        match resp {
+            Response::GetMeasurement(r) => {
+                assert!(r.pq_signing_ready);
+                assert_eq!(r.pq_pubkey.len(), ML_DSA65_PUBKEY_LEN);
+            }
+            _ => panic!("expected GetMeasurement"),
+        }
+        pq_signer::end_sealed_signer_test_session();
+        drop(_guard);
+    }
+
+    #[test]
+    #[cfg(feature = "ml-dsa-65")]
+    fn recovery_sign_rejects_pq_pubkey_mismatch_when_sealed() {
+        let _guard = install_reference_sealed_signer_for_tests();
+        let ticket = AuthorizationTicketPayload {
+            ticket_type: 0,
+            nonce: 1,
+            context_hash: [0x01; 32],
+            activation_height: 100,
+            new_measurement: b"m".to_vec(),
+            pq_pubkey: vec![0xFF; 48],
+            fork_spec_hash: None,
+            new_header_version: None,
+        };
+        let err = handle_sign_authorization_ticket(SignAuthorizationTicketRequest { ticket }).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidTicket(_)));
+        pq_signer::end_sealed_signer_test_session();
+        drop(_guard);
+    }
+
+    #[test]
+    #[cfg(feature = "ml-dsa-65")]
+    fn recovery_sign_accepts_matching_pq_pubkey_when_sealed() {
+        let _guard = install_reference_sealed_signer_for_tests();
+        let pk = pq_signer::sealed_signer_public_key_bytes().unwrap();
+        let ticket = AuthorizationTicketPayload {
+            ticket_type: 0,
+            nonce: 7,
+            context_hash: [0x02; 32],
+            activation_height: 200,
+            new_measurement: b"recovery".to_vec(),
+            pq_pubkey: pk,
+            fork_spec_hash: None,
+            new_header_version: None,
+        };
+        let resp = handle_sign_authorization_ticket(SignAuthorizationTicketRequest { ticket }).unwrap();
+        assert_eq!(resp.signature.len(), ML_DSA65_SIGNATURE_LEN);
+        pq_signer::end_sealed_signer_test_session();
+        drop(_guard);
+    }
+
     #[test]
     fn dispatch_get_measurement_works() {
         let cmd = Command::GetMeasurement(GetMeasurementRequest { version: 1 });
@@ -2000,11 +2161,11 @@ mod tests {
         match resp {
             Response::GetMeasurement(r) => {
                 assert_eq!(r.supported_ticket_types, vec![0, 1]); // static capability; type=1 needs armed state
-                #[cfg(feature = "ml-dsa-65")]
+                #[cfg(feature = "reference-test-key")]
                 assert!(r.pq_signing_ready);
                 #[cfg(feature = "test-support")]
                 assert!(!r.pq_signing_ready);
-                #[cfg(not(any(feature = "ml-dsa-65", feature = "test-support")))]
+                #[cfg(not(any(feature = "reference-test-key", feature = "test-support")))]
                 assert!(!r.pq_signing_ready);
                 assert!(!r.measurement.is_empty());
             }

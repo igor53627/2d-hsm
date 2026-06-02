@@ -23,8 +23,9 @@ serde_json = "1.0"
 
 [features]
 default = []
-# ML-DSA-65 with embedded NIST test-vector key — CI/protocol tests only (see vsock spec §2.1).
+# ML-DSA-65 crypto (sealed-key provisioning). Does not embed a secret key by itself.
 ml-dsa-65 = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
+# Public NIST test-vector keypair — CI/protocol tests only (see vsock spec §2.1).
 reference-test-key = ["ml-dsa-65"]
 # Mock 64-byte PQ signatures for examples and local dev only (see vsock spec §2.1).
 # Mutually exclusive with ml-dsa-65 (compile_error in lib.rs).
