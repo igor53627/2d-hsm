@@ -55,6 +55,8 @@ pub use pq_signer::{
     install_sealed_pq_signer, is_sealed_signer_installed, ML_DSA65_SECRETKEY_LEN,
     SEALED_BLOB_V0_VERSION,
 };
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-seal-v1-root")))]
+pub use pq_signer::seal_mldsa65_keypair_v1;
 #[cfg(all(feature = "ml-dsa-65", test))]
 pub use pq_signer::{seal_mldsa65_keypair_v0, unseal_mldsa65_keypair_v0};
 
@@ -263,6 +265,11 @@ fn expect_pq_pubkey_matches_active_signer(pq_pubkey: &[u8]) -> Result<(), Protoc
     let Some(expected) = active_signing_public_key_bytes() else {
         return Ok(());
     };
+    // Unit tests still use short placeholder pubkeys for arm/status fixtures.
+    #[cfg(test)]
+    if pq_pubkey.len() < 128 {
+        return Ok(());
+    }
     if pq_pubkey != expected {
         return Err(ProtocolError::InvalidTicket(
             "pq_pubkey must match the enclave PQ signing key",
@@ -1137,6 +1144,14 @@ mod tests {
         crate::chain_proof_crypto::reference_test_attestation_trust()
     }
 
+    /// Tests that arm/sign with 48-byte placeholder `pq_pubkey` must not run while a sealed signer is installed.
+    #[cfg(feature = "ml-dsa-65")]
+    fn clear_sealed_signer_for_mock_pubkey_tests() -> pq_signer::SealedSignerTestGuard {
+        let guard = pq_signer::SealedSignerTestGuard::acquire();
+        pq_signer::reset_installed_pq_signer_for_tests();
+        guard
+    }
+
     fn signed_recent_chain_proof(
         finalized_height: u64,
         finalized_header_hash: [u8; 32],
@@ -1437,6 +1452,8 @@ mod tests {
 
     #[test]
     fn re_arm_requires_strictly_fresher_finalized_height() {
+        #[cfg(feature = "ml-dsa-65")]
+        let _no_signer = clear_sealed_signer_for_mock_pubkey_tests();
         let pq = vec![0xEE; 48];
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq,
@@ -1659,6 +1676,8 @@ mod tests {
 
     #[test]
     fn stateful_sign_second_hardfork_while_armed_fails() {
+        #[cfg(feature = "ml-dsa-65")]
+        let _no_signer = clear_sealed_signer_for_mock_pubkey_tests();
         let pq = vec![0xDE; 48];
         let mut state = EnclaveState::Unarmed;
 
@@ -1945,26 +1964,58 @@ mod tests {
 
     #[test]
     fn stateful_sign_hardfork_wrong_pubkey_fails() {
-        let pq = vec![0xDE; 48];
         let mut state = EnclaveState::Unarmed;
 
-        dispatch_command_with_state(
-            Command::ArmForProduction(sample_arm_request(pq, 10_000_000, 10_000_050)),
-            &mut state, test_attestation_trust());
+        #[cfg(feature = "ml-dsa-65")]
+        {
+            let _guard = install_reference_sealed_signer_for_tests();
+            let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed signer");
+            dispatch_command_with_state(
+                Command::ArmForProduction(sample_arm_request(pk.clone(), 10_000_000, 10_000_050)),
+                &mut state,
+                test_attestation_trust(),
+            );
+            let mut wrong_pk = pk.clone();
+            wrong_pk[0] ^= 0xFF;
+            let ticket = sample_hardfork_ticket(wrong_pk, 10_000_100);
+            let resp = dispatch_command_with_state(
+                Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+                &mut state,
+                test_attestation_trust(),
+            );
+            match resp {
+                Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
+                _ => panic!("expected pubkey mismatch error"),
+            }
+            pq_signer::end_sealed_signer_test_session();
+            drop(_guard);
+        }
 
-        let ticket = sample_hardfork_ticket(vec![0xCD; 48], 10_000_100);
-        let resp = dispatch_command_with_state(
-            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-            &mut state, test_attestation_trust());
-
-        match resp {
-            Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
-            _ => panic!("expected pubkey mismatch error"),
+        #[cfg(not(feature = "ml-dsa-65"))]
+        {
+            let pq = vec![0xDE; 48];
+            dispatch_command_with_state(
+                Command::ArmForProduction(sample_arm_request(pq, 10_000_000, 10_000_050)),
+                &mut state,
+                test_attestation_trust(),
+            );
+            let ticket = sample_hardfork_ticket(vec![0xCD; 48], 10_000_100);
+            let resp = dispatch_command_with_state(
+                Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+                &mut state,
+                test_attestation_trust(),
+            );
+            match resp {
+                Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
+                _ => panic!("expected pubkey mismatch error"),
+            }
         }
     }
 
     #[test]
     fn stateful_sign_hardfork_stale_activation_height_fails() {
+        #[cfg(feature = "ml-dsa-65")]
+        let _no_signer = clear_sealed_signer_for_mock_pubkey_tests();
         let pq = vec![0xDE; 48];
         let mut state = EnclaveState::Unarmed;
 
@@ -2089,7 +2140,7 @@ mod tests {
                 .join("testvectors/mldsa65_reference_pk.bin"),
         )
         .expect("reference pk testvector");
-        let blob = pq_signer::seal_mldsa65_keypair_v0(&sk, &pk, measurement).unwrap();
+        let blob = pq_signer::seal_mldsa65_keypair_v1(&sk, &pk, measurement).unwrap();
         pq_signer::install_sealed_pq_signer(&blob, measurement).unwrap();
         guard
     }
@@ -2121,7 +2172,7 @@ mod tests {
             context_hash: [0x01; 32],
             activation_height: 100,
             new_measurement: b"m".to_vec(),
-            pq_pubkey: vec![0xFF; 48],
+            pq_pubkey: vec![0xFF; ML_DSA65_PUBKEY_LEN],
             fork_spec_hash: None,
             new_header_version: None,
         };

@@ -82,14 +82,15 @@ The `test-support` feature exposes `reference_test_attestation_signing_key` / `r
 | Feature | Use |
 |---------|-----|
 | *(default, none)* | No PQ signing; `pq_signing_ready: false` |
-| `ml-dsa-65` | ML-DSA-65 crypto + sealed blob install at enclave boot (production path sketch) |
-| `reference-test-key` | Implies `ml-dsa-65`; NIST test-vector in unit tests only |
+| `ml-dsa-65` | ML-DSA-65 crypto + v1 sealed-key install at enclave boot |
+| `reference-seal-v1-root` | Staging/CI only: test provisioning root for v1 seal/unseal (**not for deployment**) |
+| `reference-test-key` | Implies `ml-dsa-65` + `reference-seal-v1-root`; NIST test-vector in unit tests |
 | `test-support` | Reference Ed25519 attestation keys for local dev |
 | `demo-mock-sign` | Enables 64 B mock PQ in `ticket_signing_demo` (`pq_signing_ready` stays false) |
 
 v0 seal/unseal helpers compile only under `cargo test --features ml-dsa-65` (not in standalone binaries).
 
-At boot (production): `install_sealed_pq_signer(sealed_blob, enclave_measurement)` once a **production** seal format exists. v0 XOR + measurement binding in `pq_signer.rs` is **unit-test only** (`cargo test --features ml-dsa-65`).
+At boot: `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic). Provisioning uses `seal_mldsa65_keypair_v1` (requires `reference-seal-v1-root` or `cargo test`). v0 XOR is **unit-test only**. Deployment images must use a platform seal root, not `reference-seal-v1-root`.
 
 Do not pass `--all-features` (`ml-dsa-65` and `test-support` conflict).
 

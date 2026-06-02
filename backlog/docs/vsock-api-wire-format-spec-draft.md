@@ -50,7 +50,9 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | Install | Once per enclave process; second install without restart returns error (no silent overwrite) |
 | API | Same entrypoint: `install_sealed_pq_signer(sealed_blob, enclave_measurement)` at enclave boot only (not vsock) |
 
-Reference implementation status: `SEALED_BLOB_V1_VERSION` is defined; non-test install returns `PqSigningUnavailable("production PQ seal format (v1) not implemented")` when the blob version byte is `0x01`.
+**v1 wire layout (reference crate):** `magic[8]="2DHSMV1\\0"` · `version=1` · `meas_digest[32]=SHA3-256("2d-hsm-pq-seal-v1-meas"‖measurement)` · `nonce[12]` · `ciphertext+tag` (ChaCha20-Poly1305 over `sk‖pk`, AAD = magic‖version‖meas_digest, key = SHA3-256("2d-hsm-pq-seal-v1-key"‖provisioning_root‖meas_digest)). Measurement bytes are **not** stored in cleartext.
+
+Reference implementation status: v1 **unseal + install** works in `ml-dsa-65` builds when the enclave image includes a provisioning root (`reference-seal-v1-root` feature / test vector for CI). **Seal** helpers require the same root and are for provisioning tools/tests only. Production TEE images must replace `provisioning_root` with a platform-derived secret (vTPM / SNP VMPL / Nitro); do not ship `reference-seal-v1-root` in deployment binaries.
 
 **Scope of ML-DSA-65 inside this enclave:**
 - Canonical block-root / header-digest signing (BlockProducer hot path).
