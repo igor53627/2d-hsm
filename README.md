@@ -43,11 +43,11 @@ See `backlog/tasks/` for the full board.
 |------|--------|---------|
 | **TASK-2** | In progress | Vsock API + wire protocol; reference crate `impl/rust/enclave-protocol/` |
 | **TASK-3** | Done | Cryptographic `RecentChainProof` verification (Producer Chain Attestation v1) |
-| **TASK-1** | To do | Real post-quantum signing (ML-DSA / SLH-DSA) inside the TEE |
+| **TASK-1** | In progress | ML-DSA-65 in reference crate; seal v1 + `pq-seal-v1` CLI (staging); platform root hook at boot |
 
 **Reference implementation today:** length-prefixed CBOR framing, canonical ticket hashing (Forge cross-check), enclave arming state machine, hard-fork gating, and Ed25519 chain attestation proofs. Details: `impl/README.md` and `backlog/docs/vsock-api-wire-format-spec-draft.md`.
 
-**Next major increment:** TASK-1 (PQ signer in enclave) and Elixir host shim (TASK-2 Phase 4).
+**Next major increment:** Platform provisioning root in real TEE images, full operator runbook (TASK-1 #5), Elixir host shim (TASK-2 Phase 4). Staging PQ provisioning: `backlog/docs/pq-seal-v1-provisioning-runbook.md`.
 
 ## Development
 

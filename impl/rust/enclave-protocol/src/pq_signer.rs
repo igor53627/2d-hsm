@@ -18,8 +18,39 @@ pub const SEALED_BLOB_V0_VERSION: u8 = 0;
 /// Sealed blob format version 1 (AEAD + measurement binding).
 pub const SEALED_BLOB_V1_VERSION: u8 = 1;
 
+/// v1 sealed PQ blob magic (`2DHSMV1\0`).
 #[cfg(feature = "ml-dsa-65")]
-const SEALED_BLOB_V1_MAGIC: &[u8; 8] = b"2DHSMV1\0";
+pub const SEALED_BLOB_V1_MAGIC: &[u8; 8] = b"2DHSMV1\0";
+
+/// Runtime provisioning root from platform integration (vTPM / SNP VMPL / Nitro hook).
+/// Set once at enclave boot before `install_sealed_pq_signer` when not using `reference-seal-v1-root`.
+#[cfg(feature = "ml-dsa-65")]
+static PLATFORM_PROVISIONING_ROOT: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+/// Install the v1 provisioning root once at enclave boot (production path).
+///
+/// The root must match the secret used by the offline provisioning tool that produced the
+/// sealed blob. Do not accept this value from the untrusted host over vsock.
+#[cfg(feature = "ml-dsa-65")]
+pub fn set_pq_seal_v1_provisioning_root(root: [u8; 32]) -> Result<(), ProtocolError> {
+    let mut guard = PLATFORM_PROVISIONING_ROOT
+        .lock()
+        .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
+    if guard.is_some() {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "PQ seal v1 provisioning root already configured",
+        ));
+    }
+    *guard = Some(root);
+    Ok(())
+}
+
+#[cfg(all(feature = "ml-dsa-65", test))]
+pub(crate) fn reset_pq_seal_v1_provisioning_root_for_tests() {
+    if let Ok(mut guard) = PLATFORM_PROVISIONING_ROOT.lock() {
+        *guard = None;
+    }
+}
 #[cfg(feature = "ml-dsa-65")]
 const SEALED_BLOB_V0_MAGIC: &[u8; 8] = b"2DHSMV0\0";
 
@@ -112,15 +143,25 @@ fn install_signer_from_key_material(
     sk_bytes: &mut Vec<u8>,
     pk_bytes: &mut Vec<u8>,
 ) -> Result<(), ProtocolError> {
-    let signer = MlDsa65Signer::from_verified_key_bytes(sk_bytes, pk_bytes)?;
-    zeroize_vec(sk_bytes);
-    zeroize_vec(pk_bytes);
+    // Hold the install mutex across verify+install to prevent concurrent overwrite (runbook invariant).
     let mut guard = lock_installed_signer()?;
     if guard.is_some() {
+        zeroize_vec(sk_bytes);
+        zeroize_vec(pk_bytes);
         return Err(ProtocolError::PqSigningUnavailable(
             "PQ signer already installed; enclave restart required to reprovision",
         ));
     }
+    let signer = match MlDsa65Signer::from_verified_key_bytes(sk_bytes, pk_bytes) {
+        Ok(signer) => signer,
+        Err(e) => {
+            zeroize_vec(sk_bytes);
+            zeroize_vec(pk_bytes);
+            return Err(e);
+        }
+    };
+    zeroize_vec(sk_bytes);
+    zeroize_vec(pk_bytes);
     *guard = Some(InstalledSigner::MlDsa65(signer));
     Ok(())
 }
@@ -157,8 +198,11 @@ pub fn install_sealed_pq_signer(
     sealed_blob: &[u8],
     enclave_measurement: &[u8],
 ) -> Result<(), ProtocolError> {
-    let (mut sk_bytes, mut pk_bytes) = unseal_sealed_keypair(sealed_blob, enclave_measurement)?;
-    install_signer_from_key_material(&mut sk_bytes, &mut pk_bytes)
+    use zeroize::Zeroizing;
+    let (sk_bytes, pk_bytes) = unseal_sealed_keypair(sealed_blob, enclave_measurement)?;
+    let mut sk_bytes = Zeroizing::new(sk_bytes);
+    let mut pk_bytes = Zeroizing::new(pk_bytes);
+    install_signer_from_key_material(sk_bytes.as_mut(), pk_bytes.as_mut())
 }
 
 #[cfg(not(feature = "ml-dsa-65"))]
@@ -218,16 +262,28 @@ mod v1_seal {
         h.finalize().into()
     }
 
-    #[cfg(any(test, feature = "reference-seal-v1-root"))]
-    fn provisioning_root() -> Result<&'static [u8; 32], ProtocolError> {
-        Ok(include_bytes!("../testvectors/seal_v1_provisioning_root.bin"))
+    pub(crate) fn resolve_provisioning_root() -> Result<[u8; 32], ProtocolError> {
+        let guard = super::PLATFORM_PROVISIONING_ROOT
+            .lock()
+            .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
+        if let Some(root) = *guard {
+            return Ok(root);
+        }
+        drop(guard);
+        #[cfg(any(test, feature = "reference-seal-v1-root"))]
+        {
+            return Ok(*include_bytes!("../testvectors/seal_v1_provisioning_root.bin"));
+        }
+        #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
+        {
+            Err(ProtocolError::PqSigningUnavailable(
+                "PQ seal v1 provisioning root not configured (call set_pq_seal_v1_provisioning_root at enclave boot)",
+            ))
+        }
     }
 
-    #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
-    fn provisioning_root() -> Result<&'static [u8; 32], ProtocolError> {
-        Err(ProtocolError::PqSigningUnavailable(
-            "PQ seal v1 provisioning root not configured (platform seal required)",
-        ))
+    pub fn pq_seal_v1_expected_blob_len() -> usize {
+        SEALED_BLOB_V1_HEADER_LEN + PLAINTEXT_LEN + 16
     }
 
     fn derive_aead_key(
@@ -245,14 +301,23 @@ mod v1_seal {
         sealed_blob: &[u8],
         enclave_measurement: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+        use zeroize::Zeroizing;
+        let root = Zeroizing::new(resolve_provisioning_root()?);
+        unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, &root)
+    }
+
+    pub fn unseal_mldsa65_keypair_v1_with_root(
+        sealed_blob: &[u8],
+        enclave_measurement: &[u8],
+        provisioning_root: &[u8; 32],
+    ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
         if enclave_measurement.is_empty() {
             return Err(ProtocolError::PqSigningUnavailable(
                 "enclave measurement must be non-empty for v1 seal",
             ));
         }
         let expected_meas = measurement_digest_v1(enclave_measurement);
-        let min_len = SEALED_BLOB_V1_HEADER_LEN + PLAINTEXT_LEN + 16;
-        if sealed_blob.len() != min_len {
+        if sealed_blob.len() != pq_seal_v1_expected_blob_len() {
             return Err(ProtocolError::PqSigningUnavailable("v1 sealed blob length mismatch"));
         }
         if sealed_blob.get(..8) != Some(super::SEALED_BLOB_V1_MAGIC) {
@@ -269,13 +334,12 @@ mod v1_seal {
                 "v1 sealed blob measurement digest does not match enclave measurement",
             ));
         }
-        let root = provisioning_root()?;
-        let key = derive_aead_key(root, &expected_meas)?;
+        let key = derive_aead_key(provisioning_root, &expected_meas)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
             .map_err(|_| ProtocolError::PqSigningUnavailable("v1 AEAD key invalid"))?;
         let nonce = Nonce::from_slice(&sealed_blob[41..SEALED_BLOB_V1_HEADER_LEN]);
         let aad = &sealed_blob[..9 + V1_MEAS_DIGEST_LEN];
-        let plain = cipher
+        let mut plain = cipher
             .decrypt(
                 nonce,
                 Payload {
@@ -285,21 +349,24 @@ mod v1_seal {
             )
             .map_err(|_| ProtocolError::PqSigningUnavailable("v1 sealed blob decrypt failed"))?;
         if plain.len() != PLAINTEXT_LEN {
+            zeroize_vec(&mut plain);
             return Err(ProtocolError::PqSigningUnavailable(
                 "v1 sealed blob plaintext length mismatch",
             ));
         }
         let sk = plain[..ML_DSA65_SECRETKEY_LEN].to_vec();
         let pk = plain[ML_DSA65_SECRETKEY_LEN..].to_vec();
+        zeroize_vec(&mut plain);
         Ok((sk, pk))
     }
 
-    /// Seal ML-DSA-65 key material for staging/tests (requires `reference-seal-v1-root` or `cargo test`).
-    #[cfg(any(test, feature = "reference-seal-v1-root"))]
-    pub fn seal_mldsa65_keypair_v1(
+    /// Seal ML-DSA-65 key material (offline provisioning). Caller supplies the provisioning root.
+    #[cfg(any(test, feature = "pq-seal-provisioning"))]
+    pub fn seal_mldsa65_keypair_v1_with_root(
         secret_key: &[u8],
         public_key: &[u8],
         enclave_measurement: &[u8],
+        provisioning_root: &[u8; 32],
     ) -> Result<Vec<u8>, ProtocolError> {
         if secret_key.len() != ML_DSA65_SECRETKEY_LEN {
             return Err(ProtocolError::PqSigningUnavailable(
@@ -316,14 +383,16 @@ mod v1_seal {
                 "enclave measurement must be non-empty for v1 sealing",
             ));
         }
+        MlDsa65Signer::from_verified_key_bytes(secret_key, public_key)?;
         let meas_digest = measurement_digest_v1(enclave_measurement);
-        let root = provisioning_root()?;
-        let key = derive_aead_key(root, &meas_digest)?;
+        let key = derive_aead_key(provisioning_root, &meas_digest)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
             .map_err(|_| ProtocolError::PqSigningUnavailable("v1 AEAD key invalid"))?;
 
-        let mut plain =
-            Vec::with_capacity(ML_DSA65_SECRETKEY_LEN + crate::ML_DSA65_PUBKEY_LEN);
+        use zeroize::Zeroizing;
+        let mut plain = Zeroizing::new(Vec::with_capacity(
+            ML_DSA65_SECRETKEY_LEN + crate::ML_DSA65_PUBKEY_LEN,
+        ));
         plain.extend_from_slice(secret_key);
         plain.extend_from_slice(public_key);
 
@@ -332,7 +401,7 @@ mod v1_seal {
             ProtocolError::PqSigningUnavailable("CSPRNG unavailable for v1 seal nonce")
         })?;
 
-        let mut out = Vec::with_capacity(SEALED_BLOB_V1_HEADER_LEN + plain.len() + 16);
+        let mut out = Vec::with_capacity(pq_seal_v1_expected_blob_len());
         out.extend_from_slice(super::SEALED_BLOB_V1_MAGIC);
         out.push(SEALED_BLOB_V1_VERSION);
         out.extend_from_slice(&meas_digest);
@@ -342,7 +411,7 @@ mod v1_seal {
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
-                    msg: &plain,
+                    msg: plain.as_ref(),
                     aad,
                 },
             )
@@ -350,10 +419,51 @@ mod v1_seal {
         out.extend_from_slice(&ct);
         Ok(out)
     }
+
+    /// Seal using the configured provisioning root (platform, reference feature, or `cargo test`).
+    #[cfg(any(test, feature = "pq-seal-provisioning"))]
+    pub fn seal_mldsa65_keypair_v1(
+        secret_key: &[u8],
+        public_key: &[u8],
+        enclave_measurement: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let root = resolve_provisioning_root()?;
+        seal_mldsa65_keypair_v1_with_root(secret_key, public_key, enclave_measurement, &root)
+    }
+
+    /// Check that a sealed blob decrypts for the given measurement and root (does not return key material).
+    #[cfg(any(test, feature = "pq-seal-provisioning"))]
+    pub fn verify_sealed_blob_v1_with_root(
+        sealed_blob: &[u8],
+        enclave_measurement: &[u8],
+        provisioning_root: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        use zeroize::Zeroizing;
+        let (sk, pk) =
+            unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, provisioning_root)?;
+        let sk = Zeroizing::new(sk);
+        let pk = Zeroizing::new(pk);
+        MlDsa65Signer::from_verified_key_bytes(sk.as_ref(), pk.as_ref())?;
+        Ok(())
+    }
 }
 
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-seal-v1-root")))]
-pub use v1_seal::seal_mldsa65_keypair_v1;
+#[cfg(feature = "ml-dsa-65")]
+pub use v1_seal::{
+    measurement_digest_v1 as pq_seal_v1_measurement_digest, pq_seal_v1_expected_blob_len,
+    SEALED_BLOB_V1_HEADER_LEN,
+};
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]
+pub use v1_seal::{
+    seal_mldsa65_keypair_v1, seal_mldsa65_keypair_v1_with_root,
+    verify_sealed_blob_v1_with_root,
+};
+
+/// Whether a platform or reference provisioning root is available for v1 unseal.
+#[cfg(feature = "ml-dsa-65")]
+pub fn is_pq_seal_v1_provisioning_root_configured() -> bool {
+    v1_seal::resolve_provisioning_root().is_ok()
+}
 
 #[cfg(all(feature = "ml-dsa-65", test))]
 mod v0_seal {
@@ -465,8 +575,16 @@ mod tests {
     #[test]
     fn v1_seal_unseal_roundtrip_and_tamper_fails() {
         let _guard = SealedSignerTestGuard::acquire();
-        let sk = vec![0xABu8; ML_DSA65_SECRETKEY_LEN];
-        let pk = vec![0xCDu8; crate::ML_DSA65_PUBKEY_LEN];
+        let sk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_sk.bin"),
+        )
+        .unwrap();
+        let pk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_pk.bin"),
+        )
+        .unwrap();
         let measurement = b"enclave-measurement-placeholder";
         let blob = seal_mldsa65_keypair_v1(&sk, &pk, measurement).unwrap();
         let (back_sk, back_pk) = v1_seal::unseal_mldsa65_keypair_v1(&blob, measurement).unwrap();
@@ -516,6 +634,38 @@ mod tests {
         assert_eq!(back_sk, sk);
         assert_eq!(back_pk, pk);
         assert!(unseal_mldsa65_keypair_v0(&blob, b"wrong").is_err());
+    }
+
+    #[cfg(feature = "ml-dsa-65")]
+    #[test]
+    fn platform_provisioning_root_install_and_sign() {
+        let _guard = SealedSignerTestGuard::acquire();
+        reset_installed_pq_signer_for_tests();
+        reset_pq_seal_v1_provisioning_root_for_tests();
+        let root: [u8; 32] =
+            *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
+        set_pq_seal_v1_provisioning_root(root).unwrap();
+        assert!(set_pq_seal_v1_provisioning_root(root).is_err());
+        assert!(is_pq_seal_v1_provisioning_root_configured());
+
+        let measurement = b"enclave-measurement-placeholder";
+        let sk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_sk.bin"),
+        )
+        .unwrap();
+        let pk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_pk.bin"),
+        )
+        .unwrap();
+        let blob =
+            seal_mldsa65_keypair_v1_with_root(&sk, &pk, measurement, &root).unwrap();
+        verify_sealed_blob_v1_with_root(&blob, measurement, &root).unwrap();
+        install_sealed_pq_signer(&blob, measurement).unwrap();
+        let hash = [9u8; 32];
+        let sig = sign_ticket_hash_sealed(&hash).unwrap();
+        assert_eq!(sig.len(), crate::ML_DSA65_SIGNATURE_LEN);
     }
 
     #[cfg(feature = "ml-dsa-65")]

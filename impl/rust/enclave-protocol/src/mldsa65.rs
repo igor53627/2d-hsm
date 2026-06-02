@@ -71,6 +71,12 @@ impl MlDsa65Signer {
         self.public_key.as_bytes().to_vec()
     }
 
+    /// Secret key bytes (offline provisioning only — requires `pq-seal-provisioning`).
+    #[cfg(feature = "pq-seal-provisioning")]
+    pub fn secret_key_bytes(&self) -> &[u8] {
+        self.secret_key.as_bytes()
+    }
+
     /// Pure ML-DSA-65 over the 32-byte `ticketHash` (no pre-hash; empty `ctx` in FIPS terms).
     pub fn sign_ticket_hash(&self, ticket_hash: &[u8; 32]) -> Result<Vec<u8>, ProtocolError> {
         let sig = detached_sign(ticket_hash, &self.secret_key);
