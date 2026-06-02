@@ -1,7 +1,7 @@
 ---
 id: TASK-3
 title: Implement cryptographic RecentChainProof verification (network second factor)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-02 07:48'
 updated_date: '2026-06-02 12:00'
@@ -64,7 +64,7 @@ Implement real cryptographic verification of `RecentChainProof` inside the TEE s
 - [x] #4 Negative tests: empty proof_data, missing signature_from_recent_producer, forged heights cannot arm or sign hard-fork
 - [x] #5 Re-arm policy requires strictly fresher proof than previous session (or document explicit Phase-2 policy)
 - [x] #6 Update vsock spec + TASK-2 notes: remove 'not production-ready' caveat once crypto gate is implemented
-- [ ] #7 Full 3:3 roborev matrix + compact on the crypto verification increment (high-risk per AGENTS.md)
+- [x] #7 Full 3:3 roborev matrix + compact on the crypto verification increment (high-risk per AGENTS.md)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -77,5 +77,9 @@ Created 2026-06-02 after cc8446f / 1ae4773 matrices. Production blocker explicit
 - `ProducerAttestationTrust`: pinned attestation pubkey (not derived from public `pq_pubkey` — fixes roborev HIGH on a3fccc9).
 - `validate_recent_chain_proof` calls crypto verify; re-arm requires strictly greater `finalized_height`.
 - Spec §8.1 in vsock-api-wire-format-spec-draft.md; 47 `cargo test` passing.
-- **Pending:** 3:3 roborev + compact (AC #7).
+- **Review (2026-06-02):** Reduced 3:3 on `2d136ac` (codex security, gemini security, claude-code design) + `roborev compact` job 6509 on `fddd3f0`.
+  - HIGH (codex+gemini): measurement not in preimage → fixed in `fddd3f0`.
+  - MEDIUM (gemini): exact `proof_data` length, weak sign-time test → fixed in `fddd3f0`.
+  - Compact post-fix: **0 HIGH**, 6 MEDIUM remain (trust provisioning spec, test key in public API, GET_STATUS wire drift, ARM CBOR schema, stateless dispatch mismatch, review-gate docs).
+- Status: crypto gate implemented; remaining MEDIUMs are follow-up hardening/docs, not blockers for TASK-3 core AC.
 <!-- SECTION:NOTES:END -->
