@@ -102,7 +102,16 @@ pub fn recent_chain_proof_signing_preimage(
     recovery_tail_digest: [u8; 32],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        SIGNING_DOMAIN.len() + 8 + 32 + 8 + 32 + 32 + 4 + authorized.pq_pubkey.len(),
+        SIGNING_DOMAIN.len()
+            + 8
+            + 32
+            + 8
+            + 32
+            + 32
+            + 4
+            + authorized.pq_pubkey.len()
+            + 4
+            + authorized.measurement.len(),
     );
     out.extend_from_slice(SIGNING_DOMAIN);
     out.extend_from_slice(&proof.finalized_height.to_be_bytes());
@@ -113,14 +122,17 @@ pub fn recent_chain_proof_signing_preimage(
     let pq_len = authorized.pq_pubkey.len() as u32;
     out.extend_from_slice(&pq_len.to_be_bytes());
     out.extend_from_slice(&authorized.pq_pubkey);
+    let meas_len = authorized.measurement.len() as u32;
+    out.extend_from_slice(&meas_len.to_be_bytes());
+    out.extend_from_slice(&authorized.measurement);
     out
 }
 
 /// Parses and validates the v1 `proof_data` envelope.
 pub fn parse_proof_data_v1(proof_data: &[u8]) -> Result<ProofDataV1, ProtocolError> {
-    if proof_data.len() < PROOF_DATA_V1_LEN {
+    if proof_data.len() != PROOF_DATA_V1_LEN {
         return Err(ProtocolError::RecentChainProofValidation(
-            "proof_data too short for Producer Chain Attestation v1",
+            "proof_data must be exactly 33 bytes for Producer Chain Attestation v1",
         ));
     }
     if proof_data[0] != PROOF_DATA_FORMAT_V1 {
@@ -287,6 +299,24 @@ mod tests {
     }
 
     #[test]
+    fn tampered_measurement_fails_verification() {
+        let authorized = sample_authorized();
+        let sk = reference_test_attestation_signing_key();
+        let trust = reference_test_attestation_trust();
+        let proof = build_signed_recent_chain_proof(
+            150,
+            [0xFE; 32],
+            vec![[0xCA; 32]],
+            &authorized,
+            &sk,
+        )
+        .unwrap();
+        let mut bad_arm = authorized.clone();
+        bad_arm.measurement = b"attacker-measurement".to_vec();
+        assert!(verify_recent_chain_proof_crypto(&proof, &bad_arm, &trust).is_err());
+    }
+
+    #[test]
     fn tampered_height_fails_verification() {
         let authorized = sample_authorized();
         let sk = reference_test_attestation_signing_key();
@@ -300,6 +330,23 @@ mod tests {
         )
         .unwrap();
         proof.finalized_height = 999;
+        assert!(verify_recent_chain_proof_crypto(&proof, &authorized, &trust).is_err());
+    }
+
+    #[test]
+    fn proof_data_extra_trailing_bytes_rejected() {
+        let authorized = sample_authorized();
+        let sk = reference_test_attestation_signing_key();
+        let trust = reference_test_attestation_trust();
+        let mut proof = build_signed_recent_chain_proof(
+            150,
+            [0xFE; 32],
+            vec![[0xCA; 32]],
+            &authorized,
+            &sk,
+        )
+        .unwrap();
+        proof.proof_data.push(0xFF);
         assert!(verify_recent_chain_proof_crypto(&proof, &authorized, &trust).is_err());
     }
 

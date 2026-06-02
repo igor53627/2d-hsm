@@ -379,7 +379,7 @@ Future work (measurement transitions after hard forks, live tip tracking) may ad
 
 The reference enclave verifies this format at **`ARM_FOR_PRODUCTION`** and again at **hard-fork sign** time (fail closed).
 
-**`proof_data` (33 bytes minimum):**
+**`proof_data` (exactly 33 bytes for format 0x01):**
 
 | Offset | Size | Field |
 |--------|------|--------|
@@ -396,6 +396,7 @@ DOMAIN = "2d-hsm/RecentChainProof/v1\0"
 || authorized.source_ticket_hash[32]
 || recovery_tail_digest[32]
 || be32(len(pq_pubkey)) || pq_pubkey
+|| be32(len(measurement)) || measurement
 ```
 
 **Verifying key (MVP):** a **pinned producer attestation Ed25519 public key** passed to the enclave as `ProducerAttestationTrust` (sealed config / attested provisioning). It must **not** be derived from public `pq_pubkey` — otherwise any host knowing the pubkey could forge proofs.

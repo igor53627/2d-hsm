@@ -1187,6 +1187,7 @@ mod tests {
             tampered.signature_from_recent_producer = None;
             let mut bad_state = EnclaveState::Armed(EnclaveArmedState {
                 proof: tampered,
+                pending_hard_fork_height: None,
                 ..armed.clone()
             });
             let ticket2 = sample_hardfork_ticket(vec![0xAB; 48], 400);
@@ -1195,12 +1196,38 @@ mod tests {
                 &mut bad_state,
             )
             .unwrap_err();
-            assert!(matches!(
-                err,
-                ProtocolError::RecentChainProofValidation(_)
-                    | ProtocolError::InvalidTicket(_)
-            ));
+            assert!(
+                matches!(err, ProtocolError::RecentChainProofValidation(_)),
+                "expected crypto proof failure at sign time, got {:?}",
+                err
+            );
         }
+    }
+
+    #[test]
+    fn arm_rejects_measurement_mismatch_after_signing() {
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![0xAB; 48],
+            measurement: b"legit-meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xCC; 32],
+        };
+        let proof = signed_recent_chain_proof(200, [0xDD; 32], vec![[0xCC; 32]], &authorized);
+        let mut forged = authorized.clone();
+        forged.measurement = b"evil-meas".to_vec();
+        let err = arm_for_production(
+            &EnclaveState::Unarmed,
+            ArmForProductionRequest {
+                authorized_state: forged,
+                recent_chain_proof: proof,
+            },
+            test_attestation_trust(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::RecentChainProofValidation(_)
+        ));
     }
 
     #[test]
