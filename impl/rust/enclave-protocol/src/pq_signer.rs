@@ -105,23 +105,36 @@ pub fn install_sealed_pq_signer(
     sealed_blob: &[u8],
     enclave_measurement: &[u8],
 ) -> Result<(), ProtocolError> {
-    let (sk_bytes, pk_bytes) = unseal_mldsa65_keypair_v0(sealed_blob, enclave_measurement)?;
-    let signer = MlDsa65Signer::from_key_bytes(&sk_bytes, &pk_bytes)?;
-    let mut guard = INSTALLED_SIGNER
-        .lock()
-        .map_err(|_| ProtocolError::PqSigningUnavailable("pq signer mutex poisoned"))?;
-    if guard.is_some() {
-        #[cfg(test)]
-        {
-            *guard = None;
-        }
-        #[cfg(not(test))]
+    #[cfg(not(test))]
+    {
+        let _ = (sealed_blob, enclave_measurement);
         return Err(ProtocolError::PqSigningUnavailable(
-            "PQ signer already installed; enclave restart required to reprovision",
+            "v0 XOR sealed PQ blobs are test-only; production seal format not implemented",
         ));
     }
-    *guard = Some(InstalledSigner::MlDsa65(signer));
-    Ok(())
+    #[cfg(test)]
+    {
+        let (mut sk_bytes, mut pk_bytes) =
+            unseal_mldsa65_keypair_v0(sealed_blob, enclave_measurement)?;
+        let signer = MlDsa65Signer::from_verified_key_bytes(&sk_bytes, &pk_bytes)?;
+        zeroize_vec(&mut sk_bytes);
+        zeroize_vec(&mut pk_bytes);
+        let mut guard = INSTALLED_SIGNER
+            .lock()
+            .map_err(|_| ProtocolError::PqSigningUnavailable("pq signer mutex poisoned"))?;
+        if guard.is_some() {
+            #[cfg(test)]
+            {
+                *guard = None;
+            }
+            #[cfg(not(test))]
+            return Err(ProtocolError::PqSigningUnavailable(
+                "PQ signer already installed; enclave restart required to reprovision",
+            ));
+        }
+        *guard = Some(InstalledSigner::MlDsa65(signer));
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "ml-dsa-65"))]
@@ -153,6 +166,7 @@ pub fn reset_installed_pq_signer_for_tests() {
 }
 
 /// Reference-only: seal ML-DSA-65 keypair material to a TEE measurement (v0 sketch).
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
 pub fn seal_mldsa65_keypair_v0(
     secret_key: &[u8],
     public_key: &[u8],
@@ -190,7 +204,7 @@ pub fn seal_mldsa65_keypair_v0(
 }
 
 /// Seal only the secret key (loads matching public key from testvectors — **tests/CI only**).
-#[cfg(any(test, feature = "reference-test-key"))]
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
 pub fn seal_mldsa65_secret_key_v0(
     secret_key: &[u8],
     enclave_measurement: &[u8],
@@ -203,6 +217,7 @@ pub fn seal_mldsa65_secret_key_v0(
 }
 
 /// Reference-only: unseal v0 blob with the enclave's attested measurement.
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
 pub fn unseal_mldsa65_keypair_v0(
     sealed_blob: &[u8],
     enclave_measurement: &[u8],
@@ -230,10 +245,17 @@ pub fn unseal_mldsa65_keypair_v0(
             "sealed blob measurement does not match enclave measurement",
         ));
     }
-    let plain = xor_stream_v0(&sealed_blob[header..], enclave_measurement);
+    let mut plain = xor_stream_v0(&sealed_blob[header..], enclave_measurement);
     let sk = plain[..ML_DSA65_SECRETKEY_LEN].to_vec();
     let pk = plain[ML_DSA65_SECRETKEY_LEN..].to_vec();
+    zeroize_vec(&mut plain);
     Ok((sk, pk))
+}
+
+#[cfg(feature = "ml-dsa-65")]
+fn zeroize_vec(buf: &mut Vec<u8>) {
+    use zeroize::Zeroize;
+    buf.zeroize();
 }
 
 fn xor_stream_v0(data: &[u8], enclave_measurement: &[u8]) -> Vec<u8> {
@@ -258,6 +280,7 @@ fn xor_stream_v0(data: &[u8], enclave_measurement: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ml-dsa-65")]
     #[test]
     fn seal_unseal_roundtrip_wrong_measurement_fails() {
         let sk = vec![0xABu8; ML_DSA65_SECRETKEY_LEN];

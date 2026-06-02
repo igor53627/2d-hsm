@@ -14,6 +14,7 @@ thiserror = "1.0"
 ed25519-dalek = "2"
 pqcrypto-mldsa = { version = "0.1.2", optional = true }
 pqcrypto-traits = { version = "0.3.5", optional = true }
+zeroize = { version = "1.8", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
@@ -24,12 +25,14 @@ serde_json = "1.0"
 [features]
 default = []
 # ML-DSA-65 crypto (sealed-key provisioning). Does not embed a secret key by itself.
-ml-dsa-65 = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
-# Public NIST test-vector keypair — CI/protocol tests only (see vsock spec §2.1).
+ml-dsa-65 = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits", "dep:zeroize"]
+# Public NIST test-vector keypair — `cargo test` only (see vsock spec §2.1).
 reference-test-key = ["ml-dsa-65"]
-# Mock 64-byte PQ signatures for examples and local dev only (see vsock spec §2.1).
+# Mock 64-byte PQ + reference Ed25519 attestation keys for local dev (see vsock spec §2.1).
 # Mutually exclusive with ml-dsa-65 (compile_error in lib.rs).
 test-support = []
+# Enables mock PQ signing in the ticket_signing_demo example only (pq_signing_ready stays false).
+demo-mock-sign = ["test-support"]
 enforce-forge-crosscheck = []
 #   When enabled, the automated cross-check tests (that verify
 #   `compute_canonical_ticket_hash` against the Solidity `abi.encode` + keccak256
@@ -47,4 +50,4 @@ enforce-forge-crosscheck = []
 
 [[example]]
 name = "ticket_signing_demo"
-required-features = ["test-support"]
+required-features = ["test-support", "demo-mock-sign"]

@@ -51,14 +51,14 @@ pub use wire::{
 };
 #[cfg(feature = "ml-dsa-65")]
 pub use mldsa65::MlDsa65Signer;
-#[cfg(feature = "reference-test-key")]
-pub use mldsa65::ReferenceMlDsa65Signer;
 pub use pq_signer::{
-    install_sealed_pq_signer, is_sealed_signer_installed, seal_mldsa65_keypair_v0,
-    unseal_mldsa65_keypair_v0, ML_DSA65_SECRETKEY_LEN, SEALED_BLOB_V0_VERSION,
+    install_sealed_pq_signer, is_sealed_signer_installed, ML_DSA65_SECRETKEY_LEN,
+    SEALED_BLOB_V0_VERSION,
 };
-#[cfg(any(test, feature = "reference-test-key"))]
-pub use pq_signer::seal_mldsa65_secret_key_v0;
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
+pub use pq_signer::{
+    seal_mldsa65_keypair_v0, seal_mldsa65_secret_key_v0, unseal_mldsa65_keypair_v0,
+};
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -107,6 +107,9 @@ pub enum ProtocolError {
 
     #[error("PQ signing unavailable: {0}")]
     PqSigningUnavailable(&'static str),
+
+    #[error("PQ signature invalid: {0}")]
+    PqSignatureInvalid(&'static str),
 }
 
 /// ML-DSA-65 wire sizes (FIPS 204, vsock spec §2.1).
@@ -246,29 +249,15 @@ pub fn pq_signing_ready() -> bool {
     if cfg!(feature = "test-support") {
         return false;
     }
-    pq_signer::is_sealed_signer_installed() || cfg!(feature = "reference-test-key")
+    pq_signer::is_sealed_signer_installed()
 }
 
-/// Active PQ signing public key when operational (sealed install or reference feature).
+/// Active PQ signing public key when operational (after sealed-key install at boot).
 fn active_signing_public_key_bytes() -> Option<Vec<u8>> {
     if cfg!(feature = "test-support") {
         return None;
     }
-    if cfg!(test) && !pq_signer::is_sealed_signer_installed() {
-        return None;
-    }
-    if let Some(pk) = pq_signer::sealed_signer_public_key_bytes() {
-        return Some(pk);
-    }
-    #[cfg(feature = "reference-test-key")]
-    {
-        return Some(
-            mldsa65::ReferenceMlDsa65Signer::global()
-                .public_key_bytes_owned(),
-        );
-    }
-    #[cfg(not(feature = "reference-test-key"))]
-    None
+    pq_signer::sealed_signer_public_key_bytes()
 }
 
 /// Ticket `pq_pubkey` must match the enclave signer when a real ML-DSA key is active.
@@ -904,29 +893,22 @@ pub fn prepare_ticket_for_signing(
 // defined in AGENTS.md / .roborev.toml.
 // =============================================================================
 
-/// Production PQ signature (sealed key or reference-test-key for CI).
+/// Production PQ signature (installed sealed key only).
 #[cfg(all(feature = "ml-dsa-65", not(feature = "test-support")))]
 fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, ProtocolError> {
-    if pq_signer::is_sealed_signer_installed() {
+    if pq_signing_ready() {
         return pq_signer::sign_ticket_hash_sealed(ticket_hash);
     }
-    #[cfg(feature = "reference-test-key")]
+    #[cfg(test)]
     {
-        return mldsa65::ReferenceMlDsa65Signer::global().sign_ticket_hash(ticket_hash);
+        return Ok(compute_mock_pq_signature(ticket_hash, nonce));
     }
-    #[cfg(not(feature = "reference-test-key"))]
+    #[cfg(not(test))]
     {
-        #[cfg(test)]
-        {
-            return Ok(compute_mock_pq_signature(ticket_hash, nonce));
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (ticket_hash, nonce);
-            return Err(ProtocolError::PqSigningUnavailable(
-                "ML-DSA-65 signer not provisioned (install sealed key at enclave boot)",
-            ));
-        }
+        let _ = (ticket_hash, nonce);
+        Err(ProtocolError::PqSigningUnavailable(
+            "ML-DSA-65 signer not provisioned (install sealed key at enclave boot)",
+        ))
     }
 }
 
@@ -971,7 +953,17 @@ fn compute_mock_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Vec<u8> {
 
 #[cfg(feature = "test-support")]
 fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, ProtocolError> {
-    Ok(compute_mock_pq_signature(ticket_hash, nonce))
+    #[cfg(feature = "demo-mock-sign")]
+    {
+        return Ok(compute_mock_pq_signature(ticket_hash, nonce));
+    }
+    #[cfg(not(feature = "demo-mock-sign"))]
+    {
+        let _ = (ticket_hash, nonce);
+        Err(ProtocolError::PqSigningUnavailable(
+            "PQ signing disabled (test-support without demo-mock-sign)",
+        ))
+    }
 }
 
 #[cfg(all(not(feature = "test-support"), not(feature = "ml-dsa-65"), test))]
@@ -1889,6 +1881,11 @@ mod tests {
 
     #[test]
     fn stateful_arm_then_sign_hardfork_succeeds() {
+        #[cfg(feature = "ml-dsa-65")]
+        let _pq_guard = install_reference_sealed_signer_for_tests();
+        #[cfg(feature = "ml-dsa-65")]
+        let pq = pq_signer::sealed_signer_public_key_bytes().expect("sealed signer");
+        #[cfg(not(feature = "ml-dsa-65"))]
         let pq = vec![0xDE; 48];
         let mut state = EnclaveState::Unarmed;
 
@@ -1908,7 +1905,7 @@ mod tests {
         match sign_resp {
             Response::SignAuthorizationTicket(r) => {
                 assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&ticket));
-                #[cfg(feature = "reference-test-key")]
+                #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
                 {
                     assert_eq!(r.signature.len(), ML_DSA65_SIGNATURE_LEN);
                     mldsa65::ReferenceMlDsa65Signer::global()
@@ -1927,6 +1924,8 @@ mod tests {
         };
         assert_eq!(status.pending_hard_fork_height, Some(10_000_100));
         assert_eq!(status.last_known_block, Some(10_000_050));
+        #[cfg(feature = "ml-dsa-65")]
+        pq_signer::end_sealed_signer_test_session();
     }
 
     #[test]
@@ -2161,11 +2160,6 @@ mod tests {
         match resp {
             Response::GetMeasurement(r) => {
                 assert_eq!(r.supported_ticket_types, vec![0, 1]); // static capability; type=1 needs armed state
-                #[cfg(feature = "reference-test-key")]
-                assert!(r.pq_signing_ready);
-                #[cfg(feature = "test-support")]
-                assert!(!r.pq_signing_ready);
-                #[cfg(not(any(feature = "reference-test-key", feature = "test-support")))]
                 assert!(!r.pq_signing_ready);
                 assert!(!r.measurement.is_empty());
             }
