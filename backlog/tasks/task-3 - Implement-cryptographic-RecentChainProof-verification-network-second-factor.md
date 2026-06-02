@@ -4,7 +4,7 @@ title: Implement cryptographic RecentChainProof verification (network second fac
 status: Done
 assignee: []
 created_date: '2026-06-02 07:48'
-updated_date: '2026-06-02 12:00'
+updated_date: '2026-06-02 18:00'
 labels:
   - security
   - tee
@@ -82,4 +82,6 @@ Created 2026-06-02 after cc8446f / 1ae4773 matrices. Production blocker explicit
   - MEDIUM (gemini): exact `proof_data` length, weak sign-time test → fixed in `fddd3f0`.
   - Compact post-fix: **0 HIGH**, 6 MEDIUM remain (trust provisioning spec, test key in public API, GET_STATUS wire drift, ARM CBOR schema, stateless dispatch mismatch, review-gate docs).
 - Status: crypto gate implemented; remaining MEDIUMs are follow-up hardening/docs, not blockers for TASK-3 core AC.
+
+**Session wrap (2026-06-02):** Follow-up commit `6dced02` addressed compact MEDIUMs (measurement in preimage already in `fddd3f0`; wire.rs, trust docs, dispatch clarity, `test-support` feature). **56+ tests** passing. TASK-3 closed; unblocks TASK-1 / TASK-2 Phase 4 focus.
 <!-- SECTION:NOTES:END -->

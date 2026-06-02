@@ -4,7 +4,7 @@ title: Implement custom minimal post-quantum signing service inside TEE
 status: To Do
 assignee: []
 created_date: '2026-05-31 12:43'
-updated_date: '2026-05-31 18:38'
+updated_date: '2026-06-02 18:00'
 labels:
   - pq
   - hsm
@@ -12,7 +12,16 @@ labels:
   - signing
   - 2d
   - security
-dependencies: []
+dependencies:
+  - TASK-2
+  - TASK-3
+references:
+  - impl/rust/enclave-protocol
+  - backlog/docs/implementation-plan-vsock-api-and-hard-fork.md
+  - backlog/docs/authorization-tickets-precompile-spec-draft.md
+documentation:
+  - impl/README.md
+  - AGENTS.md
 priority: high
 ordinal: 1000
 ---
@@ -428,6 +437,30 @@ The document already contains:
 - Immediate next steps
 
 We are moving from design into actual protocol definition and skeletons.
+
+### Current plan (2026-06-02 — next major increment)
+
+**Prerequisites in tree (TASK-2 / TASK-3):**
+- Reference crate `impl/rust/enclave-protocol/`: vsock framing, canonical `ticketHash`, enclave state machine (arm / hard-fork gating), Producer Chain Attestation v1 (TASK-3).
+- Ticket signing today uses **mock PQ** (`compute_mock_pq_signature`, 64 bytes) — must be replaced.
+
+**Recommended first implementation slice (TASK-1 MVP):**
+1. Align **ML-DSA parameter set** with 2d monorepo + `authorization-tickets-precompile-spec` (single NIST set, e.g. ML-DSA-65 — confirm with 2d before coding).
+2. Replace mock signer in `handle_sign_authorization_ticket*` with real ML-DSA inside enclave boundary (Rust + audited crate, e.g. `pqcrypto-mldsa` / `liboqs` — decide in AC #2).
+3. Extend wire format: real signature sizes (~3 KB+), not 64-byte placeholder; update vsock spec + tests.
+4. Sealed key lifecycle sketch (generate / unseal in TEE — minimal for MVP).
+5. **Full roborev matrix** on first real key-handling increment (high-risk per AGENTS.md).
+
+**Algorithm policy (agreed direction):**
+- **ML-DSA** — primary for BlockProducer (~2s blocks) + AuthorizationTicket `pq_pubkey` / `signature` (size + latency).
+- **SLH-DSA** — stretch / rare high-assurance paths only; not hot block-signing path.
+- **Ed25519** (TASK-3) — separate producer **attestation** key for `RecentChainProof`; not a substitute for ticket PQ signatures.
+
+**Out of scope for first TASK-1 slice:** Elixir shim (TASK-2 Phase 4), real vsock transport, full light client, SLH-DSA, theory-378 iO hybrids.
+
+**Blocked on / needs sync with 2d:** exact ML-DSA parameter set, precompile verify expectations, whether block-header digests use same key as tickets.
+
+See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress update (2026-06-02).
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

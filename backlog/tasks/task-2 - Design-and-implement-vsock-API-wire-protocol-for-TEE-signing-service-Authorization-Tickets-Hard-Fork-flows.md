@@ -6,11 +6,16 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-05-31 18:38'
-updated_date: '2026-06-01 17:03'
+updated_date: '2026-06-02 18:00'
 labels: []
-dependencies: []
+dependencies:
+  - TASK-3
 references:
-  - '94435b4 - expose source_ticket_hash in GetStatus (AC #7)'
+  - impl/rust/enclave-protocol
+  - backlog/docs/vsock-api-wire-format-spec-draft.md
+  - 2d136ac
+  - fddd3f0
+  - 6dced02
 priority: high
 ordinal: 2000
 ---
@@ -469,4 +474,30 @@ Next: run 3:3 matrix on this commit.
 - **56 tests** in `enclave-protocol` (run `cargo test`; demo needs `--features test-support`).
 
 Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transport, integer-key CBOR for all commands.
+
+### Current plan (2026-06-02 — session wrap)
+
+**Done in reference crate (keep TASK-2 open until AC #1–#6 formally closed):**
+| Area | Status |
+|------|--------|
+| Phase 1 protocol + state machine | Done (AC #7–#9) |
+| TASK-3 crypto `RecentChainProof` | Done (feeds AC #8) |
+| `wire.rs` GET_STATUS + ARM integer CBOR | Done |
+| Docs (`impl/README`, vsock §8) | Done |
+
+**AC #1–#6 informal status (for formal closure next session):**
+- **#1–#3:** Largely satisfied by `vsock-api-wire-format-spec-draft.md` + §8; may need “stable v0.x” tag after review.
+- **#4:** Rust server yes; **Elixir host client** — not started (`impl/elixir-shim/` placeholder).
+- **#5:** Hard-fork flow in spec + demos; full operator runbook — deferred.
+- **#6:** Cross-reviewed with authorization-ticket specs; no open HIGH on protocol/ticket coupling.
+
+**Next increments (order):**
+1. **TASK-1** — real ML-DSA signing (unblocks meaningful E2E ticket signatures).
+2. **Phase 4 (this task)** — Elixir shim + stateful session over `wire.rs` encoders.
+3. Wire migration — `SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT` integer-key CBOR.
+4. Real vsock I/O (replace in-process demos).
+
+**Depends on:** TASK-1 for production-grade `SignAuthorizationTicket` responses (size + crypto).
+
+Parent plan: `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md`.
 <!-- SECTION:NOTES:END -->

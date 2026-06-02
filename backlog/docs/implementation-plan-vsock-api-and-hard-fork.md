@@ -180,10 +180,14 @@ Phase 1 reference implementation and TASK-3 crypto gate are **in tree** (`enclav
 
 **Recommended next increments (ordered):**
 
-1. **TASK-1** — replace mock PQ signatures with real ML-DSA (or SLH-DSA) inside the TEE.
-2. **TASK-2 Phase 4** — Elixir host shim using `wire.rs` encoders and stateful session.
-3. **Phase 2** — hard-fork transition state machine beyond ticket signing (measurement switch at height).
-4. **Wire migration** — integer-key CBOR for remaining commands (`SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT`).
+1. **TASK-1** — replace mock PQ with **ML-DSA** (primary PQ scheme; align parameter set with 2d + precompile; SLH-DSA stretch only). First slice: enclave signing + wire signature sizes + sealed key sketch. **Full roborev matrix** on key-handling code.
+2. **TASK-2 Phase 4** — Elixir host shim (`wire.rs`, `dispatch_command_with_state`, `test-support` for local dev only).
+3. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing (measurement / header version at activation height). Concurrency lens review when implementing.
+4. **Wire migration** — integer-key CBOR for `SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT`.
+
+**Session status (2026-06-02):** TASK-3 Done; TASK-2 Phase 1 + docs in git (`main` through `37e07a7`). Next session should start TASK-1 discovery (2d parameter-set sync) or a thin Elixir shim spike in parallel.
+
+**Task board:** `backlog/tasks/task-{1,2,3}` updated with this plan.
 
 ---
 
