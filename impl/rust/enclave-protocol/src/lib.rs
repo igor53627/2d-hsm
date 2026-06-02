@@ -753,10 +753,21 @@ pub fn validate_ticket_payload(payload: &AuthorizationTicketPayload) -> Result<(
             }
         }
         1 => {
-            // HARD_FORK_ACTIVATION
-            if payload.fork_spec_hash.is_none() || payload.new_header_version.is_none() {
+            // HARD_FORK_ACTIVATION (must match precompile skeleton §4 decoder table)
+            let fork_spec = payload.fork_spec_hash.ok_or(ProtocolError::InvalidTicket(
+                "Hard-fork tickets must include fork_spec_hash",
+            ))?;
+            if fork_spec == [0u8; 32] {
                 return Err(ProtocolError::InvalidTicket(
-                    "Hard-fork tickets must include fork_spec_hash and new_header_version",
+                    "Hard-fork fork_spec_hash must be non-zero",
+                ));
+            }
+            let header_version = payload.new_header_version.ok_or(ProtocolError::InvalidTicket(
+                "Hard-fork tickets must include new_header_version",
+            ))?;
+            if header_version == 0 {
+                return Err(ProtocolError::InvalidTicket(
+                    "Hard-fork new_header_version must be non-zero",
                 ));
             }
         }
@@ -1998,6 +2009,33 @@ mod tests {
         };
 
         assert!(validate_ticket_payload(&bad_payload).is_err());
+    }
+
+    #[test]
+    fn hard_fork_validation_rejects_zero_fork_fields() {
+        let zero_fork = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 1,
+            context_hash: [0u8; 32],
+            activation_height: 100,
+            new_measurement: vec![],
+            pq_pubkey: vec![1],
+            fork_spec_hash: Some([0u8; 32]),
+            new_header_version: Some(1),
+        };
+        assert!(validate_ticket_payload(&zero_fork).is_err());
+
+        let zero_version = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 1,
+            context_hash: [0u8; 32],
+            activation_height: 100,
+            new_measurement: vec![],
+            pq_pubkey: vec![1],
+            fork_spec_hash: Some([0xAB; 32]),
+            new_header_version: Some(0),
+        };
+        assert!(validate_ticket_payload(&zero_version).is_err());
     }
 
     #[test]

@@ -57,8 +57,8 @@ We keep the high-level struct from the previous spec, but define a clean **ABI t
 
 ```solidity
 // This is what goes inside the outer `bytes` of submit(bytes).
-// Field order matches authorization-tickets-precompile-spec-draft.md §4
-// (canonical ticketHash preimage — NOT optional for hard-fork).
+// ABI tuple for submit(bytes): includes preimage fields plus attestation/signature
+// and metadata. The signed ticketHash uses only the eight fields below (§4).
 struct RawTicket {
     uint8   ticketType;        // 0 = PRODUCER_RECOVERY, 1 = HARD_FORK_ACTIVATION
     uint64  nonce;
@@ -151,7 +151,7 @@ defmodule Chain.Precompiles.AuthorizationTickets do
     # 1. Decode the outer bytes
     # 2. Decode the inner RawTicket using ABI.TypeDecoder
     # 3. Recompute ticket_hash
-    # 4. Verify signature over ticket_hash using pqPubkey (Dilithium verify)
+    # 4. Verify ML-DSA-65 (FIPS 204) signature over ticket_hash using pqPubkey
     # 5. Verify attestation (or at least record it)
     # 6. Apply business rules (downtime for recovery, governanceRef for forks, etc.)
     # 7. Write to state.authorization_* tables
@@ -191,13 +191,13 @@ end
 
 1. **Create the module skeleton** in the 2d-hsm repo under `design/precompile_skeletons/` (or directly in a branch of the real 2d code later).
 2. Implement `decode_and_validate_ticket/1` for the `RawTicket` structure (the hardest part — get the ABI tuple types right).
-3. Implement signature verification hook (call into whatever Dilithium/ML-DSA library we choose).
+3. Implement ML-DSA-65 (FIPS 204) signature verification (mldsa-native-rs per TASK-1 / vsock spec §2.1).
 4. Write 5-6 test vectors (valid recovery ticket, valid hard-fork ticket, bad signature, insufficient downtime, etc.).
-5. Update the main spec document with the exact ABI tuple definition for `RawTicket`.
+5. ~~Update the main spec document with the exact ABI tuple definition for `RawTicket`.~~ Done in §4 above.
 
 ## 7. Open Technical Decisions to Resolve Quickly
 
-- Do we require `governanceRef != 0` for `HARD_FORK_ACTIVATION` tickets in the first version?
+- ~~Do we require `governanceRef != 0` for `HARD_FORK_ACTIVATION` tickets in the first version?~~ **Resolved (v1):** no governance for hard forks (§8); `governanceRef` is metadata only and not in the signed hash.
 - How do we handle very large `attestation` blobs? (Store hash only + allow full report via separate mechanism?)
 - Do we want a dedicated special transaction kind later for lower gas / better UX, or is calling the precompile address sufficient forever?
 
