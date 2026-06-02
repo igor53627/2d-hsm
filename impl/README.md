@@ -46,6 +46,8 @@ Full matrix (+ concurrency lens) is required for first state-machine introductio
 
 TASK-2 / TASK-3 increments on this tree went through reduced matrix + compact (commits `2d136ac`, `fddd3f0`, `6dced02`).
 
+**Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks in `cfg(test)` when no sealed signer is installed (production fail-closed). Integer-key CBOR is spec-aligned only for ARM / GET_STATUS paths; `GET_MEASUREMENT` and some tests still use derived Serde — tracked for wire-compat work.
+
 ## Building and testing
 
 ```bash
@@ -70,7 +72,7 @@ cd rust/enclave-protocol
 cargo run --example framing_demo
 
 # Full Arm → GetStatus → Sign flow (needs test attestation keys)
-cargo run --example ticket_signing_demo --features test-support
+cargo run --example ticket_signing_demo --features test-support,demo-mock-sign
 ```
 
 The `test-support` feature exposes `reference_test_attestation_signing_key` / `reference_test_attestation_trust` for local dev only — **do not enable in production enclave builds.**

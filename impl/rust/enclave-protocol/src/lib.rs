@@ -55,7 +55,7 @@ pub use pq_signer::{
     install_sealed_pq_signer, is_sealed_signer_installed, ML_DSA65_SECRETKEY_LEN,
     SEALED_BLOB_V0_VERSION,
 };
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
+#[cfg(all(feature = "ml-dsa-65", test))]
 pub use pq_signer::{
     seal_mldsa65_keypair_v0, seal_mldsa65_secret_key_v0, unseal_mldsa65_keypair_v0,
 };

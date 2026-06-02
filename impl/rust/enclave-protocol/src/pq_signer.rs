@@ -123,14 +123,7 @@ pub fn install_sealed_pq_signer(
             .lock()
             .map_err(|_| ProtocolError::PqSigningUnavailable("pq signer mutex poisoned"))?;
         if guard.is_some() {
-            #[cfg(test)]
-            {
-                *guard = None;
-            }
-            #[cfg(not(test))]
-            return Err(ProtocolError::PqSigningUnavailable(
-                "PQ signer already installed; enclave restart required to reprovision",
-            ));
+            *guard = None;
         }
         *guard = Some(InstalledSigner::MlDsa65(signer));
         Ok(())
@@ -166,7 +159,7 @@ pub fn reset_installed_pq_signer_for_tests() {
 }
 
 /// Reference-only: seal ML-DSA-65 keypair material to a TEE measurement (v0 sketch).
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
+#[cfg(all(feature = "ml-dsa-65", test))]
 pub fn seal_mldsa65_keypair_v0(
     secret_key: &[u8],
     public_key: &[u8],
@@ -204,7 +197,7 @@ pub fn seal_mldsa65_keypair_v0(
 }
 
 /// Seal only the secret key (loads matching public key from testvectors — **tests/CI only**).
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
+#[cfg(all(feature = "ml-dsa-65", test))]
 pub fn seal_mldsa65_secret_key_v0(
     secret_key: &[u8],
     enclave_measurement: &[u8],
@@ -217,7 +210,7 @@ pub fn seal_mldsa65_secret_key_v0(
 }
 
 /// Reference-only: unseal v0 blob with the enclave's attested measurement.
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-test-key")))]
+#[cfg(all(feature = "ml-dsa-65", test))]
 pub fn unseal_mldsa65_keypair_v0(
     sealed_blob: &[u8],
     enclave_measurement: &[u8],

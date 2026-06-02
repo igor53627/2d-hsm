@@ -13,6 +13,9 @@ const INSTALL_SELF_TEST_MSG: [u8; 32] = *b"2d-hsm-pq-install-self-test!!!!!";
 static REFERENCE_SIGNER: OnceLock<MlDsa65Signer> = OnceLock::new();
 
 /// ML-DSA-65 signing key held inside the enclave (sealed or reference test vector).
+///
+/// `pqcrypto_mldsa::SecretKey` does not zeroize on drop; scrubbing the live allocation
+/// requires a future `Zeroizing` container or platform seal — tracked with TASK-1 production seal.
 pub struct MlDsa65Signer {
     public_key: PublicKey,
     secret_key: SecretKey,
