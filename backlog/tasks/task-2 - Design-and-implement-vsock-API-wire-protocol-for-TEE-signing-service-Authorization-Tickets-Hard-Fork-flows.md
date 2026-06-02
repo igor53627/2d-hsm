@@ -57,6 +57,7 @@ The API must support at minimum:
 
 ## Related
 - TASK-1 (parent)
+- **TASK-3** (cryptographic `RecentChainProof` verification — production blocker for AC #8)
 - backlog/docs/authorization-tickets-precompile-spec-draft.md
 - backlog/docs/authorization-tickets-wire-format-and-precompile-skeleton.md
 
@@ -457,5 +458,5 @@ Next: run 3:3 matrix on this commit.
 - Rename/clarify `armed_at_height` → `authorized_activated_at_height` in code (honest semantics).
 - Do **not** fake-fix with non-empty `proof_data` only.
 
-**Production blocker (tracked):** cryptographic `RecentChainProof` verification before treating type=1 signatures as enforcing network second factor.
+**Production blocker → TASK-3:** cryptographic `RecentChainProof` verification before treating type=1 signatures as enforcing network second factor. See `task-3 - Implement-cryptographic-RecentChainProof-verification-network-second-factor.md`.
 <!-- SECTION:NOTES:END -->

@@ -379,7 +379,7 @@ The reference `enclave-protocol` crate implements the state machine and structur
 1. Cryptographic verification of `RecentChainProof.proof_data` and `signature_from_recent_producer` at `ARM_FOR_PRODUCTION` and at hard-fork sign time.
 2. Live chain-tip refresh between arming and signing (Phase 1 uses the arming-time proof snapshot only).
 
-Until (1) is implemented, hosts must not treat skeleton hard-fork signatures as enforcing "network as cryptographic second factor" in the full security sense.
+Until (1) is implemented, hosts must not treat skeleton hard-fork signatures as enforcing "network as cryptographic second factor" in the full security sense. Tracked as **TASK-3** in `backlog/tasks/`.
 
 ---
 
