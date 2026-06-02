@@ -380,6 +380,7 @@ mod v1_seal {
                 "enclave measurement must be non-empty for v1 sealing",
             ));
         }
+        MlDsa65Signer::from_verified_key_bytes(secret_key, public_key)?;
         let meas_digest = measurement_digest_v1(enclave_measurement);
         let key = derive_aead_key(provisioning_root, &meas_digest)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
@@ -436,6 +437,7 @@ mod v1_seal {
     ) -> Result<(), ProtocolError> {
         let (mut sk, mut pk) =
             unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, provisioning_root)?;
+        MlDsa65Signer::from_verified_key_bytes(&sk, &pk)?;
         zeroize_vec(&mut sk);
         zeroize_vec(&mut pk);
         Ok(())
@@ -569,8 +571,16 @@ mod tests {
     #[test]
     fn v1_seal_unseal_roundtrip_and_tamper_fails() {
         let _guard = SealedSignerTestGuard::acquire();
-        let sk = vec![0xABu8; ML_DSA65_SECRETKEY_LEN];
-        let pk = vec![0xCDu8; crate::ML_DSA65_PUBKEY_LEN];
+        let sk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_sk.bin"),
+        )
+        .unwrap();
+        let pk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_pk.bin"),
+        )
+        .unwrap();
         let measurement = b"enclave-measurement-placeholder";
         let blob = seal_mldsa65_keypair_v1(&sk, &pk, measurement).unwrap();
         let (back_sk, back_pk) = v1_seal::unseal_mldsa65_keypair_v1(&blob, measurement).unwrap();

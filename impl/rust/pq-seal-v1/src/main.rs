@@ -128,11 +128,13 @@ fn read_measurement(args_file: &Option<PathBuf>, args_hex: &Option<String>) -> R
     ))
 }
 
-fn read_root_32(path: &PathBuf) -> Result<[u8; 32], CliError> {
-    let bytes = fs::read(path)?;
-    bytes
+fn read_root_32(path: &PathBuf) -> Result<Zeroizing<[u8; 32]>, CliError> {
+    let bytes = Zeroizing::new(fs::read(path)?);
+    let root: [u8; 32] = (*bytes)
+        .as_slice()
         .try_into()
-        .map_err(|_| CliError::Msg("provisioning root must be exactly 32 bytes".into()))
+        .map_err(|_| CliError::Msg("provisioning root must be exactly 32 bytes".into()))?;
+    Ok(Zeroizing::new(root))
 }
 
 /// Write high-value secret material with restrictive permissions (Unix 0o600).
@@ -173,7 +175,7 @@ fn cmd_seal(args: SealArgs) -> Result<(), CliError> {
             pk.len()
         )));
     }
-    let blob = seal_mldsa65_keypair_v1_with_root(sk.as_ref(), pk.as_ref(), &measurement, &root)?;
+    let blob = seal_mldsa65_keypair_v1_with_root(sk.as_ref(), pk.as_ref(), &measurement, root.as_ref())?;
     if blob.len() != pq_seal_v1_expected_blob_len() {
         return Err(CliError::Msg("internal error: unexpected sealed blob length".into()));
     }
@@ -194,7 +196,7 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), CliError> {
     let measurement = read_measurement(&args.measurement_file, &args.measurement_hex)?;
     let root = read_root_32(&args.provisioning_root_file)?;
     let blob = fs::read(&args.sealed_blob_file)?;
-    verify_sealed_blob_v1_with_root(&blob, &measurement, &root)?;
+    verify_sealed_blob_v1_with_root(&blob, &measurement, root.as_ref())?;
     eprintln!("ok: sealed blob verifies for measurement and provisioning root");
     Ok(())
 }
