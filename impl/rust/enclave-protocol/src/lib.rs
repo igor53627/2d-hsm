@@ -18,6 +18,11 @@
 // чтобы не раздувать скелет. На более поздних фазах документацию нужно будет довести до высокого уровня.
 #![allow(missing_docs)]
 
+#[cfg(all(feature = "ml-dsa-65", feature = "test-support"))]
+compile_error!(
+    "features `ml-dsa-65` and `test-support` are mutually exclusive; do not use --all-features"
+);
+
 mod chain_proof_crypto;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
@@ -223,39 +228,25 @@ pub struct GetMeasurementResponse {
     /// when all preconditions are met. Does not reflect current readiness
     /// (e.g. type=1 additionally requires armed state; see `GET_STATUS.armed`).
     pub supported_ticket_types: Vec<u8>,
-    /// ML-DSA-65 signing operational in this build (false in release until TASK-1).
+    /// ML-DSA-65 signing operational in this build (true only with sealed key or explicit `ml-dsa-65` test key).
     pub pq_signing_ready: bool,
 }
 
 /// Whether this build can produce valid on-chain ML-DSA-65 signatures right now.
 pub fn pq_signing_ready() -> bool {
-    #[cfg(feature = "test-support")]
-    {
-        return false;
-    }
-    #[cfg(feature = "ml-dsa-65")]
-    {
-        return true;
-    }
-    false
+    cfg!(all(feature = "ml-dsa-65", not(feature = "test-support")))
 }
 
 fn measurement_response() -> GetMeasurementResponse {
     #[cfg(all(feature = "ml-dsa-65", not(feature = "test-support")))]
-    {
-        let signer = mldsa65::ReferenceMlDsa65Signer::global();
-        return GetMeasurementResponse {
-            measurement: b"enclave-measurement-placeholder".to_vec(),
-            attestation: b"attestation-placeholder".to_vec(),
-            pq_pubkey: signer.public_key_bytes_owned(),
-            supported_ticket_types: vec![0, 1],
-            pq_signing_ready: true,
-        };
-    }
+    let pq_pubkey = mldsa65::ReferenceMlDsa65Signer::global().public_key_bytes_owned();
+    #[cfg(not(all(feature = "ml-dsa-65", not(feature = "test-support"))))]
+    let pq_pubkey = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
     GetMeasurementResponse {
         measurement: b"enclave-measurement-placeholder".to_vec(),
         attestation: b"attestation-placeholder".to_vec(),
-        pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        pq_pubkey,
         supported_ticket_types: vec![0, 1],
         pq_signing_ready: pq_signing_ready(),
     }
@@ -864,13 +855,17 @@ fn produce_pq_signature(ticket_hash: &[u8; 32], _nonce: u64) -> Result<Vec<u8>, 
     mldsa65::ReferenceMlDsa65Signer::global().sign_ticket_hash(ticket_hash)
 }
 
-#[cfg(all(not(feature = "ml-dsa-65"), not(feature = "test-support")))]
+#[cfg(all(
+    not(feature = "ml-dsa-65"),
+    not(feature = "test-support"),
+    not(test)
+))]
 fn produce_pq_signature(
     _ticket_hash: &[u8; 32],
     _nonce: u64,
 ) -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
-        "ML-DSA-65 signing disabled (enable feature ml-dsa-65)",
+        "ML-DSA-65 signing disabled (enable feature ml-dsa-65 or sealed production key)",
     ))
 }
 
@@ -2008,6 +2003,8 @@ mod tests {
                 #[cfg(feature = "ml-dsa-65")]
                 assert!(r.pq_signing_ready);
                 #[cfg(feature = "test-support")]
+                assert!(!r.pq_signing_ready);
+                #[cfg(not(any(feature = "ml-dsa-65", feature = "test-support")))]
                 assert!(!r.pq_signing_ready);
                 assert!(!r.measurement.is_empty());
             }

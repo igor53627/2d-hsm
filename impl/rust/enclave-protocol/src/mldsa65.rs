@@ -1,8 +1,8 @@
-//! ML-DSA-65 (FIPS 204) signing for the reference enclave (TASK-1 MVP).
+//! ML-DSA-65 (FIPS 204) signing for protocol tests (TASK-1 MVP slice).
 //!
-//! Production TEE will load the secret key from sealed storage; this reference
-//! implementation uses a fixed test-vector keypair so protocol tests and
-//! `GET_MEASUREMENT` are stable across machines.
+//! Compiled only with the explicit `ml-dsa-65` / `reference-test-key` feature.
+//! Embeds a **public NIST test-vector secret key** — must never ship in default or
+//! production enclave builds. Production TEE loads the key from sealed storage.
 
 use crate::{ProtocolError, ML_DSA65_PUBKEY_LEN, ML_DSA65_SIGNATURE_LEN};
 use pqcrypto_mldsa::mldsa65::{detached_sign, PublicKey, SecretKey};

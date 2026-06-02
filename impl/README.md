@@ -75,9 +75,19 @@ cargo run --example ticket_signing_demo --features test-support
 
 The `test-support` feature exposes `reference_test_attestation_signing_key` / `reference_test_attestation_trust` for local dev only — **do not enable in production enclave builds.**
 
+## ML-DSA-65 features (reference crate)
+
+| Feature | Use |
+|---------|-----|
+| *(default, none)* | No PQ signing; `pq_signing_ready: false` |
+| `reference-test-key` or `ml-dsa-65` | CI/protocol tests with NIST test-vector key (3309 B sig) — **not for production** |
+| `test-support` | Local demos: 64 B mock PQ + reference Ed25519 attestation keys |
+
+Do not pass `--all-features` (`ml-dsa-65` and `test-support` conflict).
+
 ## Still deferred
 
-- Real **ML-DSA-65** signing inside the TEE (TASK-1; vsock spec §2.1 — 1952 B pubkey, 3309 B sig)
+- **Sealed** ML-DSA-65 key in the TEE (TASK-1 production path; vsock spec §2.1 — 1952 B pubkey, 3309 B sig)
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
 - Integer-key CBOR for all commands (only GET_STATUS + ARM request bodies use `wire.rs` today)

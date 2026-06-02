@@ -22,11 +22,12 @@ serde_json = "1.0"
 # For future property testing of canonical encoding
 
 [features]
-default = ["ml-dsa-65"]
-# Real ML-DSA-65 signing (FIPS 204, pqcrypto-mldsa / PQClean).
-# Production TEE target: mldsa-native-rs once stable; reference crate uses fixed test-vector key.
+default = []
+# ML-DSA-65 with embedded NIST test-vector key — CI/protocol tests only (see vsock spec §2.1).
 ml-dsa-65 = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
+reference-test-key = ["ml-dsa-65"]
 # Mock 64-byte PQ signatures for examples and local dev only (see vsock spec §2.1).
+# Mutually exclusive with ml-dsa-65 (compile_error in lib.rs).
 test-support = []
 enforce-forge-crosscheck = []
 #   When enabled, the automated cross-check tests (that verify

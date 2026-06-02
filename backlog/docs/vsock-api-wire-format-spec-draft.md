@@ -35,7 +35,7 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
 | **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1**); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1**). Stay on **v1** until an external deployment exists; use `pq_signing_ready` + signature length (3309 B) to detect mock-era peers |
 
-Until TASK-1 lands, the reference crate may return a **64-byte mock** PQ signature for demos only (`test-support`). Hosts and precompiles **must not** treat 64-byte PQ signatures as valid in production.
+**Default / production reference builds** do not embed a PQ secret key: `pq_signing_ready` is **false** and `SIGN_AUTHORIZATION_TICKET` returns `PqSigningUnavailable`. For local demos only, enable `test-support` (64-byte mock PQ sig). For CI/protocol tests with real ML-DSA-65 sizes, enable `reference-test-key` (alias for `ml-dsa-65`) — still a **public test-vector key**, not a production signer. Hosts and precompiles **must not** treat 64-byte PQ signatures as valid on-chain.
 
 **Scope of ML-DSA-65 inside this enclave:**
 - Canonical block-root / header-digest signing (BlockProducer hot path).
@@ -296,13 +296,13 @@ Error = {
   3: bytes,                ; attestation document (full, as returned by the platform)
   4: bytes,                ; pq_pubkey (ML-DSA-65: 1952 bytes production)
   5: [int]                 ; supported_ticket_types (e.g. [0, 1])
-  6: bool                  ; pq_signing_ready (false until TASK-1 ML-DSA-65 in production builds)
+  6: bool                  ; pq_signing_ready (false unless TEE has operational ML-DSA-65 signing key)
 }
 ```
 
 **Semantics of `supported_ticket_types`:** This is a **static capability list** for the enclave image (which ticket types it can sign when all preconditions are met). It does **not** mean the enclave can sign type=1 right now. Readiness for hard-fork signing requires `GET_STATUS.armed == true` plus the rules in `SIGN_AUTHORIZATION_TICKET` below.
 
-**Semantics of `pq_signing_ready`:** Operational PQ signer available **right now** (ML-DSA-65 in TEE). Until TASK-1, production images set this to **false** even if `supported_ticket_types` includes `1`; hosts must not treat `false` as “ready to produce valid on-chain PQ signatures”.
+**Semantics of `pq_signing_ready`:** Operational PQ signer available **right now** (ML-DSA-65 with a production sealed key in TEE). Default reference images set this to **false** even when `supported_ticket_types` includes `1`; hosts must not treat `false` as “ready to produce valid on-chain PQ signatures”. Dev-only `reference-test-key` builds may set it to **true** for protocol tests — not for deployment.
 
 **Error Response:** standard Error map.
 
@@ -511,7 +511,7 @@ PQ ticket signing inside the TEE remains TASK-1; this section only covers the ne
 ## 10. Next Steps
 
 - Run **roborev Reduced matrix** on this document (v0.2) + `authorization-tickets-precompile-spec-draft.md`, then `roborev compact`.
-- TASK-1: enforce ML-DSA-65 signature lengths in wire decode (reject 64-byte PQ in production builds).
+- Wire decode: reject 64-byte PQ signatures when `pq_signing_ready` is true / production profile (3309 B only).
 
 - Finalize all error codes.
 - Add `PREPARE_HARD_FORK_TRANSITION` command (or decide to do everything through `SIGN_AUTHORIZATION_TICKET` + later `ARM_FOR_PRODUCTION`).
