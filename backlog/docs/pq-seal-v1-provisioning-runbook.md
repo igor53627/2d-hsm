@@ -122,6 +122,7 @@ If `pq_signing_ready` is false:
 - Provisioning root not set (production build).
 - Measurement mismatch vs blob `meas_digest`.
 - AEAD decrypt fails but `meas_digest` matches → **provisioning root mismatch** (runtime `set_pq_seal_v1_provisioning_root` ≠ root used by `pq-seal-v1 seal`). Runtime platform root **overrides** embedded `reference-seal-v1-root`.
+- Platform root mutex poisoned → enclave/runtime fault (`pq seal platform root mutex poisoned`); **restart enclave** and investigate (not a provisioning-root mismatch).
 - Wrong blob magic / corrupt file.
 - Feature `ml-dsa-65` disabled in enclave build.
 
@@ -169,3 +170,4 @@ Full operator runbook (hot standby, attestation verification, monitoring, incide
 | Date | Change |
 |------|--------|
 | 2026-06-02 | Initial staging runbook (platform root + `pq-seal-v1` CLI) |
+| 2026-06-02 | §5 poisoned-mutex troubleshooting; paths relative to `pq-seal-v1` cwd |

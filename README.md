@@ -41,13 +41,13 @@ See `backlog/tasks/` for the full board.
 
 | Task | Status | Summary |
 |------|--------|---------|
-| **TASK-2** | In progress | Vsock API + wire protocol; reference crate `impl/rust/enclave-protocol/` |
+| **TASK-2** | In progress | Vsock API + wire protocol (`impl/rust/enclave-protocol/`); **next:** Elixir shim + real vsock I/O |
 | **TASK-3** | Done | Cryptographic `RecentChainProof` verification (Producer Chain Attestation v1) |
-| **TASK-1** | In progress | ML-DSA-65 in reference crate; seal v1 + `pq-seal-v1` CLI (staging); platform root hook at boot |
+| **TASK-1** | In progress | ML-DSA-65 + seal v1 staging **merged** (`60eeefc`); platform root in real TEE + prod CI gate next |
 
-**Reference implementation today:** length-prefixed CBOR framing, canonical ticket hashing (Forge cross-check), enclave arming state machine, hard-fork gating, and Ed25519 chain attestation proofs. Details: `impl/README.md` and `backlog/docs/vsock-api-wire-format-spec-draft.md`.
+**Reference implementation today:** ML-DSA-65 AuthorizationTicket signatures (when sealed signer installed), length-prefixed CBOR framing, canonical ticket hashing, enclave arming / hard-fork gating, Producer Chain Attestation v1. Details: `impl/README.md`, `backlog/docs/vsock-api-wire-format-spec-draft.md`.
 
-**Next major increment:** Platform provisioning root in real TEE images, full operator runbook (TASK-1 #5), Elixir host shim (TASK-2 Phase 4). Staging PQ provisioning: `backlog/docs/pq-seal-v1-provisioning-runbook.md`.
+**Next major increment:** **TASK-2** Elixir host shim + real vsock transport. **TASK-1 follow-ups:** platform `set_pq_seal_v1_provisioning_root`, no `reference-seal-v1-root` in prod builds. Staging PQ: `backlog/docs/pq-seal-v1-provisioning-runbook.md`.
 
 ## Development
 
