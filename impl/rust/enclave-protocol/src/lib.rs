@@ -385,6 +385,10 @@ pub struct EnclaveArmedState {
     /// The source ticket hash from the AuthorizedProducerState used at arming.
     /// Useful for auditing and future sign-time anti-replay checks.
     pub source_ticket_hash: [u8; 32],
+
+    /// If a HARD_FORK_ACTIVATION ticket was signed while armed, records its
+    /// `activation_height` for observability via `GET_STATUS`.
+    pub pending_hard_fork_height: Option<u64>,
 }
 
 /// Current authorization state of the enclave.
@@ -530,10 +534,49 @@ pub fn arm_for_production(
         authorized_measurement: req.authorized_state.measurement,
         authorized_pq_pubkey: req.authorized_state.pq_pubkey,
         source_ticket_hash: req.authorized_state.source_ticket_hash,
+        pending_hard_fork_height: None,
     };
 
     // For the skeleton we allow re-arming. A stricter policy can be added later.
     Ok(EnclaveState::Armed(armed_state))
+}
+
+/// Reconstructs the `AuthorizedProducerState` that was used when the enclave armed.
+fn authorized_state_from_armed(armed: &EnclaveArmedState) -> AuthorizedProducerState {
+    AuthorizedProducerState {
+        pq_pubkey: armed.authorized_pq_pubkey.clone(),
+        measurement: armed.authorized_measurement.clone(),
+        activated_at_height: armed.armed_at_height,
+        source_ticket_hash: armed.source_ticket_hash,
+    }
+}
+
+/// Phase 1 sign-time freshness checks for HARD_FORK_ACTIVATION (type=1).
+///
+/// Uses the proof captured at arming time as the enclave's last known chain view.
+/// Full cryptographic re-verification of `proof_data` is deferred (see
+/// `validate_recent_chain_proof`); we still re-run structural checks and enforce
+/// that the fork is scheduled strictly beyond the proof's finalized height.
+fn validate_hard_fork_sign_preconditions(
+    ticket: &AuthorizationTicketPayload,
+    armed: &EnclaveArmedState,
+) -> Result<(), ProtocolError> {
+    if ticket.pq_pubkey != armed.authorized_pq_pubkey {
+        return Err(ProtocolError::InvalidTicket(
+            "pq_pubkey in hard-fork ticket must match the currently armed producer key",
+        ));
+    }
+
+    let authorized = authorized_state_from_armed(armed);
+    validate_recent_chain_proof(&armed.proof, &authorized)?;
+
+    if ticket.activation_height <= armed.proof.finalized_height {
+        return Err(ProtocolError::InvalidTicket(
+            "activation_height must be strictly greater than the finalized height from the armed RecentChainProof (stale chain view)",
+        ));
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -788,45 +831,73 @@ fn compute_mock_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Vec<u8> {
     sig
 }
 
-/// The single allowed entry point for signing an AuthorizationTicket.
+/// Signs a PRODUCER_RECOVERY ticket (type=0) without requiring armed state.
 ///
-/// This function:
-/// 1. Validates the payload (strict ticket_type allow-list + hard-fork field rules).
-/// 2. Computes the canonical `ticket_hash` that must match the on-chain precompile.
-/// 3. Produces a signature over that hash (mock for now, real PQ inside TEE later).
-///
-/// Any other code path that tries to sign tickets is a protocol violation.
-pub fn handle_sign_authorization_ticket(
-    req: SignAuthorizationTicketRequest,
+/// HARD_FORK_ACTIVATION (type=1) must use `handle_sign_authorization_ticket_with_state`.
+fn sign_recovery_ticket(
+    ticket: &AuthorizationTicketPayload,
 ) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
-    // === THE ONLY ALLOWED SIGNING PATH FOR AUTHORIZATION TICKETS ===
-    //
-    // Phase 1 safety rule (post 3:3 matrix on 5a0e3e2):
-    // Hard-fork activation tickets (type 1) MUST NOT be signed from this
-    // stateless handler. Real signing for type=1 must only happen after the
-    // enclave has been successfully armed via ARM_FOR_PRODUCTION with a
-    // validated RecentChainProof (see Track B).
-    //
-    // Until the real enclave state machine exists, we fail closed here.
-    if req.ticket.ticket_type == 1 {
-        return Err(ProtocolError::InvalidTicket(
-            "Hard-fork (type=1) ticket signing is not allowed in this skeleton. \
-             It requires a real armed state with a fresh RecentChainProof \
-             (see ARM_FOR_PRODUCTION and validate_recent_chain_proof). \
-             This is a deliberate Phase 1 safety measure after 3:3 roborev review.",
-        ));
-    }
-
-    let ticket_hash = prepare_ticket_for_signing(&req.ticket)?;
-
-    // In the real enclave this will be a real PQ signature with the
-    // long-term key that never leaves the TEE.
-    let signature = compute_mock_pq_signature(&ticket_hash, req.ticket.nonce);
-
+    let ticket_hash = prepare_ticket_for_signing(ticket)?;
+    let signature = compute_mock_pq_signature(&ticket_hash, ticket.nonce);
     Ok(SignAuthorizationTicketResponse {
         signature,
         ticket_hash,
     })
+}
+
+/// The stateless signing entry point (legacy / host paths without enclave state).
+///
+/// Recovery tickets (type=0) are allowed. Hard-fork tickets (type=1) are rejected
+/// here by design — they require `handle_sign_authorization_ticket_with_state`.
+pub fn handle_sign_authorization_ticket(
+    req: SignAuthorizationTicketRequest,
+) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
+    if req.ticket.ticket_type == 1 {
+        return Err(ProtocolError::InvalidTicket(
+            "Hard-fork (type=1) ticket signing requires armed enclave state. \
+             Use dispatch_command_with_state after ARM_FOR_PRODUCTION with a validated RecentChainProof.",
+        ));
+    }
+
+    sign_recovery_ticket(&req.ticket)
+}
+
+/// Stateful signing entry point — the recommended path for all ticket types.
+///
+/// - type=0 (recovery): allowed when armed or unarmed.
+/// - type=1 (hard fork): requires `EnclaveState::Armed` with a proof that still
+///   passes structural validation and an `activation_height` beyond the proof's
+///   finalized height (AC #8).
+pub fn handle_sign_authorization_ticket_with_state(
+    req: SignAuthorizationTicketRequest,
+    state: &mut EnclaveState,
+) -> Result<SignAuthorizationTicketResponse, ProtocolError> {
+    match req.ticket.ticket_type {
+        0 => sign_recovery_ticket(&req.ticket),
+        1 => {
+            let EnclaveState::Armed(ref mut armed) = state else {
+                return Err(ProtocolError::InvalidTicket(
+                    "Hard-fork signing requires the enclave to be armed via ARM_FOR_PRODUCTION with a validated RecentChainProof",
+                ));
+            };
+
+            validate_hard_fork_sign_preconditions(&req.ticket, armed)?;
+
+            let ticket_hash = prepare_ticket_for_signing(&req.ticket)?;
+            let signature = compute_mock_pq_signature(&ticket_hash, req.ticket.nonce);
+
+            armed.pending_hard_fork_height = Some(req.ticket.activation_height);
+
+            Ok(SignAuthorizationTicketResponse {
+                signature,
+                ticket_hash,
+            })
+        }
+        _ => {
+            validate_ticket_payload(&req.ticket)?;
+            unreachable!("validate_ticket_payload only accepts ticket types 0 and 1");
+        }
+    }
 }
 
 /// Top-level dispatcher for commands received over vsock.
@@ -875,7 +946,7 @@ pub fn dispatch_command(cmd: Command) -> Response {
 pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Response {
     match cmd {
         Command::SignAuthorizationTicket(req) => {
-            match handle_sign_authorization_ticket(req) {
+            match handle_sign_authorization_ticket_with_state(req, state) {
                 Ok(resp) => Response::SignAuthorizationTicket(resp),
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
@@ -885,7 +956,7 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                 measurement: b"enclave-measurement-placeholder".to_vec(),
                 attestation: b"attestation-placeholder".to_vec(),
                 pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                supported_ticket_types: vec![0],
+                supported_ticket_types: vec![0, 1],
             })
         }
         Command::ArmForProduction(req) => {
@@ -912,8 +983,8 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
                     armed_at_height: Some(s.armed_at_height),
                     proof_finalized_height: Some(s.proof.finalized_height),
                     source_ticket_hash: Some(s.source_ticket_hash),
-                    pending_hard_fork_height: None,
-                    last_known_block: None,
+                    pending_hard_fork_height: s.pending_hard_fork_height,
+                    last_known_block: Some(s.proof.finalized_height),
                 }),
                 EnclaveState::Unarmed => Response::GetStatus(GetStatusResponse {
                     armed: false,
@@ -1287,10 +1358,44 @@ mod tests {
         }
     }
 
+    fn sample_arm_request(
+        pq_pubkey: Vec<u8>,
+        activated_at_height: u64,
+        finalized_height: u64,
+    ) -> ArmForProductionRequest {
+        ArmForProductionRequest {
+            authorized_state: AuthorizedProducerState {
+                pq_pubkey,
+                measurement: b"prod-enclave-v1".to_vec(),
+                activated_at_height,
+                source_ticket_hash: [0xAA; 32],
+            },
+            recent_chain_proof: RecentChainProof {
+                finalized_height,
+                finalized_header_hash: [0x11; 32],
+                recovery_history_tail: vec![[0xAA; 32]],
+                proof_data: vec![],
+                signature_from_recent_producer: None,
+            },
+        }
+    }
+
+    fn sample_hardfork_ticket(pq_pubkey: Vec<u8>, activation_height: u64) -> AuthorizationTicketPayload {
+        AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 42,
+            context_hash: [0xAB; 32],
+            activation_height,
+            new_measurement: b"hardfork-v5".to_vec(),
+            pq_pubkey,
+            fork_spec_hash: Some([0xEF; 32]),
+            new_header_version: Some(3),
+        }
+    }
+
     #[test]
     fn roundtrip_sign_via_framing_and_dispatch_hardfork() {
-        // In Phase 1 (post 5a0e3e2 matrix), hard-fork tickets are intentionally rejected
-        // at the handler level until real armed state + freshness proof is implemented.
+        // Stateless dispatch still rejects hard-fork (requires armed state).
         let payload = AuthorizationTicketPayload {
             ticket_type: 1,
             nonce: 0x2222,
@@ -1315,9 +1420,147 @@ mod tests {
 
         match resp {
             Response::Error(msg) => {
-                assert!(msg.contains("Hard-fork (type=1) ticket signing is not allowed"));
+                assert!(msg.contains("requires armed enclave state"));
             }
-            _ => panic!("expected Error response for hard-fork in Phase 1 skeleton"),
+            _ => panic!("expected Error response for hard-fork without state"),
+        }
+    }
+
+    #[test]
+    fn stateful_arm_then_sign_hardfork_succeeds() {
+        let pq = vec![0xDE; 48];
+        let mut state = EnclaveState::Unarmed;
+
+        let arm_resp = dispatch_command_with_state(
+            Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
+            &mut state,
+        );
+        match arm_resp {
+            Response::ArmForProduction(r) => assert_eq!(r.status, "armed"),
+            _ => panic!("expected arm success"),
+        }
+
+        let ticket = sample_hardfork_ticket(pq, 10_000_100);
+        let sign_resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: ticket.clone() }),
+            &mut state,
+        );
+
+        match sign_resp {
+            Response::SignAuthorizationTicket(r) => {
+                assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&ticket));
+                assert_eq!(r.signature.len(), 64);
+            }
+            other => panic!("expected sign success, got {:?}", other),
+        }
+
+        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state) {
+            Response::GetStatus(s) => s,
+            _ => panic!("expected GetStatus"),
+        };
+        assert_eq!(status.pending_hard_fork_height, Some(10_000_100));
+        assert_eq!(status.last_known_block, Some(10_000_050));
+    }
+
+    #[test]
+    fn stateful_sign_hardfork_without_arming_fails() {
+        let mut state = EnclaveState::Unarmed;
+        let ticket = sample_hardfork_ticket(vec![0xCD; 48], 10_000_100);
+
+        let resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+            &mut state,
+        );
+
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("requires the enclave to be armed")),
+            _ => panic!("expected error when signing hard-fork while unarmed"),
+        }
+    }
+
+    #[test]
+    fn stateful_sign_hardfork_wrong_pubkey_fails() {
+        let pq = vec![0xDE; 48];
+        let mut state = EnclaveState::Unarmed;
+
+        dispatch_command_with_state(
+            Command::ArmForProduction(sample_arm_request(pq, 10_000_000, 10_000_050)),
+            &mut state,
+        );
+
+        let ticket = sample_hardfork_ticket(vec![0xCD; 48], 10_000_100);
+        let resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+            &mut state,
+        );
+
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
+            _ => panic!("expected pubkey mismatch error"),
+        }
+    }
+
+    #[test]
+    fn stateful_sign_hardfork_stale_activation_height_fails() {
+        let pq = vec![0xDE; 48];
+        let mut state = EnclaveState::Unarmed;
+
+        dispatch_command_with_state(
+            Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
+            &mut state,
+        );
+
+        // activation_height not strictly above proof.finalized_height
+        let ticket = sample_hardfork_ticket(pq, 10_000_050);
+        let resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+            &mut state,
+        );
+
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("activation_height must be strictly greater")),
+            _ => panic!("expected stale activation_height error"),
+        }
+    }
+
+    #[test]
+    fn stateful_framing_roundtrip_hardfork_after_arm() {
+        let pq = vec![0xEE; 48];
+        let mut state = EnclaveState::Unarmed;
+
+        dispatch_command_with_state(
+            Command::ArmForProduction(sample_arm_request(pq.clone(), 100, 500)),
+            &mut state,
+        );
+
+        let payload = sample_hardfork_ticket(pq, 600);
+        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload.clone() });
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&cmd, &mut bytes).unwrap();
+        let framed = encode_message(MessageType::SignAuthorizationTicket, &bytes).unwrap();
+        let received = decode_message(&framed).unwrap();
+        let received_cmd: Command = ciborium::de::from_reader(&received.payload[..]).unwrap();
+
+        let resp = dispatch_command_with_state(received_cmd, &mut state);
+        match resp {
+            Response::SignAuthorizationTicket(r) => {
+                assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&payload));
+            }
+            _ => panic!("expected successful hard-fork sign after arm"),
+        }
+    }
+
+    #[test]
+    fn stateful_get_measurement_lists_hardfork_type() {
+        let mut state = EnclaveState::Unarmed;
+        let resp = dispatch_command_with_state(Command::GetMeasurement(GetMeasurementRequest { version: 1 }), &mut state);
+        match resp {
+            Response::GetMeasurement(r) => {
+                assert!(r.supported_ticket_types.contains(&0));
+                assert!(r.supported_ticket_types.contains(&1));
+            }
+            _ => panic!("expected GetMeasurement"),
         }
     }
 

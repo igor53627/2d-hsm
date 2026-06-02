@@ -3,7 +3,7 @@
 //! Этот пример демонстрирует рекомендуемый flow с использованием состояния:
 //! 1. Host выполняет ARM_FOR_PRODUCTION с валидным proof.
 //! 2. Проверяет статус через GET_STATUS.
-//! 3. Пытается подписать hard-fork тикет (должно пройти только после успешного arming).
+//! 3. Подписывает hard-fork тикет (только после arming + совпадающий pq_pubkey).
 //!
 //! Также показан негативный сценарий — попытка подписать hard-fork без arming.
 //!
@@ -19,17 +19,18 @@ use ciborium::de::from_reader;
 fn main() {
     println!("=== Realistic Host ↔ Enclave Session Simulation (with state) ===\n");
 
-    let mut enclave_state = EnclaveState::Unarmed;
+    let producer_pubkey = vec![0xDE; 48];
 
     // =====================================================
     // Пример 1: Правильный flow — Arm → GetStatus → Sign hard-fork
     // =====================================================
     println!("=== Scenario: Proper flow (Arm first, then sign hard-fork) ===\n");
 
-    // 1. Host выполняет ARM_FOR_PRODUCTION с валидным proof
+    let mut enclave_state = EnclaveState::Unarmed;
+
     let arm_req = enclave_protocol::ArmForProductionRequest {
         authorized_state: enclave_protocol::AuthorizedProducerState {
-            pq_pubkey: vec![0xDE; 48],
+            pq_pubkey: producer_pubkey.clone(),
             measurement: b"prod-enclave-v1".to_vec(),
             activated_at_height: 10_000_000,
             source_ticket_hash: [0xAA; 32],
@@ -52,38 +53,49 @@ fn main() {
         _ => {}
     }
 
-    // 2. Проверяем статус
     let status_cmd = Command::GetStatus(enclave_protocol::GetStatusRequest { version: 1 });
     let status_resp = dispatch_command_with_state(status_cmd, &mut enclave_state);
     println!("Host → Enclave: GET_STATUS");
     if let Response::GetStatus(s) = &status_resp {
         println!("  armed: {}", s.armed);
         if s.armed {
-            println!("  authorized_measurement: {:?}", String::from_utf8_lossy(&s.authorized_measurement));
+            println!(
+                "  authorized_measurement: {:?}",
+                String::from_utf8_lossy(&s.authorized_measurement)
+            );
+            println!("  proof_finalized_height: {:?}", s.proof_finalized_height);
         }
     }
     println!();
 
-    // 3. Теперь пытаемся подписать hard-fork тикет (должно пройти)
     let hardfork_payload = AuthorizationTicketPayload {
         ticket_type: 1,
         nonce: 42,
         context_hash: [0xAB; 32],
-        activation_height: 3_000_000,
+        activation_height: 10_500_000,
         new_measurement: b"hardfork-v5".to_vec(),
-        pq_pubkey: vec![0xCD; 48],
+        pq_pubkey: producer_pubkey,
         fork_spec_hash: Some([0xEF; 32]),
         new_header_version: Some(3),
     };
 
     simulate_signing_flow(&hardfork_payload, &mut enclave_state, "Hard-Fork after proper arming");
 
+    if let Response::GetStatus(s) = dispatch_command_with_state(
+        Command::GetStatus(enclave_protocol::GetStatusRequest { version: 1 }),
+        &mut enclave_state,
+    ) {
+        println!("After hard-fork sign — GET_STATUS:");
+        println!("  pending_hard_fork_height: {:?}", s.pending_hard_fork_height);
+        println!();
+    }
+
     // =====================================================
-    // Пример 2: Негатив — пытаемся подписать hard-fork без arming
+    // Пример 2: Негатив — hard-fork без arming
     // =====================================================
     println!("\n=== Scenario: Hard-fork signing WITHOUT prior arming (should fail) ===\n");
 
-    let mut fresh_state = EnclaveState::Unarmed; // новый "enclave" без arming
+    let mut fresh_state = EnclaveState::Unarmed;
 
     let bad_hardfork = AuthorizationTicketPayload {
         ticket_type: 1,
@@ -96,7 +108,51 @@ fn main() {
         new_header_version: Some(4),
     };
 
-    simulate_signing_flow(&bad_hardfork, &mut fresh_state, "Hard-Fork without arming (expected to fail)");
+    simulate_signing_flow(
+        &bad_hardfork,
+        &mut fresh_state,
+        "Hard-Fork without arming (expected to fail)",
+    );
+
+    // =====================================================
+    // Пример 3: Негатив — armed, но activation_height не свежее proof
+    // =====================================================
+    println!("\n=== Scenario: Hard-fork with stale activation_height (should fail) ===\n");
+
+    let mut stale_state = EnclaveState::Unarmed;
+    let arm_for_stale = enclave_protocol::ArmForProductionRequest {
+        authorized_state: enclave_protocol::AuthorizedProducerState {
+            pq_pubkey: vec![0xFF; 48],
+            measurement: b"v2".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xBB; 32],
+        },
+        recent_chain_proof: enclave_protocol::RecentChainProof {
+            finalized_height: 200,
+            finalized_header_hash: [0x22; 32],
+            recovery_history_tail: vec![[0xBB; 32]],
+            proof_data: vec![],
+            signature_from_recent_producer: None,
+        },
+    };
+    dispatch_command_with_state(Command::ArmForProduction(arm_for_stale), &mut stale_state);
+
+    let stale_ticket = AuthorizationTicketPayload {
+        ticket_type: 1,
+        nonce: 7,
+        context_hash: [0x33; 32],
+        activation_height: 200,
+        new_measurement: b"stale".to_vec(),
+        pq_pubkey: vec![0xFF; 48],
+        fork_spec_hash: Some([0x44; 32]),
+        new_header_version: Some(2),
+    };
+
+    simulate_signing_flow(
+        &stale_ticket,
+        &mut stale_state,
+        "Hard-Fork with activation_height <= proof.finalized_height",
+    );
 
     println!("\n=== Simulation finished ===");
 }
