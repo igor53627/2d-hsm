@@ -1,10 +1,10 @@
 ---
 id: TASK-1
 title: Implement custom minimal post-quantum signing service inside TEE
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-05-31 12:43'
-updated_date: '2026-06-02 18:00'
+updated_date: '2026-06-02 22:00'
 labels:
   - pq
   - hsm
@@ -438,18 +438,36 @@ The document already contains:
 
 We are moving from design into actual protocol definition and skeletons.
 
+### Merged to main (2026-06-02, squash `60eeefc` — PR #1)
+
+**PQ seal v1 staging slice (reference crate + offline CLI):**
+- ML-DSA-65 ticket signing in `enclave-protocol` (`ml-dsa-65` feature); mock PQ only without the feature.
+- Seal v1 (ChaCha20-Poly1305 + measurement digest + provisioning root); v0 XOR **test-only**.
+- `set_pq_seal_v1_provisioning_root` at boot (not vsock); install once + mutex across verify/install.
+- Offline `pq-seal-v1` CLI (`seal`, `verify`, `meas-digest`, `generate-keypair`); seal APIs behind `pq-seal-provisioning` (not in deploy enclave binary).
+- Staging runbook: `backlog/docs/pq-seal-v1-provisioning-runbook.md`; vsock spec §2.1 updated.
+- Roborev: Reduced + 2×3 + compact on high-risk paths; PR bot findings addressed in follow-up commits.
+
+**Explicit follow-ups (still TASK-1):**
+- Platform root derivation (vTPM / SNP / Nitro) → `set_pq_seal_v1_provisioning_root`.
+- CI gate: no `reference-seal-v1-root` / testvectors in production artifacts.
+- Verify path without copying SK into non-zeroizing `MlDsa65Signer` (accepted debt; runbook §8 documents CLI memory exposure).
+- Full operator runbook (AC #5 / DoD #5): hot standby, attestation ceremony, incident response — beyond PQ seal slice.
+- Elixir / Vault integration (AC #9 / DoD #6), remote attestation on caller (AC #12 / DoD #3).
+
 ### Current plan (2026-06-02 — next major increment)
 
 **Prerequisites in tree (TASK-2 / TASK-3):**
 - Reference crate `impl/rust/enclave-protocol/`: vsock framing, canonical `ticketHash`, enclave state machine (arm / hard-fork gating), Producer Chain Attestation v1 (TASK-3).
-- Ticket signing today uses **mock PQ** (`compute_mock_pq_signature`, 64 bytes) — must be replaced.
+- **ML-DSA-65 + seal v1 install** — done in reference crate (see merged slice above).
 
-**Recommended first implementation slice (TASK-1 MVP):**
-1. **ML-DSA-65** (frozen 2026-06 via 2d TASK-122 + theory-378 TASK-92.1.8 hot path) — implement in TEE; sync precompile ABI with 2d.
-2. Replace mock signer in `handle_sign_authorization_ticket*` with real ML-DSA inside enclave boundary (Rust + audited crate, e.g. `pqcrypto-mldsa` / `liboqs` — decide in AC #2).
-3. Extend wire format: real signature sizes (~3 KB+), not 64-byte placeholder; update vsock spec + tests.
-4. Sealed key lifecycle sketch (generate / unseal in TEE — minimal for MVP).
-5. **Full roborev matrix** on first real key-handling increment (high-risk per AGENTS.md).
+**Recommended next slices (TASK-1):**
+1. **Platform provisioning root** in real TEE images (wires `set_pq_seal_v1_provisioning_root`).
+2. **Production build policy** — block `reference-seal-v1-root` in deploy artifacts.
+3. **Key-handling hardening** — verify-without-signer-copy; `resolve_provisioning_root` out-param + zeroize (roborev compact #6670 low/medium debt).
+4. Sync with **2d** precompile / header signing policy (same ML-DSA key as tickets?).
+
+**Parent repo next increment:** **TASK-2** — vsock transport, Elixir shim, wire migration (see TASK-2 notes).
 
 **Algorithm policy (agreed direction):**
 - **ML-DSA** — primary for BlockProducer (~2s blocks) + AuthorizationTicket `pq_pubkey` / `signature` (size + latency).

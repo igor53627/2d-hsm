@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-05-31 18:38'
-updated_date: '2026-06-02 18:00'
+updated_date: '2026-06-02 22:00'
 labels: []
 dependencies:
   - TASK-3
@@ -491,13 +491,15 @@ Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transp
 - **#5:** Hard-fork flow in spec + demos; full operator runbook — deferred.
 - **#6:** Cross-reviewed with authorization-ticket specs; no open HIGH on protocol/ticket coupling.
 
-**Next increments (order):**
-1. **TASK-1** — real ML-DSA signing (unblocks meaningful E2E ticket signatures).
-2. **Phase 4 (this task)** — Elixir shim + stateful session over `wire.rs` encoders.
-3. Wire migration — `SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT` integer-key CBOR.
-4. Real vsock I/O (replace in-process demos).
+**TASK-1 update (2026-06-02):** ML-DSA-65 + seal v1 staging merged to `main` (`60eeefc`). Reference crate now returns **3309-byte** PQ signatures when sealed signer is installed; mock PQ only without `ml-dsa-65`. Production vsock E2E still needs platform root + deploy policy (TASK-1 follow-ups).
 
-**Depends on:** TASK-1 for production-grade `SignAuthorizationTicket` responses (size + crypto).
+**Next increments (order):**
+1. **Phase 4 (this task)** — Elixir shim + stateful session over `wire.rs` encoders.
+2. Wire migration — remaining integer-key CBOR consistency across commands.
+3. Real vsock I/O (replace in-process demos).
+4. **TASK-1** (parallel) — platform provisioning root, prod CI gate, verify-path zeroization.
+
+**Depends on:** TASK-1 platform root + prod build policy for production-grade provisioning; reference-crate crypto path is in tree.
 
 Parent plan: `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md`.
 <!-- SECTION:NOTES:END -->

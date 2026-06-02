@@ -171,20 +171,21 @@ This plan ensures we carry the same rigor that caught the two HIGH issues in the
 
 ## Progress update (2026-06-02)
 
-Phase 1 reference implementation and TASK-3 crypto gate are **in tree** (`enclave-protocol`, 56+ tests). Documentation entry points:
+Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 staging slice** are **in tree** (`enclave-protocol`, 70+ tests with `ml-dsa-65,pq-seal-provisioning`). Merged: `60eeefc` (PR #1). Documentation entry points:
 
-- `impl/README.md` — build, dispatch APIs, `test-support` feature
-- `backlog/docs/vsock-api-wire-format-spec-draft.md` — §8–§9.3 (v0.2)
+- `impl/README.md` — build, dispatch APIs, `pq-seal-v1` CLI
+- `backlog/docs/vsock-api-wire-format-spec-draft.md` — §2.1 seal v1 + §8–§9.3 (v0.2)
+- `backlog/docs/pq-seal-v1-provisioning-runbook.md` — staging operator ceremony
 - `backlog/tasks/task-3` — Done
 
 **Recommended next increments (ordered):**
 
-1. **TASK-1** — replace mock PQ with **ML-DSA-65** (FIPS 204; wire: 1952 B pubkey, 3309 B sig — vsock spec §2.1). **Full roborev matrix** on key-handling code.
-2. **TASK-2 Phase 4** — Elixir host shim (`wire.rs`, `dispatch_command_with_state`, `test-support` for local dev only).
+1. **TASK-2 Phase 4** — Elixir host shim + real vsock I/O (`wire.rs`, `dispatch_command_with_state`).
+2. **TASK-1 follow-ups** — platform `set_pq_seal_v1_provisioning_root`; prod CI gate (no `reference-seal-v1-root`); verify-path zeroization debt.
 3. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing (measurement / header version at activation height). Concurrency lens review when implementing.
-4. **Wire migration** — integer-key CBOR for `SIGN_AUTHORIZATION_TICKET`, `GET_MEASUREMENT`.
+4. **Wire migration** — remaining integer-key CBOR consistency across commands.
 
-**Session status (2026-06-02):** TASK-3 Done; TASK-2 Phase 1 + docs in git (`main` through `37e07a7`). Next session should start TASK-1 discovery (2d parameter-set sync) or a thin Elixir shim spike in parallel.
+**Session status (2026-06-02):** TASK-1 seal v1 + ML-DSA-65 reference path merged; TASK-2 is the primary implementation focus for host integration.
 
 **Task board:** `backlog/tasks/task-{1,2,3}` updated with this plan.
 
