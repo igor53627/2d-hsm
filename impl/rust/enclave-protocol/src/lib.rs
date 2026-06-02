@@ -55,8 +55,17 @@ pub use pq_signer::{
     install_sealed_pq_signer, is_sealed_signer_installed, ML_DSA65_SECRETKEY_LEN,
     SEALED_BLOB_V0_VERSION,
 };
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "reference-seal-v1-root")))]
-pub use pq_signer::seal_mldsa65_keypair_v1;
+#[cfg(feature = "ml-dsa-65")]
+pub use pq_signer::{
+    is_pq_seal_v1_provisioning_root_configured, pq_seal_v1_expected_blob_len,
+    pq_seal_v1_measurement_digest, set_pq_seal_v1_provisioning_root, SEALED_BLOB_V1_MAGIC,
+    SEALED_BLOB_V1_HEADER_LEN, SEALED_BLOB_V1_VERSION,
+};
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]
+pub use pq_signer::{
+    seal_mldsa65_keypair_v1, seal_mldsa65_keypair_v1_with_root,
+    verify_sealed_blob_v1_with_root,
+};
 #[cfg(all(feature = "ml-dsa-65", test))]
 pub use pq_signer::{seal_mldsa65_keypair_v0, unseal_mldsa65_keypair_v0};
 
@@ -1942,8 +1951,8 @@ mod tests {
         assert_eq!(status.last_known_block, Some(10_000_050));
         #[cfg(feature = "ml-dsa-65")]
         {
-            pq_signer::end_sealed_signer_test_session();
             drop(_pq_guard);
+            pq_signer::end_sealed_signer_test_session();
         }
     }
 

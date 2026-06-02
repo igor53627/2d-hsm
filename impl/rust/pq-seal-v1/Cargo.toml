@@ -1,0 +1,18 @@
+[package]
+name = "pq-seal-v1"
+version = "0.1.0"
+edition = "2021"
+description = "Offline ML-DSA-65 seal v1 provisioning tool for 2d-hsm (high-risk adjacent)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "pq-seal-v1"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+enclave-protocol = { path = "../enclave-protocol", features = ["ml-dsa-65", "pq-seal-provisioning"] }
+hex = "0.4"
+thiserror = "1.0"
+zeroize = "1.8"

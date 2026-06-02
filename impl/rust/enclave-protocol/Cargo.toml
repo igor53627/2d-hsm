@@ -34,6 +34,8 @@ ml-dsa-65 = [
     "dep:chacha20poly1305",
     "dep:getrandom",
 ]
+# Offline seal CLI / provisioning workstation only — not for enclave deploy builds.
+pq-seal-provisioning = ["ml-dsa-65"]
 # Staging/CI: reference v1 seal root (not for production deployment).
 reference-seal-v1-root = ["ml-dsa-65"]
 # Public NIST test-vector keypair — `cargo test` only (see vsock spec §2.1).

@@ -9,6 +9,7 @@ This directory contains the reference implementation of the vsock protocol and e
 | Path | Role |
 |------|------|
 | `rust/enclave-protocol/` | Canonical wire format, state machine, ticket hashing, `RecentChainProof` crypto (TASK-3) |
+| `rust/pq-seal-v1/` | Offline `pq-seal-v1` CLI for v1 sealed PQ blobs (provisioning workstation) |
 | `rust/enclave-protocol/src/wire.rs` | Spec-aligned CBOR with **integer map keys** for `GET_STATUS` and `ARM_FOR_PRODUCTION` |
 | `solidity/` | Ground-truth `abi.encode` + keccak for cross-checking `ticketHash` |
 | `elixir-shim/` | Placeholder for the future 2D host client |
@@ -52,7 +53,7 @@ TASK-2 / TASK-3 increments on this tree went through reduced matrix + compact (c
 
 ```bash
 cd rust/enclave-protocol
-cargo test
+cargo test --features ml-dsa-65,pq-seal-provisioning
 ```
 
 Optional CI gate for Solidity cross-check:
@@ -82,7 +83,8 @@ The `test-support` feature exposes `reference_test_attestation_signing_key` / `r
 | Feature | Use |
 |---------|-----|
 | *(default, none)* | No PQ signing; `pq_signing_ready: false` |
-| `ml-dsa-65` | ML-DSA-65 crypto + v1 sealed-key install at enclave boot |
+| `ml-dsa-65` | ML-DSA-65 crypto + v1 sealed-key **unseal/install** at enclave boot (deploy feature) |
+| `pq-seal-provisioning` | Seal/verify helpers + `secret_key_bytes` — **`pq-seal-v1` CLI only**, not enclave images |
 | `reference-seal-v1-root` | Staging/CI only: test provisioning root for v1 seal/unseal (**not for deployment**) |
 | `reference-test-key` | Implies `ml-dsa-65` + `reference-seal-v1-root`; NIST test-vector in unit tests |
 | `test-support` | Reference Ed25519 attestation keys for local dev |
@@ -90,13 +92,25 @@ The `test-support` feature exposes `reference_test_attestation_signing_key` / `r
 
 v0 seal/unseal helpers compile only under `cargo test --features ml-dsa-65` (not in standalone binaries).
 
-At boot: `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic). Provisioning uses `seal_mldsa65_keypair_v1` (requires `reference-seal-v1-root` or `cargo test`). v0 XOR is **unit-test only**. Deployment images must use a platform seal root, not `reference-seal-v1-root`.
+At boot (production):
+
+1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock).
+2. `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic).
+
+Staging/CI may use `reference-seal-v1-root` or `cargo test` (embedded test root). v0 XOR is **unit-test only**. **Do not** ship `reference-seal-v1-root` in deployment images.
 
 Do not pass `--all-features` (`ml-dsa-65` and `test-support` conflict).
 
+### Offline seal v1 (`pq-seal-v1`)
+
+- **CLI reference:** `rust/pq-seal-v1/README.md`
+- **Staging runbook:** `backlog/docs/pq-seal-v1-provisioning-runbook.md`
+
+Quick start: `cd rust/pq-seal-v1 && cargo build --release && ./target/release/pq-seal-v1 --help`
+
 ## Still deferred
 
-- **Sealed** ML-DSA-65 key in the TEE (TASK-1 production path; vsock spec §2.1 — 1952 B pubkey, 3309 B sig)
+- Platform-specific root derivation (vTPM / SNP VMPL / Nitro) wired into `set_pq_seal_v1_provisioning_root` in real enclave images
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
 - Integer-key CBOR for all commands (only GET_STATUS + ARM request bodies use `wire.rs` today)
