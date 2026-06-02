@@ -35,7 +35,9 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
 | **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1**); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1**). Stay on **v1** until an external deployment exists; use `pq_signing_ready` + signature length (3309 B) to detect mock-era peers |
 
-**Default / production reference builds** do not embed a PQ secret key: `pq_signing_ready` is **false** and `SIGN_AUTHORIZATION_TICKET` returns `PqSigningUnavailable`. For local demos only, enable `test-support` (64-byte mock PQ sig). For CI/protocol tests with real ML-DSA-65 sizes, enable `reference-test-key` (alias for `ml-dsa-65`) — still a **public test-vector key**, not a production signer. Hosts and precompiles **must not** treat 64-byte PQ signatures as valid on-chain.
+**Default / production reference builds** do not embed a PQ secret key: `pq_signing_ready` is **false** and `SIGN_AUTHORIZATION_TICKET` returns `PqSigningUnavailable`. For local demos only, enable `test-support` + `demo-mock-sign` (64-byte mock PQ sig; `pq_signing_ready` stays **false**). For `cargo test` with real ML-DSA-65 sizes, enable `reference-test-key` (implies `ml-dsa-65`): tests install the NIST test-vector key via the v0 sealed-blob path — **not** a production signer and **not** enabled in standalone binaries. Hosts and precompiles **must not** treat 64-byte PQ signatures as valid on-chain.
+
+**Production sealed-key provisioning (TASK-1):** The reference crate's v0 XOR seal is **unit-test only**; `install_sealed_pq_signer` in non-test `ml-dsa-65` builds returns `PqSigningUnavailable` until a real platform seal format ships. Production enclaves must provision ML-DSA-65 at boot via the future seal API (vTPM / SNP VMPL / etc.), not v0.
 
 **Scope of ML-DSA-65 inside this enclave:**
 - Canonical block-root / header-digest signing (BlockProducer hot path).
@@ -302,7 +304,7 @@ Error = {
 
 **Semantics of `supported_ticket_types`:** This is a **static capability list** for the enclave image (which ticket types it can sign when all preconditions are met). It does **not** mean the enclave can sign type=1 right now. Readiness for hard-fork signing requires `GET_STATUS.armed == true` plus the rules in `SIGN_AUTHORIZATION_TICKET` below.
 
-**Semantics of `pq_signing_ready`:** Operational PQ signer available **right now** (ML-DSA-65 with a production sealed key in TEE). Default reference images set this to **false** even when `supported_ticket_types` includes `1`; hosts must not treat `false` as “ready to produce valid on-chain PQ signatures”. Dev-only `reference-test-key` builds may set it to **true** for protocol tests — not for deployment.
+**Semantics of `pq_signing_ready`:** Operational PQ signer available **right now** (ML-DSA-65 installed via `install_sealed_pq_signer` after boot). Default reference images set this to **false** even when `supported_ticket_types` includes `1`; hosts must not treat `false` as “ready to produce valid on-chain PQ signatures”. It becomes **true** only after a successful sealed-key install (today: v0 install path exists under `cargo test` only). The `reference-test-key` feature does **not** auto-enable readiness in any deployable binary.
 
 **Error Response:** standard Error map.
 

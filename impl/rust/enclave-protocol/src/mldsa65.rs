@@ -18,17 +18,6 @@ pub struct MlDsa65Signer {
     secret_key: SecretKey,
 }
 
-impl Drop for MlDsa65Signer {
-    fn drop(&mut self) {
-        #[cfg(feature = "ml-dsa-65")]
-        {
-            use zeroize::Zeroize;
-            let mut scratch = self.secret_key.as_bytes().to_vec();
-            scratch.zeroize();
-        }
-    }
-}
-
 impl MlDsa65Signer {
     #[cfg(all(test, feature = "reference-test-key"))]
     pub fn reference_test_vector() -> &'static Self {
@@ -39,7 +28,7 @@ impl MlDsa65Signer {
         })
     }
 
-    pub fn from_key_bytes(sk_bytes: &[u8], pk_bytes: &[u8]) -> Result<Self, ProtocolError> {
+    pub(crate) fn from_key_bytes(sk_bytes: &[u8], pk_bytes: &[u8]) -> Result<Self, ProtocolError> {
         let sk = SecretKey::from_bytes(sk_bytes)
             .map_err(|_| ProtocolError::PqSigningUnavailable("invalid ML-DSA-65 secret key"))?;
         let pk = PublicKey::from_bytes(pk_bytes)
