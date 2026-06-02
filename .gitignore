@@ -1,0 +1,25 @@
+# Build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Caches and outputs
+cache/
+out/
+**/.DS_Store
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust specific
+**/.cargo/
+
+# Other generated
+*.log
