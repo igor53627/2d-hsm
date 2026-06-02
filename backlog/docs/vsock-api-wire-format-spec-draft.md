@@ -29,7 +29,11 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Parameter set** | **ML-DSA-65** (NIST Level III) — frozen for producer + tickets + on-chain verify (2d TASK-122) |
 | **Implementation (target)** | [mldsa-native](https://github.com/pq-code-package/mldsa-native) / `mldsa-native-rs` inside the TEE (2d-hsm TASK-1) |
 | **Signing mode** | Hedged (FIPS 204 default; not deterministic) |
+| **Message form** | **Pure ML-DSA** over the raw 32-byte `ticketHash` (or block digest) — **not** HashML-DSA pre-hash |
+| **Context `ctx`** | Empty (`len(ctx) = 0`) unless a future spec version defines a non-empty domain string (both enclave and 2d precompile must match) |
+| **RNG** | Hedged signing requires a CSPRNG inside the TEE (platform TRNG / NSM-seeded `getrandom`); silent RNG failure must abort sign (fail closed) |
 | **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
+| **Protocol version** | CBOR `version: 1` until TASK-1 ships ML-DSA-65 on the wire; then bump to **version 2** so hosts reject 64-byte mock PQ peers |
 
 Until TASK-1 lands, the reference crate may return a **64-byte mock** PQ signature for demos only (`test-support`). Hosts and precompiles **must not** treat 64-byte PQ signatures as valid in production.
 

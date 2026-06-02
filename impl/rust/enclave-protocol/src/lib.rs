@@ -899,7 +899,7 @@ pub fn handle_sign_authorization_ticket_with_state(
 ///
 /// Hard-fork signing, `ARM_FOR_PRODUCTION`, and `GET_STATUS` require
 /// [`dispatch_command_with_state`] with an enclave-held [`ProducerAttestationTrust`]
-/// (see §8.3 in the vsock spec — the host must not choose the trust anchor).
+/// (see §9.3 in the vsock spec — the host must not choose the trust anchor).
 pub fn dispatch_command(cmd: Command) -> Response {
     match cmd {
         Command::SignAuthorizationTicket(req) => {

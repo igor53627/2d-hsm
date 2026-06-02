@@ -1,4 +1,4 @@
-//! Spec-aligned CBOR encoding (integer map keys per vsock-api-wire-format-spec-draft §7).
+//! Spec-aligned CBOR encoding (integer map keys per vsock-api-wire-format-spec-draft §8).
 //!
 //! The logical Rust structs in `lib.rs` use field names for in-process use; vsock
 //! payloads for commands documented with integer keys must use the helpers here.

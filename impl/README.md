@@ -13,7 +13,7 @@ This directory contains the reference implementation of the vsock protocol and e
 | `solidity/` | Ground-truth `abi.encode` + keccak for cross-checking `ticketHash` |
 | `elixir-shim/` | Placeholder for the future 2D host client |
 
-**Normative protocol spec:** `backlog/docs/vsock-api-wire-format-spec-draft.md` (§7 wire schemas, §8.1 attestation, §8.3 trust provisioning).
+**Normative protocol spec:** `backlog/docs/vsock-api-wire-format-spec-draft.md` (§8 wire schemas, §9.1 Producer Chain Attestation, §9.3 trust provisioning).
 
 ## What is implemented
 

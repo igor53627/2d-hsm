@@ -76,7 +76,7 @@ Created 2026-06-02 after cc8446f / 1ae4773 matrices. Production blocker explicit
 - `chain_proof_crypto.rs`: Producer Chain Attestation v1 (`proof_data` 0x01 + tail digest, Ed25519 over domain-separated preimage).
 - `ProducerAttestationTrust`: pinned attestation pubkey (not derived from public `pq_pubkey` — fixes roborev HIGH on a3fccc9).
 - `validate_recent_chain_proof` calls crypto verify; re-arm requires strictly greater `finalized_height`.
-- Spec §8.1 in vsock-api-wire-format-spec-draft.md; 47 `cargo test` passing.
+- Spec §9.1 in vsock-api-wire-format-spec-draft.md; 47 `cargo test` passing.
 - **Review (2026-06-02):** Reduced 3:3 on `2d136ac` (codex security, gemini security, claude-code design) + `roborev compact` job 6509 on `fddd3f0`.
   - HIGH (codex+gemini): measurement not in preimage → fixed in `fddd3f0`.
   - MEDIUM (gemini): exact `proof_data` length, weak sign-time test → fixed in `fddd3f0`.

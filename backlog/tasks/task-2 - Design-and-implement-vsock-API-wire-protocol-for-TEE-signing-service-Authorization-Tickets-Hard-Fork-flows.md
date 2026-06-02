@@ -470,7 +470,7 @@ Next: run 3:3 matrix on this commit.
 - **TASK-3 Done:** Producer Chain Attestation v1 (Ed25519, pinned `ProducerAttestationTrust`, measurement in preimage). AC #7 note updated — no longer structural-only.
 - **Wire:** `wire.rs` integer-key CBOR for `GET_STATUS` and `ARM_FOR_PRODUCTION` structured `RecentChainProof`.
 - **Dispatch:** `dispatch_command` = recovery + GET_MEASUREMENT; stateful path required for arm/status/hard-fork.
-- **Docs:** `impl/README.md`, root `README.md`, vsock spec §8.3, implementation plan progress section updated.
+- **Docs:** `impl/README.md`, root `README.md`, vsock spec §9.3, implementation plan progress section updated.
 - **56 tests** in `enclave-protocol` (run `cargo test`; demo needs `--features test-support`).
 
 Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transport, integer-key CBOR for all commands.
@@ -483,10 +483,10 @@ Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transp
 | Phase 1 protocol + state machine | Done (AC #7–#9) |
 | TASK-3 crypto `RecentChainProof` | Done (feeds AC #8) |
 | `wire.rs` GET_STATUS + ARM integer CBOR | Done |
-| Docs (`impl/README`, vsock §8) | Done |
+| Docs (`impl/README`, vsock v0.2 §2–§9) | Done |
 
 **AC #1–#6 informal status (for formal closure next session):**
-- **#1–#3:** Largely satisfied by `vsock-api-wire-format-spec-draft.md` + §8; may need “stable v0.x” tag after review.
+- **#1–#3:** Largely satisfied by `vsock-api-wire-format-spec-draft.md` v0.2; tag stable after Phase 0 roborev + MEDIUM fixes.
 - **#4:** Rust server yes; **Elixir host client** — not started (`impl/elixir-shim/` placeholder).
 - **#5:** Hard-fork flow in spec + demos; full operator runbook — deferred.
 - **#6:** Cross-reviewed with authorization-ticket specs; no open HIGH on protocol/ticket coupling.

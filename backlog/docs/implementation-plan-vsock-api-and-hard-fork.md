@@ -28,7 +28,7 @@ All future implementation work in this area is classified **High-risk** by defau
 ### Phase 0 – Finalize & Re-Review Specs (Short, 1–3 days)
 - **v0.2 spec draft (2026-06-02):** `vsock-api-wire-format-spec-draft.md` — §2 ML-DSA-65, dual-path, attestation terminology (TEE vs Producer Chain Ed25519).
 - Run **Reduced roborev matrix** (`security+codex`, `security+gemini`, `design+claude-code`) on dirty `backlog/docs/*vsock*` + `*authorization-ticket*`; then `roborev compact`.
-- Full 3×3 + concurrency deferred until TASK-1 key-handling code unless matrix finds material spec issues.
+- Full 3×3 + concurrency **required** if Reduced matrix finds any **HIGH**, or any change to `ticketHash` canonicalization / ML-DSA message binding (`ctx`, pure vs HashML-DSA), before marking v0.2 deliverable Done.
 - Update this plan and AGENTS.md with any new invariants from compact.
 
 **Deliverable**: v0.2 spec files marked reviewed via roborev Reduced + compact (record outcome in task notes).
@@ -76,7 +76,7 @@ All future implementation work in this area is classified **High-risk** by defau
 **MVP complete (TASK-3, 2026-06-02):**
 
 - Producer Chain Attestation v1: mandatory `proof_data` + Ed25519 `signature_from_recent_producer`
-- Pinned `ProducerAttestationTrust` (not host-supplied; see spec §8.3)
+- Pinned `ProducerAttestationTrust` (not host-supplied; see spec §9.3)
 - Verification at `ARM_FOR_PRODUCTION` and hard-fork sign time; re-arm monotonicity on `finalized_height`
 - Reduced 3:3 matrix + compact on crypto increment; post-matrix fixes (`fddd3f0`, `6dced02`)
 
@@ -174,7 +174,7 @@ This plan ensures we carry the same rigor that caught the two HIGH issues in the
 Phase 1 reference implementation and TASK-3 crypto gate are **in tree** (`enclave-protocol`, 56+ tests). Documentation entry points:
 
 - `impl/README.md` — build, dispatch APIs, `test-support` feature
-- `backlog/docs/vsock-api-wire-format-spec-draft.md` — §7–§8.3
+- `backlog/docs/vsock-api-wire-format-spec-draft.md` — §8–§9.3 (v0.2)
 - `backlog/tasks/task-3` — Done
 
 **Recommended next increments (ordered):**
