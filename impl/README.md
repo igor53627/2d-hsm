@@ -34,8 +34,9 @@ Current focus: solid framing + первые команды с правильно
 - `ArmForProduction` с **mandatory** `recent_chain_proof`
 - `GetStatus`
 - Валидация тикетов + helper `prepare_ticket_for_signing`
+- **TASK-3:** криптографическая верификация `RecentChainProof` (Producer Chain Attestation v1, Ed25519) при arm и hard-fork sign
 
-**Важно**: Весь этот код находится под 3:3 roborev-матрицей. Любой значимый дифф перед коммитом должен пройти ревью.
+**Важно**: Весь этот код находится под 3:3 roborev-матрицей. Любой значимальный дифф перед коммитом должен пройти ревью.
 
 Примеры:
 - `cargo run --example framing_demo`

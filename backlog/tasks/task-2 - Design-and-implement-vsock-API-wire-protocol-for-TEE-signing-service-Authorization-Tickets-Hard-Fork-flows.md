@@ -65,7 +65,7 @@ This task is critical because we are doing a real hard fork mechanism, not a toy
 <!-- SECTION:DESCRIPTION:END -->
 
 - [x] #7 Real ArmForProduction handler is implemented with actual enclave state tracking (armed status + the associated validated RecentChainProof). *(Phase 1: structural proof validation only.)*
-- [x] #8 Hard-fork (type=1) AuthorizationTicket signing is properly gated: it succeeds only after the enclave has been successfully armed via ARM_FOR_PRODUCTION with a fresh, validated RecentChainProof. *(Phase 1 skeleton: structural proof + session gates; crypto verification deferred.)*
+- [x] #8 Hard-fork (type=1) AuthorizationTicket signing is properly gated: it succeeds only after the enclave has been successfully armed via ARM_FOR_PRODUCTION with a fresh, validated RecentChainProof. *(Crypto verification: TASK-3 / Producer Chain Attestation v1.)*
 - [x] #9 Example and tests demonstrate the correct flow (ArmForProduction first, then Sign hard-fork) and negative cases (attempting to sign hard-fork without proper arming or with stale proof).
 <!-- AC:END -->
 

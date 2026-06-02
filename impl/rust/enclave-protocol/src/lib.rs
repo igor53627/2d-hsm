@@ -18,9 +18,19 @@
 // чтобы не раздувать скелет. На более поздних фазах документацию нужно будет довести до высокого уровня.
 #![allow(missing_docs)]
 
+mod chain_proof_crypto;
+
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
+
+pub use chain_proof_crypto::{
+    build_proof_data_v1, build_signed_recent_chain_proof, compute_recovery_tail_digest,
+    parse_proof_data_v1, reference_test_attestation_signing_key,
+    reference_test_attestation_trust, sign_recent_chain_proof, verify_recent_chain_proof_crypto,
+    ProducerAttestationTrust, ProofDataV1, PRODUCER_ATTESTATION_SIGNATURE_LEN,
+    PROOF_DATA_FORMAT_V1, PROOF_DATA_V1_LEN,
+};
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -200,13 +210,9 @@ pub struct GetMeasurementResponse {
 /// The enclave must:
 /// - Verify it is currently armed as the authorized producer (for hard-fork tickets especially).
 ///
-///   **Phase 1 reality check:**
 ///   Hard-fork (type=1) requires `handle_sign_authorization_ticket_with_state`
-///   after arming. Structural proof checks only — **not production-ready** until
-///   `RecentChainProof` is cryptographically verified. Stateless
-///   `handle_sign_authorization_ticket` still rejects type=1. Cryptographic
-///   verification of `RecentChainProof` at arm and sign time is deferred (tracked
-///   follow-up; see TASK-2 implementation notes).
+///   after arming with a cryptographically verified `RecentChainProof` (TASK-3).
+///   Stateless `handle_sign_authorization_ticket` still rejects type=1.
 ///
 ///   Recovery tickets (type 0) are currently allowed (bootstrap path).
 ///
@@ -276,10 +282,11 @@ pub struct SignAuthorizationTicketResponse {
 /// cryptographically fresh proof that the claimed `AuthorizedProducerState`
 /// is consistent with a recent finalized prefix of the canonical chain.
 ///
-/// In Phase 1 the current `validate_recent_chain_proof` provides only
-/// structural sanity checks (see its docstring for the explicit warning).
+/// Cryptographic verification uses Producer Chain Attestation v1 in
+/// `proof_data` plus `signature_from_recent_producer` (see `chain_proof_crypto`).
+/// Full light-client proofs may extend or replace this format later.
 ///
-/// Fields are intentionally minimal for Phase 1. A real light-client proof
+/// Fields are intentionally minimal. A future light-client proof
 /// (e.g. Tendermint/Beacon chain header + validator signatures, or 2D-specific
 /// equivalent) will later live inside `proof_data` or replace parts of the
 /// struct. We do **not** implement the full verifier here (explicitly out of
@@ -304,17 +311,12 @@ pub struct RecentChainProof {
     /// This directly mitigates replay of old recovery tickets.
     pub recovery_history_tail: Vec<[u8; 32]>,
 
-    /// Opaque container for the actual cryptographic proof material.
-    /// Today: may be empty or contain a simple signature.
-    /// Future: Merkle inclusion proof, light-client aggregate signature,
-    /// or header chain segment that can be verified against a trusted
-    /// checkpoint or validator set.
+    /// Cryptographic proof material. **MVP (TASK-3):** Producer Chain
+    /// Attestation v1 — see `chain_proof_crypto` (`0x01` || 32-byte tail digest).
     pub proof_data: Vec<u8>,
 
-    /// Optional signature from a recent authorized producer over the
-    /// (height, header_hash, ...) tuple. Useful in early bootstrapping
-    /// or as an additional signal; not a substitute for proper light-client
-    /// validation in the long term.
+    /// Mandatory Ed25519 signature (64 bytes) over the domain-separated
+    /// preimage defined in `chain_proof_crypto::recent_chain_proof_signing_preimage`.
     pub signature_from_recent_producer: Option<Vec<u8>>,
 }
 
@@ -325,11 +327,7 @@ pub struct RecentChainProof {
 /// - In the real enclave, `validate_recent_chain_proof` (or its future
 ///   cryptographic successor) **must** be called before arming.
 ///
-///   **Phase 1 reality:** The current `validate_recent_chain_proof` is
-///   explicitly documented as a **structural precheck only** (see its
-///   docstring). It does NOT provide cryptographic freshness or "network as
-///   second factor" guarantees. Real enforcement will come with the full
-///   implementation of ARM_FOR_PRODUCTION + cryptographic verification.
+///   Cryptographic verification of `RecentChainProof` is required (TASK-3).
 ///
 /// After a successful arming the enclave records that it has seen a fresh proof.
 /// Subsequent `SIGN_AUTHORIZATION_TICKET` for type=1 (HARD_FORK) **must** only
@@ -375,6 +373,9 @@ pub struct EnclaveArmedState {
     /// The `RecentChainProof` that was successfully validated during arming.
     pub proof: RecentChainProof,
 
+    /// Pinned producer attestation identity used to verify this session's proof.
+    pub attestation_trust: ProducerAttestationTrust,
+
     /// On-chain activation height of the authorized producer (from
     /// `AuthorizedProducerState.activated_at_height` at arming time).
     /// Not the chain tip height at arming — see `proof.finalized_height` / GET_STATUS.
@@ -413,24 +414,6 @@ pub enum EnclaveState {
 /// Validates a `RecentChainProof` against the `AuthorizedProducerState` that
 /// the caller wishes to arm the enclave with.
 ///
-/// ========================================================================
-/// PHASE 1 — STRUCTURAL PRECHECK ONLY (post 3:3 matrix on 5a0e3e2)
-/// ========================================================================
-///
-/// THIS FUNCTION IS **NOT** A SECURITY GATE.
-///
-/// - It performs **only structural and basic monotonicity checks**.
-/// - It does **NOT** perform cryptographic verification of `proof_data`.
-/// - It does **NOT** enforce "network as cryptographic second factor".
-/// - Returning `Ok(())` from this function **MUST NOT** be interpreted as
-///   proof that the proof is fresh or authentic.
-///
-/// If you are calling this expecting a real freshness guarantee — you are
-/// using it incorrectly. The real cryptographic gate will be implemented
-/// later (full light-client / aggregate signature verification).
-///
-/// ========================================================================
-///
 /// ## Security Invariants (MUST hold — fail closed on any violation)
 ///
 /// 1. The proof must demonstrate that the chain has progressed at least to the
@@ -441,31 +424,16 @@ pub enum EnclaveState {
 /// 3. If `recovery_history_tail` is non-empty, the `source_ticket_hash` from
 ///    the authorized state **must** appear in it. Failure to contain it when
 ///    the tail is non-empty is now a hard error (see code below).
-/// 4. In a real implementation the `proof_data` (and optionally the
-///    `signature_from_recent_producer`) would be subjected to full light-client
-///    or aggregate signature verification rooted in a trusted genesis or
-///    recent checkpoint that the enclave itself obtained via attested channels
-///    (never solely from the untrusted host).
+/// 4. `proof_data` and `signature_from_recent_producer` must pass Producer
+///    Chain Attestation v1 verification (`verify_recent_chain_proof_crypto`).
 ///
-/// ## Current Implementation (Track B — Phase 1)
+/// Called at `ARM_FOR_PRODUCTION` and again at hard-fork sign time.
 ///
-/// This function performs **only structural and basic monotonicity checks**.
-/// Full cryptographic verification of `proof_data` is explicitly deferred
-/// (full light client is out of scope for this increment and would be Track
-/// for a later milestone).
-///
-/// The function is deliberately pure and takes the claimed state as input so
-/// that the real enclave code can call it at `ARM_FOR_PRODUCTION` time and
-/// also (in the future) at `SIGN_AUTHORIZATION_TICKET` time for freshness
-/// gating on hard-fork tickets.
-///
-/// Returns `Ok(())` only when all implemented checks pass.
-///
-/// **WARNING:** Do not treat `Ok(())` as "this proof is fresh and trustworthy".
-/// It only means "this proof is not obviously malformed on the structural level".
+/// Returns `Ok(())` only when structural and cryptographic checks pass.
 pub fn validate_recent_chain_proof(
     proof: &RecentChainProof,
     current_authorized: &AuthorizedProducerState,
+    trust: &ProducerAttestationTrust,
 ) -> Result<(), ProtocolError> {
     if proof.finalized_header_hash == [0u8; 32] {
         return Err(ProtocolError::RecentChainProofValidation(
@@ -508,6 +476,8 @@ pub fn validate_recent_chain_proof(
         }
     }
 
+    verify_recent_chain_proof_crypto(proof, current_authorized, trust)?;
+
     Ok(())
 }
 
@@ -520,21 +490,31 @@ pub fn validate_recent_chain_proof(
 /// In a real enclave this function would be called by the vsock handler,
 /// and the resulting state would be sealed inside the TEE.
 ///
-/// Phase 1 note: This currently relies on `validate_recent_chain_proof`,
-/// which is explicitly a structural precheck only (see its documentation).
 pub fn arm_for_production(
-    _current_state: &EnclaveState,
+    current_state: &EnclaveState,
     req: ArmForProductionRequest,
+    trust: ProducerAttestationTrust,
 ) -> Result<EnclaveState, ProtocolError> {
-    // Note: `_current_state` is accepted for future policy decisions
-    // (e.g. "can we re-arm?", "is the new proof fresher than current?", etc.).
-    // It is intentionally unused in this minimal Phase 1 implementation.
+    if let EnclaveState::Armed(ref armed) = current_state {
+        if req.recent_chain_proof.finalized_height <= armed.proof.finalized_height {
+            return Err(ProtocolError::RecentChainProofValidation(
+                "re-arm requires strictly greater finalized_height than the current session proof",
+            ));
+        }
+        if armed.attestation_trust.attestation_verifying_key.to_bytes()
+            != trust.attestation_verifying_key.to_bytes()
+        {
+            return Err(ProtocolError::RecentChainProofValidation(
+                "re-arm attestation trust must match the current session trust anchor",
+            ));
+        }
+    }
 
-    // Validate the proof using the existing (honest) Phase 1 validator.
-    validate_recent_chain_proof(&req.recent_chain_proof, &req.authorized_state)?;
+    validate_recent_chain_proof(&req.recent_chain_proof, &req.authorized_state, &trust)?;
 
     let armed_state = EnclaveArmedState {
         proof: req.recent_chain_proof,
+        attestation_trust: trust,
         authorized_activated_at_height: req.authorized_state.activated_at_height,
         authorized_measurement: req.authorized_state.measurement,
         authorized_pq_pubkey: req.authorized_state.pq_pubkey,
@@ -542,9 +522,6 @@ pub fn arm_for_production(
         pending_hard_fork_height: None,
     };
 
-    // Phase 1: re-arming is unrestricted and clears pending_hard_fork_height.
-    // Until cryptographic proof verification gates re-arm, the "one hard-fork per
-    // session" policy does not cap total signatures across re-arms.
     Ok(EnclaveState::Armed(armed_state))
 }
 
@@ -558,15 +535,10 @@ fn authorized_state_from_armed(armed: &EnclaveArmedState) -> AuthorizedProducerS
     }
 }
 
-/// Phase 1 sign-time freshness checks for HARD_FORK_ACTIVATION (type=1).
+/// Sign-time checks for HARD_FORK_ACTIVATION (type=1).
 ///
-/// Uses the proof captured at arming time as the enclave's last known chain view.
-/// Full cryptographic re-verification of `proof_data` is deferred (see
-/// `validate_recent_chain_proof`); we still re-run structural checks and enforce
-/// that the fork is scheduled strictly beyond the proof's finalized height.
-///
-/// **Not production-ready:** a compromised host can pass structural-only proofs.
-/// Real deployments must verify `proof_data` cryptographically before signing type=1.
+/// Re-runs full `validate_recent_chain_proof` (structural + cryptographic) on the
+/// armed proof snapshot and enforces activation-height ordering.
 fn validate_hard_fork_sign_preconditions(
     ticket: &AuthorizationTicketPayload,
     armed: &EnclaveArmedState,
@@ -584,7 +556,7 @@ fn validate_hard_fork_sign_preconditions(
     }
 
     let authorized = authorized_state_from_armed(armed);
-    validate_recent_chain_proof(&armed.proof, &authorized)?;
+    validate_recent_chain_proof(&armed.proof, &authorized, &armed.attestation_trust)?;
 
     if ticket.activation_height <= armed.proof.finalized_height {
         return Err(ProtocolError::InvalidTicket(
@@ -881,9 +853,8 @@ pub fn handle_sign_authorization_ticket(
 /// Stateful signing entry point — the recommended path for all ticket types.
 ///
 /// - type=0 (recovery): allowed when armed or unarmed.
-/// - type=1 (hard fork): requires `EnclaveState::Armed`, structural proof checks,
-///   `activation_height` beyond proof finalized height, and at most one hard-fork
-///   ticket per armed session (AC #8 skeleton — crypto proof verification deferred).
+/// - type=1 (hard fork): requires `EnclaveState::Armed`, full proof validation
+///   (structural + crypto), activation-height ordering, one hard-fork per session.
 pub fn handle_sign_authorization_ticket_with_state(
     req: SignAuthorizationTicketRequest,
     state: &mut EnclaveState,
@@ -959,7 +930,11 @@ pub fn dispatch_command(cmd: Command) -> Response {
 /// This is the version that should be used when the caller maintains
 /// `EnclaveState`. It properly handles `ARM_FOR_PRODUCTION` by calling
 /// `arm_for_production` and updating the state on success.
-pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Response {
+pub fn dispatch_command_with_state(
+    cmd: Command,
+    state: &mut EnclaveState,
+    attestation_trust: ProducerAttestationTrust,
+) -> Response {
     match cmd {
         Command::SignAuthorizationTicket(req) => {
             match handle_sign_authorization_ticket_with_state(req, state) {
@@ -976,7 +951,7 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
             })
         }
         Command::ArmForProduction(req) => {
-            match arm_for_production(state, req) {
+            match arm_for_production(state, req, attestation_trust) {
                 Ok(new_state) => {
                     *state = new_state;
                     Response::ArmForProduction(ArmForProductionResponse {
@@ -1021,6 +996,30 @@ pub fn dispatch_command_with_state(cmd: Command, state: &mut EnclaveState) -> Re
 mod tests {
     use super::*;
 
+    fn test_attestation_signing_key() -> ed25519_dalek::SigningKey {
+        reference_test_attestation_signing_key()
+    }
+
+    fn test_attestation_trust() -> ProducerAttestationTrust {
+        reference_test_attestation_trust()
+    }
+
+    fn signed_recent_chain_proof(
+        finalized_height: u64,
+        finalized_header_hash: [u8; 32],
+        recovery_history_tail: Vec<[u8; 32]>,
+        authorized: &AuthorizedProducerState,
+    ) -> RecentChainProof {
+        build_signed_recent_chain_proof(
+            finalized_height,
+            finalized_header_hash,
+            recovery_history_tail,
+            authorized,
+            &test_attestation_signing_key(),
+        )
+        .expect("test proof signing must succeed")
+    }
+
     #[test]
     fn roundtrip_get_measurement() {
         let req = GetMeasurementRequest { version: 1 };
@@ -1061,7 +1060,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_recent_chain_proof_accepts_valid_proof() {
+    fn validate_recent_chain_proof_accepts_valid_signed_proof() {
+        let state = AuthorizedProducerState {
+            pq_pubkey: vec![1; 48],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xCA; 32],
+        };
+
+        let proof = signed_recent_chain_proof(150, [0xFE; 32], vec![[0xCA; 32]], &state);
+        assert!(validate_recent_chain_proof(&proof, &state, &test_attestation_trust()).is_ok());
+    }
+
+    #[test]
+    fn validate_recent_chain_proof_rejects_empty_proof_data() {
         let state = AuthorizedProducerState {
             pq_pubkey: vec![1; 48],
             measurement: b"meas".to_vec(),
@@ -1074,10 +1086,169 @@ mod tests {
             finalized_header_hash: [0xFE; 32],
             recovery_history_tail: vec![[0xCA; 32]],
             proof_data: vec![],
+            signature_from_recent_producer: Some(vec![0u8; 64]),
+        };
+
+        assert!(validate_recent_chain_proof(&proof, &state, &test_attestation_trust()).is_err());
+    }
+
+    #[test]
+    fn validate_recent_chain_proof_rejects_missing_signature() {
+        let state = AuthorizedProducerState {
+            pq_pubkey: vec![1; 48],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xCA; 32],
+        };
+
+        let proof = RecentChainProof {
+            finalized_height: 150,
+            finalized_header_hash: [0xFE; 32],
+            recovery_history_tail: vec![[0xCA; 32]],
+            proof_data: build_proof_data_v1(&[[0xCA; 32]]),
             signature_from_recent_producer: None,
         };
 
-        assert!(validate_recent_chain_proof(&proof, &state).is_ok());
+        assert!(validate_recent_chain_proof(&proof, &state, &test_attestation_trust()).is_err());
+    }
+
+    #[test]
+    fn validate_recent_chain_proof_rejects_forged_height_with_valid_signature() {
+        let state = AuthorizedProducerState {
+            pq_pubkey: vec![1; 48],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xCA; 32],
+        };
+
+        let mut proof = signed_recent_chain_proof(150, [0xFE; 32], vec![[0xCA; 32]], &state);
+        proof.finalized_height = 9999;
+        assert!(validate_recent_chain_proof(&proof, &state, &test_attestation_trust()).is_err());
+    }
+
+    #[test]
+    fn arm_and_hardfork_reject_unsigned_proof() {
+        let pq = vec![0xAB; 48];
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pq.clone(),
+            measurement: b"m".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xCC; 32],
+        };
+
+        let unsigned = RecentChainProof {
+            finalized_height: 200,
+            finalized_header_hash: [0xDD; 32],
+            recovery_history_tail: vec![[0xCC; 32]],
+            proof_data: vec![],
+            signature_from_recent_producer: None,
+        };
+
+        let arm_err = arm_for_production(
+            &EnclaveState::Unarmed,
+            ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: unsigned.clone(),
+            },
+            test_attestation_trust(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            arm_err,
+            ProtocolError::RecentChainProofValidation(_)
+        ));
+
+        let mut state = EnclaveState::Unarmed;
+        dispatch_command_with_state(
+            Command::ArmForProduction(ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: signed_recent_chain_proof(
+                    200,
+                    [0xDD; 32],
+                    vec![[0xCC; 32]],
+                    &authorized,
+                ),
+            }),
+            &mut state,
+            test_attestation_trust(),
+        );
+
+        let ticket = sample_hardfork_ticket(pq, 300);
+        let sign_resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+            &mut state,
+            test_attestation_trust(),
+        );
+        assert!(matches!(sign_resp, Response::SignAuthorizationTicket(_)));
+
+        if let EnclaveState::Armed(ref armed) = state {
+            let mut tampered = armed.proof.clone();
+            tampered.proof_data.clear();
+            tampered.signature_from_recent_producer = None;
+            let mut bad_state = EnclaveState::Armed(EnclaveArmedState {
+                proof: tampered,
+                ..armed.clone()
+            });
+            let ticket2 = sample_hardfork_ticket(vec![0xAB; 48], 400);
+            let err = handle_sign_authorization_ticket_with_state(
+                SignAuthorizationTicketRequest { ticket: ticket2 },
+                &mut bad_state,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                ProtocolError::RecentChainProofValidation(_)
+                    | ProtocolError::InvalidTicket(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn re_arm_requires_strictly_fresher_finalized_height() {
+        let pq = vec![0xEE; 48];
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pq,
+            measurement: b"m".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
+
+        let first = signed_recent_chain_proof(200, [0x11; 32], vec![[0xAA; 32]], &authorized);
+        let armed = arm_for_production(
+            &EnclaveState::Unarmed,
+            ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: first,
+            },
+            test_attestation_trust(),
+        )
+        .unwrap();
+
+        let stale_rearm = signed_recent_chain_proof(200, [0x22; 32], vec![[0xAA; 32]], &authorized);
+        let err = arm_for_production(
+            &armed,
+            ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: stale_rearm,
+            },
+            test_attestation_trust(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::RecentChainProofValidation(_)
+        ));
+
+        let fresher = signed_recent_chain_proof(250, [0x33; 32], vec![[0xAA; 32]], &authorized);
+        assert!(arm_for_production(
+            &armed,
+            ArmForProductionRequest {
+                authorized_state: authorized,
+                recent_chain_proof: fresher,
+            },
+            test_attestation_trust(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1094,11 +1265,11 @@ mod tests {
             finalized_height: 150,
             finalized_header_hash: [0xFE; 32],
             recovery_history_tail: vec![[0x11; 32]], // non-empty but does not contain source
-            proof_data: vec![],
-            signature_from_recent_producer: None,
+            proof_data: build_proof_data_v1(&[[0x11; 32]]),
+            signature_from_recent_producer: Some(vec![0u8; 64]),
         };
 
-        let err = validate_recent_chain_proof(&bad, &state).unwrap_err();
+        let err = validate_recent_chain_proof(&bad, &state, &test_attestation_trust()).unwrap_err();
         assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
@@ -1107,23 +1278,23 @@ mod tests {
         // Basic test for the new arm_for_production function (AC #7)
         let initial = EnclaveState::Unarmed;
 
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![1; 48],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
         let req = ArmForProductionRequest {
-            authorized_state: AuthorizedProducerState {
-                pq_pubkey: vec![1; 48],
-                measurement: b"meas".to_vec(),
-                activated_at_height: 100,
-                source_ticket_hash: [0xAA; 32],
-            },
-            recent_chain_proof: RecentChainProof {
-                finalized_height: 150,
-                finalized_header_hash: [0xFE; 32],
-                recovery_history_tail: vec![[0xAA; 32]],
-                proof_data: vec![],
-                signature_from_recent_producer: None,
-            },
+            authorized_state: authorized.clone(),
+            recent_chain_proof: signed_recent_chain_proof(
+                150,
+                [0xFE; 32],
+                vec![[0xAA; 32]],
+                &authorized,
+            ),
         };
 
-        let new_state = arm_for_production(&initial, req).expect("arming should succeed");
+        let new_state = arm_for_production(&initial, req, test_attestation_trust()).expect("arming should succeed");
 
         match new_state {
             EnclaveState::Armed(s) => {
@@ -1138,24 +1309,24 @@ mod tests {
         // Demonstrates using the stateful dispatcher (the new recommended path)
         let mut state = EnclaveState::Unarmed;
 
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![1; 48],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
         let req = ArmForProductionRequest {
-            authorized_state: AuthorizedProducerState {
-                pq_pubkey: vec![1; 48],
-                measurement: b"meas".to_vec(),
-                activated_at_height: 100,
-                source_ticket_hash: [0xAA; 32],
-            },
-            recent_chain_proof: RecentChainProof {
-                finalized_height: 150,
-                finalized_header_hash: [0xFE; 32],
-                recovery_history_tail: vec![[0xAA; 32]],
-                proof_data: vec![],
-                signature_from_recent_producer: None,
-            },
+            authorized_state: authorized.clone(),
+            recent_chain_proof: signed_recent_chain_proof(
+                150,
+                [0xFE; 32],
+                vec![[0xAA; 32]],
+                &authorized,
+            ),
         };
 
         let cmd = Command::ArmForProduction(req);
-        let resp = dispatch_command_with_state(cmd, &mut state);
+        let resp = dispatch_command_with_state(cmd, &mut state, test_attestation_trust());
 
         match resp {
             Response::ArmForProduction(r) => {
@@ -1168,7 +1339,7 @@ mod tests {
         assert!(matches!(state, EnclaveState::Armed(_)));
 
         // Also verify via GetStatus
-        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state) {
+        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state, test_attestation_trust()) {
             Response::GetStatus(r) => r,
             _ => panic!("expected GetStatus"),
         };
@@ -1180,33 +1351,27 @@ mod tests {
 
     #[test]
     fn get_status_reflects_armed_state() {
-        // PHASE 1 / SKELETON BEHAVIOR
-        // This test arms the enclave using an empty `proof_data` and no signature.
-        // In Phase 1 this is intentionally allowed (structural precheck only).
-        // When real cryptographic verification of the proof is implemented,
-        // this test (and the arming path it exercises) must be revisited.
-        // Consider adding an ignored/pending test that asserts the desired fail-closed behavior.
         let mut state = EnclaveState::Unarmed;
 
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![0xAA; 48],
+            measurement: b"armed-measurement-v1".to_vec(),
+            activated_at_height: 200,
+            source_ticket_hash: [0xBB; 32],
+        };
         let req = ArmForProductionRequest {
-            authorized_state: AuthorizedProducerState {
-                pq_pubkey: vec![0xAA; 48],
-                measurement: b"armed-measurement-v1".to_vec(),
-                activated_at_height: 200,
-                source_ticket_hash: [0xBB; 32],
-            },
-            recent_chain_proof: RecentChainProof {
-                finalized_height: 250,
-                finalized_header_hash: [0xCC; 32],
-                recovery_history_tail: vec![[0xBB; 32]],
-                proof_data: vec![],
-                signature_from_recent_producer: None,
-            },
+            authorized_state: authorized.clone(),
+            recent_chain_proof: signed_recent_chain_proof(
+                250,
+                [0xCC; 32],
+                vec![[0xBB; 32]],
+                &authorized,
+            ),
         };
 
-        let _ = dispatch_command_with_state(Command::ArmForProduction(req), &mut state);
+        let _ = dispatch_command_with_state(Command::ArmForProduction(req), &mut state, test_attestation_trust());
 
-        let status_resp = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state) {
+        let status_resp = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state, test_attestation_trust()) {
             Response::GetStatus(r) => r,
             _ => panic!("expected GetStatus"),
         };
@@ -1230,16 +1395,19 @@ mod tests {
                 activated_at_height: 100,
                 source_ticket_hash: [0xAA; 32],
             },
-            recent_chain_proof: RecentChainProof {
-                finalized_height: 50, // stale: below activated_at_height
-                finalized_header_hash: [0x11; 32],
-                recovery_history_tail: vec![[0xAA; 32]],
-                proof_data: vec![],
-                signature_from_recent_producer: None,
+            recent_chain_proof: {
+                let authorized = AuthorizedProducerState {
+                    pq_pubkey: vec![1; 48],
+                    measurement: b"meas".to_vec(),
+                    activated_at_height: 100,
+                    source_ticket_hash: [0xAA; 32],
+                };
+                // Height 50 is stale; signing still uses a structurally valid proof blob.
+                signed_recent_chain_proof(50, [0x11; 32], vec![[0xAA; 32]], &authorized)
             },
         };
 
-        let resp = dispatch_command_with_state(Command::ArmForProduction(bad_req), &mut state);
+        let resp = dispatch_command_with_state(Command::ArmForProduction(bad_req), &mut state, test_attestation_trust());
 
         match resp {
             Response::ArmForProduction(r) => {
@@ -1264,21 +1432,18 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         let first = sample_hardfork_ticket(pq.clone(), 10_000_100);
         let ok = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: first }),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
         assert!(matches!(ok, Response::SignAuthorizationTicket(_)));
 
         let second = sample_hardfork_ticket(pq, 10_000_200);
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: second }),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
         match resp {
             Response::Error(msg) => assert!(msg.contains("only one HARD_FORK_ACTIVATION")),
             _ => panic!("expected refusal of second hard-fork sign"),
@@ -1298,11 +1463,11 @@ mod tests {
             finalized_height: 20,
             finalized_header_hash: [0; 32],
             recovery_history_tail: vec![],
-            proof_data: vec![],
-            signature_from_recent_producer: None,
+            proof_data: build_proof_data_v1(&[]),
+            signature_from_recent_producer: Some(vec![0u8; 64]),
         };
 
-        let err = validate_recent_chain_proof(&bad, &state).unwrap_err();
+        let err = validate_recent_chain_proof(&bad, &state, &test_attestation_trust()).unwrap_err();
         assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
@@ -1319,11 +1484,11 @@ mod tests {
             finalized_height: 500, // older than activation
             finalized_header_hash: [0x11; 32],
             recovery_history_tail: vec![],
-            proof_data: vec![],
-            signature_from_recent_producer: None,
+            proof_data: build_proof_data_v1(&[]),
+            signature_from_recent_producer: Some(vec![0u8; 64]),
         };
 
-        let err = validate_recent_chain_proof(&stale, &state).unwrap_err();
+        let err = validate_recent_chain_proof(&stale, &state, &test_attestation_trust()).unwrap_err();
         assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
@@ -1340,11 +1505,11 @@ mod tests {
             finalized_height: 50,
             finalized_header_hash: [0xBB; 32],
             recovery_history_tail: vec![[0; 32]], // zero hash in tail
-            proof_data: vec![],
-            signature_from_recent_producer: None,
+            proof_data: build_proof_data_v1(&[[0; 32]]),
+            signature_from_recent_producer: Some(vec![0u8; 64]),
         };
 
-        let err = validate_recent_chain_proof(&bad, &state).unwrap_err();
+        let err = validate_recent_chain_proof(&bad, &state, &test_attestation_trust()).unwrap_err();
         assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
@@ -1358,13 +1523,17 @@ mod tests {
                 activated_at_height: 1,
                 source_ticket_hash: [0x01; 32],
             },
-            recent_chain_proof: RecentChainProof {
-                finalized_height: 10,
-                finalized_header_hash: [0x02; 32],
-                recovery_history_tail: vec![],
-                proof_data: vec![],
-                signature_from_recent_producer: None,
-            },
+            recent_chain_proof: signed_recent_chain_proof(
+                10,
+                [0x02; 32],
+                vec![],
+                &AuthorizedProducerState {
+                    pq_pubkey: vec![1; 48],
+                    measurement: b"m".to_vec(),
+                    activated_at_height: 1,
+                    source_ticket_hash: [0x01; 32],
+                },
+            ),
         };
 
         assert_eq!(req.recent_chain_proof.finalized_height, 10);
@@ -1412,20 +1581,20 @@ mod tests {
         activated_at_height: u64,
         finalized_height: u64,
     ) -> ArmForProductionRequest {
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pq_pubkey.clone(),
+            measurement: b"prod-enclave-v1".to_vec(),
+            activated_at_height,
+            source_ticket_hash: [0xAA; 32],
+        };
         ArmForProductionRequest {
-            authorized_state: AuthorizedProducerState {
-                pq_pubkey,
-                measurement: b"prod-enclave-v1".to_vec(),
-                activated_at_height,
-                source_ticket_hash: [0xAA; 32],
-            },
-            recent_chain_proof: RecentChainProof {
+            authorized_state: authorized.clone(),
+            recent_chain_proof: signed_recent_chain_proof(
                 finalized_height,
-                finalized_header_hash: [0x11; 32],
-                recovery_history_tail: vec![[0xAA; 32]],
-                proof_data: vec![],
-                signature_from_recent_producer: None,
-            },
+                [0x11; 32],
+                vec![[0xAA; 32]],
+                &authorized,
+            ),
         }
     }
 
@@ -1482,8 +1651,7 @@ mod tests {
 
         let arm_resp = dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
         match arm_resp {
             Response::ArmForProduction(r) => assert_eq!(r.status, "armed"),
             _ => panic!("expected arm success"),
@@ -1492,8 +1660,7 @@ mod tests {
         let ticket = sample_hardfork_ticket(pq, 10_000_100);
         let sign_resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: ticket.clone() }),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         match sign_resp {
             Response::SignAuthorizationTicket(r) => {
@@ -1503,7 +1670,7 @@ mod tests {
             other => panic!("expected sign success, got {:?}", other),
         }
 
-        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state) {
+        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state, test_attestation_trust()) {
             Response::GetStatus(s) => s,
             _ => panic!("expected GetStatus"),
         };
@@ -1518,8 +1685,7 @@ mod tests {
 
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         match resp {
             Response::Error(msg) => assert!(msg.contains("requires the enclave to be armed")),
@@ -1534,14 +1700,12 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq, 10_000_000, 10_000_050)),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         let ticket = sample_hardfork_ticket(vec![0xCD; 48], 10_000_100);
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         match resp {
             Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
@@ -1556,15 +1720,13 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         // activation_height not strictly above proof.finalized_height
         let ticket = sample_hardfork_ticket(pq, 10_000_050);
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         match resp {
             Response::Error(msg) => assert!(msg.contains("activation_height must be strictly greater")),
@@ -1579,8 +1741,7 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 100, 500)),
-            &mut state,
-        );
+            &mut state, test_attestation_trust());
 
         let payload = sample_hardfork_ticket(pq, 600);
         let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload.clone() });
@@ -1591,7 +1752,7 @@ mod tests {
         let received = decode_message(&framed).unwrap();
         let received_cmd: Command = ciborium::de::from_reader(&received.payload[..]).unwrap();
 
-        let resp = dispatch_command_with_state(received_cmd, &mut state);
+        let resp = dispatch_command_with_state(received_cmd, &mut state, test_attestation_trust());
         match resp {
             Response::SignAuthorizationTicket(r) => {
                 assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&payload));
@@ -1603,7 +1764,7 @@ mod tests {
     #[test]
     fn stateful_get_measurement_lists_hardfork_type() {
         let mut state = EnclaveState::Unarmed;
-        let resp = dispatch_command_with_state(Command::GetMeasurement(GetMeasurementRequest { version: 1 }), &mut state);
+        let resp = dispatch_command_with_state(Command::GetMeasurement(GetMeasurementRequest { version: 1 }), &mut state, test_attestation_trust());
         match resp {
             Response::GetMeasurement(r) => {
                 assert!(r.supported_ticket_types.contains(&0));

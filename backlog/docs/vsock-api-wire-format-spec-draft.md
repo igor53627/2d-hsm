@@ -293,9 +293,10 @@ For `ticket_type == 1` (Hard Fork):
 - The enclave **should** have reasonably fresh on-chain view (network second factor) before signing a hard fork announcement.
 - `activation_height` must be strictly greater than the `finalized_height` from the `RecentChainProof` captured at arming (the enclave's last known chain view for this session).
 - `fork_spec_hash` must be non-null.
-- At most **one** hard-fork ticket may be signed per armed session; a second attempt must be refused until re-arming. **Phase 1 caveat:** re-arming is unrestricted and resets this counter; the bound is only meaningful once re-arm requires a cryptographically fresh proof.
+- At most **one** hard-fork ticket may be signed per armed session; a second attempt must be refused until re-arming with a **strictly fresher** `finalized_height` than the current session proof.
+- At hard-fork sign time the enclave **re-runs** full `RecentChainProof` validation (structural + cryptographic) on the armed proof snapshot.
 
-**Phase 1 skeleton (2026-06):** The reference implementation enforces armed state, pubkey match, structural proof re-check, activation-height ordering, and single hard-fork per session. **Cryptographic verification of `proof_data` is not yet implemented** — hard-fork signatures from the skeleton are **not production-ready** until that follow-up lands.
+**TASK-3 (2026-06-02):** The reference `enclave-protocol` crate verifies Producer Chain Attestation v1 at arm and sign time (see §8.1).
 
 For both types:
 - The enclave must never sign a ticket where `pq_pubkey` does not match the key it actually controls.
@@ -372,14 +373,47 @@ Future work (measurement transitions after hard forks, live tip tracking) may ad
 
 ---
 
-## 8. Phase 1 vs production readiness (2026-06-02)
+## 8. RecentChainProof — cryptographic MVP (TASK-3, 2026-06-02)
 
-The reference `enclave-protocol` crate implements the state machine and structural gates for TASK-2 AC #7–#9. The following are **explicitly deferred** and block treating hard-fork signatures as production-safe:
+### 8.1 Producer Chain Attestation v1 (implemented)
 
-1. Cryptographic verification of `RecentChainProof.proof_data` and `signature_from_recent_producer` at `ARM_FOR_PRODUCTION` and at hard-fork sign time.
-2. Live chain-tip refresh between arming and signing (Phase 1 uses the arming-time proof snapshot only).
+The reference enclave verifies this format at **`ARM_FOR_PRODUCTION`** and again at **hard-fork sign** time (fail closed).
 
-Until (1) is implemented, hosts must not treat skeleton hard-fork signatures as enforcing "network as cryptographic second factor" in the full security sense. Tracked as **TASK-3** in `backlog/tasks/`.
+**`proof_data` (33 bytes minimum):**
+
+| Offset | Size | Field |
+|--------|------|--------|
+| 0 | 1 | `format_id = 0x01` |
+| 1 | 32 | `recovery_tail_digest = keccak256(concat recovery_history_tail hashes in order)` |
+
+**`signature_from_recent_producer`:** mandatory **64-byte Ed25519** signature over:
+
+```text
+DOMAIN = "2d-hsm/RecentChainProof/v1\0"
+|| be64(finalized_height)
+|| finalized_header_hash[32]
+|| be64(authorized.activated_at_height)
+|| authorized.source_ticket_hash[32]
+|| recovery_tail_digest[32]
+|| be32(len(pq_pubkey)) || pq_pubkey
+```
+
+**Verifying key (MVP):** a **pinned producer attestation Ed25519 public key** passed to the enclave as `ProducerAttestationTrust` (sealed config / attested provisioning). It must **not** be derived from public `pq_pubkey` — otherwise any host knowing the pubkey could forge proofs.
+
+**Reference crate:** tests and demos use `reference_test_attestation_trust()`; production enclaves load their own trust anchor.
+
+**Structural checks (unchanged):** non-zero header hash, `finalized_height >= activated_at_height`, tail anti-replay when non-empty.
+
+**Re-arm policy:** new proof must have `finalized_height` **strictly greater** than the previous armed session proof; trust anchor bytes must match the current session.
+
+**Host obligation:** hold the attestation **signing** secret (block producer side only); outer CBOR fields must match the signed preimage.
+
+### 8.2 Still deferred (not TASK-3)
+
+1. **Live chain-tip refresh** between arming and signing (arming-time snapshot only).
+2. **Full light-client** / validator-set proofs inside `proof_data` (future format `0x02+`).
+
+PQ ticket signing inside the TEE remains TASK-1; this section only covers the network-second-factor gate.
 
 ---
 

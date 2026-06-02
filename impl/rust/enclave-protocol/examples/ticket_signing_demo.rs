@@ -10,8 +10,9 @@
 //! Запуск: cargo run --example ticket_signing_demo
 
 use enclave_protocol::{
-    AuthorizationTicketPayload, Command, EnclaveState, MessageType, Response,
-    dispatch_command_with_state, encode_message, decode_message,
+    AuthorizationTicketPayload, AuthorizedProducerState, Command, EnclaveState, MessageType,
+    Response, build_signed_recent_chain_proof, dispatch_command_with_state, encode_message,
+    decode_message, reference_test_attestation_signing_key, reference_test_attestation_trust,
 };
 use ciborium::ser::into_writer;
 use ciborium::de::from_reader;
@@ -28,24 +29,27 @@ fn main() {
 
     let mut enclave_state = EnclaveState::Unarmed;
 
+    let authorized = AuthorizedProducerState {
+        pq_pubkey: producer_pubkey.clone(),
+        measurement: b"prod-enclave-v1".to_vec(),
+        activated_at_height: 10_000_000,
+        source_ticket_hash: [0xAA; 32],
+    };
     let arm_req = enclave_protocol::ArmForProductionRequest {
-        authorized_state: enclave_protocol::AuthorizedProducerState {
-            pq_pubkey: producer_pubkey.clone(),
-            measurement: b"prod-enclave-v1".to_vec(),
-            activated_at_height: 10_000_000,
-            source_ticket_hash: [0xAA; 32],
-        },
-        recent_chain_proof: enclave_protocol::RecentChainProof {
-            finalized_height: 10_000_050,
-            finalized_header_hash: [0x11; 32],
-            recovery_history_tail: vec![[0xAA; 32]],
-            proof_data: vec![],
-            signature_from_recent_producer: None,
-        },
+        authorized_state: authorized.clone(),
+        recent_chain_proof: build_signed_recent_chain_proof(
+            10_000_050,
+            [0x11; 32],
+            vec![[0xAA; 32]],
+            &authorized,
+            &reference_test_attestation_signing_key(),
+        )
+        .expect("valid signed proof for demo"),
     };
 
     let arm_cmd = Command::ArmForProduction(arm_req);
-    let arm_resp = dispatch_command_with_state(arm_cmd, &mut enclave_state);
+    let trust = reference_test_attestation_trust();
+    let arm_resp = dispatch_command_with_state(arm_cmd, &mut enclave_state, trust);
     println!("Host → Enclave: ARM_FOR_PRODUCTION");
     match &arm_resp {
         Response::ArmForProduction(r) => println!("  Enclave: {}\n", r.status),
@@ -54,7 +58,7 @@ fn main() {
     }
 
     let status_cmd = Command::GetStatus(enclave_protocol::GetStatusRequest { version: 1 });
-    let status_resp = dispatch_command_with_state(status_cmd, &mut enclave_state);
+    let status_resp = dispatch_command_with_state(status_cmd, &mut enclave_state, trust);
     println!("Host → Enclave: GET_STATUS");
     if let Response::GetStatus(s) = &status_resp {
         println!("  armed: {}", s.armed);
@@ -84,6 +88,7 @@ fn main() {
     if let Response::GetStatus(s) = dispatch_command_with_state(
         Command::GetStatus(enclave_protocol::GetStatusRequest { version: 1 }),
         &mut enclave_state,
+        trust,
     ) {
         println!("After hard-fork sign — GET_STATUS:");
         println!("  pending_hard_fork_height: {:?}", s.pending_hard_fork_height);
@@ -120,22 +125,28 @@ fn main() {
     println!("\n=== Scenario: Hard-fork with stale activation_height (should fail) ===\n");
 
     let mut stale_state = EnclaveState::Unarmed;
-    let arm_for_stale = enclave_protocol::ArmForProductionRequest {
-        authorized_state: enclave_protocol::AuthorizedProducerState {
-            pq_pubkey: vec![0xFF; 48],
-            measurement: b"v2".to_vec(),
-            activated_at_height: 100,
-            source_ticket_hash: [0xBB; 32],
-        },
-        recent_chain_proof: enclave_protocol::RecentChainProof {
-            finalized_height: 200,
-            finalized_header_hash: [0x22; 32],
-            recovery_history_tail: vec![[0xBB; 32]],
-            proof_data: vec![],
-            signature_from_recent_producer: None,
-        },
+    let stale_authorized = AuthorizedProducerState {
+        pq_pubkey: vec![0xFF; 48],
+        measurement: b"v2".to_vec(),
+        activated_at_height: 100,
+        source_ticket_hash: [0xBB; 32],
     };
-    dispatch_command_with_state(Command::ArmForProduction(arm_for_stale), &mut stale_state);
+    let arm_for_stale = enclave_protocol::ArmForProductionRequest {
+        authorized_state: stale_authorized.clone(),
+        recent_chain_proof: build_signed_recent_chain_proof(
+            200,
+            [0x22; 32],
+            vec![[0xBB; 32]],
+            &stale_authorized,
+            &reference_test_attestation_signing_key(),
+        )
+        .expect("valid signed proof for stale-height demo"),
+    };
+    dispatch_command_with_state(
+        Command::ArmForProduction(arm_for_stale),
+        &mut stale_state,
+        reference_test_attestation_trust(),
+    );
 
     let stale_ticket = AuthorizationTicketPayload {
         ticket_type: 1,
@@ -181,7 +192,11 @@ fn simulate_signing_flow(
     let received_command: Command =
         from_reader(&received.payload[..]).expect("deserialize failed");
 
-    let response = dispatch_command_with_state(received_command, state);
+    let response = dispatch_command_with_state(
+        received_command,
+        state,
+        reference_test_attestation_trust(),
+    );
 
     match &response {
         Response::SignAuthorizationTicket(r) => {
