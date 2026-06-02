@@ -19,6 +19,8 @@
 #![allow(missing_docs)]
 
 mod chain_proof_crypto;
+#[cfg(feature = "ml-dsa-65")]
+mod mldsa65;
 mod wire;
 
 use serde::{Deserialize, Serialize};
@@ -37,8 +39,12 @@ pub use chain_proof_crypto::{
 };
 pub use wire::{
     decode_arm_for_production_request, decode_get_status_request, decode_get_status_response,
+    decode_sign_authorization_ticket_request, decode_sign_authorization_ticket_response,
     encode_arm_for_production_request, encode_get_status_request, encode_get_status_response,
+    encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
 };
+#[cfg(feature = "ml-dsa-65")]
+pub use mldsa65::ReferenceMlDsa65Signer;
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -221,15 +227,37 @@ pub struct GetMeasurementResponse {
     pub pq_signing_ready: bool,
 }
 
-/// Whether this build can produce PQ signatures (mock/test vs production ML-DSA).
+/// Whether this build can produce valid on-chain ML-DSA-65 signatures right now.
 pub fn pq_signing_ready() -> bool {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     {
-        true
+        return false;
     }
-    #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(feature = "ml-dsa-65")]
     {
-        false
+        return true;
+    }
+    false
+}
+
+fn measurement_response() -> GetMeasurementResponse {
+    #[cfg(all(feature = "ml-dsa-65", not(feature = "test-support")))]
+    {
+        let signer = mldsa65::ReferenceMlDsa65Signer::global();
+        return GetMeasurementResponse {
+            measurement: b"enclave-measurement-placeholder".to_vec(),
+            attestation: b"attestation-placeholder".to_vec(),
+            pq_pubkey: signer.public_key_bytes_owned(),
+            supported_ticket_types: vec![0, 1],
+            pq_signing_ready: true,
+        };
+    }
+    GetMeasurementResponse {
+        measurement: b"enclave-measurement-placeholder".to_vec(),
+        attestation: b"attestation-placeholder".to_vec(),
+        pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        supported_ticket_types: vec![0, 1],
+        pq_signing_ready: pq_signing_ready(),
     }
 }
 
@@ -830,18 +858,23 @@ pub fn prepare_ticket_for_signing(
 // defined in AGENTS.md / .roborev.toml.
 // =============================================================================
 
-/// Production PQ signature (TASK-1: ML-DSA-65 via mldsa-native inside TEE).
-#[cfg(not(any(test, feature = "test-support")))]
+/// Production PQ signature (TASK-1: ML-DSA-65).
+#[cfg(all(feature = "ml-dsa-65", not(feature = "test-support")))]
+fn produce_pq_signature(ticket_hash: &[u8; 32], _nonce: u64) -> Result<Vec<u8>, ProtocolError> {
+    mldsa65::ReferenceMlDsa65Signer::global().sign_ticket_hash(ticket_hash)
+}
+
+#[cfg(all(not(feature = "ml-dsa-65"), not(feature = "test-support")))]
 fn produce_pq_signature(
     _ticket_hash: &[u8; 32],
     _nonce: u64,
 ) -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
-        "ML-DSA-65 signing not implemented; enable feature test-support for mock-only demos or complete TASK-1",
+        "ML-DSA-65 signing disabled (enable feature ml-dsa-65)",
     ))
 }
 
-/// Deterministic mock for a post-quantum signature (tests / `test-support` only).
+/// Deterministic mock for a post-quantum signature (`test-support` / unit tests without `ml-dsa-65`).
 #[cfg(any(test, feature = "test-support"))]
 fn compute_mock_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Vec<u8> {
     const MOCK_SECRET: &[u8] = b"2d-hsm-track-a-deterministic-mock-pq-sig-secret--DO-NOT-USE-IN-REAL-ENCLAVE--THIS-IS-ONLY-FOR-TESTING-THE-PROTOCOL-LAYER--";
@@ -866,7 +899,12 @@ fn compute_mock_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Vec<u8> {
     sig
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
+fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, ProtocolError> {
+    Ok(compute_mock_pq_signature(ticket_hash, nonce))
+}
+
+#[cfg(all(not(feature = "test-support"), not(feature = "ml-dsa-65"), test))]
 fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, ProtocolError> {
     Ok(compute_mock_pq_signature(ticket_hash, nonce))
 }
@@ -952,19 +990,7 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
-        Command::GetMeasurement(_req) => {
-            // Minimal but useful response for now.
-            // In a real enclave this would return the actual measurement
-            // of the running image + supported operations.
-            Response::GetMeasurement(GetMeasurementResponse {
-                measurement: b"enclave-measurement-placeholder".to_vec(),
-                attestation: b"attestation-placeholder".to_vec(),
-                pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                // Image capability: hard-fork is supported only via the stateful path.
-                supported_ticket_types: vec![0, 1],
-                pq_signing_ready: pq_signing_ready(),
-            })
-        }
+        Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
         Command::ArmForProduction(_) => Response::Error(
             "ARM_FOR_PRODUCTION requires dispatch_command_with_state and an enclave-held ProducerAttestationTrust (host cannot supply the trust anchor)".to_string(),
         ),
@@ -992,15 +1018,7 @@ pub fn dispatch_command_with_state(
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
-        Command::GetMeasurement(_req) => {
-            Response::GetMeasurement(GetMeasurementResponse {
-                measurement: b"enclave-measurement-placeholder".to_vec(),
-                attestation: b"attestation-placeholder".to_vec(),
-                pq_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                supported_ticket_types: vec![0, 1],
-                pq_signing_ready: pq_signing_ready(),
-            })
-        }
+        Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
         Command::ArmForProduction(req) => {
             match arm_for_production(state, req, attestation_trust) {
                 Ok(new_state) => {
@@ -1818,6 +1836,14 @@ mod tests {
         match sign_resp {
             Response::SignAuthorizationTicket(r) => {
                 assert_eq!(r.ticket_hash, compute_canonical_ticket_hash(&ticket));
+                #[cfg(feature = "ml-dsa-65")]
+                {
+                    assert_eq!(r.signature.len(), ML_DSA65_SIGNATURE_LEN);
+                    mldsa65::ReferenceMlDsa65Signer::global()
+                        .verify_ticket_hash(&r.ticket_hash, &r.signature)
+                        .unwrap();
+                }
+                #[cfg(feature = "test-support")]
                 assert_eq!(r.signature.len(), 64);
             }
             other => panic!("expected sign success, got {:?}", other),
@@ -1979,7 +2005,10 @@ mod tests {
         match resp {
             Response::GetMeasurement(r) => {
                 assert_eq!(r.supported_ticket_types, vec![0, 1]); // static capability; type=1 needs armed state
-                assert!(r.pq_signing_ready); // cfg(test): mock signing available
+                #[cfg(feature = "ml-dsa-65")]
+                assert!(r.pq_signing_ready);
+                #[cfg(feature = "test-support")]
+                assert!(!r.pq_signing_ready);
                 assert!(!r.measurement.is_empty());
             }
             _ => panic!("expected GetMeasurement response"),

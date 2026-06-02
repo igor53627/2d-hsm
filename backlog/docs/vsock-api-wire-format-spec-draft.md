@@ -33,7 +33,7 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Context `ctx`** | Empty (`len(ctx) = 0`) unless a future spec version defines a non-empty domain string (both enclave and 2d precompile must match) |
 | **RNG** | Hedged signing requires a CSPRNG inside the TEE (platform TRNG / NSM-seeded `getrandom`); silent RNG failure must abort sign (fail closed) |
 | **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
-| **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1** in `encode_message` / `decode_message`); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1** today). Bump **both** to **2** when TASK-1 ships ML-DSA-65 on the wire so peers reject 64-byte mock PQ signatures |
+| **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1**); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1**). Stay on **v1** until an external deployment exists; use `pq_signing_ready` + signature length (3309 B) to detect mock-era peers |
 
 Until TASK-1 lands, the reference crate may return a **64-byte mock** PQ signature for demos only (`test-support`). Hosts and precompiles **must not** treat 64-byte PQ signatures as valid in production.
 
