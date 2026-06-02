@@ -1951,8 +1951,8 @@ mod tests {
         assert_eq!(status.last_known_block, Some(10_000_050));
         #[cfg(feature = "ml-dsa-65")]
         {
-            drop(_pq_guard);
             pq_signer::end_sealed_signer_test_session();
+            drop(_pq_guard);
         }
     }
 

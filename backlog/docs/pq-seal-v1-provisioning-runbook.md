@@ -28,6 +28,7 @@ Operator procedures for provisioning the **ML-DSA-65 Block Producer key** into a
 - [ ] Target enclave **measurement** bytes fixed for this image build (PCR / policy hash / manifest digest — same definition the enclave uses at `install_sealed_pq_signer`).
 - [ ] **Provisioning root** agreed for this environment (staging: 32-byte file; production: platform-derived).
 - [ ] `pq-seal-v1` built: `cd impl/rust/pq-seal-v1 && cargo build --release`
+- [ ] For §3 commands below, run from `impl/rust/pq-seal-v1` (binary: `./target/release/pq-seal-v1`)
 - [ ] Enclave binary built with `ml-dsa-65`; production builds **without** `reference-seal-v1-root`
 - [ ] `ProducerAttestationTrust` configured inside enclave (separate from PQ seal — §9.3 in vsock spec)
 
@@ -51,7 +52,7 @@ Optional check:
 **Option A — generate new producer key (staging only):**
 
 ```bash
-pq-seal-v1 generate-keypair \
+./target/release/pq-seal-v1 generate-keypair \
   --secret-key-out /secure/producer.sk.bin \
   --public-key-out /secure/producer.pk.bin
 ```
@@ -63,7 +64,7 @@ Verify file sizes before sealing.
 ### 3.3 Seal blob (staging root)
 
 ```bash
-pq-seal-v1 seal \
+./target/release/pq-seal-v1 seal \
   --measurement-file ./enclave.measurement \
   --secret-key-file /secure/producer.sk.bin \
   --public-key-file /secure/producer.pk.bin \
@@ -76,7 +77,7 @@ Expected: **6053** byte output; stderr includes `meas_digest=...`.
 ### 3.4 Verify before handoff
 
 ```bash
-pq-seal-v1 verify \
+./target/release/pq-seal-v1 verify \
   --sealed-blob-file /secure/producer-key.sealed \
   --measurement-file ./enclave.measurement \
   --provisioning-root-file impl/rust/enclave-protocol/testvectors/seal_v1_provisioning_root.bin

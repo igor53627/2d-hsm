@@ -129,12 +129,16 @@ fn read_measurement(args_file: &Option<PathBuf>, args_hex: &Option<String>) -> R
 }
 
 fn read_root_32(path: &PathBuf) -> Result<Zeroizing<[u8; 32]>, CliError> {
-    let bytes = Zeroizing::new(fs::read(path)?);
-    let root: [u8; 32] = (*bytes)
-        .as_slice()
-        .try_into()
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut root = Zeroizing::new([0u8; 32]);
+    file.read_exact(root.as_mut())
         .map_err(|_| CliError::Msg("provisioning root must be exactly 32 bytes".into()))?;
-    Ok(Zeroizing::new(root))
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(CliError::Msg("provisioning root must be exactly 32 bytes".into()));
+    }
+    Ok(root)
 }
 
 /// Write high-value secret material with restrictive permissions (Unix 0o600).
@@ -151,7 +155,11 @@ fn write_secret_file(path: &PathBuf, data: &[u8]) -> Result<(), CliError> {
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, data)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(data)?;
         Ok(())
     }
 }

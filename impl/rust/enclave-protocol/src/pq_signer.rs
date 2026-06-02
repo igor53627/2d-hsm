@@ -198,11 +198,11 @@ pub fn install_sealed_pq_signer(
     sealed_blob: &[u8],
     enclave_measurement: &[u8],
 ) -> Result<(), ProtocolError> {
-    let (mut sk_bytes, mut pk_bytes) = unseal_sealed_keypair(sealed_blob, enclave_measurement)?;
-    let result = install_signer_from_key_material(&mut sk_bytes, &mut pk_bytes);
-    zeroize_vec(&mut sk_bytes);
-    zeroize_vec(&mut pk_bytes);
-    result
+    use zeroize::Zeroizing;
+    let (sk_bytes, pk_bytes) = unseal_sealed_keypair(sealed_blob, enclave_measurement)?;
+    let mut sk_bytes = Zeroizing::new(sk_bytes);
+    let mut pk_bytes = Zeroizing::new(pk_bytes);
+    install_signer_from_key_material(sk_bytes.as_mut(), pk_bytes.as_mut())
 }
 
 #[cfg(not(feature = "ml-dsa-65"))]
@@ -263,11 +263,13 @@ mod v1_seal {
     }
 
     pub(crate) fn resolve_provisioning_root() -> Result<[u8; 32], ProtocolError> {
-        if let Ok(guard) = super::PLATFORM_PROVISIONING_ROOT.lock() {
-            if let Some(root) = *guard {
-                return Ok(root);
-            }
+        let guard = super::PLATFORM_PROVISIONING_ROOT
+            .lock()
+            .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
+        if let Some(root) = *guard {
+            return Ok(root);
         }
+        drop(guard);
         #[cfg(any(test, feature = "reference-seal-v1-root"))]
         {
             return Ok(*include_bytes!("../testvectors/seal_v1_provisioning_root.bin"));
@@ -299,7 +301,8 @@ mod v1_seal {
         sealed_blob: &[u8],
         enclave_measurement: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-        let root = resolve_provisioning_root()?;
+        use zeroize::Zeroizing;
+        let root = Zeroizing::new(resolve_provisioning_root()?);
         unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, &root)
     }
 
@@ -435,11 +438,12 @@ mod v1_seal {
         enclave_measurement: &[u8],
         provisioning_root: &[u8; 32],
     ) -> Result<(), ProtocolError> {
-        let (mut sk, mut pk) =
+        use zeroize::Zeroizing;
+        let (sk, pk) =
             unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, provisioning_root)?;
-        MlDsa65Signer::from_verified_key_bytes(&sk, &pk)?;
-        zeroize_vec(&mut sk);
-        zeroize_vec(&mut pk);
+        let sk = Zeroizing::new(sk);
+        let pk = Zeroizing::new(pk);
+        MlDsa65Signer::from_verified_key_bytes(sk.as_ref(), pk.as_ref())?;
         Ok(())
     }
 }
