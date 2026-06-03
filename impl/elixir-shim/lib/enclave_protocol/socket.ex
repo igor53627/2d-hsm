@@ -21,7 +21,7 @@ defmodule EnclaveProtocol.Socket do
   def request(socket, frame) when is_port(socket) and is_binary(frame) do
     with :ok <- :gen_tcp.send(socket, frame),
          {:ok, <<len::unsigned-big-integer-size(32)>>} <- read_exact(socket, 4),
-         true <- len > 0 and len <= Framing.max_payload_len(),
+         true <- len > 0 and len <= Framing.max_total_len(),
          {:ok, body} <- read_exact(socket, len) do
       {:ok, <<len::unsigned-big-integer-size(32), body::binary>>}
     else

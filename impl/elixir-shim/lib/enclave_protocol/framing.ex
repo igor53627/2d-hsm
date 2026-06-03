@@ -5,7 +5,8 @@ defmodule EnclaveProtocol.Framing do
   """
 
   @protocol_version 1
-  @max_payload_len 1_048_576
+  # Spec § framing: cap applies to `total_len` (= 2 + payload), not payload alone.
+  @max_total_len 1_048_576
   @msg_get_measurement 0x01
   @msg_sign_authorization_ticket 0x10
   @msg_arm_for_production 0x20
@@ -27,7 +28,7 @@ defmodule EnclaveProtocol.Framing do
   def protocol_version, do: @protocol_version
 
   @doc false
-  def max_payload_len, do: @max_payload_len
+  def max_total_len, do: @max_total_len
 
   @doc """
   Build a framed GET_MEASUREMENT request (integer-key CBOR payload `{1 => 1}`).
@@ -55,7 +56,7 @@ defmodule EnclaveProtocol.Framing do
         <<total_len::unsigned-big-integer-size(32), version, msg_type, payload::binary>>
       ) do
     cond do
-      total_len > @max_payload_len ->
+      total_len > @max_total_len ->
         {:error, {:frame_too_large, total_len}}
 
       version != @protocol_version ->

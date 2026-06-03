@@ -47,7 +47,17 @@ Per `AGENTS.md`:
 
 **Full matrix** (+ concurrency lens) is required for first state-machine introduction, core gating changes, and all `impl/**/*.rs` changes touching ticket signing, `ARM_FOR_PRODUCTION`, hard-fork transition, or key lifecycle — see AGENTS.md.
 
-TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, `6dced02`). TASK-2 Phase 4 (stateful host session + Elixir shim) requires Full Matrix before merge.
+TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, `6dced02`).
+
+### TASK-2 Phase 4 review record (PR #3 — do not merge on Reduced alone for the initial intro)
+
+| Phase | Commits / topic | Matrix | Compact |
+|-------|-----------------|--------|---------|
+| Initial intro | stateful session, Elixir, wire | Reduced **6717–6721**, **6755–6757** + Full 2×3 **6758–6763** (`pse-review-2x3.sh`) | **6765** (2 HIGH → fixed before `47d141c`) |
+| Shared-state fix | `47d141c` UDS anti-equivocation | Reduced **6773–6778** | **6778** (no code High) |
+| Doc alignment | `8baa062` plan/README/spec | Reduced **6781–6783** | **6785** (doc gate wording; reconciled below) |
+
+**Merge rule:** First introduction of `EnclaveState` over transport required **Full Matrix** (table row 1). Later rows are follow-ups inside that reviewed direction (Reduced + compact per `AGENTS.md`). Cite this table in PR description; do not mark the task “reviewed” with only the latest Reduced run.
 
 **Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks in `cfg(test)` / `demo-mock-sign` when no sealed signer is installed (production fail-closed). Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
 

@@ -49,4 +49,4 @@ mix test --only integration  # optional tag; default mix test runs all
 
 ## High-risk review
 
-This shim is part of **TASK-2 Phase 4** (stateful session, ARM, SIGN). Per `impl/README.md` and `AGENTS.md`, merge requires the **Full Matrix** (Reduced 3-review set + concurrency 2×3 floor where applicable) and `roborev compact --wait` — not Reduced alone. Framing/CBOR edits in this tree are never isolated from arming/signing gating.
+This shim is part of **TASK-2 Phase 4** (stateful session, ARM, SIGN). Merge review ladder (Full on intro + follow-up Reduced): see **`impl/README.md` → TASK-2 Phase 4 review record**. Framing/CBOR edits here are never isolated from arming/signing gating.
