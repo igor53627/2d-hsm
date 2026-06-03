@@ -3,7 +3,7 @@
 set -euo pipefail
 
 GUEST_CID="${GUEST_CID:-42}"
-PORT="${2D_HSM_VSOCK_PORT:-5000}"
+PORT="${HSM_VSOCK_PORT:-5000}"
 
 python3 <<PY
 import socket, struct, os

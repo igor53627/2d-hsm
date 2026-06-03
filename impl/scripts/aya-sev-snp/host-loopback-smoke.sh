@@ -3,7 +3,7 @@
 set -euo pipefail
 
 BIN="${HSM_BIN:-/root/2d-hsm/impl/rust/enclave-protocol/target/debug/enclave-vsock-staging}"
-PORT="${2D_HSM_VSOCK_PORT:-5000}"
+PORT="${HSM_VSOCK_PORT:-5000}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "Build first: cd impl/rust/enclave-protocol && cargo build --bin enclave-vsock-staging --features staging-vsock"
