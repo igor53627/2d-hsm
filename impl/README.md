@@ -59,17 +59,32 @@ TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, 
 
 **Merge rule:** First introduction of `EnclaveState` over transport required **Full Matrix** (table row 1). Later rows are follow-ups inside that reviewed direction (Reduced + compact per `AGENTS.md`). Cite this table in PR description; do not mark the task “reviewed” with only the latest Reduced run.
 
-**Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks in `cfg(test)` / `demo-mock-sign` when no sealed signer is installed (production fail-closed). Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
+**Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks only under `test-support` / `demo-mock-sign` (or `ml-dsa-65` tests **without** `reference-test-key`). With `reference-test-key`, unit tests fail closed if the sealed signer is not installed. Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
 
 ## Building and testing
 
 ```bash
 cd rust/enclave-protocol
-cargo test --features ml-dsa-65,pq-seal-provisioning
+# Seal/provisioning CLI + ML-DSA unit tests (no reference-key / staging-host)
+cargo test --features ml-dsa-65,pq-seal-provisioning   # 74 lib tests
 
 # Reference host session / wire integration (mutually exclusive with ml-dsa-65):
 cargo test --features test-support,demo-mock-sign
+
+# TASK-1 staging: real ML-DSA-65 + fail-closed SIGN (`reference-test-key` pulls seal + provisioning)
+cargo test --features reference-test-key
+cargo build --bin enclave-uds-staging --features staging-host   # debug only; release + staging-host fails at compile time
+./target/debug/enclave-uds-staging
+# Optional socket override (do not use 2D_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
+# 2D_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
 ```
+
+| Profile | Features | SIGN signature | Binaries |
+|---------|----------|----------------|----------|
+| Dev mock (TASK-2) | `test-support`, `demo-mock-sign` | 64-byte deterministic mock | `enclave-uds-server`, `enclave-stdio-session` |
+| Seal / provisioning (CLI) | `ml-dsa-65`, `pq-seal-provisioning` | N/A (seal/unseal unit tests only) | `pq-seal-v1` CLI (sibling crate) |
+| Staging (TASK-1 slice) | `staging-host` | ML-DSA-65 (3309 B); fail-closed without seal at boot | `enclave-uds-staging` (debug build only) |
+| ML-DSA integration tests | `reference-test-key` | ML-DSA-65 (3309 B); fail-closed without `install_*` in test | (library tests only) |
 
 Optional CI gate for Solidity cross-check:
 
@@ -109,8 +124,10 @@ v0 seal/unseal helpers compile only under `cargo test --features ml-dsa-65` (not
 
 At boot (production):
 
-1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock).
+1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock), or `boot_configure_pq_seal_v1_platform_root()` once a platform hook is linked.
 2. `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic).
+
+Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo profile name `release`** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`. Custom Cargo profiles that do not report `PROFILE=release` are not covered; use a deploy-time feature audit until a second gate lands.
 
 Staging/CI may use `reference-seal-v1-root` or `cargo test` (embedded test root). v0 XOR is **unit-test only**. **Do not** ship `reference-seal-v1-root` in deployment images.
 
@@ -137,9 +154,19 @@ cargo build --bin enclave-stdio-session --bin enclave-uds-server --features test
 cd ../../elixir-shim && mix test
 ```
 
-## Still deferred (follow-on, not TASK-2 blockers)
+## Staging UDS (TASK-1, PR #4)
 
-- Platform-specific root derivation (vTPM / SNP VMPL / Nitro) in production enclave images
+```bash
+cd rust/enclave-protocol
+cargo build --bin enclave-uds-staging --features staging-host
+./target/debug/enclave-uds-staging   # default ~/.2d-hsm/enclave-staging.sock
+# Override: 2D_HSM_ENCLAVE_STAGING_SOCKET — operator must use a private parent (mode 0700,
+# owned by the server UID); the binary does not enforce this on custom paths.
+```
+
+## Still deferred (follow-on)
+
+- Hardware-backed root derivation (vTPM / SNP VMPL / Nitro) wired into `boot_configure_pq_seal_v1_platform_root`
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
 - Production **AF_VSOCK** transport (Unix socket + stdio are reference dev paths)

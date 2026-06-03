@@ -7,9 +7,14 @@ use crate::{
 };
 use crate::{build_signed_recent_chain_proof, reference_test_attestation_signing_key};
 
-/// Pre-built `ARM_FOR_PRODUCTION` framed message for reference tests.
+/// Pre-built `ARM_FOR_PRODUCTION` framed message for reference tests (placeholder 48-byte PQ).
 pub fn sample_arm_for_production_frame() -> Vec<u8> {
-    let pq = vec![0xDE; 48];
+    sample_arm_for_production_frame_with_pubkey(vec![0xDE; 48])
+}
+
+/// ARM frame with a specific `pq_pubkey` (use sealed signer key for ML-DSA staging tests).
+pub fn sample_arm_for_production_frame_with_pubkey(pq_pubkey: Vec<u8>) -> Vec<u8> {
+    let pq = pq_pubkey;
     let authorized = AuthorizedProducerState {
         pq_pubkey: pq.clone(),
         measurement: b"prod-enclave-v1".to_vec(),

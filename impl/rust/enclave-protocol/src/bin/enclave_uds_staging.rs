@@ -1,12 +1,12 @@
-//! Unix domain socket server — dev transport matching vsock framing (TASK-2 Phase 4).
+//! Unix domain socket server — **staging** profile (TASK-1 slice).
 //!
-//! **Dev only:** one shared [`EnclaveState`] per server process (all connections), matching a
-//! single enclave instance. Socket under `~/.2d-hsm/` (parent `0700`), mode `0600`.
-//! Any same-UID process that can open the socket may issue ARM/SIGN — not a production auth boundary.
+//! Like `enclave-uds-server` but built with `staging-host`: installs the reference ML-DSA-65
+//! sealed signer at boot (fail-closed SIGN without seal). **Not for production.**
 
 use enclave_protocol::{
-    bind_unix_listener, default_dev_socket_dir, process_framed_with_shared_state,
-    read_framed_message, write_framed_message, EnclaveState, HostSession,
+    bind_unix_listener, default_dev_socket_dir, install_reference_sealed_signer_staging,
+    is_sealed_signer_installed, process_framed_with_shared_state, pq_signing_ready,
+    read_framed_message, reference_test_attestation_trust, write_framed_message, EnclaveState,
     ProducerAttestationTrust,
 };
 use std::env;
@@ -21,18 +21,18 @@ const MAX_CONCURRENT_SESSIONS: usize = 32;
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One enclave process: shared authorization state across all UDS client connections.
 struct SharedEnclaveRuntime {
     state: Arc<Mutex<EnclaveState>>,
     attestation_trust: ProducerAttestationTrust,
 }
 
 impl SharedEnclaveRuntime {
-    fn reference_test() -> Self {
-        Self {
+    fn staging() -> Result<Self, enclave_protocol::ProtocolError> {
+        install_reference_sealed_signer_staging()?;
+        Ok(Self {
             state: Arc::new(Mutex::new(EnclaveState::Unarmed)),
-            attestation_trust: HostSession::reference_test().attestation_trust,
-        }
+            attestation_trust: reference_test_attestation_trust(),
+        })
     }
 }
 
@@ -46,28 +46,31 @@ impl Drop for SessionSlotGuard {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("enclave-uds-server: {e}");
+        eprintln!("enclave-uds-staging: {e}");
         std::process::exit(1);
     }
 }
 
 fn default_socket_path() -> PathBuf {
-    default_dev_socket_dir().join("enclave.sock")
+    default_dev_socket_dir().join("enclave-staging.sock")
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::var("2D_HSM_ENCLAVE_SOCKET")
+    // Separate from dev `2D_HSM_ENCLAVE_SOCKET` so staging cannot unlink the mock server's socket.
+    let path = env::var("2D_HSM_ENCLAVE_STAGING_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_socket_path());
     let private_dir = default_dev_socket_dir();
     let listener = bind_unix_listener(&path, &private_dir)?;
+
+    let runtime = Arc::new(SharedEnclaveRuntime::staging()?);
     eprintln!(
-        "enclave-uds-server listening on {} (mode 0600, shared enclave state, max {} connections)",
+        "enclave-uds-staging listening on {} (ML-DSA sealed signer installed={}, pq_signing_ready={})",
         path.display(),
-        MAX_CONCURRENT_SESSIONS
+        is_sealed_signer_installed(),
+        pq_signing_ready()
     );
 
-    let runtime = Arc::new(SharedEnclaveRuntime::reference_test());
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let stream = match stream {

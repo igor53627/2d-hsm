@@ -3,10 +3,10 @@ id: TASK-2
 title: >-
   Design and implement vsock API + wire protocol for TEE signing service
   (Authorization Tickets + Hard Fork flows)
-status: Ready for Review
+status: Done
 assignee: []
 created_date: '2026-05-31 18:38'
-updated_date: '2026-06-03 12:00'
+updated_date: '2026-06-03 14:00'
 labels: []
 dependencies:
   - TASK-3

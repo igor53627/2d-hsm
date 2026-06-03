@@ -171,7 +171,7 @@ This plan ensures we carry the same rigor that caught the two HIGH issues in the
 
 ## Progress update (2026-06-02)
 
-Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 staging slice** are **in tree** (`enclave-protocol`; **~62** tests default `cargo test`, **70** with `ml-dsa-65` / `pq-seal-provisioning`). Merged: `60eeefc` (PR #1). Documentation entry points:
+Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1** are **on `main`** (`enclave-protocol`; **~62** tests default `cargo test`, **74** with `ml-dsa-65,pq-seal-provisioning`, **80** with `reference-test-key`). Merged: `60eeefc` (PR #1) + TASK-2 `3af56b9` (PR #3). Documentation entry points:
 
 - `impl/README.md` — build, dispatch APIs, `pq-seal-v1` CLI
 - `backlog/docs/vsock-api-wire-format-spec-draft.md` — §2.1 seal v1 + §8–§9.3 (v0.2)
@@ -180,12 +180,13 @@ Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 st
 
 **Recommended next increments (ordered):**
 
-1. **TASK-2 PR** — single stack: wire session + Elixir UDS + docs. **Merge:** Full Matrix on initial Phase 4 intro (roborev **6758–6763** + compact **6765**) plus follow-up Reduced + compact on material fixes (**6778** @ `47d141c`, **6785** @ doc commits). See `impl/README.md` review table — not “Reduced only.”
-2. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + **`process_framed_with_shared_state`** (one `EnclaveState` per enclave process). Do **not** give each vsock connection its own `HostSession` — that reintroduces hard-fork anti-equivocation bugs (see `enclave-uds-server` + compact 6765/6778). `HostSession` remains a single-connection convenience wrapper only.
-3. **TASK-1 follow-ups** — platform `set_pq_seal_v1_provisioning_root`; prod CI gate; verify-path zeroization debt.
-4. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing. Concurrency lens when implementing.
+1. ~~**TASK-2 PR**~~ — **Done** (merged `main` @ `3af56b9`, 2026-06-03). Review ladder: `impl/README.md`.
+2. **TASK-1 staging transport + platform boot hook (PR #4, in progress)** — items 2–3 shipped together: `staging-host` / `enclave-uds-staging`, `2D_HSM_ENCLAVE_STAGING_SOCKET`, `boot_configure_pq_seal_v1_platform_root`, optional `platform-provisioning-from-file` (labs), **`release_build` compile_error** on reference/staging features.
+3. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + **`process_framed_with_shared_state`**. **Blocked** until hardware-backed `set_pq_seal_v1_provisioning_root` (vTPM/SNP/Nitro) — the PR #4 hook alone is not sufficient.
+4. **TASK-1 follow-ups** — deploy-time feature audit / second release gate; verify-path zeroization debt; full operator runbook.
+5. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing. Concurrency lens when implementing.
 
-**Session status (2026-06-03):** TASK-2 Phase 4 reference host path done. Review ladder: Full **6758–6763** + **6765** → fix **47d141c** → Reduced **6778** → docs **8baa062** → Reduced **6785**. AC #1–#6 closed; **Ready for Review** / merge when PR cites the full ladder (`impl/README.md`).
+**Session status (2026-06-03):** TASK-2 **Done** on `main`. Active: **PR #4** (plan item 2 = staging UDS + platform boot hook).
 
 **Task board:** `backlog/tasks/task-{1,2,3}` updated with this plan.
 

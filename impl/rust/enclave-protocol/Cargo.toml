@@ -5,6 +5,7 @@ edition = "2021"
 description = "Canonical vsock wire protocol between 2D host and TEE signing service (high-risk component)"
 license = "MIT OR Apache-2.0"
 publish = false
+build = "build.rs"
 
 [dependencies]
 ciborium = "0.2"
@@ -39,11 +40,21 @@ ml-dsa-65 = [
 pq-seal-provisioning = ["ml-dsa-65"]
 # Staging/CI: reference v1 seal root (not for production deployment).
 reference-seal-v1-root = ["ml-dsa-65"]
+# Lab/integration: load 32-byte root from `2D_HSM_PQ_SEAL_V1_ROOT_FILE` at boot (debug builds only).
+platform-provisioning-from-file = ["ml-dsa-65"]
 # Public NIST test-vector keypair — `cargo test` only (see vsock spec §2.1).
-reference-test-key = ["ml-dsa-65", "reference-seal-v1-root"]
+reference-test-key = ["ml-dsa-65", "reference-seal-v1-root", "pq-seal-provisioning"]
 # Mock 64-byte PQ + reference Ed25519 attestation keys for local dev (see vsock spec §2.1).
 # Mutually exclusive with ml-dsa-65 (compile_error in lib.rs).
 test-support = ["dep:hex"]
+# Staging/CI enclave profile: real ML-DSA-65 + reference seal (mutually exclusive with test-support via ml-dsa-65).
+staging-host = [
+    "ml-dsa-65",
+    "pq-seal-provisioning",
+    "reference-seal-v1-root",
+    "reference-test-key",
+    "dep:hex",
+]
 # Enables mock PQ signing in the ticket_signing_demo example only (pq_signing_ready stays false).
 demo-mock-sign = ["test-support"]
 enforce-forge-crosscheck = []
@@ -74,6 +85,11 @@ required-features = ["test-support"]
 name = "enclave-uds-server"
 path = "src/bin/enclave_uds_server.rs"
 required-features = ["test-support"]
+
+[[bin]]
+name = "enclave-uds-staging"
+path = "src/bin/enclave_uds_staging.rs"
+required-features = ["staging-host"]
 
 [[example]]
 name = "ticket_signing_demo"
