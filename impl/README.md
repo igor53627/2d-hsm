@@ -59,27 +59,28 @@ TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, 
 
 **Merge rule:** First introduction of `EnclaveState` over transport required **Full Matrix** (table row 1). Later rows are follow-ups inside that reviewed direction (Reduced + compact per `AGENTS.md`). Cite this table in PR description; do not mark the task “reviewed” with only the latest Reduced run.
 
-**Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks in `cfg(test)` / `demo-mock-sign` when no sealed signer is installed (production fail-closed). Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
+**Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks only under `test-support` / `demo-mock-sign` (or `ml-dsa-65` tests **without** `reference-test-key`). With `reference-test-key`, unit tests fail closed if the sealed signer is not installed. Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
 
 ## Building and testing
 
 ```bash
 cd rust/enclave-protocol
+# Seal/provisioning CLI + ML-DSA unit tests (no reference-key integration tests)
 cargo test --features ml-dsa-65,pq-seal-provisioning
 
 # Reference host session / wire integration (mutually exclusive with ml-dsa-65):
 cargo test --features test-support,demo-mock-sign
 
-# TASK-1 staging slice: real ML-DSA-65 signatures (reference sealed key; no 64-byte mock)
-cargo test --features ml-dsa-65,reference-test-key,reference-seal-v1-root
+# TASK-1 staging: real ML-DSA-65 + fail-closed SIGN (`reference-test-key` pulls seal + provisioning)
+cargo test --features reference-test-key
 cargo build --bin enclave-uds-staging --features staging-host
 ```
 
 | Profile | Features | SIGN signature | Binaries |
 |---------|----------|----------------|----------|
 | Dev mock (TASK-2) | `test-support`, `demo-mock-sign` | 64-byte deterministic mock | `enclave-uds-server`, `enclave-stdio-session` |
-| Staging (TASK-1 slice) | `staging-host` (= `ml-dsa-65` + reference seal) | ML-DSA-65 (3309 B) | `enclave-uds-staging` |
-| Production-shaped tests | `ml-dsa-65`, `reference-test-key` | Sealed reference key in tests; **fail-closed** without `install_*` |
+| Staging (TASK-1 slice) | `staging-host` | ML-DSA-65 (3309 B); fail-closed without seal at boot | `enclave-uds-staging` |
+| ML-DSA integration tests | `reference-test-key` | ML-DSA-65 (3309 B); fail-closed without `install_*` in test | (library tests only) |
 
 Optional CI gate for Solidity cross-check:
 

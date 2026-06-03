@@ -65,6 +65,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| default_socket_path());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Only tighten ~/.2d-hsm; custom 2D_HSM_ENCLAVE_SOCKET parents are the operator's responsibility.
         if Some(parent) == default_socket_path().parent() {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }

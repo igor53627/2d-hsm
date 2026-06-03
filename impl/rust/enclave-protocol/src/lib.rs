@@ -1120,15 +1120,14 @@ impl HostSession {
     }
 }
 
-/// Install the public ML-DSA-65 reference keypair as a v1 sealed signer (staging/CI only).
-///
-/// Uses `testvectors/mldsa65_reference_{sk,pk}.bin` and measurement `prod-enclave-v1`
-/// (aligned with `host_test_fixtures`). **Not for production deployment.**
-#[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
 /// Measurement bytes shared by staging install + `host_test_fixtures` ARM frames.
 #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
 pub const REFERENCE_STAGING_MEASUREMENT: &[u8] = b"prod-enclave-v1";
 
+/// Install the public ML-DSA-65 reference keypair as a v1 sealed signer (staging/CI only).
+///
+/// Uses `testvectors/mldsa65_reference_{sk,pk}.bin` and [`REFERENCE_STAGING_MEASUREMENT`].
+/// **Not for production deployment.**
 #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
 pub fn install_reference_sealed_signer_staging() -> Result<(), ProtocolError> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors");
@@ -2441,10 +2440,12 @@ mod tests {
 
     #[test]
     fn stateful_arm_then_sign_hardfork_succeeds() {
-        #[cfg(feature = "ml-dsa-65")]
+        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         let _pq_guard = install_reference_sealed_signer_for_tests();
-        #[cfg(feature = "ml-dsa-65")]
+        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         let pq = pq_signer::sealed_signer_public_key_bytes().expect("sealed signer");
+        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
+        let pq = vec![0xDE; 48];
         #[cfg(not(feature = "ml-dsa-65"))]
         let pq = vec![0xDE; 48];
         let mut state = EnclaveState::Unarmed;
@@ -2505,7 +2506,7 @@ mod tests {
     fn stateful_sign_hardfork_wrong_pubkey_fails() {
         let mut state = EnclaveState::Unarmed;
 
-        #[cfg(feature = "ml-dsa-65")]
+        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         {
             let _guard = install_reference_sealed_signer_for_tests();
             let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed signer");
@@ -2528,7 +2529,7 @@ mod tests {
             }
         }
 
-        #[cfg(not(feature = "ml-dsa-65"))]
+        #[cfg(not(all(feature = "ml-dsa-65", feature = "reference-test-key")))]
         {
             let pq = vec![0xDE; 48];
             dispatch_command_with_state(
@@ -2701,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ml-dsa-65")]
+    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
     fn sealed_signer_sets_pq_signing_ready_and_measurement_pubkey() {
         let _guard = install_reference_sealed_signer_for_tests();
         assert!(pq_signing_ready());
@@ -2716,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ml-dsa-65")]
+    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
     fn recovery_sign_rejects_pq_pubkey_mismatch_when_sealed() {
         let _guard = install_reference_sealed_signer_for_tests();
         let ticket = AuthorizationTicketPayload {
@@ -2734,7 +2735,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ml-dsa-65")]
+    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
     fn recovery_sign_accepts_matching_pq_pubkey_when_sealed() {
         let _guard = install_reference_sealed_signer_for_tests();
         let pk = pq_signer::sealed_signer_public_key_bytes().unwrap();
