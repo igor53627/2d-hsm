@@ -5,8 +5,11 @@ use std::io;
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use vsock::{VsockAddr, VsockListener};
 
-/// Default Nitro-style enclave CID (parent VM is typically CID 3 for the enclave side in many setups).
+/// Default Nitro-style enclave CID (many Nitro setups use CID 3 for the enclave listener).
+/// On generic Linux dev hosts (e.g. SEV loopback on **aya**), use `2D_HSM_VSOCK_CID=1` or `4294967295`.
 pub const DEFAULT_VSOCK_CID: u32 = 3;
+/// Loopback-friendly CID (`VMADDR_CID_LOCAL`) for `vsock_loopback` on dev Linux.
+pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
 /// Default vsock service port for the signing service (override via `2D_HSM_VSOCK_PORT`).
 pub const DEFAULT_VSOCK_PORT: u32 = 5000;
 

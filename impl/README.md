@@ -159,7 +159,9 @@ cd ../../elixir-shim && mix test
 ```bash
 cd rust/enclave-protocol
 cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Linux only
-# 2D_HSM_VSOCK_CID=3 2D_HSM_VSOCK_PORT=5000 ./target/debug/enclave-vsock-staging
+# Nitro-style: 2D_HSM_VSOCK_CID=3 2D_HSM_VSOCK_PORT=5000
+# SEV dev host (aya, vsock_loopback): 2D_HSM_VSOCK_CID=1 2D_HSM_VSOCK_PORT=5000
+./target/debug/enclave-vsock-staging
 ```
 
 Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Build on Linux** (e.g. SEV dev host `aya`, CI, Nitro parent) — not a runnable vsock server on macOS (compile-only stub there). At runtime the host needs vsock enabled (`vmw_vsock_vmci_transport` / `vhost_vsock`); bind errors such as `Cannot assign requested address` mean CID/port are wrong for that machine.
