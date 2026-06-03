@@ -3,12 +3,12 @@
 set -euo pipefail
 
 GUEST_CID="${GUEST_CID:-42}"
-PORT="${HSM_VSOCK_PORT:-5000}"
-
-python3 <<PY
-import socket, struct, os
-cid = int(os.environ.get("GUEST_CID", "${GUEST_CID}"))
-port = int(os.environ.get("PORT", "${PORT}"))
+export GUEST_CID="${GUEST_CID:-42}"
+export HSM_VSOCK_PORT="${HSM_VSOCK_PORT:-5000}"
+python3 <<'PY'
+import os, socket, struct
+cid = int(os.environ["GUEST_CID"])
+port = int(os.environ["HSM_VSOCK_PORT"])
 payload = bytes([0xA1, 0x01, 0x01])
 body = bytes([1, 0x01]) + payload
 frame = struct.pack(">I", len(body)) + body
