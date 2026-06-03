@@ -1,4 +1,4 @@
-# Elixir host shim (TASK-2 Phase 4 start)
+# Elixir host shim (TASK-2 Phase 4)
 
 Reference **2D host client** for the vsock wire protocol. Normative spec: `backlog/docs/vsock-api-wire-format-spec-draft.md`.
 
@@ -7,37 +7,43 @@ Reference **2D host client** for the vsock wire protocol. Normative spec: `backl
 | Capability | Status |
 |------------|--------|
 | Length-prefixed framing | Done (`EnclaveProtocol.Framing`) |
-| `GET_MEASUREMENT` integer-key CBOR | Done (matches `enclave-protocol` `wire.rs`) |
-| Stdio integration test | Done (`enclave-stdio-bridge` + `mix test`) |
-| Real vsock transport | Not started |
-| `ARM_FOR_PRODUCTION` / `GET_STATUS` / sign | Not started |
+| `GET_MEASUREMENT` integer-key CBOR | Done |
+| Stateless stdio (`GET_MEASUREMENT` only) | Done (`EnclaveProtocol.StdioClient` + `enclave-stdio-bridge`) |
+| Stateful UDS session | Done (`EnclaveProtocol.Session` + `enclave-uds-server`) |
+| `ARM_FOR_PRODUCTION` / `GET_STATUS` over UDS | Done (integration tests) |
+| Wire fixtures from Rust | Done (`EnclaveProtocol.TestFixtures` + `enclave-stdio-session export-*`) |
+| Production AF_VSOCK | Follow-on (same framing/CBOR modules) |
 
 ## Prerequisites
 
 - Elixir ~> 1.14
-- Rust toolchain (builds `enclave-stdio-bridge`)
+- Rust toolchain
 
 ## Quick start
 
 ```bash
-# Rust bridge (one framed message on stdin → one on stdout)
+# Stateless GET_MEASUREMENT
 cd ../rust/enclave-protocol
 cargo build --bin enclave-stdio-bridge
-
-# Elixir tests (builds bridge if missing)
 cd ../../elixir-shim
 mix deps.get
 mix test
+
+# Full session tests (builds UDS + session binaries automatically)
+mix test --only integration  # optional tag; default mix test runs all
 ```
 
 ## Layout
 
 | Module | Role |
 |--------|------|
-| `EnclaveProtocol.Framing` | Frame encode/decode + GET_MEASUREMENT CBOR |
-| `EnclaveProtocol.StdioClient` | `System.cmd` adapter for local dev |
+| `EnclaveProtocol.Framing` | Frame encode/decode + GET_MEASUREMENT / GET_STATUS CBOR |
+| `EnclaveProtocol.StdioClient` | One-shot stdio bridge for GET_MEASUREMENT |
+| `EnclaveProtocol.Socket` | Unix domain socket read/write |
+| `EnclaveProtocol.Session` | Stateful client (GET_MEASUREMENT, GET_STATUS, raw frames) |
+| `EnclaveProtocol.TestFixtures` | Import pre-built ARM frames from Rust |
 
-Production path will add a vsock-backed transport module; keep framing/CBOR shared.
+Production path: add a vsock-backed transport module reusing `Framing` + `Session` request helpers.
 
 ## High-risk review
 

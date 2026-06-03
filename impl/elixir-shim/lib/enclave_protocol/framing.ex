@@ -6,9 +6,17 @@ defmodule EnclaveProtocol.Framing do
 
   @protocol_version 1
   @msg_get_measurement 0x01
+  @msg_sign_authorization_ticket 0x10
+  @msg_get_status 0x30
 
   @doc "Message type for GET_MEASUREMENT."
   def msg_get_measurement, do: @msg_get_measurement
+
+  @doc "Message type for SIGN_AUTHORIZATION_TICKET."
+  def msg_sign_authorization_ticket, do: @msg_sign_authorization_ticket
+
+  @doc "Message type for GET_STATUS."
+  def msg_get_status, do: @msg_get_status
 
   @doc false
   def protocol_version, do: @protocol_version
@@ -58,12 +66,22 @@ defmodule EnclaveProtocol.Framing do
   """
   @spec decode_get_measurement_response(binary()) :: {:ok, map()} | {:error, term()}
   def decode_get_measurement_response(payload) when is_binary(payload) do
-    case CBOR.decode(payload) do
-      {:ok, map, _} when is_map(map) ->
-        decode_measurement_map(map)
+    with {:ok, map} <- decode_exact_map(payload) do
+      decode_measurement_map(map)
+    end
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  @doc "Parse SIGN_AUTHORIZATION_TICKET success response (integer keys 1–3)."
+  @spec decode_sign_authorization_ticket_response(binary()) :: {:ok, map()} | {:error, term()}
+  def decode_sign_authorization_ticket_response(payload) when is_binary(payload) do
+    with {:ok, map} <- decode_exact_map(payload),
+         1 <- Map.get(map, 1),
+         signature when is_binary(signature) <- cbor_bytes(Map.get(map, 2)),
+         ticket_hash when is_binary(ticket_hash) and byte_size(ticket_hash) == 32 <-
+           cbor_bytes(Map.get(map, 3)) do
+      {:ok, %{version: 1, signature: signature, ticket_hash: ticket_hash}}
+    else
+      _ -> {:error, :invalid_sign_response}
     end
   end
 
@@ -87,6 +105,52 @@ defmodule EnclaveProtocol.Framing do
       _ -> {:error, :invalid_get_measurement_response}
     end
   end
+
+  @doc "Parse GET_STATUS response (integer keys 1–9)."
+  @spec decode_get_status_response(binary()) :: {:ok, map()} | {:error, term()}
+  def decode_get_status_response(payload) when is_binary(payload) do
+    with {:ok, map} <- decode_exact_map(payload) do
+      decode_status_map(map)
+    end
+  end
+
+  defp decode_exact_map(payload) do
+    case CBOR.decode(payload) do
+      {:ok, map, rest} when is_map(map) and rest in ["", <<>>] ->
+        {:ok, map}
+
+      {:ok, _, _} ->
+        {:error, :trailing_cbor_bytes}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_status_map(map) do
+    with 1 <- Map.get(map, 1),
+         armed when is_boolean(armed) <- Map.get(map, 2) do
+      {:ok,
+       %{
+         version: 1,
+         armed: armed,
+         authorized_measurement: cbor_bytes(Map.get(map, 3)),
+         authorized_pq_pubkey: cbor_bytes(Map.get(map, 4)),
+         authorized_activated_at_height: Map.get(map, 5),
+         proof_finalized_height: Map.get(map, 6),
+         source_ticket_hash: cbor_optional_bytes(Map.get(map, 7)),
+         pending_hard_fork_height: Map.get(map, 8),
+         last_known_block: Map.get(map, 9)
+       }}
+    else
+      _ -> {:error, :invalid_get_status_response}
+    end
+  end
+
+  defp cbor_optional_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: bin
+  defp cbor_optional_bytes(bin) when is_binary(bin), do: bin
+  defp cbor_optional_bytes(nil), do: nil
+  defp cbor_optional_bytes(_), do: nil
 
   defp cbor_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: bin
   defp cbor_bytes(bin) when is_binary(bin), do: bin

@@ -24,6 +24,8 @@ compile_error!(
 );
 
 mod chain_proof_crypto;
+#[cfg(feature = "test-support")]
+mod host_test_fixtures;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
 mod pq_signer;
@@ -43,11 +45,14 @@ pub use chain_proof_crypto::{
 pub use chain_proof_crypto::{
     reference_test_attestation_signing_key, reference_test_attestation_trust,
 };
+#[cfg(feature = "test-support")]
+pub use host_test_fixtures::{sample_arm_for_production_frame, sample_recovery_sign_frame};
 pub use wire::{
-    decode_arm_for_production_request, decode_get_measurement_request,
-    decode_get_measurement_response, decode_get_status_request, decode_get_status_response,
-    decode_sign_authorization_ticket_request, decode_sign_authorization_ticket_response,
-    encode_arm_for_production_request, encode_get_measurement_request,
+    decode_arm_for_production_request, decode_arm_for_production_response,
+    decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
+    decode_get_status_response, decode_sign_authorization_ticket_request,
+    decode_sign_authorization_ticket_response, encode_arm_for_production_request,
+    encode_arm_for_production_response, encode_get_measurement_request,
     encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
     encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
     encode_wire_error,
@@ -1057,48 +1062,133 @@ pub fn handle_sign_authorization_ticket_with_state(
     }
 }
 
-/// Process one length-prefixed frame (host ↔ enclave wire path).
+/// Host-side session state for stateful vsock / UDS / stdio-session transports.
 ///
-/// Uses integer-key CBOR encoders from [`wire`] for commands that have spec-aligned
-/// helpers. Intended for the stdio bridge and the Elixir host shim.
+/// `attestation_trust` must come from enclave provisioning (§9.3), not from the host
+/// payload. The reference `enclave-stdio-session` / `enclave-uds-server` binaries load
+/// test trust only under `test-support`.
+pub struct HostSession {
+    /// Enclave authorization state (arming, pending hard fork).
+    pub state: EnclaveState,
+    /// Pinned Producer Chain Attestation trust (Ed25519 verify key).
+    pub attestation_trust: ProducerAttestationTrust,
+}
+
+impl HostSession {
+    /// New unarmed session with caller-supplied trust (production enclave entry).
+    pub fn new(attestation_trust: ProducerAttestationTrust) -> Self {
+        Self {
+            state: EnclaveState::Unarmed,
+            attestation_trust,
+        }
+    }
+
+    /// Reference dev session (requires `test-support` feature).
+    #[cfg(feature = "test-support")]
+    pub fn reference_test() -> Self {
+        Self::new(reference_test_attestation_trust())
+    }
+}
+
+fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command, ProtocolError> {
+    match msg_type {
+        MessageType::GetMeasurement => {
+            Ok(Command::GetMeasurement(decode_get_measurement_request(payload)?))
+        }
+        MessageType::SignAuthorizationTicket => Ok(Command::SignAuthorizationTicket(
+            decode_sign_authorization_ticket_request(payload)?,
+        )),
+        MessageType::ArmForProduction => Ok(Command::ArmForProduction(
+            decode_arm_for_production_request(payload)?,
+        )),
+        MessageType::GetStatus => Ok(Command::GetStatus(decode_get_status_request(payload)?)),
+    }
+}
+
+fn encode_wire_response(msg_type: MessageType, response: &Response) -> Result<Vec<u8>, ProtocolError> {
+    match (msg_type, response) {
+        (MessageType::GetMeasurement, Response::GetMeasurement(r)) => {
+            encode_get_measurement_response(r)
+        }
+        (MessageType::ArmForProduction, Response::ArmForProduction(r)) => {
+            encode_arm_for_production_response(r)
+        }
+        (MessageType::GetStatus, Response::GetStatus(r)) => encode_get_status_response(r),
+        (MessageType::SignAuthorizationTicket, Response::SignAuthorizationTicket(r)) => {
+            encode_sign_authorization_ticket_response(r)
+        }
+        (_, Response::Error(msg)) => encode_wire_error(1, msg),
+        (expected, other) => encode_wire_error(
+            1,
+            &format!("unexpected response {:?} for message type {:?}", other, expected),
+        ),
+    }
+}
+
+/// Process one framed host request with session state (all commands, integer-key wire).
+pub fn process_framed_with_session(
+    frame: &[u8],
+    session: &mut HostSession,
+) -> Result<Vec<u8>, ProtocolError> {
+    let framed = decode_message(frame)?;
+    let cmd = decode_wire_command(framed.msg_type, &framed.payload)?;
+    let response =
+        dispatch_command_with_state(cmd, &mut session.state, session.attestation_trust);
+    let body = encode_wire_response(framed.msg_type, &response)?;
+    encode_message(framed.msg_type, &body)
+}
+
+/// Stateless one-shot bridge: **GET_MEASUREMENT only** (no `test-support` required).
 pub fn process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let framed = decode_message(frame)?;
-    let (msg_type, payload) = match framed.msg_type {
-        MessageType::GetMeasurement => {
-            let req = decode_get_measurement_request(&framed.payload)?;
-            let body = match dispatch_command(Command::GetMeasurement(req)) {
-                Response::GetMeasurement(resp) => encode_get_measurement_response(&resp)?,
-                Response::Error(msg) => encode_wire_error(1, &msg)?,
-                other => encode_wire_error(
-                    1,
-                    &format!("unexpected dispatch response for GET_MEASUREMENT: {:?}", other),
-                )?,
-            };
-            (MessageType::GetMeasurement, body)
-        }
-        MessageType::SignAuthorizationTicket => {
-            let body = encode_wire_error(
-                1,
-                "SIGN_AUTHORIZATION_TICKET: decode/dispatch via stdio bridge not implemented; use stateful enclave entry",
-            )?;
-            (MessageType::SignAuthorizationTicket, body)
-        }
-        MessageType::ArmForProduction => {
-            let body = encode_wire_error(
-                1,
-                "ARM_FOR_PRODUCTION requires dispatch_command_with_state (not available on stdio bridge)",
-            )?;
-            (MessageType::ArmForProduction, body)
-        }
-        MessageType::GetStatus => {
-            let body = encode_wire_error(
-                1,
-                "GET_STATUS requires dispatch_command_with_state (not available on stdio bridge)",
-            )?;
-            (MessageType::GetStatus, body)
-        }
+    if framed.msg_type != MessageType::GetMeasurement {
+        let body = encode_wire_error(
+            1,
+            "stateless stdio bridge supports GET_MEASUREMENT only; use enclave-stdio-session for ARM/STATUS/SIGN",
+        )?;
+        return encode_message(framed.msg_type, &body);
+    }
+    let req = decode_get_measurement_request(&framed.payload)?;
+    let body = match dispatch_command(Command::GetMeasurement(req)) {
+        Response::GetMeasurement(resp) => encode_get_measurement_response(&resp)?,
+        Response::Error(msg) => encode_wire_error(1, &msg)?,
+        other => encode_wire_error(
+            1,
+            &format!("unexpected dispatch response for GET_MEASUREMENT: {:?}", other),
+        )?,
     };
-    encode_message(msg_type, &payload)
+    encode_message(MessageType::GetMeasurement, &body)
+}
+
+/// Read one length-prefixed frame from a stream (blocking).
+pub fn read_framed_message<R: std::io::Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
+    use std::io::Read;
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(ProtocolError::from)?;
+    let total_len = u32::from_be_bytes(len_buf);
+    if total_len > MAX_MESSAGE_SIZE {
+        return Err(ProtocolError::MessageTooLarge(total_len));
+    }
+    let total_len = total_len as usize;
+    let mut body = vec![0u8; total_len];
+    reader.read_exact(&mut body).map_err(ProtocolError::from)?;
+    let mut frame = Vec::with_capacity(4 + total_len);
+    frame.extend_from_slice(&len_buf);
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// Write one length-prefixed frame to a stream.
+pub fn write_framed_message<W: std::io::Write>(
+    writer: &mut W,
+    frame: &[u8],
+) -> Result<(), ProtocolError> {
+    use std::io::Write;
+    writer.write_all(frame).map_err(ProtocolError::from)?;
+    writer.flush().map_err(ProtocolError::from)?;
+    Ok(())
 }
 
 /// Stateless dispatcher — **recovery tickets (type 0) and GET_MEASUREMENT only**.
@@ -1324,6 +1414,66 @@ mod tests {
         assert_eq!(resp.supported_ticket_types, vec![0, 1]);
         assert!(!resp.pq_signing_ready);
         assert!(!resp.measurement.is_empty());
+    }
+
+    #[test]
+    fn read_framed_message_rejects_oversized_length_prefix() {
+        use std::io::Cursor;
+        let oversized = (MAX_MESSAGE_SIZE + 1).to_be_bytes();
+        let mut reader = Cursor::new(oversized);
+        let err = read_framed_message(&mut reader).unwrap_err();
+        assert!(matches!(err, ProtocolError::MessageTooLarge(_)));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn process_framed_session_arm_status_sign_hardfork() {
+        use crate::host_test_fixtures::sample_arm_for_production_frame;
+        use crate::{
+            decode_arm_for_production_response, decode_get_status_response,
+            decode_sign_authorization_ticket_response, encode_get_status_request,
+            encode_sign_authorization_ticket_request,
+        };
+
+        let mut session = HostSession::reference_test();
+        let arm_frame = sample_arm_for_production_frame();
+        let arm_resp_frame = process_framed_with_session(&arm_frame, &mut session).unwrap();
+        let arm_decoded = decode_message(&arm_resp_frame).unwrap();
+        let arm_body = decode_arm_for_production_response(&arm_decoded.payload).unwrap();
+        assert_eq!(arm_body.status, "armed");
+
+        let status_payload =
+            encode_get_status_request(&GetStatusRequest { version: 1 }).unwrap();
+        let status_frame =
+            encode_message(MessageType::GetStatus, &status_payload).unwrap();
+        let status_resp_frame =
+            process_framed_with_session(&status_frame, &mut session).unwrap();
+        let status_decoded = decode_message(&status_resp_frame).unwrap();
+        let status = decode_get_status_response(&status_decoded.payload).unwrap();
+        assert!(status.armed);
+
+        let pq = vec![0xDE; 48];
+        let ticket = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 99,
+            context_hash: [0xAB; 32],
+            activation_height: 10_500_000,
+            new_measurement: b"hf-meas".to_vec(),
+            pq_pubkey: pq,
+            fork_spec_hash: Some([0xEF; 32]),
+            new_header_version: Some(3),
+        };
+        let sign_payload =
+            encode_sign_authorization_ticket_request(&SignAuthorizationTicketRequest { ticket })
+                .unwrap();
+        let sign_frame =
+            encode_message(MessageType::SignAuthorizationTicket, &sign_payload).unwrap();
+        let sign_resp_frame = process_framed_with_session(&sign_frame, &mut session).unwrap();
+        let sign_decoded = decode_message(&sign_resp_frame).unwrap();
+        let sign_resp =
+            decode_sign_authorization_ticket_response(&sign_decoded.payload).unwrap();
+        assert_eq!(sign_resp.signature.len(), 64);
+        assert_eq!(sign_resp.ticket_hash.len(), 32);
     }
 
     // ---------------------------------------------------------------------

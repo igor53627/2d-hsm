@@ -17,6 +17,7 @@ pqcrypto-traits = { version = "0.3.5", optional = true }
 zeroize = { version = "1.8", optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
+hex = { version = "0.4", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
@@ -42,7 +43,7 @@ reference-seal-v1-root = ["ml-dsa-65"]
 reference-test-key = ["ml-dsa-65", "reference-seal-v1-root"]
 # Mock 64-byte PQ + reference Ed25519 attestation keys for local dev (see vsock spec §2.1).
 # Mutually exclusive with ml-dsa-65 (compile_error in lib.rs).
-test-support = []
+test-support = ["dep:hex"]
 # Enables mock PQ signing in the ticket_signing_demo example only (pq_signing_ready stays false).
 demo-mock-sign = ["test-support"]
 enforce-forge-crosscheck = []
@@ -63,6 +64,16 @@ enforce-forge-crosscheck = []
 [[bin]]
 name = "enclave-stdio-bridge"
 path = "src/bin/enclave_stdio_bridge.rs"
+
+[[bin]]
+name = "enclave-stdio-session"
+path = "src/bin/enclave_stdio_session.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "enclave-uds-server"
+path = "src/bin/enclave_uds_server.rs"
+required-features = ["test-support"]
 
 [[example]]
 name = "ticket_signing_demo"

@@ -4,9 +4,9 @@
 //! payloads for commands documented with integer keys must use the helpers here.
 
 use crate::{
-    ArmForProductionRequest, AuthorizationTicketPayload, AuthorizedProducerState,
-    GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest, GetStatusResponse,
-    ProtocolError, RecentChainProof, SignAuthorizationTicketRequest,
+    ArmForProductionRequest, ArmForProductionResponse, AuthorizationTicketPayload,
+    AuthorizedProducerState, GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest,
+    GetStatusResponse, ProtocolError, RecentChainProof, SignAuthorizationTicketRequest,
     SignAuthorizationTicketResponse, PROTOCOL_VERSION,
 };
 
@@ -365,6 +365,59 @@ pub fn decode_get_status_response(bytes: &[u8]) -> Result<GetStatusResponse, Pro
     })
 }
 
+/// CBOR-encode `ARM_FOR_PRODUCTION` success (`{ 1: "armed" }`) or wire error on refuse.
+pub fn encode_arm_for_production_response(
+    resp: &ArmForProductionResponse,
+) -> Result<Vec<u8>, ProtocolError> {
+    if resp.status == "armed" {
+        let value = Value::Map(vec![(
+            Value::Integer(1.into()),
+            Value::Text("armed".to_string()),
+        )]);
+        return encode_value(&value);
+    }
+    let reason = resp
+        .reason
+        .as_deref()
+        .unwrap_or("ARM_FOR_PRODUCTION refused");
+    encode_wire_error(2, reason)
+}
+
+/// Decode `ARM_FOR_PRODUCTION` response (armed map or wire error).
+pub fn decode_arm_for_production_response(
+    bytes: &[u8],
+) -> Result<ArmForProductionResponse, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol(
+            "ARM_FOR_PRODUCTION response must be a CBOR map",
+        ));
+    };
+    if let Ok(status) = map_get(&map, 1).and_then(value_to_text) {
+        if status == "armed" {
+            return Ok(ArmForProductionResponse {
+                status: "armed".to_string(),
+                reason: None,
+            });
+        }
+    }
+    let code = map_get(&map, 1).and_then(value_to_u64).unwrap_or(2);
+    let reason = map_get(&map, 2)
+        .and_then(value_to_text)
+        .unwrap_or_else(|_| format!("arm refused (code {})", code));
+    Ok(ArmForProductionResponse {
+        status: "refused".to_string(),
+        reason: Some(reason),
+    })
+}
+
+fn value_to_text(v: &Value) -> Result<String, ProtocolError> {
+    match v {
+        Value::Text(s) => Ok(s.clone()),
+        _ => Err(ProtocolError::WireProtocol("expected CBOR text")),
+    }
+}
+
 /// CBOR-encode `ARM_FOR_PRODUCTION` request (spec keys 1–3).
 pub fn encode_arm_for_production_request(
     req: &ArmForProductionRequest,
@@ -513,6 +566,25 @@ pub fn decode_sign_authorization_ticket_response(
 mod tests {
     use super::*;
     use crate::{GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest};
+
+    #[test]
+    fn arm_response_wire_roundtrip() {
+        let armed = ArmForProductionResponse {
+            status: "armed".to_string(),
+            reason: None,
+        };
+        let bytes = encode_arm_for_production_response(&armed).unwrap();
+        assert_eq!(decode_arm_for_production_response(&bytes).unwrap().status, "armed");
+
+        let refused = ArmForProductionResponse {
+            status: "refused".to_string(),
+            reason: Some("bad proof".to_string()),
+        };
+        let bytes = encode_arm_for_production_response(&refused).unwrap();
+        let decoded = decode_arm_for_production_response(&bytes).unwrap();
+        assert_eq!(decoded.status, "refused");
+        assert!(decoded.reason.is_some());
+    }
 
     #[test]
     fn get_measurement_wire_roundtrip() {
