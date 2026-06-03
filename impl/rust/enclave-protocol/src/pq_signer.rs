@@ -98,6 +98,13 @@ impl SealedSignerTestGuard {
     }
 }
 
+#[cfg(test)]
+impl Drop for SealedSignerTestGuard {
+    fn drop(&mut self) {
+        reset_installed_pq_signer_for_tests();
+    }
+}
+
 enum InstalledSigner {
     #[cfg(feature = "ml-dsa-65")]
     MlDsa65(MlDsa65Signer),

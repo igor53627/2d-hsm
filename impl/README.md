@@ -69,7 +69,17 @@ cargo test --features ml-dsa-65,pq-seal-provisioning
 
 # Reference host session / wire integration (mutually exclusive with ml-dsa-65):
 cargo test --features test-support,demo-mock-sign
+
+# TASK-1 staging slice: real ML-DSA-65 signatures (reference sealed key; no 64-byte mock)
+cargo test --features ml-dsa-65,reference-test-key,reference-seal-v1-root
+cargo build --bin enclave-uds-staging --features staging-host
 ```
+
+| Profile | Features | SIGN signature | Binaries |
+|---------|----------|----------------|----------|
+| Dev mock (TASK-2) | `test-support`, `demo-mock-sign` | 64-byte deterministic mock | `enclave-uds-server`, `enclave-stdio-session` |
+| Staging (TASK-1 slice) | `staging-host` (= `ml-dsa-65` + reference seal) | ML-DSA-65 (3309 B) | `enclave-uds-staging` |
+| Production-shaped tests | `ml-dsa-65`, `reference-test-key` | Sealed reference key in tests; **fail-closed** without `install_*` |
 
 Optional CI gate for Solidity cross-check:
 

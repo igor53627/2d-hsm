@@ -43,9 +43,14 @@ impl ProducerAttestationTrust {
 
 /// Reference attestation keypair for tests, demos, and local development only.
 ///
-/// **Do not use in production enclaves.** Enabled with `cfg(test)` or the
-/// `test-support` crate feature only.
-#[cfg(any(test, feature = "test-support"))]
+/// **Do not use in production enclaves.** Enabled for tests, `test-support`, and
+/// `staging-host` / `reference-test-key` profiles only.
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "staging-host",
+    feature = "reference-test-key"
+))]
 pub fn reference_test_attestation_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[
         0x3d, 0x40, 0x4b, 0x52, 0x36, 0x7b, 0x5b, 0x8f, 0x86, 0x3c, 0x1f, 0x2e, 0x9a, 0x0d,
@@ -55,7 +60,12 @@ pub fn reference_test_attestation_signing_key() -> SigningKey {
 }
 
 /// Trust anchor matching [`reference_test_attestation_signing_key`].
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "staging-host",
+    feature = "reference-test-key"
+))]
 pub fn reference_test_attestation_trust() -> ProducerAttestationTrust {
     ProducerAttestationTrust {
         attestation_verifying_key: reference_test_attestation_signing_key().verifying_key(),

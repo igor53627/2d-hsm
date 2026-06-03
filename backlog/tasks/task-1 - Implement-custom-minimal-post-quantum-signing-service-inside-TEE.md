@@ -461,6 +461,11 @@ We are moving from design into actual protocol definition and skeletons.
 - Reference crate `impl/rust/enclave-protocol/`: vsock framing, canonical `ticketHash`, enclave state machine (arm / hard-fork gating), Producer Chain Attestation v1 (TASK-3).
 - **ML-DSA-65 + seal v1 install** — done in reference crate (see merged slice above).
 
+**2026-06-03 — Staging ML-DSA on dev transport (branch `feat/task-1-staging-mldsa-dev-transport`):**
+- Feature `staging-host`: `enclave-uds-staging` installs reference sealed signer at boot; shared `EnclaveState`.
+- Tests with `reference-test-key`: fail-closed SIGN without seal; framed arm→HF asserts `ML_DSA65_SIGNATURE_LEN`.
+- Dev mock path unchanged: `test-support` + `demo-mock-sign` (64 B).
+
 **Recommended next slices (TASK-1):**
 1. **Platform provisioning root** in real TEE images (wires `set_pq_seal_v1_provisioning_root`).
 2. **Production build policy** — block `reference-seal-v1-root` in deploy artifacts.
