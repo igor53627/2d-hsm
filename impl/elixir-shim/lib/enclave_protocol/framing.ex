@@ -213,15 +213,16 @@ defmodule EnclaveProtocol.Framing do
   end
 
   defp decode_status_map(map) do
-    with 1 <- Map.get(map, 1),
+    with true <- status_has_all_keys?(map),
+         1 <- Map.get(map, 1),
          armed when is_boolean(armed) <- Map.get(map, 2),
          {:ok, measurement} <- cbor_required_bytes(Map.get(map, 3)),
          {:ok, pq_pubkey} <- cbor_required_bytes(Map.get(map, 4)),
-         {:ok, activated} <- optional_u64_field(Map.get(map, 5)),
-         {:ok, finalized} <- optional_u64_field(Map.get(map, 6)),
-         {:ok, source_hash} <- cbor_source_ticket_hash(Map.get(map, 7)),
-         {:ok, pending_hf} <- optional_u64_field(Map.get(map, 8)),
-         {:ok, last_block} <- optional_u64_field(Map.get(map, 9)) do
+         {:ok, activated} <- optional_u64_field_present(map, 5),
+         {:ok, finalized} <- optional_u64_field_present(map, 6),
+         {:ok, source_hash} <- cbor_source_ticket_hash_present(map, 7),
+         {:ok, pending_hf} <- optional_u64_field_present(map, 8),
+         {:ok, last_block} <- optional_u64_field_present(map, 9) do
       {:ok,
        %{
          version: 1,
@@ -237,6 +238,18 @@ defmodule EnclaveProtocol.Framing do
     else
       _ -> {:error, :invalid_get_status_response}
     end
+  end
+
+  defp status_has_all_keys?(map) do
+    Enum.all?(1..9, &Map.has_key?(map, &1))
+  end
+
+  defp optional_u64_field_present(map, key) do
+    optional_u64_field(Map.get(map, key))
+  end
+
+  defp cbor_source_ticket_hash_present(map, key) do
+    cbor_source_ticket_hash(Map.get(map, key))
   end
 
   defp optional_u64_field(nil), do: {:ok, nil}
