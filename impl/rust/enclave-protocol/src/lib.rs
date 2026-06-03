@@ -46,7 +46,10 @@ pub use chain_proof_crypto::{
     reference_test_attestation_signing_key, reference_test_attestation_trust,
 };
 #[cfg(feature = "test-support")]
-pub use host_test_fixtures::{sample_arm_for_production_frame, sample_recovery_sign_frame};
+pub use host_test_fixtures::{
+    sample_arm_for_production_frame, sample_hardfork_sign_frame,
+    sample_recovery_sign_frame, sample_second_hardfork_sign_frame,
+};
 pub use wire::{
     decode_arm_for_production_request, decode_arm_for_production_response,
     decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
@@ -1172,22 +1175,34 @@ pub fn process_framed_with_session(
     frame: &[u8],
     session: &mut HostSession,
 ) -> Result<Vec<u8>, ProtocolError> {
+    process_framed_with_shared_state(frame, &mut session.state, session.attestation_trust)
+}
+
+/// Process one framed request against **shared** enclave state (one `EnclaveState` per enclave process).
+///
+/// Use for production vsock and for `enclave-uds-server` (all UDS connections must share state so
+/// hard-fork anti-equivocation holds). `HostSession` is a convenience wrapper for a single connection.
+pub fn process_framed_with_shared_state(
+    frame: &[u8],
+    state: &mut EnclaveState,
+    attestation_trust: ProducerAttestationTrust,
+) -> Result<Vec<u8>, ProtocolError> {
     let msg_type = peek_msg_type_from_frame(frame);
-    match try_process_framed_with_session(frame, session) {
+    match try_process_framed_with_shared_state(frame, state, attestation_trust) {
         Ok(resp) => Ok(resp),
         Err(e @ ProtocolError::Io(_)) => Err(e),
         Err(e) => encode_wire_error_frame(msg_type, e),
     }
 }
 
-fn try_process_framed_with_session(
+fn try_process_framed_with_shared_state(
     frame: &[u8],
-    session: &mut HostSession,
+    state: &mut EnclaveState,
+    attestation_trust: ProducerAttestationTrust,
 ) -> Result<Vec<u8>, ProtocolError> {
     let framed = decode_message(frame)?;
     let cmd = decode_wire_command(framed.msg_type, &framed.payload)?;
-    let response =
-        dispatch_command_with_state(cmd, &mut session.state, session.attestation_trust);
+    let response = dispatch_command_with_state(cmd, state, attestation_trust);
     let body = encode_wire_response(framed.msg_type, &response)?;
     encode_message(framed.msg_type, &body)
 }
@@ -1549,6 +1564,89 @@ mod tests {
             decode_sign_authorization_ticket_response(&sign_decoded.payload).unwrap();
         assert_eq!(sign_resp.signature.len(), 64);
         assert_eq!(sign_resp.ticket_hash.len(), 32);
+    }
+
+    /// Simulates two UDS connections sharing one `EnclaveState` (variant A for compact 6765).
+    #[cfg(all(feature = "test-support", feature = "demo-mock-sign"))]
+    #[test]
+    fn shared_enclave_state_across_connections_rejects_second_hardfork() {
+        use crate::host_test_fixtures::sample_arm_for_production_frame;
+        use crate::{
+            decode_sign_authorization_ticket_response, decode_wire_error, encode_message,
+            encode_sign_authorization_ticket_request, is_wire_error_payload, peek_msg_type_from_frame,
+            AuthorizationTicketPayload, MessageType, SignAuthorizationTicketRequest,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let trust = HostSession::reference_test().attestation_trust;
+        let state = Arc::new(Mutex::new(EnclaveState::Unarmed));
+
+        let arm_frame = sample_arm_for_production_frame();
+        {
+            let mut guard = state.lock().unwrap();
+            process_framed_with_shared_state(&arm_frame, &mut guard, trust).unwrap();
+        }
+
+        let pq = vec![0xDE; 48];
+        let first_ticket = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 1,
+            context_hash: [0x01; 32],
+            activation_height: 10_000_100,
+            new_measurement: b"hf-a".to_vec(),
+            pq_pubkey: pq.clone(),
+            fork_spec_hash: Some([0xEF; 32]),
+            new_header_version: Some(3),
+        };
+        let first_frame = encode_message(
+            MessageType::SignAuthorizationTicket,
+            &encode_sign_authorization_ticket_request(&SignAuthorizationTicketRequest {
+                ticket: first_ticket,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        {
+            let mut guard = state.lock().unwrap();
+            let resp = process_framed_with_shared_state(&first_frame, &mut guard, trust).unwrap();
+            let decoded = decode_message(&resp).unwrap();
+            assert!(!is_wire_error_payload(&decoded.payload));
+            let sign =
+                decode_sign_authorization_ticket_response(&decoded.payload).unwrap();
+            assert_eq!(sign.signature.len(), 64);
+        }
+
+        let second_ticket = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 2,
+            context_hash: [0x02; 32],
+            activation_height: 10_000_200,
+            new_measurement: b"hf-b".to_vec(),
+            pq_pubkey: pq,
+            fork_spec_hash: Some([0xEF; 32]),
+            new_header_version: Some(3),
+        };
+        let second_frame = encode_message(
+            MessageType::SignAuthorizationTicket,
+            &encode_sign_authorization_ticket_request(&SignAuthorizationTicketRequest {
+                ticket: second_ticket,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        {
+            let mut guard = state.lock().unwrap();
+            let resp =
+                process_framed_with_shared_state(&second_frame, &mut guard, trust).unwrap();
+            let decoded = decode_message(&resp).unwrap();
+            assert!(is_wire_error_payload(&decoded.payload));
+            let (code, reason) = decode_wire_error(&decoded.payload).unwrap();
+            assert_eq!(code, 1);
+            assert!(reason.contains("only one HARD_FORK_ACTIVATION"));
+            assert_eq!(peek_msg_type_from_frame(&resp), MessageType::SignAuthorizationTicket);
+        }
     }
 
     // ---------------------------------------------------------------------

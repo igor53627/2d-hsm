@@ -6,10 +6,13 @@
 //! Export fixtures (stdout, one line hex):
 //!   enclave-stdio-session export-arm-frame
 //!   enclave-stdio-session export-recovery-sign-frame
+//!   enclave-stdio-session export-hardfork-sign-frame
+//!   enclave-stdio-session export-second-hardfork-sign-frame
 
 use enclave_protocol::{
     process_framed_with_session, read_framed_message, sample_arm_for_production_frame,
-    sample_recovery_sign_frame, write_framed_message, HostSession,
+    sample_hardfork_sign_frame, sample_recovery_sign_frame, sample_second_hardfork_sign_frame,
+    write_framed_message, HostSession,
 };
 use std::env;
 use std::io::{self, BufReader, Write};
@@ -52,6 +55,8 @@ fn export_fixture(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let frame = match name {
         "export-arm-frame" => sample_arm_for_production_frame(),
         "export-recovery-sign-frame" => sample_recovery_sign_frame(),
+        "export-hardfork-sign-frame" => sample_hardfork_sign_frame(),
+        "export-second-hardfork-sign-frame" => sample_second_hardfork_sign_frame(),
         other => {
             eprintln!("unknown export: {other}");
             std::process::exit(2);

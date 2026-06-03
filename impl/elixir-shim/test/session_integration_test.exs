@@ -6,10 +6,14 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
 
   setup_all do
     build_reference_bins!()
+    :ok
+  end
+
+  setup do
     socket_path = unique_socket_path()
     start_uds_server!(socket_path)
     on_exit(fn -> stop_uds_server(socket_path) end)
-    {:ok, socket_path: socket_path}
+    {:ok, socket_path: socket_path, session_bin: Path.expand(@session_rel, __DIR__)}
   end
 
   test "GET_MEASUREMENT and GET_STATUS over UDS session", %{socket_path: socket_path} do
@@ -24,9 +28,7 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     refute status.armed
   end
 
-  test "recovery SIGN_AUTHORIZATION_TICKET over UDS", %{socket_path: socket_path} do
-    session_bin = Path.expand(@session_rel, __DIR__)
-
+  test "recovery SIGN_AUTHORIZATION_TICKET over UDS", %{socket_path: socket_path, session_bin: session_bin} do
     assert {:ok, session} = EnclaveProtocol.Session.connect(socket_path)
     on_exit(fn -> EnclaveProtocol.Session.close(session) end)
 
@@ -37,9 +39,7 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     assert byte_size(sign.ticket_hash) == 32
   end
 
-  test "ARM → GET_STATUS armed over UDS", %{socket_path: socket_path} do
-    session_bin = Path.expand(@session_rel, __DIR__)
-
+  test "ARM → GET_STATUS armed over UDS", %{socket_path: socket_path, session_bin: session_bin} do
     assert {:ok, session} = EnclaveProtocol.Session.connect(socket_path)
     on_exit(fn -> EnclaveProtocol.Session.close(session) end)
 
@@ -49,6 +49,31 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     assert {:ok, status} = EnclaveProtocol.Session.get_status(session)
     assert status.armed
     assert status.proof_finalized_height == 10_000_050
+  end
+
+  test "second hard-fork on another UDS connection is rejected (shared enclave state)",
+       %{socket_path: socket_path, session_bin: session_bin} do
+    assert {:ok, conn_a} = EnclaveProtocol.Session.connect(socket_path)
+    assert {:ok, conn_b} = EnclaveProtocol.Session.connect(socket_path)
+    on_exit(fn ->
+      EnclaveProtocol.Session.close(conn_a)
+      EnclaveProtocol.Session.close(conn_b)
+    end)
+
+    assert {:ok, arm_frame} = EnclaveProtocol.TestFixtures.arm_frame(session_bin)
+    assert {:ok, %{status: "armed"}} =
+             EnclaveProtocol.Session.arm_for_production(conn_a, arm_frame)
+
+    assert {:ok, hf1} = EnclaveProtocol.TestFixtures.hardfork_sign_frame(session_bin)
+    assert {:ok, sign} = EnclaveProtocol.Session.sign_authorization_ticket(conn_a, hf1)
+    assert byte_size(sign.signature) == 64
+
+    assert {:ok, hf2} = EnclaveProtocol.TestFixtures.second_hardfork_sign_frame(session_bin)
+
+    assert {:error, {:wire_error, %{code: 1, reason: reason}}} =
+             EnclaveProtocol.Session.sign_authorization_ticket(conn_b, hf2)
+
+    assert reason =~ "only one HARD_FORK_ACTIVATION"
   end
 
   defp unique_socket_path do

@@ -15,6 +15,18 @@ defmodule EnclaveProtocol.TestFixtures do
     export_hex_frame(session_bin, "export-recovery-sign-frame")
   end
 
+  @doc "Hex-decoded framed hard-fork `SIGN_AUTHORIZATION_TICKET` (first fork in armed session)."
+  @spec hardfork_sign_frame(Path.t()) :: {:ok, binary()} | {:error, term()}
+  def hardfork_sign_frame(session_bin) do
+    export_hex_frame(session_bin, "export-hardfork-sign-frame")
+  end
+
+  @doc "Hex-decoded second hard-fork sign frame (must be rejected while still armed)."
+  @spec second_hardfork_sign_frame(Path.t()) :: {:ok, binary()} | {:error, term()}
+  def second_hardfork_sign_frame(session_bin) do
+    export_hex_frame(session_bin, "export-second-hardfork-sign-frame")
+  end
+
   defp export_hex_frame(bin, arg) do
     case System.cmd(bin, [arg], stderr_to_stdout: true) do
       {hex, 0} ->

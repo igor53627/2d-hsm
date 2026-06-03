@@ -32,6 +32,37 @@ pub fn sample_arm_for_production_frame() -> Vec<u8> {
     encode_message(MessageType::ArmForProduction, &payload).expect("frame arm")
 }
 
+/// Pre-built hard-fork `SIGN_AUTHORIZATION_TICKET` framed message (reference PQ pubkey).
+pub fn sample_hardfork_sign_frame() -> Vec<u8> {
+    hardfork_sign_frame_at(10_000_100, 1, [0x01; 32])
+}
+
+/// Second hard-fork ticket (different activation height) for anti-equivocation tests.
+pub fn sample_second_hardfork_sign_frame() -> Vec<u8> {
+    hardfork_sign_frame_at(10_000_200, 2, [0x02; 32])
+}
+
+fn hardfork_sign_frame_at(
+    activation_height: u64,
+    nonce: u64,
+    context_hash: [u8; 32],
+) -> Vec<u8> {
+    let ticket = AuthorizationTicketPayload {
+        ticket_type: 1,
+        nonce,
+        context_hash,
+        activation_height,
+        new_measurement: b"hardfork-v5".to_vec(),
+        pq_pubkey: vec![0xDE; 48],
+        fork_spec_hash: Some([0xEF; 32]),
+        new_header_version: Some(3),
+    };
+    let req = SignAuthorizationTicketRequest { ticket };
+    let payload =
+        encode_sign_authorization_ticket_request(&req).expect("encode sign request");
+    encode_message(MessageType::SignAuthorizationTicket, &payload).expect("frame sign")
+}
+
 /// Pre-built recovery `SIGN_AUTHORIZATION_TICKET` framed message.
 pub fn sample_recovery_sign_frame() -> Vec<u8> {
     let ticket = AuthorizationTicketPayload {
