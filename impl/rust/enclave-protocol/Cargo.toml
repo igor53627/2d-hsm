@@ -44,7 +44,7 @@ reference-test-key = ["ml-dsa-65", "reference-seal-v1-root", "pq-seal-provisioni
 # Mock 64-byte PQ + reference Ed25519 attestation keys for local dev (see vsock spec §2.1).
 # Mutually exclusive with ml-dsa-65 (compile_error in lib.rs).
 test-support = ["dep:hex"]
-# Staging/CI enclave profile: real ML-DSA-65 + reference seal (not mutually exclusive with test-support).
+# Staging/CI enclave profile: real ML-DSA-65 + reference seal (mutually exclusive with test-support via ml-dsa-65).
 staging-host = [
     "ml-dsa-65",
     "pq-seal-provisioning",

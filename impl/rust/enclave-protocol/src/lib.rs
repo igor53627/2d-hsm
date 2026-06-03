@@ -1121,24 +1121,42 @@ impl HostSession {
 }
 
 /// Measurement bytes shared by staging install + `host_test_fixtures` ARM frames.
-#[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
+#[cfg(all(
+    feature = "ml-dsa-65",
+    any(feature = "reference-test-key", feature = "staging-host")
+))]
 pub const REFERENCE_STAGING_MEASUREMENT: &[u8] = b"prod-enclave-v1";
 
-/// Install the public ML-DSA-65 reference keypair as a v1 sealed signer (staging/CI only).
+#[cfg(all(
+    feature = "ml-dsa-65",
+    any(feature = "reference-test-key", feature = "staging-host")
+))]
+static REFERENCE_MLDSA65_SK: &[u8] = include_bytes!("../testvectors/mldsa65_reference_sk.bin");
+
+#[cfg(all(
+    feature = "ml-dsa-65",
+    any(feature = "reference-test-key", feature = "staging-host")
+))]
+static REFERENCE_MLDSA65_PK: &[u8] = include_bytes!("../testvectors/mldsa65_reference_pk.bin");
+
+/// Install the NIST reference ML-DSA-65 keypair as a v1 sealed signer (embedded at build time).
 ///
-/// Uses `testvectors/mldsa65_reference_{sk,pk}.bin` and [`REFERENCE_STAGING_MEASUREMENT`].
-/// **Not for production deployment.**
-#[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-pub fn install_reference_sealed_signer_staging() -> Result<(), ProtocolError> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors");
-    let sk = std::fs::read(dir.join("mldsa65_reference_sk.bin")).map_err(|_| {
-        ProtocolError::PqSigningUnavailable("staging reference sk testvector unreadable")
-    })?;
-    let pk = std::fs::read(dir.join("mldsa65_reference_pk.bin")).map_err(|_| {
-        ProtocolError::PqSigningUnavailable("staging reference pk testvector unreadable")
-    })?;
+/// **Staging/CI only** — not for production deployment.
+#[cfg(all(
+    feature = "ml-dsa-65",
+    any(feature = "reference-test-key", feature = "staging-host")
+))]
+fn install_reference_sealed_signer_from_embedded() -> Result<(), ProtocolError> {
+    let sk = REFERENCE_MLDSA65_SK.to_vec();
+    let pk = REFERENCE_MLDSA65_PK.to_vec();
     let blob = seal_mldsa65_keypair_v1(&sk, &pk, REFERENCE_STAGING_MEASUREMENT)?;
     pq_signer::install_sealed_pq_signer(&blob, REFERENCE_STAGING_MEASUREMENT)
+}
+
+/// Boot-time install for `enclave-uds-staging` (requires `staging-host`).
+#[cfg(feature = "staging-host")]
+pub fn install_reference_sealed_signer_staging() -> Result<(), ProtocolError> {
+    install_reference_sealed_signer_from_embedded()
 }
 
 fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command, ProtocolError> {
@@ -1871,6 +1889,8 @@ mod tests {
 
     #[test]
     fn arm_and_hardfork_reject_unsigned_proof() {
+        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
+        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         let _guard = install_reference_sealed_signer_for_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
@@ -1945,12 +1965,8 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    ProtocolError::RecentChainProofValidation(_)
-                        | ProtocolError::InvalidTicket(_)
-                ),
-                "expected proof or pubkey gate at sign time, got {:?}",
+                matches!(err, ProtocolError::RecentChainProofValidation(_)),
+                "expected proof re-validation at sign time, got {:?}",
                 err
             );
         }
@@ -2333,6 +2349,8 @@ mod tests {
 
     #[test]
     fn roundtrip_sign_via_framing_and_dispatch_recovery() {
+        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
+        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         let _guard = install_reference_sealed_signer_for_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
@@ -2440,6 +2458,8 @@ mod tests {
 
     #[test]
     fn stateful_arm_then_sign_hardfork_succeeds() {
+        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
+        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         let _pq_guard = install_reference_sealed_signer_for_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
@@ -2575,6 +2595,8 @@ mod tests {
 
     #[test]
     fn stateful_framing_roundtrip_hardfork_after_arm() {
+        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
+        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
         let _guard = install_reference_sealed_signer_for_tests();
         #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
@@ -2662,43 +2684,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "ml-dsa-65")]
-    fn load_reference_sk_for_seal_tests() -> Vec<u8> {
-        std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("testvectors/mldsa65_reference_sk.bin"),
-        )
-        .expect("reference sk testvector")
-    }
-
-    /// Holds the sealed-signer test lock and resets the installed signer on drop.
     #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-    struct ReferenceSignerTestGuard {
-        _lock: pq_signer::SealedSignerTestGuard,
-    }
-
-    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-    impl Drop for ReferenceSignerTestGuard {
-        fn drop(&mut self) {
-            pq_signer::end_sealed_signer_test_session();
-        }
-    }
-
-    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-    fn install_reference_sealed_signer_for_tests() -> ReferenceSignerTestGuard {
-        let _lock = pq_signer::SealedSignerTestGuard::acquire();
-        pq_signer::begin_sealed_signer_test_session();
+    fn install_reference_sealed_signer_for_tests() -> pq_signer::SealedSignerTestGuard {
+        let guard = pq_signer::SealedSignerTestGuard::acquire();
         pq_signer::reset_installed_pq_signer_for_tests();
-        let sk = load_reference_sk_for_seal_tests();
-        let pk = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("testvectors/mldsa65_reference_pk.bin"),
-        )
-        .expect("reference pk testvector");
-        let blob =
-            pq_signer::seal_mldsa65_keypair_v1(&sk, &pk, REFERENCE_STAGING_MEASUREMENT).unwrap();
-        pq_signer::install_sealed_pq_signer(&blob, REFERENCE_STAGING_MEASUREMENT).unwrap();
-        ReferenceSignerTestGuard { _lock }
+        install_reference_sealed_signer_from_embedded().expect("reference signer install");
+        guard
     }
 
     #[test]

@@ -74,6 +74,8 @@ cargo test --features test-support,demo-mock-sign
 # TASK-1 staging: real ML-DSA-65 + fail-closed SIGN (`reference-test-key` pulls seal + provisioning)
 cargo test --features reference-test-key
 cargo build --bin enclave-uds-staging --features staging-host
+# Optional socket override (do not use 2D_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
+# 2D_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
 ```
 
 | Profile | Features | SIGN signature | Binaries |

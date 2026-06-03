@@ -4,9 +4,9 @@
 //! sealed signer at boot (fail-closed SIGN without seal). **Not for production.**
 
 use enclave_protocol::{
-    install_reference_sealed_signer_staging, process_framed_with_shared_state,
-    pq_signing_ready, read_framed_message, write_framed_message, EnclaveState, HostSession,
-    ProducerAttestationTrust,
+    install_reference_sealed_signer_staging, is_sealed_signer_installed,
+    process_framed_with_shared_state, pq_signing_ready, read_framed_message,
+    write_framed_message, EnclaveState, HostSession, ProducerAttestationTrust,
 };
 use std::env;
 use std::os::unix::fs::PermissionsExt;
@@ -60,7 +60,8 @@ fn default_socket_path() -> PathBuf {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::var("2D_HSM_ENCLAVE_SOCKET")
+    // Separate from dev `2D_HSM_ENCLAVE_SOCKET` so staging cannot unlink the mock server's socket.
+    let path = env::var("2D_HSM_ENCLAVE_STAGING_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_socket_path());
     if let Some(parent) = path.parent() {
@@ -80,7 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "enclave-uds-staging listening on {} (ML-DSA sealed signer installed={}, pq_signing_ready={})",
         path.display(),
-        true,
+        is_sealed_signer_installed(),
         pq_signing_ready()
     );
 
