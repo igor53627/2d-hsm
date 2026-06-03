@@ -600,7 +600,6 @@ mod tests {
     use crate::{GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest};
 
     #[test]
-    #[test]
     fn wire_error_with_optional_diagnostic_key3() {
         let map = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
@@ -614,6 +613,7 @@ mod tests {
         assert_eq!(reason, "proof stale");
     }
 
+    #[test]
     fn arm_response_wire_roundtrip() {
         let armed = ArmForProductionResponse {
             status: "armed".to_string(),

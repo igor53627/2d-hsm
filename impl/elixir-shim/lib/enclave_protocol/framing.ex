@@ -217,11 +217,11 @@ defmodule EnclaveProtocol.Framing do
          armed when is_boolean(armed) <- Map.get(map, 2),
          {:ok, measurement} <- cbor_required_bytes(Map.get(map, 3)),
          {:ok, pq_pubkey} <- cbor_required_bytes(Map.get(map, 4)),
-         activated when is_integer(activated) or is_nil(activated) <- Map.get(map, 5),
-         finalized when is_integer(finalized) or is_nil(finalized) <- Map.get(map, 6),
+         {:ok, activated} <- optional_u64_field(Map.get(map, 5)),
+         {:ok, finalized} <- optional_u64_field(Map.get(map, 6)),
          {:ok, source_hash} <- cbor_source_ticket_hash(Map.get(map, 7)),
-         pending_hf when is_integer(pending_hf) or is_nil(pending_hf) <- Map.get(map, 8),
-         last_block when is_integer(last_block) or is_nil(last_block) <- Map.get(map, 9) do
+         {:ok, pending_hf} <- optional_u64_field(Map.get(map, 8)),
+         {:ok, last_block} <- optional_u64_field(Map.get(map, 9)) do
       {:ok,
        %{
          version: 1,
@@ -238,6 +238,10 @@ defmodule EnclaveProtocol.Framing do
       _ -> {:error, :invalid_get_status_response}
     end
   end
+
+  defp optional_u64_field(nil), do: {:ok, nil}
+  defp optional_u64_field(n) when is_integer(n) and n >= 0, do: {:ok, n}
+  defp optional_u64_field(_), do: {:error, :invalid_u64_field}
 
   defp cbor_required_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: {:ok, bin}
   defp cbor_required_bytes(_), do: {:error, :invalid_bytes_field}
