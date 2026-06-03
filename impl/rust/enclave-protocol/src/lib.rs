@@ -347,8 +347,15 @@ fn measurement_response() -> GetMeasurementResponse {
     let pq_pubkey = active_signing_public_key_bytes()
         .unwrap_or_else(|| vec![0xDE, 0xAD, 0xBE, 0xEF]);
 
+    // Advertise the same measurement the staging signer is sealed under, so the
+    // wire identity matches the seal binding (REFERENCE_STAGING_MEASUREMENT).
+    #[cfg(feature = "staging-host")]
+    let measurement = REFERENCE_STAGING_MEASUREMENT.to_vec();
+    #[cfg(not(feature = "staging-host"))]
+    let measurement = b"enclave-measurement-placeholder".to_vec();
+
     GetMeasurementResponse {
-        measurement: b"enclave-measurement-placeholder".to_vec(),
+        measurement,
         attestation: b"attestation-placeholder".to_vec(),
         pq_pubkey,
         supported_ticket_types: vec![0, 1],
