@@ -4,9 +4,10 @@
 //! payloads for commands documented with integer keys must use the helpers here.
 
 use crate::{
-    ArmForProductionRequest, AuthorizationTicketPayload, AuthorizedProducerState,
-    GetStatusRequest, GetStatusResponse, ProtocolError, RecentChainProof,
-    SignAuthorizationTicketRequest, SignAuthorizationTicketResponse, PROTOCOL_VERSION,
+    ArmForProductionRequest, ArmForProductionResponse, AuthorizationTicketPayload,
+    AuthorizedProducerState, GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest,
+    GetStatusResponse, ProtocolError, RecentChainProof, SignAuthorizationTicketRequest,
+    SignAuthorizationTicketResponse, PROTOCOL_VERSION,
 };
 
 fn require_protocol_version(version: u64) -> Result<(), ProtocolError> {
@@ -181,6 +182,128 @@ fn decode_recent_chain_proof(v: &Value) -> Result<RecentChainProof, ProtocolErro
     })
 }
 
+/// CBOR-encode wire error (`{ 1: error_code, 2: reason }`).
+pub fn encode_wire_error(error_code: i64, reason: &str) -> Result<Vec<u8>, ProtocolError> {
+    let value = Value::Map(vec![
+        (Value::Integer(1.into()), Value::Integer(error_code.into())),
+        (Value::Integer(2.into()), Value::Text(reason.to_string())),
+    ]);
+    encode_value(&value)
+}
+
+/// Decode spec wire error body `{ 1: code, 2: reason }` (not a command success map).
+pub fn decode_wire_error(bytes: &[u8]) -> Result<(i64, String), ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol("wire error must be a CBOR map"));
+    };
+    if !is_wire_error_map(&map) {
+        return Err(ProtocolError::WireProtocol("payload is a success response, not a wire error"));
+    }
+    let code = value_to_u64(map_get(&map, 1)?)? as i64;
+    let reason = value_to_text(map_get(&map, 2)?)?;
+    Ok((code, reason))
+}
+
+/// True when `payload` is a wire error map (integer code + text reason; key 3 may hold diagnostics).
+pub fn is_wire_error_payload(bytes: &[u8]) -> bool {
+    decode_wire_error(bytes).is_ok()
+}
+
+/// Spec error shape: `{ 1: int, 2: tstr, 3?: diagnostic }` — distinguished from success by text at key 2.
+fn is_wire_error_map(map: &[(Value, Value)]) -> bool {
+    matches!(
+        (map_get(map, 1), map_get(map, 2)),
+        (Ok(Value::Integer(_)), Ok(Value::Text(_)))
+    )
+}
+
+fn value_to_u8(v: &Value) -> Result<u8, ProtocolError> {
+    let n = value_to_u64(v)?;
+    u8::try_from(n).map_err(|_| ProtocolError::InvalidTicket("ticket_type out of range"))
+}
+
+/// CBOR-encode `GET_MEASUREMENT` request (`{ 1: version }`).
+pub fn encode_get_measurement_request(req: &GetMeasurementRequest) -> Result<Vec<u8>, ProtocolError> {
+    let value = Value::Map(vec![(
+        Value::Integer(1.into()),
+        Value::Integer(req.version.into()),
+    )]);
+    encode_value(&value)
+}
+
+/// CBOR-decode `GET_MEASUREMENT` request.
+pub fn decode_get_measurement_request(bytes: &[u8]) -> Result<GetMeasurementRequest, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol(
+            "GET_MEASUREMENT request must be a CBOR map",
+        ));
+    };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
+    Ok(GetMeasurementRequest {
+        version: version as u8,
+    })
+}
+
+/// CBOR-encode `GET_MEASUREMENT` response (spec keys 1–6).
+pub fn encode_get_measurement_response(
+    resp: &GetMeasurementResponse,
+) -> Result<Vec<u8>, ProtocolError> {
+    let ticket_types: Vec<Value> = resp
+        .supported_ticket_types
+        .iter()
+        .map(|t| Value::Integer(u64::from(*t).into()))
+        .collect();
+    let value = Value::Map(vec![
+        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+        (Value::Integer(2.into()), Value::Bytes(resp.measurement.clone())),
+        (Value::Integer(3.into()), Value::Bytes(resp.attestation.clone())),
+        (Value::Integer(4.into()), Value::Bytes(resp.pq_pubkey.clone())),
+        (Value::Integer(5.into()), Value::Array(ticket_types)),
+        (Value::Integer(6.into()), Value::Bool(resp.pq_signing_ready)),
+    ]);
+    encode_value(&value)
+}
+
+/// CBOR-decode `GET_MEASUREMENT` response.
+pub fn decode_get_measurement_response(
+    bytes: &[u8],
+) -> Result<GetMeasurementResponse, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol(
+            "GET_MEASUREMENT response must be a CBOR map",
+        ));
+    };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
+    let supported = match map_get(&map, 5)? {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| {
+                let n = value_to_u64(v)?;
+                u8::try_from(n).map_err(|_| {
+                    ProtocolError::WireProtocol("supported_ticket_types entry out of range")
+                })
+            })
+            .collect::<Result<Vec<u8>, ProtocolError>>()?,
+        _ => {
+            return Err(ProtocolError::WireProtocol(
+                "supported_ticket_types must be a CBOR array",
+            ))
+        }
+    };
+    Ok(GetMeasurementResponse {
+        measurement: value_to_bytes(map_get(&map, 2)?)?,
+        attestation: value_to_bytes(map_get(&map, 3)?)?,
+        pq_pubkey: value_to_bytes(map_get(&map, 4)?)?,
+        supported_ticket_types: supported,
+        pq_signing_ready: value_to_bool(map_get(&map, 6)?)?,
+    })
+}
+
 /// CBOR-encode `GET_STATUS` request (`{ 1: version }`).
 pub fn encode_get_status_request(req: &GetStatusRequest) -> Result<Vec<u8>, ProtocolError> {
     let value = Value::Map(vec![(
@@ -274,6 +397,59 @@ pub fn decode_get_status_response(bytes: &[u8]) -> Result<GetStatusResponse, Pro
     })
 }
 
+/// CBOR-encode `ARM_FOR_PRODUCTION` success (`{ 1: "armed" }`) or wire error on refuse.
+pub fn encode_arm_for_production_response(
+    resp: &ArmForProductionResponse,
+) -> Result<Vec<u8>, ProtocolError> {
+    if resp.status == "armed" {
+        let value = Value::Map(vec![(
+            Value::Integer(1.into()),
+            Value::Text("armed".to_string()),
+        )]);
+        return encode_value(&value);
+    }
+    let reason = resp
+        .reason
+        .as_deref()
+        .unwrap_or("ARM_FOR_PRODUCTION refused");
+    encode_wire_error(2, reason)
+}
+
+/// Decode `ARM_FOR_PRODUCTION` response (armed map or wire error).
+pub fn decode_arm_for_production_response(
+    bytes: &[u8],
+) -> Result<ArmForProductionResponse, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol(
+            "ARM_FOR_PRODUCTION response must be a CBOR map",
+        ));
+    };
+    if let Ok(status) = map_get(&map, 1).and_then(value_to_text) {
+        if status == "armed" {
+            return Ok(ArmForProductionResponse {
+                status: "armed".to_string(),
+                reason: None,
+            });
+        }
+    }
+    let code = map_get(&map, 1).and_then(value_to_u64).unwrap_or(2);
+    let reason = map_get(&map, 2)
+        .and_then(value_to_text)
+        .unwrap_or_else(|_| format!("arm refused (code {})", code));
+    Ok(ArmForProductionResponse {
+        status: "refused".to_string(),
+        reason: Some(reason),
+    })
+}
+
+fn value_to_text(v: &Value) -> Result<String, ProtocolError> {
+    match v {
+        Value::Text(s) => Ok(s.clone()),
+        _ => Err(ProtocolError::WireProtocol("expected CBOR text")),
+    }
+}
+
 /// CBOR-encode `ARM_FOR_PRODUCTION` request (spec keys 1–3).
 pub fn encode_arm_for_production_request(
     req: &ArmForProductionRequest,
@@ -330,7 +506,7 @@ fn decode_authorization_ticket_payload(v: &Value) -> Result<AuthorizationTicketP
         ));
     };
     Ok(AuthorizationTicketPayload {
-        ticket_type: value_to_u64(map_get(&map, 1)?)? as u8,
+        ticket_type: value_to_u8(map_get(&map, 1)?)?,
         nonce: value_to_u64(map_get(&map, 2)?)?,
         context_hash: value_to_bytes32(map_get(&map, 3)?)?,
         activation_height: value_to_u64(map_get(&map, 4)?)?,
@@ -421,7 +597,64 @@ pub fn decode_sign_authorization_ticket_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GetStatusRequest;
+    use crate::{GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest};
+
+    #[test]
+    fn wire_error_with_optional_diagnostic_key3() {
+        let map = vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Text("proof stale".to_string())),
+            (Value::Integer(3.into()), Value::Map(vec![])),
+        ];
+        let bytes = encode_value(&Value::Map(map)).unwrap();
+        assert!(is_wire_error_payload(&bytes));
+        let (code, reason) = decode_wire_error(&bytes).unwrap();
+        assert_eq!(code, 2);
+        assert_eq!(reason, "proof stale");
+    }
+
+    #[test]
+    fn arm_response_wire_roundtrip() {
+        let armed = ArmForProductionResponse {
+            status: "armed".to_string(),
+            reason: None,
+        };
+        let bytes = encode_arm_for_production_response(&armed).unwrap();
+        assert_eq!(decode_arm_for_production_response(&bytes).unwrap().status, "armed");
+
+        let refused = ArmForProductionResponse {
+            status: "refused".to_string(),
+            reason: Some("bad proof".to_string()),
+        };
+        let bytes = encode_arm_for_production_response(&refused).unwrap();
+        let decoded = decode_arm_for_production_response(&bytes).unwrap();
+        assert_eq!(decoded.status, "refused");
+        assert!(decoded.reason.is_some());
+    }
+
+    #[test]
+    fn get_measurement_wire_roundtrip() {
+        let req = GetMeasurementRequest { version: 1 };
+        let bytes = encode_get_measurement_request(&req).unwrap();
+        assert_eq!(decode_get_measurement_request(&bytes).unwrap().version, 1);
+
+        let resp = GetMeasurementResponse {
+            measurement: b"meas".to_vec(),
+            attestation: b"att".to_vec(),
+            pq_pubkey: vec![0xDE, 0xAD],
+            supported_ticket_types: vec![0, 1],
+            pq_signing_ready: false,
+        };
+        let bytes = encode_get_measurement_response(&resp).unwrap();
+        let Value::Map(map) = decode_value(&bytes).unwrap() else {
+            panic!("expected map");
+        };
+        assert!(map.iter().all(|(k, _)| matches!(k, Value::Integer(_))));
+        let decoded = decode_get_measurement_response(&bytes).unwrap();
+        assert_eq!(decoded.measurement, b"meas");
+        assert_eq!(decoded.supported_ticket_types, vec![0, 1]);
+        assert!(!decoded.pq_signing_ready);
+    }
 
     #[test]
     fn get_status_response_uses_integer_map_keys() {
@@ -523,6 +756,27 @@ mod tests {
         let decoded = decode_sign_authorization_ticket_request(&bytes).unwrap();
         assert_eq!(decoded.ticket.nonce, 42);
         assert_eq!(decoded.ticket.new_header_version, Some(3));
+    }
+
+    #[test]
+    fn sign_request_rejects_ticket_type_out_of_range() {
+        let map = vec![
+            (Value::Integer(1.into()), Value::Integer(256.into())),
+            (Value::Integer(2.into()), Value::Integer(1.into())),
+            (Value::Integer(3.into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(5.into()), Value::Bytes(b"m".to_vec())),
+            (Value::Integer(6.into()), Value::Bytes(vec![0xAA; 48])),
+            (Value::Integer(7.into()), Value::Null),
+            (Value::Integer(8.into()), Value::Null),
+        ];
+        let ticket = Value::Map(map);
+        let req_map = vec![
+            (Value::Integer(1.into()), Value::Integer(1.into())),
+            (Value::Integer(2.into()), ticket),
+        ];
+        let bytes = encode_value(&Value::Map(req_map)).unwrap();
+        assert!(decode_sign_authorization_ticket_request(&bytes).is_err());
     }
 
     #[test]

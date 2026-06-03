@@ -280,6 +280,8 @@ Every message on the vsock is:
 - This is the convention actually implemented in the reference crate (`enclave-protocol`).
 - The previous wording ("includes the 6-byte header") was incorrect and has been aligned with the implementation to avoid interop breakage.
 
+**Maximum frame size (normative):** `total_length` MUST NOT exceed **1 MiB** (`1_048_576` bytes). Host and enclave implementations MUST reject larger length prefixes before allocating the remainder of the frame. Reference constant: `enclave-protocol::MAX_MESSAGE_SIZE` (Rust); Elixir shim compares the same limit against `total_len` in `EnclaveProtocol.Framing`.
+
 We will use **canonical CBOR** (RFC 7049 section 3.9) for all payloads where determinism matters.
 
 ---

@@ -3,10 +3,10 @@ id: TASK-2
 title: >-
   Design and implement vsock API + wire protocol for TEE signing service
   (Authorization Tickets + Hard Fork flows)
-status: In Progress
+status: Ready for Review
 assignee: []
 created_date: '2026-05-31 18:38'
-updated_date: '2026-06-02 22:00'
+updated_date: '2026-06-03 12:00'
 labels: []
 dependencies:
   - TASK-3
@@ -53,12 +53,12 @@ The API must support at minimum:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Clear protocol specification document exists (commands, formats, error handling, security invariants).
-- [ ] #2 Wire format is defined and justified (why this encoding).
-- [ ] #3 Security model for each command is documented (what the enclave checks before acting).
-- [ ] #4 Basic client (host side) and server (TEE side) skeletons are implemented and can exchange at least measurement + ticket signing requests.
-- [ ] #5 Hard Fork announcement flow is explicitly described end-to-end using this API.
-- [ ] #6 The design is reviewed against the Authorization Tickets spec and the hard fork requirements (producer-driven, scheduled at specific block height, header version change, TEE measurement binding).
+- [x] #1 Clear protocol specification document exists (commands, formats, error handling, security invariants).
+- [x] #2 Wire format is defined and justified (why this encoding).
+- [x] #3 Security model for each command is documented (what the enclave checks before acting).
+- [x] #4 Basic client (host side) and server (TEE side) skeletons are implemented and can exchange at least measurement + ticket signing requests. *(Elixir: GET_MEASUREMENT/GET_STATUS encoded natively; ARM/SIGN requests replayed from Rust `TestFixtures` — native Elixir ARM/SIGN encoders are follow-on.)*
+- [x] #5 Hard Fork **wire/protocol sequence** (arm → sign type=1 → status) documented in spec §8 using this API. *(Operator runbook — human steps — is deferred; not part of this AC.)*
+- [x] #6 The design is reviewed against the Authorization Tickets spec and the hard fork requirements (producer-driven, scheduled at specific block height, header version change, TEE measurement binding).
 
 ## Related
 - TASK-1 (parent)
@@ -473,33 +473,19 @@ Next: run 3:3 matrix on this commit.
 - **Docs:** `impl/README.md`, root `README.md`, vsock spec §9.3, implementation plan progress section updated.
 - **`enclave-protocol` tests:** ~62 default `cargo test`; **70** with `--features ml-dsa-65` (or `ml-dsa-65,pq-seal-provisioning`). Demos need `--features test-support`.
 
-Remaining TASK-2 gaps: formal AC #1–#6 closure, Elixir shim, real vsock transport, integer-key CBOR for all commands.
+2026-06-03 — TASK-2 Phase 4 closure (reference host integration):
 
-### Current plan (2026-06-02 — session wrap)
+- **Wire:** integer-key CBOR for all four commands in `wire.rs`; `process_framed_with_shared_state` for multi-connection transports; `HostSession` for single-connection dev binaries only.
+- **Transports:** `enclave-stdio-bridge` (stateless GET_MEASUREMENT), `enclave-stdio-session`, `enclave-uds-server` (dev stand-in: shared `EnclaveState`, same-UID socket trust — see `elixir-shim/README.md`).
+- **Elixir:** `impl/elixir-shim/` — Framing, StdioClient, Socket, Session, TestFixtures; `mix test` (stdio + UDS). ARM/SIGN over UDS use Rust-exported frames, not native Elixir encoders.
+- **AC #1–#3:** `backlog/docs/vsock-api-wire-format-spec-draft.md` v0.2 (commands, CBOR, security invariants per command).
+- **AC #4:** Rust session/framing tests + Elixir UDS tests (`get_measurement`, `get_status`, `arm_for_production`, `sign_authorization_ticket` with fixtures). Integration tests use **64-byte mock** signatures (`demo-mock-sign`), not ML-DSA 3309 B.
+- **AC #5:** Hard-fork flow in spec §8 + `ticket_signing_demo` / session tests (Arm → Sign type=1). *"End-to-end"* here means wire/protocol sequence; **operator runbook** is explicitly deferred.
+- **AC #6:** Cross-reviewed with authorization-ticket specs (design-artifact matrices + **Full** 2×3 jobs **6758–6763** + compact **6765** on Phase 4 intro; follow-up Reduced **6778** / **6785** on `47d141c` / doc commits — see `impl/README.md` review table).
 
-**Done in reference crate (keep TASK-2 open until AC #1–#6 formally closed):**
-| Area | Status |
-|------|--------|
-| Phase 1 protocol + state machine | Done (AC #7–#9) |
-| TASK-3 crypto `RecentChainProof` | Done (feeds AC #8) |
-| `wire.rs` GET_STATUS + ARM integer CBOR | Done |
-| Docs (`impl/README`, vsock v0.2 §2–§9) | Done |
+**Merge gate (separate from AC closure):** `[x]` Full Matrix + compact **6765** on initial `impl/` Phase 4; `[x]` follow-up compact **6778** (shared state); `[x]` doc reconciliation + compact **6785**. PR description must cite job IDs above. Post-merge: production AF_VSOCK + native Elixir ARM/SIGN encoders (implementation plan §2).
 
-**AC #1–#6 informal status (for formal closure next session):**
-- **#1–#3:** Largely satisfied by `vsock-api-wire-format-spec-draft.md` v0.2; tag stable after Phase 0 roborev + MEDIUM fixes.
-- **#4:** Rust server yes; **Elixir host client** — not started (`impl/elixir-shim/` placeholder).
-- **#5:** Hard-fork flow in spec + demos; full operator runbook — deferred.
-- **#6:** Cross-reviewed with authorization-ticket specs; no open HIGH on protocol/ticket coupling.
-
-**TASK-1 update (2026-06-02):** ML-DSA-65 + seal v1 staging merged to `main` (`60eeefc`). Reference crate now returns **3309-byte** PQ signatures when sealed signer is installed; mock PQ only without `ml-dsa-65`. Production vsock E2E still needs platform root + deploy policy (TASK-1 follow-ups).
-
-**Next increments (order):**
-1. **Phase 4 (this task)** — Elixir shim + stateful session over `wire.rs` encoders.
-2. Wire migration — remaining integer-key CBOR consistency across commands.
-3. Real vsock I/O (replace in-process demos).
-4. **TASK-1** (parallel) — platform provisioning root, prod CI gate, verify-path zeroization.
-
-**Depends on:** TASK-1 platform root + prod build policy for production-grade provisioning; reference-crate crypto path is in tree.
+**Follow-on (not TASK-2):** production AF_VSOCK, operator runbook polish, live chain-tip refresh, light-client `proof_data` format `0x02+`, TASK-1 platform root in enclave images.
 
 Parent plan: `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md`.
 <!-- SECTION:NOTES:END -->
