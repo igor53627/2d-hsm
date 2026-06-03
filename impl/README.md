@@ -82,7 +82,8 @@ cargo build --bin enclave-uds-staging --features staging-host   # debug only; re
 | Profile | Features | SIGN signature | Binaries |
 |---------|----------|----------------|----------|
 | Dev mock (TASK-2) | `test-support`, `demo-mock-sign` | 64-byte deterministic mock | `enclave-uds-server`, `enclave-stdio-session` |
-| Staging (TASK-1 slice) | `staging-host` | ML-DSA-65 (3309 B); fail-closed without seal at boot | `enclave-uds-staging` |
+| Seal / provisioning (CLI) | `ml-dsa-65`, `pq-seal-provisioning` | N/A (seal/unseal unit tests only) | `pq-seal-v1` CLI (sibling crate) |
+| Staging (TASK-1 slice) | `staging-host` | ML-DSA-65 (3309 B); fail-closed without seal at boot | `enclave-uds-staging` (debug build only) |
 | ML-DSA integration tests | `reference-test-key` | ML-DSA-65 (3309 B); fail-closed without `install_*` in test | (library tests only) |
 
 Optional CI gate for Solidity cross-check:
@@ -126,7 +127,7 @@ At boot (production):
 1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock), or `boot_configure_pq_seal_v1_platform_root()` once a platform hook is linked.
 2. `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic).
 
-Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo `release` profile** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`.
+Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo profile name `release`** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`. Custom Cargo profiles that do not report `PROFILE=release` are not covered; use a deploy-time feature audit until a second gate lands.
 
 Staging/CI may use `reference-seal-v1-root` or `cargo test` (embedded test root). v0 XOR is **unit-test only**. **Do not** ship `reference-seal-v1-root` in deployment images.
 
@@ -159,7 +160,8 @@ cd ../../elixir-shim && mix test
 cd rust/enclave-protocol
 cargo build --bin enclave-uds-staging --features staging-host
 ./target/debug/enclave-uds-staging   # default ~/.2d-hsm/enclave-staging.sock
-# Override: 2D_HSM_ENCLAVE_STAGING_SOCKET (parent must be mode 0700 if not ~/.2d-hsm)
+# Override: 2D_HSM_ENCLAVE_STAGING_SOCKET — operator must use a private parent (mode 0700,
+# owned by the server UID); the binary does not enforce this on custom paths.
 ```
 
 ## Still deferred (follow-on)
