@@ -41,13 +41,13 @@ This directory contains the reference implementation of the vsock protocol and e
 
 Per `AGENTS.md`:
 
-1. **Reduced matrix** (default for incremental high-risk work): codex security, gemini security, claude-code design.
+1. **Reduced matrix** only for incremental high-risk work that does not introduce significant state-machine logic or modify ticket-signing / `ARM_FOR_PRODUCTION` / hard-fork gating in `impl/**/*.rs`.
 2. **`roborev compact --wait`** after the matrix.
 3. Address High/Critical and relevant Medium findings before treating the increment as reviewed.
 
-Full matrix (+ concurrency lens) is required for first state-machine introduction, core gating changes, or after HIGH findings — see AGENTS.md.
+**Full matrix** (+ concurrency lens) is required for first state-machine introduction, core gating changes, and all `impl/**/*.rs` changes touching ticket signing, `ARM_FOR_PRODUCTION`, hard-fork transition, or key lifecycle — see AGENTS.md.
 
-TASK-2 / TASK-3 increments on this tree went through reduced matrix + compact (commits `2d136ac`, `fddd3f0`, `6dced02`).
+TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, `6dced02`). TASK-2 Phase 4 (stateful host session + Elixir shim) requires Full Matrix before merge.
 
 **Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks in `cfg(test)` / `demo-mock-sign` when no sealed signer is installed (production fail-closed). Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
 

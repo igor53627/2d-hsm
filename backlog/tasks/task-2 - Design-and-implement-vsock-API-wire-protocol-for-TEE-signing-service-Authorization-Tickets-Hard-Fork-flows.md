@@ -480,7 +480,7 @@ Next: run 3:3 matrix on this commit.
 - **Elixir:** `impl/elixir-shim/` — Framing, StdioClient, Socket, Session, TestFixtures; `mix test` (stdio + UDS ARM/STATUS).
 - **AC #1–#6:** Marked complete; #4 evidence: Rust `process_framed_session_*` tests + Elixir UDS (`get_measurement`, `get_status`, `sign_authorization_ticket` with recovery fixture).
 
-**Before merge / single PR:** Reduced roborev matrix on `impl/` + `roborev compact` (per `AGENTS.md`). Consider Full 2×3 if reviewers flag session/gating changes.
+**Before merge / single PR:** Full Matrix (3×3) on `impl/` + `roborev compact` (per `AGENTS.md` — stateful ARM/STATUS/SIGN in `impl/rust/enclave-protocol`, first `EnclaveState` introduction).
 
 **Follow-on (not TASK-2):** production AF_VSOCK, operator runbook polish, live chain-tip refresh, light-client `proof_data` format `0x02+`, TASK-1 platform root in enclave images.
 

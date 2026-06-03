@@ -206,8 +206,11 @@ defmodule EnclaveProtocol.Framing do
       {:ok, map, rest} when is_map(map) and rest in ["", <<>>] ->
         {:ok, map}
 
-      {:ok, _, _} ->
+      {:ok, map, _rest} when is_map(map) ->
         {:error, :trailing_cbor_bytes}
+
+      {:ok, _, _} ->
+        {:error, :not_a_map}
 
       {:error, reason} ->
         {:error, reason}
@@ -217,11 +220,11 @@ defmodule EnclaveProtocol.Framing do
   defp decode_status_map(map) do
     with 1 <- Map.get(map, 1),
          armed when is_boolean(armed) <- Map.get(map, 2),
-         measurement <- cbor_optional_bytes(Map.get(map, 3)),
-         pq_pubkey <- cbor_optional_bytes(Map.get(map, 4)),
+         {:ok, measurement} <- cbor_optional_bytes(Map.get(map, 3)),
+         {:ok, pq_pubkey} <- cbor_optional_bytes(Map.get(map, 4)),
          activated <- Map.get(map, 5),
          finalized <- Map.get(map, 6),
-         source_hash <- cbor_optional_bytes(Map.get(map, 7)),
+         {:ok, source_hash} <- cbor_optional_bytes(Map.get(map, 7)),
          pending_hf <- Map.get(map, 8),
          last_block <- Map.get(map, 9) do
       {:ok,
@@ -241,9 +244,9 @@ defmodule EnclaveProtocol.Framing do
     end
   end
 
-  defp cbor_optional_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: bin
-  defp cbor_optional_bytes(nil), do: nil
-  defp cbor_optional_bytes(_), do: nil
+  defp cbor_optional_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: {:ok, bin}
+  defp cbor_optional_bytes(nil), do: {:ok, nil}
+  defp cbor_optional_bytes(_), do: {:error, :invalid_optional_bytes}
 
   defp cbor_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: bin
   defp cbor_bytes(_), do: nil

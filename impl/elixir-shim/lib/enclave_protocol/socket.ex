@@ -25,8 +25,13 @@ defmodule EnclaveProtocol.Socket do
          {:ok, body} <- read_exact(socket, len) do
       {:ok, <<len::unsigned-big-integer-size(32), body::binary>>}
     else
-      false -> {:error, :frame_too_large}
-      {:error, _} = err -> err
+      false ->
+        close(socket)
+        {:error, :frame_too_large}
+
+      {:error, _} = err ->
+        close(socket)
+        err
     end
   end
 

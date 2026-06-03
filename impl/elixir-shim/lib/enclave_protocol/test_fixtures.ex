@@ -18,7 +18,10 @@ defmodule EnclaveProtocol.TestFixtures do
   defp export_hex_frame(bin, arg) do
     case System.cmd(bin, [arg], stderr_to_stdout: true) do
       {hex, 0} ->
-        {:ok, Base.decode16!(String.trim(hex), case: :mixed)}
+        case Base.decode16(String.trim(hex), case: :mixed) do
+          {:ok, frame} -> {:ok, frame}
+          :error -> {:error, {:invalid_fixture_hex, String.trim(hex)}}
+        end
 
       {output, code} ->
         {:error, {:export_failed, code, output}}

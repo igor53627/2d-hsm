@@ -180,7 +180,7 @@ Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 st
 
 **Recommended next increments (ordered):**
 
-1. **TASK-2 PR** — single stack: wire session + Elixir UDS + docs; roborev Reduced (+ Full 2×3 if required) before merge.
+1. **TASK-2 PR** — single stack: wire session + Elixir UDS + docs; **Full Matrix** (3×3 + `roborev compact`) required before merge (introduces `EnclaveState` / arming / stateful `impl/**/*.rs` path per `AGENTS.md`).
 2. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + `HostSession` from Phase 4.
 3. **TASK-1 follow-ups** — platform `set_pq_seal_v1_provisioning_root`; prod CI gate; verify-path zeroization debt.
 4. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing. Concurrency lens when implementing.

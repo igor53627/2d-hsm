@@ -10,18 +10,16 @@ defmodule EnclaveProtocol.StdioRoundtripTest do
   defp ensure_bridge! do
     path = bridge_path()
 
-    unless File.regular?(path) do
-      {output, status} =
-        System.cmd(
-          "cargo",
-          ["build", "--bin", "enclave-stdio-bridge"],
-          cd: Path.expand("../../rust/enclave-protocol", __DIR__),
-          stderr_to_stdout: true
-        )
+    {output, status} =
+      System.cmd(
+        "cargo",
+        ["build", "--bin", "enclave-stdio-bridge"],
+        cd: Path.expand("../../rust/enclave-protocol", __DIR__),
+        stderr_to_stdout: true
+      )
 
-      if status != 0 do
-        flunk("failed to build enclave-stdio-bridge:\n#{output}")
-      end
+    if status != 0 do
+      flunk("failed to build enclave-stdio-bridge:\n#{output}")
     end
 
     path
