@@ -13,7 +13,7 @@ This directory contains the reference implementation of the vsock protocol and e
 | `rust/enclave-protocol/src/wire.rs` | Spec-aligned CBOR with **integer map keys** for all four commands |
 | `rust/enclave-protocol/src/bin/` | `enclave-stdio-bridge` (stateless GET_MEASUREMENT), `enclave-stdio-session`, `enclave-uds-server` (dev transport) |
 | `solidity/` | Ground-truth `abi.encode` + keccak for cross-checking `ticketHash` |
-| `elixir-shim/` | Host client: framing, stdio GET_MEASUREMENT, UDS session (ARM/STATUS) — see `elixir-shim/README.md` |
+| `elixir-shim/` | Host client: framing, stdio GET_MEASUREMENT, UDS session — ARM/SIGN via Rust-exported frames — see `elixir-shim/README.md` |
 
 **Normative protocol spec:** `backlog/docs/vsock-api-wire-format-spec-draft.md` (§8 wire schemas, §9.1 Producer Chain Attestation, §9.3 trust provisioning).
 
@@ -25,8 +25,8 @@ This directory contains the reference implementation of the vsock protocol and e
 - Enclave state: `EnclaveState` / `EnclaveArmedState`, `arm_for_production`, re-arm monotonicity
 - **Producer Chain Attestation v1** (TASK-3): Ed25519 over domain-separated preimage; pinned `ProducerAttestationTrust` (not derived from public `pq_pubkey`)
 - Hard-fork gating: armed + crypto proof + pubkey match + one fork per session
-- Wire helpers + `process_framed_with_session` / `HostSession` for stateful host↔enclave transports
-- Dev transports: multi-frame stdio session + Unix domain socket server (TASK-2 Phase 4 stand-in for vsock)
+- Wire helpers + `process_framed_with_shared_state` (one `EnclaveState` per enclave process); `HostSession` / `process_framed_with_session` for single-connection dev tools only
+- Dev transports: multi-frame stdio session + UDS server with **shared** enclave state across connections (TASK-2 Phase 4 stand-in for vsock)
 
 ## Dispatch surfaces (important)
 

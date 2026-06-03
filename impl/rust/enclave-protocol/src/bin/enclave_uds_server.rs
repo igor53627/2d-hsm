@@ -2,6 +2,7 @@
 //!
 //! **Dev only:** one shared [`EnclaveState`] per server process (all connections), matching a
 //! single enclave instance. Socket under `~/.2d-hsm/` (parent `0700`), mode `0600`.
+//! Any same-UID process that can open the socket may issue ARM/SIGN — not a production auth boundary.
 
 use enclave_protocol::{
     process_framed_with_shared_state, read_framed_message, write_framed_message, EnclaveState,

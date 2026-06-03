@@ -56,7 +56,7 @@ The API must support at minimum:
 - [x] #1 Clear protocol specification document exists (commands, formats, error handling, security invariants).
 - [x] #2 Wire format is defined and justified (why this encoding).
 - [x] #3 Security model for each command is documented (what the enclave checks before acting).
-- [x] #4 Basic client (host side) and server (TEE side) skeletons are implemented and can exchange at least measurement + ticket signing requests.
+- [x] #4 Basic client (host side) and server (TEE side) skeletons are implemented and can exchange at least measurement + ticket signing requests. *(Elixir: GET_MEASUREMENT/GET_STATUS encoded natively; ARM/SIGN requests replayed from Rust `TestFixtures` — native Elixir ARM/SIGN encoders are follow-on.)*
 - [x] #5 Hard Fork announcement flow is explicitly described end-to-end using this API.
 - [x] #6 The design is reviewed against the Authorization Tickets spec and the hard fork requirements (producer-driven, scheduled at specific block height, header version change, TEE measurement binding).
 
@@ -475,15 +475,15 @@ Next: run 3:3 matrix on this commit.
 
 2026-06-03 — TASK-2 Phase 4 closure (reference host integration):
 
-- **Wire:** integer-key CBOR for all four commands in `wire.rs`; `process_framed_with_session` + `HostSession`.
-- **Transports:** `enclave-stdio-bridge` (stateless GET_MEASUREMENT), `enclave-stdio-session`, `enclave-uds-server` (dev stand-in for vsock).
-- **Elixir:** `impl/elixir-shim/` — Framing, StdioClient, Socket, Session, TestFixtures; `mix test` (stdio + UDS ARM/STATUS).
+- **Wire:** integer-key CBOR for all four commands in `wire.rs`; `process_framed_with_shared_state` for multi-connection transports; `HostSession` for single-connection dev binaries only.
+- **Transports:** `enclave-stdio-bridge` (stateless GET_MEASUREMENT), `enclave-stdio-session`, `enclave-uds-server` (dev stand-in: shared `EnclaveState`, same-UID socket trust — see `elixir-shim/README.md`).
+- **Elixir:** `impl/elixir-shim/` — Framing, StdioClient, Socket, Session, TestFixtures; `mix test` (stdio + UDS). ARM/SIGN over UDS use Rust-exported frames, not native Elixir encoders.
 - **AC #1–#3:** `backlog/docs/vsock-api-wire-format-spec-draft.md` v0.2 (commands, CBOR, security invariants per command).
-- **AC #4:** Rust `process_framed_session_*` + Elixir UDS integration tests (`get_measurement`, `get_status`, `arm_for_production`, `sign_authorization_ticket`).
-- **AC #5:** Hard-fork flow in spec §8 + `ticket_signing_demo` / session tests (Arm → Sign type=1); operator runbook deferred.
-- **AC #6:** Cross-reviewed with authorization-ticket specs (prior matrices on design artifacts); no open HIGH on ticket coupling.
+- **AC #4:** Rust session/framing tests + Elixir UDS tests (`get_measurement`, `get_status`, `arm_for_production`, `sign_authorization_ticket` with fixtures). Integration tests use **64-byte mock** signatures (`demo-mock-sign`), not ML-DSA 3309 B.
+- **AC #5:** Hard-fork flow in spec §8 + `ticket_signing_demo` / session tests (Arm → Sign type=1). *"End-to-end"* here means wire/protocol sequence; **operator runbook** is explicitly deferred.
+- **AC #6:** Cross-reviewed with authorization-ticket specs (prior matrices on design artifacts + Reduced matrix + compact **6778** on branch after shared-state fix `47d141c`).
 
-**Before merge / single PR:** Full Matrix (3×3) on `impl/` + `roborev compact` (per `AGENTS.md` — stateful ARM/STATUS/SIGN in `impl/rust/enclave-protocol`, first `EnclaveState` introduction).
+**Merge gate:** Initial Phase 4 required Full Matrix on `impl/` (per `AGENTS.md`). Post-merge follow-up: production AF_VSOCK must use shared state API (see implementation plan § next increments).
 
 **Follow-on (not TASK-2):** production AF_VSOCK, operator runbook polish, live chain-tip refresh, light-client `proof_data` format `0x02+`, TASK-1 platform root in enclave images.
 
