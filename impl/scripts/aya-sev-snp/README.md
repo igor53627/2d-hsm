@@ -43,9 +43,20 @@ SEV_MODE=sev MEMORY=4096 VCPUS=2 ./run-guest-vm.sh
 
 **Inside the guest**, bind uses `2D_HSM_VSOCK_CID=4294967295` (`VMADDR_CID_ANY`). **On the host**, connect to `GUEST_CID=42` (QEMU `vhost-vsock-pci`).
 
-Stock Ubuntu QEMU 8.2 has only legacy `sev-guest` (fails with EPERM on this SNP host). Build SNP-capable QEMU once:
+**SNP host prep** (once per machine):
 
 ```bash
-./install-qemu-snp.sh   # installs to /opt/qemu-snp (QEMU 9.2.x, ~15–25 min)
-./run-snp-smoke.sh      # SNP VM + guest HSM + host vsock smoke
+./prepare-snp-host.sh    # QEMU 10 + kernel 6.17; then REBOOT into 6.17
+./run-snp-smoke.sh       # SNP VM + guest HSM + host vsock smoke
 ```
+
+If boot stops at `Convert non guest_memfd ... 0xfee00000`, build AMD OVMF:
+
+```bash
+git clone https://github.com/AMDESE/AMDSEV.git /tmp/AMDSEV
+cd /tmp/AMDSEV && ./build.sh ovmf --install /opt/amde-ovmf
+export SNP_BIOS=/opt/amde-ovmf/OVMF.fd
+./run-snp-smoke.sh
+```
+
+Stock Ubuntu QEMU 8.2 only has legacy `sev-guest` (EPERM on this host).

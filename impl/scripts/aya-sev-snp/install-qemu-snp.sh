@@ -9,6 +9,7 @@ BUILD_ROOT="${SCRIPT_DIR}/qemu-build"
 SRC="${BUILD_ROOT}/qemu-${VERSION}"
 
 if [[ -x "${PREFIX}/bin/qemu-system-x86_64" ]] \
+  && "${PREFIX}/bin/qemu-system-x86_64" --version 2>&1 | grep -q "version ${VERSION}" \
   && "${PREFIX}/bin/qemu-system-x86_64" -object help 2>&1 | grep -q sev-snp-guest; then
   echo "install-qemu-snp: already OK at ${PREFIX}"
   "${PREFIX}/bin/qemu-system-x86_64" --version
