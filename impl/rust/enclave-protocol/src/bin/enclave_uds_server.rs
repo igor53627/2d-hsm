@@ -1,7 +1,7 @@
 //! Unix domain socket server — dev transport matching vsock framing (TASK-2 Phase 4).
 //!
-//! **Dev only:** binds a user-private socket (default under `~/.2d-hsm/`), mode `0600`,
-//! caps concurrent connections. Not a production enclave entrypoint (no peer auth).
+//! **Dev only:** socket under `~/.2d-hsm/` (parent dir `0700`), mode `0600`, session cap.
+//! Not a production enclave entrypoint (no peer auth).
 
 use enclave_protocol::{
     process_framed_with_session, read_framed_message, write_framed_message, HostSession,
@@ -17,6 +17,14 @@ use std::time::Duration;
 
 const MAX_CONCURRENT_SESSIONS: usize = 32;
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct SessionSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for SessionSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -39,6 +47,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| default_socket_path());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
     if path.exists() {
         std::fs::remove_file(&path)?;
@@ -53,19 +62,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let stream = stream?;
-        let prev = active.fetch_add(1, Ordering::SeqCst);
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
+        };
+        let prev = active.fetch_add(1, Ordering::Relaxed);
         if prev >= MAX_CONCURRENT_SESSIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
+            active.fetch_sub(1, Ordering::Relaxed);
             eprintln!("rejecting connection: at session cap");
             continue;
         }
         let active = Arc::clone(&active);
         thread::spawn(move || {
+            let _guard = SessionSlotGuard(active);
             if let Err(e) = handle_client(stream) {
                 eprintln!("session error: {e}");
             }
-            active.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
@@ -78,8 +93,7 @@ fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error
         let frame = match read_framed_message(&mut stream) {
             Ok(f) => f,
             Err(enclave_protocol::ProtocolError::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
                 break;
             }

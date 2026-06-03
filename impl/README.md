@@ -56,6 +56,9 @@ TASK-2 / TASK-3 increments on this tree went through reduced matrix + compact (c
 ```bash
 cd rust/enclave-protocol
 cargo test --features ml-dsa-65,pq-seal-provisioning
+
+# Reference host session / wire integration (mutually exclusive with ml-dsa-65):
+cargo test --features test-support,demo-mock-sign
 ```
 
 Optional CI gate for Solidity cross-check:

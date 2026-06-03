@@ -3,9 +3,9 @@ defmodule EnclaveProtocol.Socket do
   Unix domain socket transport (dev stand-in for vsock; same framing as production).
   """
 
+  alias EnclaveProtocol.Framing
+
   @read_timeout_ms 5_000
-  # Matches enclave-protocol MAX_MESSAGE_SIZE (1 MiB framed body + 4-byte prefix).
-  @max_frame_bytes 1_048_576 + 4
 
   @doc "Connect to the reference enclave UDS server."
   @spec connect(Path.t()) :: {:ok, port()} | {:error, term()}
@@ -21,7 +21,7 @@ defmodule EnclaveProtocol.Socket do
   def request(socket, frame) when is_port(socket) and is_binary(frame) do
     with :ok <- :gen_tcp.send(socket, frame),
          {:ok, <<len::unsigned-big-integer-size(32)>>} <- read_exact(socket, 4),
-         true <- len <= @max_frame_bytes,
+         true <- len > 0 and len <= Framing.max_payload_len(),
          {:ok, body} <- read_exact(socket, len) do
       {:ok, <<len::unsigned-big-integer-size(32), body::binary>>}
     else
@@ -35,6 +35,8 @@ defmodule EnclaveProtocol.Socket do
   def close(socket) when is_port(socket) do
     :gen_tcp.close(socket)
   end
+
+  defp read_exact(_socket, 0), do: {:ok, <<>>}
 
   defp read_exact(socket, nbytes) when nbytes > 0 do
     case :gen_tcp.recv(socket, nbytes, @read_timeout_ms) do

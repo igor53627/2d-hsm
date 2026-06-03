@@ -191,6 +191,50 @@ pub fn encode_wire_error(error_code: i64, reason: &str) -> Result<Vec<u8>, Proto
     encode_value(&value)
 }
 
+/// Decode spec wire error body `{ 1: code, 2: reason }` (not a command success map).
+pub fn decode_wire_error(bytes: &[u8]) -> Result<(i64, String), ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol("wire error must be a CBOR map"));
+    };
+    if is_success_response_map(&map) {
+        return Err(ProtocolError::WireProtocol("payload is a success response, not a wire error"));
+    }
+    let code = value_to_u64(map_get(&map, 1)?)? as i64;
+    let reason = value_to_text(map_get(&map, 2)?)?;
+    Ok((code, reason))
+}
+
+/// True when `payload` is a wire error map (integer code + text reason, no success shape).
+pub fn is_wire_error_payload(bytes: &[u8]) -> bool {
+    decode_wire_error(bytes).is_ok()
+}
+
+fn is_success_response_map(map: &[(Value, Value)]) -> bool {
+    if map_get(map, 3).is_ok() {
+        return true;
+    }
+    if let Ok(v) = map_get(map, 1) {
+        if matches!(v, Value::Text(s) if s == "armed") {
+            return true;
+        }
+    }
+    if let Ok(v) = map_get(map, 2) {
+        if matches!(v, Value::Bool(_)) {
+            return true;
+        }
+        if matches!(v, Value::Bytes(_)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn value_to_u8(v: &Value) -> Result<u8, ProtocolError> {
+    let n = value_to_u64(v)?;
+    u8::try_from(n).map_err(|_| ProtocolError::InvalidTicket("ticket_type out of range"))
+}
+
 /// CBOR-encode `GET_MEASUREMENT` request (`{ 1: version }`).
 pub fn encode_get_measurement_request(req: &GetMeasurementRequest) -> Result<Vec<u8>, ProtocolError> {
     let value = Value::Map(vec![(
@@ -474,7 +518,7 @@ fn decode_authorization_ticket_payload(v: &Value) -> Result<AuthorizationTicketP
         ));
     };
     Ok(AuthorizationTicketPayload {
-        ticket_type: value_to_u64(map_get(&map, 1)?)? as u8,
+        ticket_type: value_to_u8(map_get(&map, 1)?)?,
         nonce: value_to_u64(map_get(&map, 2)?)?,
         context_hash: value_to_bytes32(map_get(&map, 3)?)?,
         activation_height: value_to_u64(map_get(&map, 4)?)?,
@@ -710,6 +754,27 @@ mod tests {
         let decoded = decode_sign_authorization_ticket_request(&bytes).unwrap();
         assert_eq!(decoded.ticket.nonce, 42);
         assert_eq!(decoded.ticket.new_header_version, Some(3));
+    }
+
+    #[test]
+    fn sign_request_rejects_ticket_type_out_of_range() {
+        let map = vec![
+            (Value::Integer(1.into()), Value::Integer(256.into())),
+            (Value::Integer(2.into()), Value::Integer(1.into())),
+            (Value::Integer(3.into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(5.into()), Value::Bytes(b"m".to_vec())),
+            (Value::Integer(6.into()), Value::Bytes(vec![0xAA; 48])),
+            (Value::Integer(7.into()), Value::Null),
+            (Value::Integer(8.into()), Value::Null),
+        ];
+        let ticket = Value::Map(map);
+        let req_map = vec![
+            (Value::Integer(1.into()), Value::Integer(1.into())),
+            (Value::Integer(2.into()), ticket),
+        ];
+        let bytes = encode_value(&Value::Map(req_map)).unwrap();
+        assert!(decode_sign_authorization_ticket_request(&bytes).is_err());
     }
 
     #[test]

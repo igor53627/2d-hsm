@@ -51,11 +51,11 @@ pub use wire::{
     decode_arm_for_production_request, decode_arm_for_production_response,
     decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
     decode_get_status_response, decode_sign_authorization_ticket_request,
-    decode_sign_authorization_ticket_response, encode_arm_for_production_request,
+    decode_sign_authorization_ticket_response, decode_wire_error, encode_arm_for_production_request,
     encode_arm_for_production_response, encode_get_measurement_request,
     encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
     encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
-    encode_wire_error,
+    encode_wire_error, is_wire_error_payload,
 };
 #[cfg(feature = "ml-dsa-65")]
 pub use mldsa65::MlDsa65Signer;
@@ -1125,8 +1125,62 @@ fn encode_wire_response(msg_type: MessageType, response: &Response) -> Result<Ve
     }
 }
 
+/// Best-effort message type from a frame prefix (for error responses when decode fails).
+pub fn peek_msg_type_from_frame(frame: &[u8]) -> MessageType {
+    match frame.get(5) {
+        Some(0x01) => MessageType::GetMeasurement,
+        Some(0x10) => MessageType::SignAuthorizationTicket,
+        Some(0x20) => MessageType::ArmForProduction,
+        Some(0x30) => MessageType::GetStatus,
+        _ => MessageType::GetMeasurement,
+    }
+}
+
+fn protocol_error_to_wire_body(e: &ProtocolError) -> Result<Vec<u8>, ProtocolError> {
+    let (code, reason) = match e {
+        ProtocolError::MessageTooLarge(n) => (1, format!("message too large: {n}")),
+        ProtocolError::InvalidVersion { got, expected } => {
+            (1, format!("invalid version: got {got}, expected {expected}"))
+        }
+        ProtocolError::UnknownMessageType(b) => (1, format!("unknown message type: {b}")),
+        ProtocolError::WireProtocol(s) => (1, (*s).to_string()),
+        ProtocolError::InvalidTicket(s) => (2, (*s).to_string()),
+        ProtocolError::RecentChainProofValidation(s) => (2, (*s).to_string()),
+        ProtocolError::PqSigningUnavailable(s) => (2, (*s).to_string()),
+        ProtocolError::PqSignatureInvalid(s) => (2, (*s).to_string()),
+        ProtocolError::CborDecode(err) => (1, format!("cbor decode error: {err}")),
+        ProtocolError::CborEncode(err) => (1, format!("cbor encode error: {err}")),
+        ProtocolError::Io(_) => {
+            return Err(ProtocolError::WireProtocol(
+                "internal: Io errors must not be encoded as wire errors",
+            ));
+        }
+    };
+    encode_wire_error(code, &reason)
+}
+
+fn encode_wire_error_frame(msg_type: MessageType, e: ProtocolError) -> Result<Vec<u8>, ProtocolError> {
+    let body = protocol_error_to_wire_body(&e)?;
+    encode_message(msg_type, &body)
+}
+
 /// Process one framed host request with session state (all commands, integer-key wire).
+///
+/// Decode/dispatch failures return a wire error frame on the **same** `msg_type` (connection stays up).
+/// I/O errors still propagate to the transport layer.
 pub fn process_framed_with_session(
+    frame: &[u8],
+    session: &mut HostSession,
+) -> Result<Vec<u8>, ProtocolError> {
+    let msg_type = peek_msg_type_from_frame(frame);
+    match try_process_framed_with_session(frame, session) {
+        Ok(resp) => Ok(resp),
+        Err(e @ ProtocolError::Io(_)) => Err(e),
+        Err(e) => encode_wire_error_frame(msg_type, e),
+    }
+}
+
+fn try_process_framed_with_session(
     frame: &[u8],
     session: &mut HostSession,
 ) -> Result<Vec<u8>, ProtocolError> {
@@ -1140,22 +1194,31 @@ pub fn process_framed_with_session(
 
 /// Stateless one-shot bridge: **GET_MEASUREMENT only** (no `test-support` required).
 pub fn process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let msg_type = peek_msg_type_from_frame(frame);
+    match try_process_framed_bytes(frame) {
+        Ok(resp) => Ok(resp),
+        Err(e @ ProtocolError::Io(_)) => Err(e),
+        Err(e) => encode_wire_error_frame(msg_type, e),
+    }
+}
+
+fn try_process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let framed = decode_message(frame)?;
     if framed.msg_type != MessageType::GetMeasurement {
-        let body = encode_wire_error(
-            1,
+        return Err(ProtocolError::WireProtocol(
             "stateless stdio bridge supports GET_MEASUREMENT only; use enclave-stdio-session for ARM/STATUS/SIGN",
-        )?;
-        return encode_message(framed.msg_type, &body);
+        ));
     }
     let req = decode_get_measurement_request(&framed.payload)?;
     let body = match dispatch_command(Command::GetMeasurement(req)) {
         Response::GetMeasurement(resp) => encode_get_measurement_response(&resp)?,
         Response::Error(msg) => encode_wire_error(1, &msg)?,
-        other => encode_wire_error(
-            1,
-            &format!("unexpected dispatch response for GET_MEASUREMENT: {:?}", other),
-        )?,
+        other => {
+            encode_wire_error(
+                1,
+                &format!("unexpected dispatch response for GET_MEASUREMENT: {:?}", other),
+            )?
+        }
     };
     encode_message(MessageType::GetMeasurement, &body)
 }
@@ -1417,6 +1480,20 @@ mod tests {
     }
 
     #[test]
+    fn process_framed_with_session_returns_wire_error_on_unknown_msg_type() {
+        #[cfg(feature = "test-support")]
+        let mut session = HostSession::reference_test();
+        #[cfg(not(feature = "test-support"))]
+        compile_error!("test requires test-support");
+        let payload = encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
+        let mut bad_frame = encode_message(MessageType::GetMeasurement, &payload).unwrap();
+        bad_frame[5] = 0xFF;
+        let resp = process_framed_with_session(&bad_frame, &mut session).unwrap();
+        let decoded = decode_message(&resp).unwrap();
+        assert!(is_wire_error_payload(&decoded.payload));
+    }
+
+    #[test]
     fn read_framed_message_rejects_oversized_length_prefix() {
         use std::io::Cursor;
         let oversized = (MAX_MESSAGE_SIZE + 1).to_be_bytes();
@@ -1425,7 +1502,7 @@ mod tests {
         assert!(matches!(err, ProtocolError::MessageTooLarge(_)));
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "demo-mock-sign"))]
     #[test]
     fn process_framed_session_arm_status_sign_hardfork() {
         use crate::host_test_fixtures::sample_arm_for_production_frame;

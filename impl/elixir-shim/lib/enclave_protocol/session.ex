@@ -28,16 +28,7 @@ defmodule EnclaveProtocol.Session do
   @spec get_measurement(t()) :: {:ok, map()} | {:error, term()}
   def get_measurement(%__MODULE__{socket: socket}) do
     frame = Framing.build_get_measurement_request()
-
-    with {:ok, response} <- Socket.request(socket, frame),
-         {:ok, {msg, payload}} <- Framing.decode_frame(response),
-         true <- msg == Framing.msg_get_measurement(),
-         {:ok, body} <- Framing.decode_get_measurement_response(payload) do
-      {:ok, body}
-    else
-      false -> {:error, :unexpected_message_type}
-      {:error, _} = err -> err
-    end
+    request_and_decode(socket, Framing.msg_get_measurement(), frame)
   end
 
   @doc "GET_STATUS"
@@ -45,33 +36,26 @@ defmodule EnclaveProtocol.Session do
   def get_status(%__MODULE__{socket: socket}) do
     payload = CBOR.encode(%{1 => 1})
     frame = Framing.encode_frame(Framing.msg_get_status(), payload)
-
-    with {:ok, response} <- Socket.request(socket, frame),
-         {:ok, {msg, body}} <- Framing.decode_frame(response),
-         true <- msg == Framing.msg_get_status(),
-         {:ok, status} <- Framing.decode_get_status_response(body) do
-      {:ok, status}
-    else
-      false -> {:error, :unexpected_message_type}
-      {:error, _} = err -> err
-    end
+    request_and_decode(socket, Framing.msg_get_status(), frame)
   end
 
-  @doc "Send a pre-built framed request (e.g. from `TestFixtures`) and return raw response frame."
-  @spec request_raw(t(), binary()) :: {:ok, binary()} | {:error, term()}
-  def request_raw(%__MODULE__{socket: socket}, frame) do
-    Socket.request(socket, frame)
+  @doc "ARM_FOR_PRODUCTION (pass a pre-built request frame from `TestFixtures`)."
+  @spec arm_for_production(t(), binary()) :: {:ok, map()} | {:error, term()}
+  def arm_for_production(%__MODULE__{socket: socket}, request_frame) do
+    request_and_decode(socket, Framing.msg_arm_for_production(), request_frame)
   end
 
-  @doc """
-  Send a framed SIGN_AUTHORIZATION_TICKET request and parse the success response.
-  """
+  @doc "SIGN_AUTHORIZATION_TICKET (pass a pre-built request frame from `TestFixtures`)."
   @spec sign_authorization_ticket(t(), binary()) :: {:ok, map()} | {:error, term()}
   def sign_authorization_ticket(%__MODULE__{socket: socket}, request_frame) do
+    request_and_decode(socket, Framing.msg_sign_authorization_ticket(), request_frame)
+  end
+
+  defp request_and_decode(socket, expected_msg, request_frame) do
     with {:ok, response} <- Socket.request(socket, request_frame),
          {:ok, {msg, payload}} <- Framing.decode_frame(response),
-         true <- msg == Framing.msg_sign_authorization_ticket(),
-         {:ok, body} <- Framing.decode_sign_authorization_ticket_response(payload) do
+         true <- msg == expected_msg,
+         {:ok, body} <- Framing.decode_response_payload(msg, payload) do
       {:ok, body}
     else
       false -> {:error, :unexpected_message_type}
