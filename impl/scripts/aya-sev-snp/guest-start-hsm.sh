@@ -22,7 +22,7 @@ ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "ubuntu@${VM_HOST}" "sudo mkdir -
 scp -o StrictHostKeyChecking=no -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:${GUEST_DIR}/enclave-vsock-staging"
 
 ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
-  "pkill -x enclave-vsock-staging 2>/dev/null || true; \
+  "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \
    nohup env 2D_HSM_VSOCK_CID=4294967295 2D_HSM_VSOCK_PORT=5000 \
    ${GUEST_DIR}/enclave-vsock-staging > /tmp/enclave-vsock-staging.log 2>&1 & \
    sleep 2; grep listening /tmp/enclave-vsock-staging.log || cat /tmp/enclave-vsock-staging.log"

@@ -10,12 +10,8 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-pkill -x enclave-vsock-staging 2>/dev/null || true
+pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true
 sleep 2
-if pgrep -x enclave-vsock-staging >/dev/null; then
-  echo "stop existing enclave-vsock-staging first"
-  exit 1
-fi
 
 env 2D_HSM_VSOCK_CID=1 "2D_HSM_VSOCK_PORT=$PORT" nohup "$BIN" >/tmp/enclave-vsock-staging.log 2>&1 &
 sleep 1
@@ -42,5 +38,5 @@ assert b"prod-enclave-v1" in resp, "missing staging measurement in response"
 print("host-loopback-smoke: OK", len(resp), "bytes")
 PY
 
-pkill -x enclave-vsock-staging 2>/dev/null || true
+pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true
 echo "host-loopback-smoke: passed"
