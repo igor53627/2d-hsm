@@ -4,6 +4,7 @@ set -euo pipefail
 
 SSH_PORT="${SSH_PORT:-2222}"
 VM_HOST="${VM_HOST:-localhost}"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
 BIN="${HSM_BIN:-/root/2d-hsm/impl/rust/enclave-protocol/target/debug/enclave-vsock-staging}"
 GUEST_DIR="${GUEST_DIR:-/opt/2d-hsm}"
 
@@ -11,17 +12,17 @@ GUEST_DIR="${GUEST_DIR:-/opt/2d-hsm}"
 
 echo "Waiting for guest SSH on port ${SSH_PORT}..."
 for i in $(seq 1 60); do
-  if ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no -p "$SSH_PORT" "ubuntu@${VM_HOST}" "echo ok" 2>/dev/null; then
+  if ssh $SSH_OPTS -o ConnectTimeout=2 -p "$SSH_PORT" "ubuntu@${VM_HOST}" "echo ok" 2>/dev/null; then
     break
   fi
   sleep 5
   [[ "$i" == 60 ]] && { echo "SSH timeout"; exit 1; }
 done
 
-ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "ubuntu@${VM_HOST}" "sudo mkdir -p ${GUEST_DIR} && sudo chown ubuntu:ubuntu ${GUEST_DIR}"
-scp -o StrictHostKeyChecking=no -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:${GUEST_DIR}/enclave-vsock-staging"
+ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" "sudo mkdir -p ${GUEST_DIR} && sudo chown ubuntu:ubuntu ${GUEST_DIR}"
+scp $SSH_OPTS -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:${GUEST_DIR}/enclave-vsock-staging"
 
-ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
+ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
   "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \
    nohup env 2D_HSM_VSOCK_CID=4294967295 2D_HSM_VSOCK_PORT=5000 \
    ${GUEST_DIR}/enclave-vsock-staging > /tmp/enclave-vsock-staging.log 2>&1 & \
