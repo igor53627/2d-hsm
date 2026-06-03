@@ -1,8 +1,8 @@
 //! AF_VSOCK listener (Linux / Nitro / SEV-SNP reference transport).
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use vsock::{VsockAddr, VsockListener};
 
 /// Default Nitro-style enclave CID (parent VM is typically CID 3 for the enclave side in many setups).
@@ -27,13 +27,13 @@ pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
     Ok((cid, port))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub fn bind_vsock_listener(cid: u32, port: u32) -> Result<VsockListener, io::Error> {
     let addr = VsockAddr::new(cid, port);
     VsockListener::bind(&addr)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", feature = "vsock-transport")))]
 pub fn bind_vsock_listener(_cid: u32, _port: u32) -> Result<(), String> {
-    Err("AF_VSOCK is only available on Linux".to_string())
+    Err("AF_VSOCK requires Linux and feature vsock-transport (use staging-vsock)".to_string())
 }

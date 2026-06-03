@@ -162,7 +162,9 @@ cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Lin
 # 2D_HSM_VSOCK_CID=3 2D_HSM_VSOCK_PORT=5000 ./target/debug/enclave-vsock-staging
 ```
 
-Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Production** `enclave-vsock` (no `staging-host`, platform root + sealed PQ at boot) is blocked on hardware-backed `set_pq_seal_v1_provisioning_root` and enclave-provisioned `ProducerAttestationTrust`.
+Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Build on Linux** (e.g. SEV dev host `aya`, CI, Nitro parent) — not a runnable vsock server on macOS (compile-only stub there). At runtime the host needs vsock enabled (`vmw_vsock_vmci_transport` / `vhost_vsock`); bind errors such as `Cannot assign requested address` mean CID/port are wrong for that machine.
+
+**Production** `enclave-vsock` (no `staging-host`, platform root + sealed PQ at boot) is blocked on hardware-backed `set_pq_seal_v1_provisioning_root` and enclave-provisioned `ProducerAttestationTrust`.
 
 ## Staging UDS (TASK-1, PR #4)
 
