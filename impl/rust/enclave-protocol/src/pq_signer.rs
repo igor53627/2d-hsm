@@ -57,28 +57,6 @@ const SEALED_BLOB_V0_MAGIC: &[u8; 8] = b"2DHSMV0\0";
 static INSTALLED_SIGNER: Mutex<Option<InstalledSigner>> = Mutex::new(None);
 
 #[cfg(test)]
-#[allow(dead_code)]
-static SEALED_SIGNER_TEST_SESSIONS: Mutex<usize> = Mutex::new(0);
-
-#[cfg(test)]
-pub fn begin_sealed_signer_test_session() {
-    *SEALED_SIGNER_TEST_SESSIONS
-        .lock()
-        .expect("sealed test session mutex poisoned") += 1;
-}
-
-#[cfg(test)]
-pub fn end_sealed_signer_test_session() {
-    let mut count = SEALED_SIGNER_TEST_SESSIONS
-        .lock()
-        .expect("sealed test session mutex poisoned");
-    *count = count.saturating_sub(1);
-    if *count == 0 {
-        reset_installed_pq_signer_for_tests();
-    }
-}
-
-#[cfg(test)]
 static SEALED_SIGNER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Holds the global sealed-signer test lock for the whole test (prevents parallel leakage).
@@ -93,7 +71,7 @@ impl SealedSignerTestGuard {
         Self {
             _lock: SEALED_SIGNER_TEST_LOCK
                 .lock()
-                .expect("sealed signer test lock poisoned"),
+                .unwrap_or_else(|e| e.into_inner()),
         }
     }
 }
@@ -102,6 +80,8 @@ impl SealedSignerTestGuard {
 impl Drop for SealedSignerTestGuard {
     fn drop(&mut self) {
         reset_installed_pq_signer_for_tests();
+        #[cfg(feature = "ml-dsa-65")]
+        reset_pq_seal_v1_provisioning_root_for_tests();
     }
 }
 
@@ -466,7 +446,17 @@ pub use v1_seal::{
     verify_sealed_blob_v1_with_root,
 };
 
-/// Whether a platform or reference provisioning root is available for v1 unseal.
+/// Whether the platform boot hook installed a provisioning root (not the CI/test fallback).
+#[cfg(feature = "ml-dsa-65")]
+pub fn is_platform_pq_seal_v1_provisioning_root_set() -> bool {
+    PLATFORM_PROVISIONING_ROOT
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|_| ()))
+        .is_some()
+}
+
+/// Whether v1 unseal can resolve a provisioning root (platform, reference-seal, or `cfg(test)`).
 #[cfg(feature = "ml-dsa-65")]
 pub fn is_pq_seal_v1_provisioning_root_configured() -> bool {
     v1_seal::resolve_provisioning_root().is_ok()

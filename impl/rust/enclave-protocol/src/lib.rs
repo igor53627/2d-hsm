@@ -24,7 +24,7 @@ compile_error!(
 );
 
 #[cfg(all(
-    not(debug_assertions),
+    release_build,
     any(
         feature = "staging-host",
         feature = "reference-test-key",
@@ -36,10 +36,7 @@ compile_error!(
      must not be enabled in release builds; use ml-dsa-65 with platform set_pq_seal_v1_provisioning_root"
 );
 
-#[cfg(all(
-    not(debug_assertions),
-    feature = "platform-provisioning-from-file"
-))]
+#[cfg(all(release_build, feature = "platform-provisioning-from-file"))]
 compile_error!(
     "feature platform-provisioning-from-file is for debug/integration builds only, not release"
 );
@@ -108,7 +105,8 @@ pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
 pub use uds_listen::{bind_unix_listener, default_dev_socket_dir};
 #[cfg(feature = "ml-dsa-65")]
 pub use pq_signer::{
-    is_pq_seal_v1_provisioning_root_configured, pq_seal_v1_expected_blob_len,
+    is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
+    pq_seal_v1_expected_blob_len,
     pq_seal_v1_measurement_digest, set_pq_seal_v1_provisioning_root, SEALED_BLOB_V1_MAGIC,
     SEALED_BLOB_V1_HEADER_LEN, SEALED_BLOB_V1_VERSION,
 };

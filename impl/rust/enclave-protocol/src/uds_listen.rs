@@ -6,21 +6,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
-/// Bind a UDS listener at `path` with parent `0700` and socket `0600`.
+/// Bind a UDS listener at `path` with socket mode `0600`.
 ///
-/// When `path` is not under `default_parent`, the parent must already exist with mode `0700`
-/// so other local users cannot connect during the brief window before socket chmod.
+/// Creates the parent directory when missing. Tightens the default `private_dir` to `0700`;
+/// custom `2D_HSM_ENCLAVE_*_SOCKET` parents are created but not chmod'd (operator responsibility).
 pub fn bind_unix_listener(
     path: &Path,
     private_dir: &Path,
 ) -> Result<UnixListener, io::Error> {
     if let Some(parent) = path.parent() {
-        let is_default_parent = Some(parent) == Some(private_dir);
-        if is_default_parent {
-            fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
+        if path_parent_is_private_dir(parent, private_dir) {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        } else {
-            require_private_socket_parent(parent)?;
         }
     }
     if path.exists() {
@@ -31,33 +28,20 @@ pub fn bind_unix_listener(
     Ok(listener)
 }
 
-fn require_private_socket_parent(parent: &Path) -> Result<(), io::Error> {
-    let meta = fs::metadata(parent).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "socket parent {} must exist with mode 0700 before bind (custom socket path): {e}",
-                parent.display()
-            ),
-        )
-    })?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "socket parent {} must be mode 0700 (got {mode:o}); use default ~/.2d-hsm path or fix permissions",
-                parent.display()
-            ),
-        ));
+fn path_parent_is_private_dir(parent: &Path, private_dir: &Path) -> bool {
+    if parent == private_dir {
+        return true;
     }
-    Ok(())
+    match (parent.canonicalize(), private_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
-/// Default dev socket directory: `$HOME/.2d-hsm`.
+/// Default dev socket directory: `$HOME/.2d-hsm` (or `$TMPDIR/.2d-hsm` when `HOME` is unset).
 pub fn default_dev_socket_dir() -> PathBuf {
-    std::env::var("HOME")
+    let base = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join(".2d-hsm")
+        .unwrap_or_else(|| std::env::temp_dir());
+    base.join(".2d-hsm")
 }

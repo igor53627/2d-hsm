@@ -6,7 +6,7 @@
 use enclave_protocol::{
     bind_unix_listener, default_dev_socket_dir, install_reference_sealed_signer_staging,
     is_sealed_signer_installed, process_framed_with_shared_state, pq_signing_ready,
-    read_framed_message, write_framed_message, EnclaveState, HostSession,
+    read_framed_message, reference_test_attestation_trust, write_framed_message, EnclaveState,
     ProducerAttestationTrust,
 };
 use std::env;
@@ -31,7 +31,7 @@ impl SharedEnclaveRuntime {
         install_reference_sealed_signer_staging()?;
         Ok(Self {
             state: Arc::new(Mutex::new(EnclaveState::Unarmed)),
-            attestation_trust: HostSession::reference_staging().attestation_trust,
+            attestation_trust: reference_test_attestation_trust(),
         })
     }
 }

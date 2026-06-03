@@ -65,15 +65,16 @@ TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, 
 
 ```bash
 cd rust/enclave-protocol
-# Seal/provisioning CLI + ML-DSA unit tests (no reference-key integration tests)
-cargo test --features ml-dsa-65,pq-seal-provisioning
+# Seal/provisioning CLI + ML-DSA unit tests (no reference-key / staging-host)
+cargo test --features ml-dsa-65,pq-seal-provisioning   # 74 lib tests
 
 # Reference host session / wire integration (mutually exclusive with ml-dsa-65):
 cargo test --features test-support,demo-mock-sign
 
 # TASK-1 staging: real ML-DSA-65 + fail-closed SIGN (`reference-test-key` pulls seal + provisioning)
 cargo test --features reference-test-key
-cargo build --bin enclave-uds-staging --features staging-host
+cargo build --bin enclave-uds-staging --features staging-host   # debug only; release + staging-host fails at compile time
+./target/debug/enclave-uds-staging
 # Optional socket override (do not use 2D_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
 # 2D_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
 ```
@@ -125,7 +126,7 @@ At boot (production):
 1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock), or `boot_configure_pq_seal_v1_platform_root()` once a platform hook is linked.
 2. `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic).
 
-Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Release builds** `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled.
+Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo `release` profile** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`.
 
 Staging/CI may use `reference-seal-v1-root` or `cargo test` (embedded test root). v0 XOR is **unit-test only**. **Do not** ship `reference-seal-v1-root` in deployment images.
 

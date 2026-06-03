@@ -56,8 +56,7 @@ fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], Proto
 mod tests {
     use super::*;
     use crate::pq_signer::{
-        is_pq_seal_v1_provisioning_root_configured, reset_pq_seal_v1_provisioning_root_for_tests,
-        SealedSignerTestGuard,
+        is_platform_pq_seal_v1_provisioning_root_set, SealedSignerTestGuard,
     };
 
     #[cfg(all(
@@ -68,16 +67,14 @@ mod tests {
     #[test]
     fn boot_configure_errors_without_platform_hook() {
         let _guard = SealedSignerTestGuard::acquire();
-        reset_pq_seal_v1_provisioning_root_for_tests();
         assert!(boot_configure_pq_seal_v1_platform_root().is_err());
-        assert!(!is_pq_seal_v1_provisioning_root_configured());
+        assert!(!is_platform_pq_seal_v1_provisioning_root_set());
     }
 
     #[cfg(all(feature = "ml-dsa-65", feature = "platform-provisioning-from-file"))]
     #[test]
     fn read_provisioning_root_file_accepts_32_bytes() {
         let _guard = SealedSignerTestGuard::acquire();
-        reset_pq_seal_v1_provisioning_root_for_tests();
         let root = include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("platform_root.bin");
@@ -85,6 +82,6 @@ mod tests {
         let loaded = read_provisioning_root_file(&path).unwrap();
         assert_eq!(loaded, *root);
         set_pq_seal_v1_provisioning_root(loaded).unwrap();
-        assert!(is_pq_seal_v1_provisioning_root_configured());
+        assert!(is_platform_pq_seal_v1_provisioning_root_set());
     }
 }
