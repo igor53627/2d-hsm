@@ -23,7 +23,31 @@ compile_error!(
     "features `ml-dsa-65` and `test-support` are mutually exclusive; do not use --all-features"
 );
 
+#[cfg(all(
+    not(debug_assertions),
+    any(
+        feature = "staging-host",
+        feature = "reference-test-key",
+        feature = "reference-seal-v1-root"
+    )
+))]
+compile_error!(
+    "reference/staging PQ features (staging-host, reference-test-key, reference-seal-v1-root) \
+     must not be enabled in release builds; use ml-dsa-65 with platform set_pq_seal_v1_provisioning_root"
+);
+
+#[cfg(all(
+    not(debug_assertions),
+    feature = "platform-provisioning-from-file"
+))]
+compile_error!(
+    "feature platform-provisioning-from-file is for debug/integration builds only, not release"
+);
+
 mod chain_proof_crypto;
+#[cfg(feature = "ml-dsa-65")]
+mod platform_provisioning_boot;
+mod uds_listen;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",
@@ -79,6 +103,9 @@ pub use pq_signer::{
     install_sealed_pq_signer, is_sealed_signer_installed, ML_DSA65_SECRETKEY_LEN,
     SEALED_BLOB_V0_VERSION,
 };
+#[cfg(feature = "ml-dsa-65")]
+pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
+pub use uds_listen::{bind_unix_listener, default_dev_socket_dir};
 #[cfg(feature = "ml-dsa-65")]
 pub use pq_signer::{
     is_pq_seal_v1_provisioning_root_configured, pq_seal_v1_expected_blob_len,

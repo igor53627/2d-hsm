@@ -39,6 +39,8 @@ ml-dsa-65 = [
 pq-seal-provisioning = ["ml-dsa-65"]
 # Staging/CI: reference v1 seal root (not for production deployment).
 reference-seal-v1-root = ["ml-dsa-65"]
+# Lab/integration: load 32-byte root from `2D_HSM_PQ_SEAL_V1_ROOT_FILE` at boot (debug builds only).
+platform-provisioning-from-file = ["ml-dsa-65"]
 # Public NIST test-vector keypair — `cargo test` only (see vsock spec §2.1).
 reference-test-key = ["ml-dsa-65", "reference-seal-v1-root", "pq-seal-provisioning"]
 # Mock 64-byte PQ + reference Ed25519 attestation keys for local dev (see vsock spec §2.1).

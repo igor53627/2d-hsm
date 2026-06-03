@@ -171,7 +171,7 @@ This plan ensures we carry the same rigor that caught the two HIGH issues in the
 
 ## Progress update (2026-06-02)
 
-Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 staging slice** are **in tree** (`enclave-protocol`; **~62** tests default `cargo test`, **73** with `ml-dsa-65,pq-seal-provisioning`, **80** with `reference-test-key`. Merged: `60eeefc` (PR #1). Documentation entry points:
+Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1** are **on `main`** (`enclave-protocol`; **~62** tests default `cargo test`, **73** with `ml-dsa-65,pq-seal-provisioning`, **80** with `reference-test-key`). Merged: `60eeefc` (PR #1) + TASK-2 `3af56b9` (PR #3). Documentation entry points:
 
 - `impl/README.md` — build, dispatch APIs, `pq-seal-v1` CLI
 - `backlog/docs/vsock-api-wire-format-spec-draft.md` — §2.1 seal v1 + §8–§9.3 (v0.2)
@@ -181,12 +181,13 @@ Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1 st
 **Recommended next increments (ordered):**
 
 1. ~~**TASK-2 PR**~~ — **Done** (merged `main` @ `3af56b9`, 2026-06-03). Review ladder: `impl/README.md`.
-2. **TASK-1 staging slice (in progress)** — ML-DSA-65 on dev transport: `staging-host` profile, `enclave-uds-staging`, fail-closed without sealed signer when `reference-test-key`; CI `cargo test --features reference-test-key` (implies seal + provisioning).
-3. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + **`process_framed_with_shared_state`** (one `EnclaveState` per enclave process). Do **not** give each vsock connection its own `HostSession`. Depends on TASK-1 staging signer path.
-4. **TASK-1 follow-ups** — platform `set_pq_seal_v1_provisioning_root`; prod CI gate; verify-path zeroization debt.
-5. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing. Concurrency lens when implementing.
+2. **TASK-1 staging transport (PR #4, in progress)** — ML-DSA-65 on dev UDS: `staging-host`, `enclave-uds-staging`, fail-closed without sealed signer; `2D_HSM_ENCLAVE_STAGING_SOCKET` (separate from dev mock socket).
+3. **TASK-1 platform provisioning root (in progress)** — `boot_configure_pq_seal_v1_platform_root` + optional `platform-provisioning-from-file` (labs); production hook from vTPM/SNP/Nitro; **release `compile_error`** on `reference-seal-v1-root` / `staging-host`.
+4. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + **`process_framed_with_shared_state`**. Depends on TASK-1 staging signer + platform root.
+5. **TASK-1 follow-ups** — verify-path zeroization debt; full operator runbook.
+6. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing. Concurrency lens when implementing.
 
-**Session status (2026-06-03):** TASK-2 **Done** (merged). Active increment: **TASK-1 staging ML-DSA** on dev transport (see item 2).
+**Session status (2026-06-03):** TASK-2 **Done** on `main`. Active: **PR #4** staging UDS + **platform provisioning root** boot hook (items 2–3).
 
 **Task board:** `backlog/tasks/task-{1,2,3}` updated with this plan.
 

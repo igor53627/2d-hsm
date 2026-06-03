@@ -4,13 +4,13 @@
 //! sealed signer at boot (fail-closed SIGN without seal). **Not for production.**
 
 use enclave_protocol::{
-    install_reference_sealed_signer_staging, is_sealed_signer_installed,
-    process_framed_with_shared_state, pq_signing_ready, read_framed_message,
-    write_framed_message, EnclaveState, HostSession, ProducerAttestationTrust,
+    bind_unix_listener, default_dev_socket_dir, install_reference_sealed_signer_staging,
+    is_sealed_signer_installed, process_framed_with_shared_state, pq_signing_ready,
+    read_framed_message, write_framed_message, EnclaveState, HostSession,
+    ProducerAttestationTrust,
 };
 use std::env;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,11 +52,7 @@ fn main() {
 }
 
 fn default_socket_path() -> PathBuf {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join(".2d-hsm")
-        .join("enclave-staging.sock")
+    default_dev_socket_dir().join("enclave-staging.sock")
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,18 +60,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::var("2D_HSM_ENCLAVE_STAGING_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_socket_path());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        // Only tighten ~/.2d-hsm; custom 2D_HSM_ENCLAVE_SOCKET parents are the operator's responsibility.
-        if Some(parent) == default_socket_path().parent() {
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let private_dir = default_dev_socket_dir();
+    let listener = bind_unix_listener(&path, &private_dir)?;
 
     let runtime = Arc::new(SharedEnclaveRuntime::staging()?);
     eprintln!(
