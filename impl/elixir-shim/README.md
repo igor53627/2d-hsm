@@ -47,4 +47,4 @@ Production path: add a vsock-backed transport module reusing `Framing` + `Sessio
 
 ## High-risk review
 
-Changes to framing or CBOR layouts are **high-risk** (`impl/`). Run Reduced roborev matrix + `roborev compact` before merge (see root `AGENTS.md`).
+This shim is part of **TASK-2 Phase 4** (stateful session, ARM, SIGN). Per `impl/README.md` and `AGENTS.md`, merge requires the **Full Matrix** (Reduced 3-review set + concurrency 2×3 floor where applicable) and `roborev compact --wait` — not Reduced alone. Framing/CBOR edits in this tree are never isolated from arming/signing gating.

@@ -478,7 +478,10 @@ Next: run 3:3 matrix on this commit.
 - **Wire:** integer-key CBOR for all four commands in `wire.rs`; `process_framed_with_session` + `HostSession`.
 - **Transports:** `enclave-stdio-bridge` (stateless GET_MEASUREMENT), `enclave-stdio-session`, `enclave-uds-server` (dev stand-in for vsock).
 - **Elixir:** `impl/elixir-shim/` — Framing, StdioClient, Socket, Session, TestFixtures; `mix test` (stdio + UDS ARM/STATUS).
-- **AC #1–#6:** Marked complete; #4 evidence: Rust `process_framed_session_*` tests + Elixir UDS (`get_measurement`, `get_status`, `sign_authorization_ticket` with recovery fixture).
+- **AC #1–#3:** `backlog/docs/vsock-api-wire-format-spec-draft.md` v0.2 (commands, CBOR, security invariants per command).
+- **AC #4:** Rust `process_framed_session_*` + Elixir UDS integration tests (`get_measurement`, `get_status`, `arm_for_production`, `sign_authorization_ticket`).
+- **AC #5:** Hard-fork flow in spec §8 + `ticket_signing_demo` / session tests (Arm → Sign type=1); operator runbook deferred.
+- **AC #6:** Cross-reviewed with authorization-ticket specs (prior matrices on design artifacts); no open HIGH on ticket coupling.
 
 **Before merge / single PR:** Full Matrix (3×3) on `impl/` + `roborev compact` (per `AGENTS.md` — stateful ARM/STATUS/SIGN in `impl/rust/enclave-protocol`, first `EnclaveState` introduction).
 

@@ -154,14 +154,9 @@ defmodule EnclaveProtocol.Framing do
 
   defp decode_success_payload(_msg_type, _payload), do: {:error, :unknown_message_type}
 
+  # Spec: error `{1: int, 2: tstr, 3?: diagnostic}` — key 2 is text, not CBOR :bytes (signatures use :bytes).
   defp wire_error_map?(map) do
-    not success_response_map?(map) and is_integer(Map.get(map, 1)) and
-      is_binary(Map.get(map, 2)) and not Map.has_key?(map, 3)
-  end
-
-  defp success_response_map?(map) do
-    Map.has_key?(map, 3) or Map.get(map, 1) == "armed" or is_boolean(Map.get(map, 2)) or
-      cbor_bytes(Map.get(map, 2)) != nil
+    is_integer(Map.get(map, 1)) and is_binary(Map.get(map, 2)) and cbor_bytes(Map.get(map, 2)) == nil
   end
 
   defp decode_measurement_map(map) do
@@ -220,13 +215,13 @@ defmodule EnclaveProtocol.Framing do
   defp decode_status_map(map) do
     with 1 <- Map.get(map, 1),
          armed when is_boolean(armed) <- Map.get(map, 2),
-         {:ok, measurement} <- cbor_optional_bytes(Map.get(map, 3)),
-         {:ok, pq_pubkey} <- cbor_optional_bytes(Map.get(map, 4)),
-         activated <- Map.get(map, 5),
-         finalized <- Map.get(map, 6),
-         {:ok, source_hash} <- cbor_optional_bytes(Map.get(map, 7)),
-         pending_hf <- Map.get(map, 8),
-         last_block <- Map.get(map, 9) do
+         {:ok, measurement} <- cbor_required_bytes(Map.get(map, 3)),
+         {:ok, pq_pubkey} <- cbor_required_bytes(Map.get(map, 4)),
+         activated when is_integer(activated) or is_nil(activated) <- Map.get(map, 5),
+         finalized when is_integer(finalized) or is_nil(finalized) <- Map.get(map, 6),
+         {:ok, source_hash} <- cbor_source_ticket_hash(Map.get(map, 7)),
+         pending_hf when is_integer(pending_hf) or is_nil(pending_hf) <- Map.get(map, 8),
+         last_block when is_integer(last_block) or is_nil(last_block) <- Map.get(map, 9) do
       {:ok,
        %{
          version: 1,
@@ -244,9 +239,15 @@ defmodule EnclaveProtocol.Framing do
     end
   end
 
-  defp cbor_optional_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: {:ok, bin}
-  defp cbor_optional_bytes(nil), do: {:ok, nil}
-  defp cbor_optional_bytes(_), do: {:error, :invalid_optional_bytes}
+  defp cbor_required_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: {:ok, bin}
+  defp cbor_required_bytes(_), do: {:error, :invalid_bytes_field}
+
+  defp cbor_source_ticket_hash(nil), do: {:ok, nil}
+
+  defp cbor_source_ticket_hash(%CBOR.Tag{tag: :bytes, value: bin}) when byte_size(bin) == 32,
+    do: {:ok, bin}
+
+  defp cbor_source_ticket_hash(_), do: {:error, :invalid_source_ticket_hash}
 
   defp cbor_bytes(%CBOR.Tag{tag: :bytes, value: bin}) when is_binary(bin), do: bin
   defp cbor_bytes(_), do: nil

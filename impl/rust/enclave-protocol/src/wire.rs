@@ -197,7 +197,7 @@ pub fn decode_wire_error(bytes: &[u8]) -> Result<(i64, String), ProtocolError> {
     let Value::Map(map) = value else {
         return Err(ProtocolError::WireProtocol("wire error must be a CBOR map"));
     };
-    if is_success_response_map(&map) {
+    if !is_wire_error_map(&map) {
         return Err(ProtocolError::WireProtocol("payload is a success response, not a wire error"));
     }
     let code = value_to_u64(map_get(&map, 1)?)? as i64;
@@ -205,29 +205,17 @@ pub fn decode_wire_error(bytes: &[u8]) -> Result<(i64, String), ProtocolError> {
     Ok((code, reason))
 }
 
-/// True when `payload` is a wire error map (integer code + text reason, no success shape).
+/// True when `payload` is a wire error map (integer code + text reason; key 3 may hold diagnostics).
 pub fn is_wire_error_payload(bytes: &[u8]) -> bool {
     decode_wire_error(bytes).is_ok()
 }
 
-fn is_success_response_map(map: &[(Value, Value)]) -> bool {
-    if map_get(map, 3).is_ok() {
-        return true;
-    }
-    if let Ok(v) = map_get(map, 1) {
-        if matches!(v, Value::Text(s) if s == "armed") {
-            return true;
-        }
-    }
-    if let Ok(v) = map_get(map, 2) {
-        if matches!(v, Value::Bool(_)) {
-            return true;
-        }
-        if matches!(v, Value::Bytes(_)) {
-            return true;
-        }
-    }
-    false
+/// Spec error shape: `{ 1: int, 2: tstr, 3?: diagnostic }` — distinguished from success by text at key 2.
+fn is_wire_error_map(map: &[(Value, Value)]) -> bool {
+    matches!(
+        (map_get(map, 1), map_get(map, 2)),
+        (Ok(Value::Integer(_)), Ok(Value::Text(_)))
+    )
 }
 
 fn value_to_u8(v: &Value) -> Result<u8, ProtocolError> {
@@ -612,6 +600,20 @@ mod tests {
     use crate::{GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest};
 
     #[test]
+    #[test]
+    fn wire_error_with_optional_diagnostic_key3() {
+        let map = vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Text("proof stale".to_string())),
+            (Value::Integer(3.into()), Value::Map(vec![])),
+        ];
+        let bytes = encode_value(&Value::Map(map)).unwrap();
+        assert!(is_wire_error_payload(&bytes));
+        let (code, reason) = decode_wire_error(&bytes).unwrap();
+        assert_eq!(code, 2);
+        assert_eq!(reason, "proof stale");
+    }
+
     fn arm_response_wire_roundtrip() {
         let armed = ArmForProductionResponse {
             status: "armed".to_string(),

@@ -47,7 +47,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| default_socket_path());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        // Only harden permissions on the default app dir (~/.2d-hsm), not arbitrary env paths.
+        if Some(parent) == default_socket_path().parent() {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     if path.exists() {
         std::fs::remove_file(&path)?;

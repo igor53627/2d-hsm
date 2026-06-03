@@ -1479,12 +1479,10 @@ mod tests {
         assert!(!resp.measurement.is_empty());
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
     fn process_framed_with_session_returns_wire_error_on_unknown_msg_type() {
-        #[cfg(feature = "test-support")]
         let mut session = HostSession::reference_test();
-        #[cfg(not(feature = "test-support"))]
-        compile_error!("test requires test-support");
         let payload = encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
         let mut bad_frame = encode_message(MessageType::GetMeasurement, &payload).unwrap();
         bad_frame[5] = 0xFF;
