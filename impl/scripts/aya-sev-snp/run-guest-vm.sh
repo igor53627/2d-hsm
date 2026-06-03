@@ -11,9 +11,13 @@ DISK="${DISK:-vm-disk.qcow2}"
 CLOUDINIT="${CLOUDINIT:-cloud-init.iso}"
 SSH_PORT="${SSH_PORT:-2222}"
 GUEST_CID="${GUEST_CID:-42}"
-SEV_MODE="${SEV_MODE:-sev}"
+SEV_MODE="${SEV_MODE:-snp}"
 
-QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+if [[ -x /opt/qemu-snp/bin/qemu-system-x86_64 ]]; then
+  QEMU_BIN="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
+else
+  QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+fi
 
 [[ -f "$DISK" && -f "$CLOUDINIT" ]] || {
   echo "Run ./setup-guest-image.sh first"
@@ -37,15 +41,19 @@ if [[ "$SEV_MODE" == "none" ]]; then
 elif [[ "$(cat /sys/module/kvm_amd/parameters/sev 2>/dev/null)" != "Y" ]]; then
   echo "SEV not available — use SEV_MODE=none"
   exit 1
-elif $QEMU_BIN -object help 2>&1 | grep -q sev-snp-guest; then
-  echo "SEV-SNP guest"
-  SEV_OPTS="-object memory-backend-memfd,id=ram1,size=${MEMORY}M,share=true,prealloc=false"
+elif [[ "$SEV_MODE" == "snp" ]] && $QEMU_BIN -object help 2>&1 | grep -q sev-snp-guest; then
+  echo "SEV-SNP guest (sev-snp-guest)"
+  SEV_OPTS="-object memory-backend-memfd-private,id=ram1,size=${MEMORY}M,share=true"
   SEV_OPTS+=" -object sev-snp-guest,id=sev0,policy=0x30000,cbitpos=51,reduced-phys-bits=1"
   MACHINE_OPTS="q35,confidential-guest-support=sev0,memory-backend=ram1"
-else
-  echo "SEV-ES guest (sev-guest)"
+elif [[ "$SEV_MODE" == "es" ]] && $QEMU_BIN -object help 2>&1 | grep -q sev-guest; then
+  echo "SEV-ES guest (sev-guest) — often EPERM on SNP-only hosts; prefer SEV_MODE=snp"
   SEV_OPTS="-object sev-guest,id=sev0,sev-device=/dev/sev,cbitpos=51,reduced-phys-bits=1"
   MACHINE_OPTS="q35,confidential-guest-support=sev0"
+else
+  echo "Requested SEV_MODE=$SEV_MODE not supported by $QEMU_BIN"
+  echo "Run ./install-qemu-snp.sh for SEV_MODE=snp"
+  exit 1
 fi
 
 VSOCK_OPTS="-device vhost-vsock-pci,guest-cid=${GUEST_CID}"

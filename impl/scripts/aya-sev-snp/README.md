@@ -43,4 +43,9 @@ SEV_MODE=sev MEMORY=4096 VCPUS=2 ./run-guest-vm.sh
 
 **Inside the guest**, bind uses `2D_HSM_VSOCK_CID=4294967295` (`VMADDR_CID_ANY`). **On the host**, connect to `GUEST_CID=42` (QEMU `vhost-vsock-pci`).
 
-Full **SEV-SNP** needs QEMU with `sev-snp-guest` (not in stock Ubuntu 24.04 QEMU 8.2 here). SEV-ES (`sev-guest`) is the usual step on this host until AMD QEMU is installed.
+Stock Ubuntu QEMU 8.2 has only legacy `sev-guest` (fails with EPERM on this SNP host). Build SNP-capable QEMU once:
+
+```bash
+./install-qemu-snp.sh   # installs to /opt/qemu-snp (QEMU 9.2.x, ~15–25 min)
+./run-snp-smoke.sh      # SNP VM + guest HSM + host vsock smoke
+```
