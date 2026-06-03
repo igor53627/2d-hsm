@@ -42,9 +42,11 @@ compile_error!(
 );
 
 mod chain_proof_crypto;
+pub mod enclave_serve;
 #[cfg(feature = "ml-dsa-65")]
 mod platform_provisioning_boot;
 mod uds_listen;
+pub mod vsock_listen;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",

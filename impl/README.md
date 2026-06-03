@@ -154,6 +154,16 @@ cargo build --bin enclave-stdio-session --bin enclave-uds-server --features test
 cd ../../elixir-shim && mix test
 ```
 
+## Staging vsock (TASK-1 / production transport slice, Linux)
+
+```bash
+cd rust/enclave-protocol
+cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Linux only
+# 2D_HSM_VSOCK_CID=3 2D_HSM_VSOCK_PORT=5000 ./target/debug/enclave-vsock-staging
+```
+
+Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Production** `enclave-vsock` (no `staging-host`, platform root + sealed PQ at boot) is blocked on hardware-backed `set_pq_seal_v1_provisioning_root` and enclave-provisioned `ProducerAttestationTrust`.
+
 ## Staging UDS (TASK-1, PR #4)
 
 ```bash

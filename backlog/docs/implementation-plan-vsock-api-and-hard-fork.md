@@ -182,7 +182,7 @@ Phase 1 reference implementation, TASK-3 crypto gate, and **TASK-1 PQ seal v1** 
 
 1. ~~**TASK-2 PR**~~ — **Done** (merged `main` @ `3af56b9`, 2026-06-03). Review ladder: `impl/README.md`.
 2. **TASK-1 staging transport + platform boot hook (PR #4, in progress)** — items 2–3 shipped together: `staging-host` / `enclave-uds-staging`, `2D_HSM_ENCLAVE_STAGING_SOCKET`, `boot_configure_pq_seal_v1_platform_root`, optional `platform-provisioning-from-file` (labs), **`release_build` compile_error** on reference/staging features.
-3. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + **`process_framed_with_shared_state`**. **Blocked** until hardware-backed `set_pq_seal_v1_provisioning_root` (vTPM/SNP/Nitro) — the PR #4 hook alone is not sufficient.
+3. **Production vsock** — AF_VSOCK transport (Nitro/SEV); reuse `wire.rs` + **`process_framed_with_shared_state`**. **In progress:** `enclave-vsock-staging` (Linux, `staging-vsock`) mirrors UDS staging; **blocked for prod binary** until hardware-backed `set_pq_seal_v1_provisioning_root` + sealed `ProducerAttestationTrust`.
 4. **TASK-1 follow-ups** — deploy-time feature audit / second release gate; verify-path zeroization debt; full operator runbook.
 5. **Phase 2 (plan)** — hard-fork transition state machine beyond ticket signing. Concurrency lens when implementing.
 
