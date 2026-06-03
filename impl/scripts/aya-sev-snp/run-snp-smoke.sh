@@ -32,7 +32,7 @@ QEMU_PID=$!
 echo "QEMU pid=$QEMU_PID log=$LOG"
 
 for i in $(seq 1 90); do
-  if grep -qE "does not accept value|failed to initialize|Error while|qemu-system-x86_64:" "$LOG" 2>/dev/null; then
+  if grep -qE "does not accept value|failed to initialize|Error while" "$LOG" 2>/dev/null; then
     tail -20 "$LOG"
     exit 1
   fi

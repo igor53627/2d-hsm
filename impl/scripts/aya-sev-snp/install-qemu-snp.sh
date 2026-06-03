@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${QEMU_SNP_PREFIX:-/opt/qemu-snp}"
-VERSION="${QEMU_SNP_VERSION:-9.2.3}"
+VERSION="${QEMU_SNP_VERSION:-10.0.0}"
 BUILD_ROOT="${SCRIPT_DIR}/qemu-build"
 SRC="${BUILD_ROOT}/qemu-${VERSION}"
 

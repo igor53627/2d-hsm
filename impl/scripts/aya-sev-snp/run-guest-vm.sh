@@ -40,7 +40,8 @@ elif [[ "$SEV_MODE" == "snp" ]] && $QEMU_BIN -object help 2>&1 | grep -q sev-snp
   [[ -f "$SNP_BIOS" ]] || { echo "Missing SNP OVMF: $SNP_BIOS"; exit 1; }
   USE_SNP_BIOS=1
   QEMU_CPU="${QEMU_CPU:-EPYC-v4}"
-  SEV_OPTS="-object memory-backend-memfd,id=ram1,size=${MEMORY}M,share=true,prealloc=false"
+  # Omit -m when using memory-backend (set via run-guest-vm SNP path only)
+  SEV_OPTS="-object memory-backend-memfd-private,id=ram1,size=${MEMORY}M,share=true"
   SEV_OPTS+=" -object sev-snp-guest,id=sev0,policy=0x30000,cbitpos=51,reduced-phys-bits=1"
   MACHINE_OPTS="q35,confidential-guest-support=sev0,memory-backend=ram1"
 elif [[ "$SEV_MODE" == "es" ]] && $QEMU_BIN -object help 2>&1 | grep -q sev-guest; then
@@ -73,7 +74,13 @@ COMMON=(
 )
 
 if [[ "$USE_SNP_BIOS" == 1 ]]; then
-  exec $QEMU_BIN "${COMMON[@]}" -bios "$SNP_BIOS" $SEV_OPTS
+  # SNP RAM comes only from memory-backend; do not pass -m (APIC/memfd layout).
+  exec $QEMU_BIN -enable-kvm -cpu "$QEMU_CPU" -smp "$VCPUS" -machine "$MACHINE_OPTS" \
+    -drive "file=$DISK,format=qcow2,if=virtio" \
+    -drive "file=$CLOUDINIT,format=raw,if=virtio" \
+    -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22" \
+    -device virtio-net-pci,netdev=net0 \
+    $VSOCK_OPTS -nographic -bios "$SNP_BIOS" $SEV_OPTS
 fi
 
 OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
