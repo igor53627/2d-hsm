@@ -43,7 +43,7 @@ elif [[ "$(cat /sys/module/kvm_amd/parameters/sev 2>/dev/null)" != "Y" ]]; then
   exit 1
 elif [[ "$SEV_MODE" == "snp" ]] && $QEMU_BIN -object help 2>&1 | grep -q sev-snp-guest; then
   echo "SEV-SNP guest (sev-snp-guest)"
-  SEV_OPTS="-object memory-backend-memfd-private,id=ram1,size=${MEMORY}M,share=true"
+  SEV_OPTS="-object memory-backend-memfd,id=ram1,size=${MEMORY}M,share=true,prealloc=false"
   SEV_OPTS+=" -object sev-snp-guest,id=sev0,policy=0x30000,cbitpos=51,reduced-phys-bits=1"
   MACHINE_OPTS="q35,confidential-guest-support=sev0,memory-backend=ram1"
 elif [[ "$SEV_MODE" == "es" ]] && $QEMU_BIN -object help 2>&1 | grep -q sev-guest; then
