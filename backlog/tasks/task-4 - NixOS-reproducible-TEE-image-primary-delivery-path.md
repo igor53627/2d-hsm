@@ -4,7 +4,7 @@ title: NixOS reproducible TEE image as primary 2d-hsm delivery path
 status: Planned
 assignee: []
 created_date: '2026-06-04'
-updated_date: '2026-06-04'
+updated_date: '2026-06-05'
 labels:
   - nix
   - nixos
@@ -126,6 +126,7 @@ Production measurement in tickets comes from **TEE attestation**, not from stori
 - **TASK-1** (parent) — Phase 2 "Skeleton + CI + reproducible build for the TEE image"
 - **TASK-2** (Done) — vsock API consumed inside NixOS guest
 - **TASK-3** (Done) — measurement in attestation preimage; manifest must not break binding
+- **TASK-5** — prod `enclave-vsock` in guest, platform PQ seal, SNP, real measurement (follow-on after Phase B smokes)
 - `feat/task-1-vsock-staging-transport` branch work — merge or rebase before Phase C
 
 ## Implementation Notes

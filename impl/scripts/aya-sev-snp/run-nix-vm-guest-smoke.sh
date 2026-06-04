@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
+VM_FLAKE_ATTR="${VM_FLAKE_ATTR:-vm}"
 VM_LINK="${VM_LINK:-/tmp/vm-hsm-runner}"
 DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm-smoke.qcow2}"
 GUEST_CID="${GUEST_CID:-42}"
@@ -28,8 +29,8 @@ cleanup
 : >"$LOG"
 
 cd "$FLAKE_DIR"
-echo "[1/4] nix build .#vm -> $VM_LINK"
-nix build .#vm --out-link "$VM_LINK"
+echo "[1/4] nix build .#${VM_FLAKE_ATTR} -> $VM_LINK"
+nix build ".#${VM_FLAKE_ATTR}" --out-link "$VM_LINK"
 
 RUNNER=""
 for candidate in "$VM_LINK"/bin/run-*-vm "$VM_LINK"/bin/*run*nixos*; do
@@ -76,4 +77,4 @@ if [ "$ok" != 1 ]; then
   exit 1
 fi
 
-echo "[4/4] host-guest-vsock-smoke: passed (NixOS vm-hsm)"
+echo "[4/4] host-guest-vsock-smoke: passed (NixOS vm-hsm, .#${VM_FLAKE_ATTR})"

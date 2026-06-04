@@ -1,7 +1,26 @@
-# Minimal NixOS guest for 2d-hsm TEE staging (TASK-4 Phase B).
-# Uses enclave-staging until platform PQ seal + prod enclave are wired in the guest.
-{ config, lib, pkgs, enclave-staging, ... }:
+# Minimal NixOS guest for 2d-hsm TEE (TASK-4 Phase B / TASK-5 prod mode).
+{
+  config,
+  lib,
+  pkgs,
+  enclavePackage,
+  enclaveMode ? "staging",
+  producerAttestationTrustFile ? null,
+  ...
+}:
 
+let
+  mode = enclaveMode;
+  isProd = mode == "production";
+  binName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
+  unitName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
+  trustFile =
+    if isProd then
+      producerAttestationTrustFile
+        or (throw "production guest requires producerAttestationTrustFile (lab: lab-prod-fixtures)")
+    else
+      null;
+in
 {
   boot.loader.grub.enable = false;
   boot.initrd.availableKernelModules = [
@@ -26,30 +45,33 @@
   services.openssh.enable = false;
   documentation.enable = false;
 
-  environment.systemPackages = [ enclave-staging pkgs.coreutils ];
+  environment.systemPackages = [ enclavePackage pkgs.coreutils ];
 
-  systemd.services.enclave-vsock-staging = {
-    description = "2d-hsm vsock staging enclave";
+  systemd.services.${unitName} = {
+    description = "2d-hsm vsock enclave (${mode})";
     after = [
       "systemd-modules-load.service"
       "systemd-udev-settle.service"
     ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
-      ExecStart = "${enclave-staging}/bin/enclave-vsock-staging";
+      ExecStart = "${enclavePackage}/bin/${binName}";
       Restart = "always";
       RestartSec = "3";
       StandardOutput = "journal+console";
       StandardError = "journal+console";
     };
     preStart = ''
-      echo "[vm-hsm] starting enclave-vsock-staging" >/dev/console
+      echo "[vm-hsm] starting ${binName} (${mode})" >/dev/console
     '';
-    environment = {
-      # Must match QEMU vhost-vsock-pci guest-cid; TWOD_* (not 2D_*) is valid in systemd.
-      TWOD_HSM_VSOCK_CID = "42";
-      TWOD_HSM_VSOCK_PORT = "5000";
-    };
+    environment =
+      {
+        TWOD_HSM_VSOCK_CID = "42";
+        TWOD_HSM_VSOCK_PORT = "5000";
+      }
+      // lib.optionalAttrs isProd {
+        TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE = "${trustFile}";
+      };
   };
 
   system.stateVersion = "25.05";

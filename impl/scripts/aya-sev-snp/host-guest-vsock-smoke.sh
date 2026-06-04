@@ -5,6 +5,8 @@ set -euo pipefail
 GUEST_CID="${GUEST_CID:-42}"
 export GUEST_CID="${GUEST_CID:-42}"
 export TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
+# Staging GET_MEASUREMENT uses prod-enclave-v1; production profile uses enclave-measurement-placeholder.
+export VSOCK_SMOKE_MEASUREMENT_MARKER="${VSOCK_SMOKE_MEASUREMENT_MARKER:-prod-enclave-v1}"
 python3 <<'PY'
 import os, socket, struct
 cid = int(os.environ["GUEST_CID"])
@@ -22,6 +24,7 @@ while len(resp) < 4:
 total = struct.unpack(">I", resp[:4])[0]
 while len(resp) < 4 + total:
     resp += s.recv(8192)
-assert b"prod-enclave-v1" in resp, resp[:200]
+marker = os.environ["VSOCK_SMOKE_MEASUREMENT_MARKER"].encode()
+assert marker in resp, (marker, resp[:200])
 print("host-guest-vsock-smoke: OK cid=%d port=%d bytes=%d" % (cid, port, len(resp)))
 PY

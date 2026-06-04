@@ -29,15 +29,21 @@
         measurement-manifest = pkgs.callPackage ./measurement-manifest.nix {
           inherit enclave enclave-staging flakeMeta;
         };
-        nixosVm = import ./vm.nix {
-          inherit nixpkgs enclave-staging;
+        nixosVmStaging = import ./vm.nix {
+          inherit nixpkgs enclave enclave-staging;
+          guestProfile = "staging";
+        };
+        nixosVmProduction = import ./vm.nix {
+          inherit nixpkgs enclave enclave-staging;
+          guestProfile = "production";
         };
       in
       {
         packages = {
           inherit enclave enclave-staging measurement-manifest;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
-          vm = nixosVm.config.system.build.vm;
+          vm = nixosVmStaging.config.system.build.vm;
+          vm-production = nixosVmProduction.config.system.build.vm;
           default = enclave;
         };
 
@@ -54,7 +60,8 @@
             echo "  nix build .#enclave          # production vsock binary"
             echo "  nix build .#enclave-staging  # staging vsock (aya smokes)"
             echo "  nix build .#measurement-manifest"
-            echo "  nix build .#vm               # Phase B NixOS guest runner"
+            echo "  nix build .#vm               # Phase B NixOS guest (staging)"
+            echo "  nix build .#vm-production    # prod enclave-vsock + lab trust VK"
           '';
         };
 

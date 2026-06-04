@@ -48,9 +48,14 @@ See `scripts/write-measurement-manifest.sh`. Fields include `git_revision`, `fla
 
 **Note:** `protocol_measurement_label` for production is still `enclave-measurement-placeholder` until platform SNP/Nitro measurement is wired into `GET_MEASUREMENT`. Staging uses `prod-enclave-v1` (reference signer).
 
-## Phase B (follow-on)
+## Phase B / TASK-5 guest profiles
 
-`packages.vm` — minimal NixOS qcow2 with systemd unit wrapping `enclave-vsock` or staging binary.
+| Flake output | Guest binary | Use |
+|--------------|--------------|-----|
+| `vm` | `enclave-vsock-staging` | aya smokes (default) |
+| `vm-production` | `enclave-vsock` + lab `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` | prod transport smoke (`run-nix-vm-guest-smoke-prod.sh`) |
+
+Production guest still needs platform PQ seal for `pq_signing_ready`; GET_MEASUREMENT returns `enclave-measurement-placeholder` until SNP/Nitro measurement is wired.
 
 ## Related
 
