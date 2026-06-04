@@ -3,6 +3,7 @@
   nixpkgs,
   enclave-staging,
   enclave,
+  enclave-production-lab,
   guestProfile ? "staging",
 }:
 
@@ -11,16 +12,32 @@ let
   labFixtures = import ./lab-prod-fixtures.nix {
     pkgs = nixpkgs.legacyPackages.${system};
   };
-  isProd = guestProfile == "production";
-  enclavePackage = if isProd then enclave else enclave-staging;
-  enclaveMode = guestProfile;
+  isProd = guestProfile == "production" || guestProfile == "production-lab";
+  isProdLab = guestProfile == "production-lab";
+  enclavePackage =
+    if guestProfile == "staging" then
+      enclave-staging
+    else if isProdLab then
+      enclave-production-lab
+    else
+      enclave;
+  enclaveMode = if isProdLab then "production" else guestProfile;
   producerAttestationTrustFile =
     if isProd then labFixtures.producerAttestationTrustFile else null;
+  pqSealProvisioningRootFile =
+    if isProdLab then labFixtures.pqSealProvisioningRootFile else null;
+  pqSealedSignerFile = if isProdLab then labFixtures.pqSealedSignerFile else null;
 in
 nixpkgs.lib.nixosSystem {
   inherit system;
   specialArgs = {
-    inherit enclavePackage enclaveMode producerAttestationTrustFile;
+    inherit
+      enclavePackage
+      enclaveMode
+      producerAttestationTrustFile
+      pqSealProvisioningRootFile
+      pqSealedSignerFile
+      ;
   };
   modules = [
     ./nixos-module.nix

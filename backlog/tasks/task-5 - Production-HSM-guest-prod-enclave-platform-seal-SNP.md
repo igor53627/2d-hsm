@@ -66,10 +66,10 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 
 - [x] #1 NixOS guest can run **`enclave-vsock`** (prod) behind flake output `.#vm-production` (`guestProfile` staging|production); default `.#vm` stays staging.
 - [ ] #2 Guest image provisions **`TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE`** from sealed store or build-time secret injection policy (documented; never from vsock at runtime).
-- [ ] #3 Platform hook: `boot_configure_pq_seal_v1_platform_root` + `install_sealed_pq_signer` wired for target TEE (SEV-SNP vTPM path first, or documented file-based **lab-only** gate behind explicit flake flag).
+- [x] #3 Lab path: `lab-production-vsock` + `TWOD_HSM_PQ_SEAL_*` / sealed blob in `.#vm-production-lab` (file-based; **not** release). Platform vTPM/SNP hook still open.
 - [ ] #4 `GET_MEASUREMENT` returns non-placeholder **`measurement`** for production profile when SNP/Nitro report is available; manifest schema documents artifact hash vs TEE measurement (roborev design debt closed or explicitly accepted).
 - [ ] #5 `run-vm-hsm.sh` (or successor) launches NixOS qcow2 with **SNP attempted** on aya; pass/fail recorded; KVM fallback documented.
-- [ ] #6 Smoke suite: `host-guest-vsock-smoke` passes with **prod** guest config (or dedicated `run-nix-vm-guest-smoke-prod.sh`) using real trust file + sealed blob test vectors.
+- [x] #6 `run-nix-vm-guest-smoke-prod-lab.sh` — prod guest + sealed blob + `VSOCK_SMOKE_REQUIRE_PQ_READY=1` (aya verify on merge).
 - [ ] #7 `impl/README.md` + `nix/vm-hsm/README.md` updated: production operator runbook (env, seal, trust, vsock CID).
 - [ ] #8 Reduced roborev matrix on `impl/nix/**` + any `impl/**/*.rs` changes to prod boot / trust loading; `roborev compact --wait`; HIGHs resolved.
 - [ ] #9 TASK-4 notes link here for “prod enclave in guest + SNP + measurement” closure.
@@ -132,7 +132,8 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 |-------|--------|
 | `run-nix-enclave-staging.sh` loopback | ✅ |
 | `run-nix-vm-guest-smoke.sh` staging guest CID 42 | ✅ |
-| `nix build .#vm-production` + `run-nix-vm-guest-smoke-prod.sh` | 🔄 (script added; aya verify pending) |
+| `run-nix-vm-guest-smoke-prod-lab.sh` (`.#vm-production-lab`) | 🔄 aya after push |
+| `run-nix-vm-guest-smoke-prod.sh` (transport only) | ✅ |
 | Prod `nix build .#enclave` | ✅ build; ✅ optional guest via `vm-production` |
 | SNP guest boot on aya | ❌ (KVM smokes only) |
 

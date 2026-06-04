@@ -59,6 +59,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("enclave-vsock: platform provisioning root not configured: {e}"),
     }
 
+    #[cfg(feature = "lab-pq-seal-from-file")]
+    match enclave_protocol::boot_lab_pq_seal::boot_install_lab_sealed_signer_from_file() {
+        Ok(()) => eprintln!("enclave-vsock: lab sealed PQ signer installed"),
+        Err(e) => eprintln!("enclave-vsock: lab sealed signer install failed: {e}"),
+    }
+
     let (cid, port) = vsock_listen_addr_from_env()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = bind_vsock_listener(cid, port)?;

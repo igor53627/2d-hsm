@@ -72,7 +72,7 @@ nix flake lock   # first checkout
 nix build .#enclave .#enclave-staging .#measurement-manifest
 ```
 
-CI publishes `manifest.json` from `.#measurement-manifest` (artifact `vm-hsm-measurement-manifest`). Use `enclave-staging` for aya vsock smokes; `enclave` is the release `enclave-vsock` binary (requires `2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE` at runtime).
+CI publishes `manifest.json` from `.#measurement-manifest` (artifact `vm-hsm-measurement-manifest`). Use `enclave-staging` for aya vsock smokes; `enclave` is the release `enclave-vsock` binary (requires `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` at runtime).
 
 ### Cargo (local dev)
 
@@ -88,8 +88,8 @@ cargo test --features test-support,demo-mock-sign
 cargo test --features reference-test-key
 cargo build --bin enclave-uds-staging --features staging-host   # debug only; release + staging-host fails at compile time
 ./target/debug/enclave-uds-staging
-# Optional socket override (do not use 2D_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
-# 2D_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
+# Optional socket override (do not use TWOD_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
+# TWOD_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
 ```
 
 | Profile | Features | SIGN signature | Binaries |
@@ -140,7 +140,7 @@ At boot (production):
 1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock), or `boot_configure_pq_seal_v1_platform_root()` once a platform hook is linked.
 2. `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic).
 
-Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo profile name `release`** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`. Custom Cargo profiles that do not report `PROFILE=release` are not covered; use a deploy-time feature audit until a second gate lands.
+Labs (debug only): feature `platform-provisioning-from-file` reads `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo profile name `release`** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`. Custom Cargo profiles that do not report `PROFILE=release` are not covered; use a deploy-time feature audit until a second gate lands.
 
 Staging/CI may use `reference-seal-v1-root` or `cargo test` (embedded test root). v0 XOR is **unit-test only**. **Do not** ship `reference-seal-v1-root` in deployment images.
 
@@ -179,7 +179,7 @@ cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Lin
 
 Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Build on Linux** (e.g. SEV dev host `aya`, CI, Nitro parent) — not a runnable vsock server on macOS (compile-only stub there). At runtime the host needs vsock enabled (`vmw_vsock_vmci_transport` / `vhost_vsock`); bind errors such as `Cannot assign requested address` mean CID/port are wrong for that machine.
 
-**Production** `enclave-vsock` (`production-vsock`, release-only via `nix build .#enclave`): requires `2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE` (32-byte Ed25519 VK) at boot; platform PQ seal + sealed signer still need vTPM/SNP/Nitro hooks.
+**Production** `enclave-vsock` (`production-vsock`, release-only via `nix build .#enclave`): requires `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` (32-byte Ed25519 VK) at boot; platform PQ seal + sealed signer still need vTPM/SNP/Nitro hooks.
 
 ## Staging UDS (TASK-1, PR #4)
 
@@ -187,7 +187,7 @@ Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **B
 cd rust/enclave-protocol
 cargo build --bin enclave-uds-staging --features staging-host
 ./target/debug/enclave-uds-staging   # default ~/.2d-hsm/enclave-staging.sock
-# Override: 2D_HSM_ENCLAVE_STAGING_SOCKET — operator must use a private parent (mode 0700,
+# Override: TWOD_HSM_ENCLAVE_STAGING_SOCKET — operator must use a private parent (mode 0700,
 # owned by the server UID); the binary does not enforce this on custom paths.
 ```
 

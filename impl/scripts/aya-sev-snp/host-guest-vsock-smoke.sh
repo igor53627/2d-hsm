@@ -26,5 +26,8 @@ while len(resp) < 4 + total:
     resp += s.recv(8192)
 marker = os.environ["VSOCK_SMOKE_MEASUREMENT_MARKER"].encode()
 assert marker in resp, (marker, resp[:200])
+if os.environ.get("VSOCK_SMOKE_REQUIRE_PQ_READY") == "1":
+    # CBOR map key 6 = pq_signing_ready (wire.rs); true encodes as 0xf5.
+    assert b"\x06\xf5" in resp, ("pq_signing_ready not true", resp[:120])
 print("host-guest-vsock-smoke: OK cid=%d port=%d bytes=%d" % (cid, port, len(resp)))
 PY

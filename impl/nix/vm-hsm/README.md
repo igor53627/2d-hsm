@@ -54,8 +54,9 @@ See `scripts/write-measurement-manifest.sh`. Fields include `git_revision`, `fla
 |--------------|--------------|-----|
 | `vm` | `enclave-vsock-staging` | aya smokes (default) |
 | `vm-production` | `enclave-vsock` + lab `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` | prod transport smoke (`run-nix-vm-guest-smoke-prod.sh`) |
+| `vm-production-lab` | debug `lab-production-vsock` + PQ seal files | `pq_signing_ready` smoke (`run-nix-vm-guest-smoke-prod-lab.sh`) |
 
-Production guest still needs platform PQ seal for `pq_signing_ready`; GET_MEASUREMENT returns `enclave-measurement-placeholder` until SNP/Nitro measurement is wired.
+Release `vm-production` has no PQ seal. Lab seal uses `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` + `TWOD_HSM_PQ_SEALED_SIGNER_FILE` (debug build only). Real measurement still needs SNP/Nitro (TASK-5 Phase 3).
 
 ## Related
 

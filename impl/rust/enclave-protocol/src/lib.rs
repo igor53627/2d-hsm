@@ -36,11 +36,18 @@ compile_error!(
      must not be enabled in release builds; use ml-dsa-65 with platform set_pq_seal_v1_provisioning_root"
 );
 
-#[cfg(all(release_build, feature = "platform-provisioning-from-file"))]
+#[cfg(all(
+    release_build,
+    any(
+        feature = "platform-provisioning-from-file",
+        feature = "lab-pq-seal-from-file"
+    )
+))]
 compile_error!(
-    "feature platform-provisioning-from-file is for debug/integration builds only, not release"
+    "lab file provisioning features are for debug/integration builds only, not release"
 );
 
+pub mod boot_lab_pq_seal;
 mod chain_proof_crypto;
 pub mod env_config;
 pub mod enclave_serve;

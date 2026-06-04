@@ -4,9 +4,15 @@
 let
   src = ../../rust/enclave-protocol;
   staging = profile == "staging";
+  labProd = profile == "production-lab";
   pname = if staging then "enclave-vsock-staging" else "enclave-vsock";
   buildFeatures =
-    if staging then [ "staging-vsock" ] else [ "production-vsock" ];
+    if staging then
+      [ "staging-vsock" ]
+    else if labProd then
+      [ "lab-production-vsock" ]
+    else
+      [ "production-vsock" ];
 in
 
 rustPlatform.buildRustPackage {
@@ -16,7 +22,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = "${src}/Cargo.lock";
 
   buildFeatures = buildFeatures;
-  buildType = if staging then "debug" else "release";
+  buildType = if staging || labProd then "debug" else "release";
 
   cargoBuildFlags = [ "--bin ${pname}" ];
 

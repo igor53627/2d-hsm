@@ -6,6 +6,8 @@
   enclavePackage,
   enclaveMode ? "staging",
   producerAttestationTrustFile ? null,
+  pqSealProvisioningRootFile ? null,
+  pqSealedSignerFile ? null,
   ...
 }:
 
@@ -72,6 +74,12 @@ in
       }
       // lib.optionalAttrs isProd {
         TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE = "${trustFile}";
+      }
+      // lib.optionalAttrs (
+        isProd && pqSealProvisioningRootFile != null && pqSealedSignerFile != null
+      ) {
+        TWOD_HSM_PQ_SEAL_V1_ROOT_FILE = "${pqSealProvisioningRootFile}";
+        TWOD_HSM_PQ_SEALED_SIGNER_FILE = "${pqSealedSignerFile}";
       };
   };
 
