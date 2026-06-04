@@ -13,20 +13,25 @@ pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
 /// Default vsock service port for the signing service (override via `2D_HSM_VSOCK_PORT`).
 pub const DEFAULT_VSOCK_PORT: u32 = 5000;
 
-/// Resolve `(cid, port)` from `2D_HSM_VSOCK_CID` / `2D_HSM_VSOCK_PORT` or defaults.
+fn env_u32(names: &[&str], default: u32) -> Result<u32, String> {
+    for name in names {
+        if let Ok(s) = std::env::var(name) {
+            return s
+                .parse::<u32>()
+                .map_err(|_| format!("{name} must be a u32"));
+        }
+    }
+    Ok(default)
+}
+
+/// Resolve `(cid, port)` from env or defaults.
+///
+/// Prefers `HSM_VSOCK_CID` / `HSM_VSOCK_PORT` (valid for **systemd** `Environment=`).
+/// Also accepts `2D_HSM_VSOCK_*` for shell/scripts (`env 2D_HSM_…=…`); names starting with
+/// a digit are not passed through systemd.
 pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
-    let cid = std::env::var("2D_HSM_VSOCK_CID")
-        .ok()
-        .map(|s| s.parse::<u32>())
-        .transpose()
-        .map_err(|_| "2D_HSM_VSOCK_CID must be a u32")?
-        .unwrap_or(DEFAULT_VSOCK_CID);
-    let port = std::env::var("2D_HSM_VSOCK_PORT")
-        .ok()
-        .map(|s| s.parse::<u32>())
-        .transpose()
-        .map_err(|_| "2D_HSM_VSOCK_PORT must be a u32")?
-        .unwrap_or(DEFAULT_VSOCK_PORT);
+    let cid = env_u32(&["HSM_VSOCK_CID", "2D_HSM_VSOCK_CID"], DEFAULT_VSOCK_CID)?;
+    let port = env_u32(&["HSM_VSOCK_PORT", "2D_HSM_VSOCK_PORT"], DEFAULT_VSOCK_PORT)?;
     Ok((cid, port))
 }
 

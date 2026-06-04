@@ -46,9 +46,9 @@
       echo "[vm-hsm] starting enclave-vsock-staging" >/dev/console
     '';
     environment = {
-      # Guest: bind VMADDR_CID_ANY; QEMU still exposes guest as GUEST_CID (42) to the host.
-      "2D_HSM_VSOCK_CID" = "4294967295";
-      "2D_HSM_VSOCK_PORT" = "5000";
+      # systemd cannot set env names starting with a digit; use HSM_VSOCK_* (see vsock_listen.rs).
+      HSM_VSOCK_CID = "42";
+      HSM_VSOCK_PORT = "5000";
     };
   };
 

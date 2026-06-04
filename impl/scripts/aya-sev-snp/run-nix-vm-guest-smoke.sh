@@ -62,13 +62,12 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     tail -40 "$LOG" >&2 || true
     exit 1
   fi
-  if grep -qE 'enclave-vsock-staging listening|\[vm-hsm\] starting enclave' "$LOG" 2>/dev/null; then
-    if GUEST_CID="$GUEST_CID" HSM_VSOCK_PORT="$HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
-      ok=1
-      break
-    fi
+  # Enclave logs go to journal, not always serial — probe vsock directly.
+  if GUEST_CID="$GUEST_CID" HSM_VSOCK_PORT="$HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
+    ok=1
+    break
   fi
-  sleep 3
+  sleep 5
 done
 
 if [ "$ok" != 1 ]; then
