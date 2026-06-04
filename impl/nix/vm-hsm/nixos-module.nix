@@ -1,4 +1,5 @@
 # Minimal NixOS guest for 2d-hsm TEE staging (TASK-4 Phase B).
+# Uses enclave-staging until platform PQ seal + prod enclave are wired in the guest.
 { config, lib, pkgs, enclave-staging, ... }:
 
 {

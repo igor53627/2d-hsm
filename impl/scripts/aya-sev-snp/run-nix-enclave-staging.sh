@@ -18,12 +18,6 @@ if ! command -v nix >/dev/null; then
 fi
 
 cd "$FLAKE_DIR"
-if [ -d "$ROOT/.git" ]; then
-  git -C "$ROOT" add -f impl/nix/vm-hsm impl/rust/enclave-protocol/Cargo.lock \
-    impl/rust/enclave-protocol/Cargo.toml \
-    impl/rust/enclave-protocol/src/bin/enclave_vsock.rs \
-    impl/rust/enclave-protocol/src/lib.rs 2>/dev/null || true
-fi
 
 echo "[1/3] nix build .#enclave-staging -> $OUT_LINK"
 nix build .#enclave-staging --out-link "$OUT_LINK"

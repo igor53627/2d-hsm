@@ -36,8 +36,8 @@
       {
         packages = {
           inherit enclave enclave-staging measurement-manifest;
+          # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVm.config.system.build.vm;
-          qcow2 = nixosVm.config.system.build.qcow2;
           default = enclave;
         };
 
@@ -54,7 +54,7 @@
             echo "  nix build .#enclave          # production vsock binary"
             echo "  nix build .#enclave-staging  # staging vsock (aya smokes)"
             echo "  nix build .#measurement-manifest"
-            echo "  nix build .#qcow2            # Phase B NixOS guest"
+            echo "  nix build .#vm               # Phase B NixOS guest runner"
           '';
         };
 
