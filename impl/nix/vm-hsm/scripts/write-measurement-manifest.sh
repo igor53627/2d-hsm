@@ -14,6 +14,7 @@ ENCLAVE_STAGING_DRV="${ENCLAVE_STAGING_DRV:-unknown}"
 PROD_SHA="$(sha256sum "$PROD" | awk '{print $1}')"
 STAGING_SHA="$(sha256sum "$STAGING" | awk '{print $1}')"
 
+# prod_protocol_measurement must match boot_lab_pq_seal::LAB_PROD_MEASUREMENT (enclave-protocol).
 jq -n \
   --arg schema_version "1" \
   --arg git_revision "$GIT_REVISION" \
@@ -23,7 +24,6 @@ jq -n \
   --arg enclave_staging_derivation "$ENCLAVE_STAGING_DRV" \
   --arg prod_artifact_sha256 "$PROD_SHA" \
   --arg staging_artifact_sha256 "$STAGING_SHA" \
-  # Must match boot_lab_pq_seal::LAB_PROD_MEASUREMENT in enclave-protocol.
   --arg prod_protocol_measurement "enclave-measurement-placeholder" \
   --arg staging_protocol_measurement "prod-enclave-v1" \
   '{
