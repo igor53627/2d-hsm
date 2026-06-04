@@ -10,7 +10,10 @@
     "virtio_net"
     "vsock"
   ];
-  boot.kernelModules = [ "vsock" ];
+  boot.kernelModules = [
+    "vsock"
+    "vmw_vsock_virtio_transport"
+  ];
   boot.kernelParams = [ "console=ttyS0" ];
 
   fileSystems."/" = {
@@ -27,16 +30,23 @@
 
   systemd.services.enclave-vsock-staging = {
     description = "2d-hsm vsock staging enclave";
-    after = [ "network.target" ];
+    after = [
+      "systemd-modules-load.service"
+      "systemd-udev-settle.service"
+    ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
       ExecStart = "${enclave-staging}/bin/enclave-vsock-staging";
-      Restart = "on-failure";
+      Restart = "always";
+      RestartSec = "3";
       StandardOutput = "journal+console";
       StandardError = "journal+console";
     };
+    preStart = ''
+      echo "[vm-hsm] starting enclave-vsock-staging" >/dev/console
+    '';
     environment = {
-      # Bind all guest CIDs (host connects to GUEST_CID, e.g. 42).
+      # Guest: bind VMADDR_CID_ANY; QEMU still exposes guest as GUEST_CID (42) to the host.
       "2D_HSM_VSOCK_CID" = "4294967295";
       "2D_HSM_VSOCK_PORT" = "5000";
     };

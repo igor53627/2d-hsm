@@ -19,7 +19,7 @@ fi
 
 cleanup() {
   pkill -f 'run-nixos-vm' 2>/dev/null || true
-  pkill -f 'qemu-system-x86_64.*vm-hsm' 2>/dev/null || true
+  pkill -f 'qemu-system-x86_64.*-name vm-hsm' 2>/dev/null || true
   sleep 2
 }
 trap cleanup EXIT
@@ -28,21 +28,28 @@ cleanup
 : >"$LOG"
 
 cd "$FLAKE_DIR"
-echo "[1/4] nix build .#vm"
-nix build .#vm --out-link "$VM_LINK" >>"$LOG" 2>&1
+echo "[1/4] nix build .#vm -> $VM_LINK"
+nix build .#vm --out-link "$VM_LINK"
 
-RUNNER=$(find "$VM_LINK/bin" -maxdepth 1 -type l -name '*run*nixos*' -o -name '*run*nixos*' 2>/dev/null | head -1)
-if [ -z "$RUNNER" ] || [ ! -e "$RUNNER" ]; then
-  RUNNER=$(find "$VM_LINK/bin" -executable | head -1)
+RUNNER=""
+for candidate in "$VM_LINK"/bin/run-*-vm "$VM_LINK"/bin/*run*nixos*; do
+  if [ -e "$candidate" ]; then
+    RUNNER=$(readlink -f "$candidate")
+    break
+  fi
+done
+if [ -z "$RUNNER" ] || [ ! -x "$RUNNER" ]; then
+  echo "could not find run-nixos-vm under $VM_LINK/bin" >&2
+  ls -la "$VM_LINK/bin" >&2 || true
+  exit 1
 fi
 echo "[2/4] starting NixOS vm-hsm (runner=$RUNNER, disk=$DISK_IMAGE, cid=$GUEST_CID)"
 
 export NIX_DISK_IMAGE="$DISK_IMAGE"
-export QEMU_OPTS="${QEMU_OPTS:-} -device vhost-vsock-pci,guest-cid=${GUEST_CID}"
-# Faster boot polling in nixos test runner style VMs
-export QEMU_KERNEL_PARAMS="${QEMU_KERNEL_PARAMS:-} vsock.connect_timeout=5"
+# Headless on servers (no GTK); vsock for host↔guest smoke.
+export QEMU_OPTS="${QEMU_OPTS:-} -display none -device vhost-vsock-pci,guest-cid=${GUEST_CID}"
 
-nohup "$RUNNER" >>"$LOG" 2>&1 &
+nohup "$RUNNER" </dev/null >>"$LOG" 2>&1 &
 VM_PID=$!
 echo "VM pid=$VM_PID log=$LOG"
 
@@ -55,16 +62,18 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     tail -40 "$LOG" >&2 || true
     exit 1
   fi
-  if GUEST_CID="$GUEST_CID" HSM_VSOCK_PORT="$HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
-    ok=1
-    break
+  if grep -qE 'enclave-vsock-staging listening|\[vm-hsm\] starting enclave' "$LOG" 2>/dev/null; then
+    if GUEST_CID="$GUEST_CID" HSM_VSOCK_PORT="$HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
+      ok=1
+      break
+    fi
   fi
   sleep 3
 done
 
 if [ "$ok" != 1 ]; then
-  echo "guest vsock smoke timed out; tail log:" >&2
-  tail -60 "$LOG" >&2 || true
+  echo "guest vsock smoke timed out; log tail:" >&2
+  tail -100 "$LOG" >&2 || true
   exit 1
 fi
 

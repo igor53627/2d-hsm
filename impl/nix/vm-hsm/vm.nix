@@ -11,9 +11,10 @@ nixpkgs.lib.nixosSystem {
     ./nixos-module.nix
     "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
     {
-      virtualisation.memorySize = 512;
+      virtualisation.memorySize = 1024;
       virtualisation.cores = 2;
-      virtualisation.diskSize = 1024;
+      virtualisation.diskSize = 2048;
+      virtualisation.qemu.options = [ "-nographic" ];
     }
   ];
 }
