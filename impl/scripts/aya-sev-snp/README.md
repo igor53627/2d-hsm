@@ -41,7 +41,7 @@ SEV_MODE=sev MEMORY=4096 VCPUS=2 ./run-guest-vm.sh
 ./host-guest-vsock-smoke.sh
 ```
 
-**Inside the guest**, bind uses `TWOD_HSM_VSOCK_CID=42` (must match QEMU `guest-cid`). **On the host**, connect to `GUEST_CID=42` (`vhost-vsock-pci`). Use `TWOD_*`, not `2D_*` — env names cannot start with a digit (systemd).
+**Inside the guest**, bind uses `TWOD_HSM_VSOCK_CID=42` (must match QEMU `guest-cid`). **On the host**, connect to `GUEST_CID=42` (`vhost-vsock-pci`). All operator env vars use the `TWOD_` prefix (not `2D_`) — see vsock spec §2.4 and `impl/rust/enclave-protocol/src/env_config.rs`.
 
 **SNP host prep** (once per machine):
 

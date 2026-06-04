@@ -8,7 +8,6 @@ use enclave_protocol::{
     bind_unix_listener, default_dev_socket_dir, install_reference_sealed_signer_staging,
     is_sealed_signer_installed, pq_signing_ready, reference_test_attestation_trust,
 };
-use std::env;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,7 +35,10 @@ fn default_socket_path() -> PathBuf {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::var("2D_HSM_ENCLAVE_STAGING_SOCKET")
+    use enclave_protocol::env_config::{
+        var_twod, LEGACY_HSM_ENCLAVE_STAGING_SOCKET, TWOD_HSM_ENCLAVE_STAGING_SOCKET,
+    };
+    let path = var_twod(TWOD_HSM_ENCLAVE_STAGING_SOCKET, LEGACY_HSM_ENCLAVE_STAGING_SOCKET)
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_socket_path());
     let private_dir = default_dev_socket_dir();

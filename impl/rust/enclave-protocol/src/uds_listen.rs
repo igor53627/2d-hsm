@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// Bind a UDS listener at `path` with socket mode `0600`.
 ///
 /// Creates the parent directory when missing. Tightens the default `private_dir` to `0700`;
-/// custom `2D_HSM_ENCLAVE_*_SOCKET` parents are created but not chmod'd (operator responsibility).
+/// custom `TWOD_HSM_ENCLAVE_*_SOCKET` parents are created but not chmod'd (operator responsibility).
 pub fn bind_unix_listener(
     path: &Path,
     private_dir: &Path,

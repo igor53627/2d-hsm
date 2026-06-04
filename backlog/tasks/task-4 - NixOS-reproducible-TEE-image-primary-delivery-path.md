@@ -70,7 +70,7 @@ Production measurement in tickets comes from **TEE attestation**, not from stori
 - [ ] #2 `flake.lock` committed; CI workflow runs `nix build .#enclave` and `.#vm` on `x86_64-linux`.
 - [ ] #3 Documented **measurement manifest** format (JSON/CBOR): `git_revision`, `flake_lock`, `enclave_derivation`, `vm_derivation`, `protocol_version` → script computes hash for `forkSpecHash` helper.
 - [ ] #4 Reproducibility: two CI builds from same lock → identical enclave measurement (or documented allowed variance); manifest published as CI artifact.
-- [ ] #5 NixOS guest module: systemd unit for HSM binary, vsock bind, minimal firewall; **no** SSH, no extraneous services; `boot.loader.grub.enable = false`.
+- [ ] #5 NixOS guest module: systemd unit for HSM binary, `TWOD_HSM_VSOCK_*` bind (not `2D_HSM_*`), minimal firewall; **no** SSH, no extraneous services; `boot.loader.grub.enable = false`.
 - [ ] #6 `impl/scripts/aya-sev-snp/run-vm-hsm.sh` (or equivalent) launches NixOS qcow2; documents `SEV_MODE=none` vs SNP and QEMU requirements.
 - [ ] #7 Smoke on aya: `host-guest-vsock-smoke` passes with Nix-built guest (KVM minimum; SNP recorded pass/fail in task notes).
 - [ ] #8 `impl/README.md` states NixOS path is **primary for production TEE**; Ubuntu path labeled dev/KVM fallback.

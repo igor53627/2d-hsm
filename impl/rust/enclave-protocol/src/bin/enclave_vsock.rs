@@ -24,8 +24,15 @@ fn load_attestation_trust() -> Result<enclave_protocol::ProducerAttestationTrust
     use std::env;
     use std::fs;
 
-    let path = env::var("2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE").map_err(|_| {
-        "2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE must point to a 32-byte Ed25519 verifying key"
+    use enclave_protocol::env_config::{
+        var_twod, LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE, TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
+    };
+    let path = var_twod(
+        TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
+        LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
+    )
+    .map_err(|_| {
+        "TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE must point to a 32-byte Ed25519 verifying key"
     })?;
     let bytes = fs::read(path)?;
     let key: [u8; 32] = bytes

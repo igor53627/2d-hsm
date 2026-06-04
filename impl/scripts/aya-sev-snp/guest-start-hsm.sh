@@ -24,7 +24,7 @@ scp $SSH_OPTS -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:${GUEST_DIR}/enclave-vsoc
 
 ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
   "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \
-   nohup env TWOD_HSM_VSOCK_CID=4294967295 TWOD_HSM_VSOCK_PORT=5000 \
+   nohup env TWOD_HSM_VSOCK_CID=42 TWOD_HSM_VSOCK_PORT=5000 \
    ${GUEST_DIR}/enclave-vsock-staging > /tmp/enclave-vsock-staging.log 2>&1 & \
    sleep 2; grep listening /tmp/enclave-vsock-staging.log || cat /tmp/enclave-vsock-staging.log"
 

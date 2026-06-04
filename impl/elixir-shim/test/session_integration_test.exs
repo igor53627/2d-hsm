@@ -113,7 +113,7 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
         :binary,
         :exit_status,
         {:args, []},
-        {:env, [{~c"2D_HSM_ENCLAVE_SOCKET", to_charlist(socket_path)}]}
+        {:env, [{~c"TWOD_HSM_ENCLAVE_SOCKET", to_charlist(socket_path)}]}
       ])
 
     Process.put(:enclave_uds_port, port)

@@ -5,7 +5,7 @@
 **Status**: Draft **v0.2** — post-TASK-3 crypto gate; ML-DSA-65 + dual-path aligned with 2d TASK-122 / theory-378 TASK-92.1.8  
 **Goal**: Define the communication protocol between the 2D host (Block Producer) and the minimal post-quantum signing service running inside a TEE (Nitro Enclave / SEV-SNP).
 
-**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
+**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). §2.4 AF_VSOCK bind env (`TWOD_HSM_VSOCK_*`, not `2D_HSM_*` — systemd-safe). Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
 
 ## 1. Why this API exists
 
@@ -88,6 +88,21 @@ Do **not** conflate them:
 - The Ed25519 verifying key (`ProducerAttestationTrust`) is **not** derived from `pq_pubkey` (see §9.3).
 
 User and bridge transactions on 2d remain **secp256k1** until a separate wallet PQ migration (2d TASK-24). This service does not sign Ethereum-style user txs.
+
+### 2.4 AF_VSOCK transport (bind address)
+
+The reference enclave listens on **AF_VSOCK** before accepting framed commands (§5+). Operator configuration uses environment variables on the **guest** (TEE VM / enclave process):
+
+| Variable | Required | Default (reference) | Semantics |
+|----------|----------|---------------------|-----------|
+| `TWOD_HSM_VSOCK_CID` | no | `3` (Nitro-style) | VSock CID the enclave **binds** inside the guest |
+| `TWOD_HSM_VSOCK_PORT` | no | `5000` | VSock port (service listener) |
+
+**Naming rule:** Use the `TWOD_` prefix, not `2D_`. POSIX and **systemd** reject environment keys that start with a digit, so `2D_HSM_VSOCK_CID` in a unit file is silently ignored and the process falls back to defaults (misconfiguration). The reference implementation also accepts deprecated `2D_HSM_VSOCK_*` for one transition period when set via `env(1)` or shells that allow it.
+
+**Host connect address (untrusted orchestrator):** The host connects to the guest using the hypervisor-assigned guest CID (e.g. QEMU `-device vhost-vsock-pci,guest-cid=42` → host uses CID **42**, while the guest may bind with `TWOD_HSM_VSOCK_CID=42` on virtio-vsock). Nitro loopback dev hosts often use CID `1` or `4294967295` (`VMADDR_CID_ANY`) for bind; production QEMU/SEV guests must match `guest-cid`.
+
+**Security:** Vsock is still an untrusted channel for *request content*; only the enclave-side bind + TEE measurement establish which process speaks the protocol. Framing and command semantics are unchanged by transport env.
 
 ## 3. Design Principles
 

@@ -42,6 +42,7 @@ compile_error!(
 );
 
 mod chain_proof_crypto;
+pub mod env_config;
 pub mod enclave_serve;
 #[cfg(feature = "ml-dsa-65")]
 pub mod platform_provisioning_boot;

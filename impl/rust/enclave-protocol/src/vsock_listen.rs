@@ -5,6 +5,10 @@ use std::io;
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use vsock::{VsockAddr, VsockListener};
 
+use crate::env_config::{
+    var_twod, LEGACY_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_PORT, TWOD_HSM_VSOCK_CID, TWOD_HSM_VSOCK_PORT,
+};
+
 /// Default Nitro-style enclave CID (many Nitro setups use CID 3 for the enclave listener).
 /// On generic Linux dev hosts (e.g. SEV loopback on **aya**), use `TWOD_HSM_VSOCK_CID=1` or `4294967295`.
 pub const DEFAULT_VSOCK_CID: u32 = 3;
@@ -13,28 +17,21 @@ pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
 /// Default vsock service port (override via `TWOD_HSM_VSOCK_PORT`).
 pub const DEFAULT_VSOCK_PORT: u32 = 5000;
 
-/// Env keys for vsock bind (systemd-safe: no leading digit — use `TWOD_`, not `2D_`).
-pub const ENV_VSOCK_CID: &[&str] = &["TWOD_HSM_VSOCK_CID", "HSM_VSOCK_CID", "2D_HSM_VSOCK_CID"];
-pub const ENV_VSOCK_PORT: &[&str] = &["TWOD_HSM_VSOCK_PORT", "HSM_VSOCK_PORT", "2D_HSM_VSOCK_PORT"];
-
-fn env_u32(names: &[&str], default: u32) -> Result<u32, String> {
-    for name in names {
-        if let Ok(s) = std::env::var(name) {
-            return s
-                .parse::<u32>()
-                .map_err(|_| format!("{name} must be a u32"));
-        }
+fn env_u32_twod(primary: &str, legacy: &str, default: u32) -> Result<u32, String> {
+    match var_twod(primary, legacy) {
+        Ok(s) => s
+            .parse::<u32>()
+            .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u32")),
+        Err(_) => Ok(default),
     }
-    Ok(default)
 }
 
 /// Resolve `(cid, port)` from env or defaults.
 ///
-/// Canonical keys: `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT` (`2D` → `TWOD` for systemd/shell).
-/// Legacy aliases `HSM_VSOCK_*` and `2D_HSM_VSOCK_*` are still accepted.
+/// Canonical: `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT`. Legacy `2D_HSM_VSOCK_*` still accepted.
 pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
-    let cid = env_u32(ENV_VSOCK_CID, DEFAULT_VSOCK_CID)?;
-    let port = env_u32(ENV_VSOCK_PORT, DEFAULT_VSOCK_PORT)?;
+    let cid = env_u32_twod(TWOD_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_CID, DEFAULT_VSOCK_CID)?;
+    let port = env_u32_twod(TWOD_HSM_VSOCK_PORT, LEGACY_HSM_VSOCK_PORT, DEFAULT_VSOCK_PORT)?;
     Ok((cid, port))
 }
 

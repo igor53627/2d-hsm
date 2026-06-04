@@ -9,7 +9,6 @@ use enclave_protocol::{
     read_framed_message, write_framed_message, EnclaveState, HostSession,
     ProducerAttestationTrust,
 };
-use std::env;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,7 +55,10 @@ fn default_socket_path() -> PathBuf {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::var("2D_HSM_ENCLAVE_SOCKET")
+    use enclave_protocol::env_config::{
+        var_twod, LEGACY_HSM_ENCLAVE_SOCKET, TWOD_HSM_ENCLAVE_SOCKET,
+    };
+    let path = var_twod(TWOD_HSM_ENCLAVE_SOCKET, LEGACY_HSM_ENCLAVE_SOCKET)
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_socket_path());
     let private_dir = default_dev_socket_dir();
