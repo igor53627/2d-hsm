@@ -39,7 +39,7 @@ Today (2026-06-05, branch `feat/task-1-vsock-staging-transport`):
 
 - Protocol + state machine + ML-DSA staging signer work in Rust.
 - NixOS guest runs **`enclave-vsock-staging`** with `TWOD_HSM_VSOCK_*` — host→guest vsock smoke passes (KVM).
-- Release **`enclave-vsock`** runs in `.#vm-production` / `.#vm-production-lab` with **lab** attestation trust (transport / seal smokes). Platform trust + PQ root from vTPM/SNP remain open (Phase 3).
+- **`.#vm-production`:** release `enclave-vsock` + lab attestation VK (transport smoke). **`.#vm-production-lab`:** debug `lab-production-vsock` + file PQ seal (`pq_signing_ready` smoke). Platform trust + PQ root from vTPM/SNP remain open (Phase 3).
 - SNP launch on aya is not the smoke path; production `GET_MEASUREMENT` / manifest still use placeholder measurement labels.
 
 This task is the **operational production milestone** after TASK-4 Phase B (transport + guest shell).

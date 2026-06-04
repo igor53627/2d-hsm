@@ -196,6 +196,8 @@ cargo build --bin enclave-uds-staging --features staging-host
 - Hardware-backed root derivation (vTPM / SNP VMPL / Nitro) wired into `boot_configure_pq_seal_v1_platform_root`
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
-- Production **AF_VSOCK** transport (Unix socket + stdio are reference dev paths)
+- **Mainnet production guest:** platform attestation trust + SNP measurement (see `nix/vm-hsm/README.md`; `.#vm-production` is lab-trust transport smoke only)
+
+Host↔guest **AF_VSOCK** smokes are green via Nix (`impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`). Unix socket + stdio remain dev paths.
 
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` for phased roadmap.
