@@ -36,6 +36,17 @@ pub fn bind_vsock_listener(cid: u32, port: u32) -> Result<VsockListener, io::Err
     VsockListener::bind(&addr)
 }
 
+/// Apply the same session I/O timeouts as UDS staging (prevents slot exhaustion on idle peers).
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+pub fn configure_vsock_session_timeouts(
+    stream: &mut vsock::VsockStream,
+) -> Result<(), io::Error> {
+    use crate::enclave_serve::{READ_TIMEOUT, WRITE_TIMEOUT};
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "linux", feature = "vsock-transport")))]
 pub fn bind_vsock_listener(_cid: u32, _port: u32) -> Result<(), String> {
     Err("AF_VSOCK requires Linux and feature vsock-transport (use staging-vsock)".to_string())

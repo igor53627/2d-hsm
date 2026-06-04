@@ -39,7 +39,9 @@ fn load_attestation_trust() -> Result<enclave_protocol::ProducerAttestationTrust
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use enclave_protocol::enclave_serve::{serve_framed_connection, SharedEnclaveRuntime};
     use enclave_protocol::platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
-    use enclave_protocol::vsock_listen::{bind_vsock_listener, vsock_listen_addr_from_env};
+    use enclave_protocol::vsock_listen::{
+        bind_vsock_listener, configure_vsock_session_timeouts, vsock_listen_addr_from_env,
+    };
     use enclave_protocol::{is_sealed_signer_installed, pq_signing_ready};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -78,6 +80,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        if let Err(e) = configure_vsock_session_timeouts(&mut stream) {
+            eprintln!("vsock timeout setup failed: {e}");
+            continue;
+        }
         let prev = active.fetch_add(1, Ordering::Relaxed);
         if prev >= enclave_protocol::enclave_serve::MAX_CONCURRENT_SESSIONS {
             active.fetch_sub(1, Ordering::Relaxed);

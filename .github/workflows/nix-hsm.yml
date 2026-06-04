@@ -1,5 +1,8 @@
 name: nix-hsm
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, 'feat/**']
@@ -22,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v3
 
       - name: Lock flake
         run: nix flake lock

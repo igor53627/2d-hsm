@@ -24,7 +24,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         install_reference_sealed_signer_staging, is_sealed_signer_installed, pq_signing_ready,
         reference_test_attestation_trust,
     };
-    use enclave_protocol::vsock_listen::{bind_vsock_listener, vsock_listen_addr_from_env};
+    use enclave_protocol::vsock_listen::{
+        bind_vsock_listener, configure_vsock_session_timeouts, vsock_listen_addr_from_env,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
@@ -57,6 +59,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        if let Err(e) = configure_vsock_session_timeouts(&mut stream) {
+            eprintln!("vsock timeout setup failed: {e}");
+            continue;
+        }
         let prev = active.fetch_add(1, Ordering::Relaxed);
         if prev >= enclave_protocol::enclave_serve::MAX_CONCURRENT_SESSIONS {
             active.fetch_sub(1, Ordering::Relaxed);
