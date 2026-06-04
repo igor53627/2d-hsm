@@ -25,8 +25,11 @@ rustPlatform.buildRustPackage {
   buildType = if staging || labProd then "debug" else "release";
 
   # Custom cargo profiles skip PROFILE=release; enforce key-safety compile_errors on prod builds.
-  env.TWOD_HSM_STRICT_RELEASE_GUARDS =
-    if (!staging && !labProd) then "1" else null;
+  env =
+    if (!staging && !labProd) then
+      { TWOD_HSM_STRICT_RELEASE_GUARDS = "1"; }
+    else
+      { };
 
   cargoBuildFlags = [ "--bin ${pname}" ];
 
