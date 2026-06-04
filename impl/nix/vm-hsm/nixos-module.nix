@@ -15,11 +15,12 @@ let
   binName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
   unitName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
   trustFile =
-    if isProd then
+    if !isProd then
+      null
+    else if producerAttestationTrustFile != null then
       producerAttestationTrustFile
-        or (throw "production guest requires producerAttestationTrustFile (lab: lab-prod-fixtures)")
     else
-      null;
+      throw "production guest requires producerAttestationTrustFile (lab: lab-prod-fixtures)";
 in
 {
   boot.loader.grub.enable = false;
