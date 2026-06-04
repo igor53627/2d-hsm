@@ -6,11 +6,13 @@ use crate::{
 };
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAX_CONCURRENT_SESSIONS: usize = 32;
 pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Wall-clock cap per connection (slowloris / byte-at-a-time idle reads).
+pub const SESSION_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One enclave process: shared authorization state across all transport connections.
 pub struct SharedEnclaveRuntime {
@@ -32,8 +34,9 @@ pub fn serve_framed_connection<S>(stream: &mut S, runtime: &SharedEnclaveRuntime
 where
     S: Read + Write,
 {
+    let session_deadline = Instant::now() + SESSION_TOTAL_TIMEOUT;
     loop {
-        let frame = match read_framed_message(stream) {
+        let frame = match read_framed_message_before(stream, session_deadline) {
             Ok(f) => f,
             Err(ProtocolError::Io(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
@@ -55,6 +58,57 @@ where
         )?;
         drop(state);
         write_framed_message(stream, &response)?;
+    }
+    Ok(())
+}
+
+fn read_framed_message_before<R: Read>(
+    reader: &mut R,
+    deadline: Instant,
+) -> Result<Vec<u8>, ProtocolError> {
+    use crate::ProtocolError;
+    use std::io::{ErrorKind, Read};
+
+    let mut len_buf = [0u8; 4];
+    read_exact_before_deadline(reader, &mut len_buf, deadline)?;
+    let total_len = u32::from_be_bytes(len_buf) as usize;
+    if total_len > crate::MAX_MESSAGE_SIZE as usize {
+        return Err(ProtocolError::MessageTooLarge(total_len as u32));
+    }
+    let mut body = vec![0u8; total_len];
+    read_exact_before_deadline(reader, &mut body, deadline)?;
+    let mut frame = Vec::with_capacity(4 + total_len);
+    frame.extend_from_slice(&len_buf);
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+fn read_exact_before_deadline<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<(), ProtocolError> {
+    use std::io::{ErrorKind, Read};
+
+    let mut off = 0;
+    while off < buf.len() {
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::Io(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "session total timeout exceeded",
+            )));
+        }
+        match reader.read(&mut buf[off..]) {
+            Ok(0) => {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "connection closed while reading frame",
+                )));
+            }
+            Ok(n) => off += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(ProtocolError::from(e)),
+        }
     }
     Ok(())
 }

@@ -35,31 +35,19 @@ find_runner() {
 }
 
 vsock_probe() {
-  python3 <<'PY'
-import os, socket, struct, sys
-cid = int(os.environ.get("PROBE_CID", "42"))
-port = int(os.environ.get("TWOD_HSM_VSOCK_PORT", "5000"))
-AF_VSOCK = 40
-print(f"probe cid={cid} port={port}")
-try:
-    s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect((cid, port))
-    print("  connect: OK")
-    try:
-        payload = bytes([0xA1, 0x01, 0x01])
-        body = bytes([1, 0x01]) + payload
-        frame = struct.pack(">I", len(body)) + body
-        s.sendall(frame)
-        print("  sent frame", len(frame), "bytes")
-        resp = s.recv(256)
-        print("  recv:", len(resp), resp[:80])
-    except Exception as e:
-        print("  io:", type(e).__name__, e)
-    s.close()
-except Exception as e:
-    print("  connect:", type(e).__name__, e)
-PY
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  export GUEST_CID="${PROBE_CID:-42}"
+  export VSOCK_SMOKE_TIMEOUT=5
+  export VSOCK_SMOKE_LABEL="vsock-probe-cid=${GUEST_CID}"
+  unset VSOCK_SMOKE_MEASUREMENT_MARKER
+  unset VSOCK_SMOKE_REQUIRE_PQ_READY
+  echo "probe cid=${GUEST_CID} port=${TWOD_HSM_VSOCK_PORT:-5000}"
+  if python3 "$script_dir/vsock_smoke_client.py"; then
+    echo "  connect+GET_MEASUREMENT: OK"
+  else
+    echo "  probe failed (see above)"
+  fi
 }
 
 echo "=== [1] nix build .#vm ==="

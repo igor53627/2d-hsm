@@ -122,3 +122,11 @@ required-features = ["production-vsock"]
 [[example]]
 name = "ticket_signing_demo"
 required-features = ["test-support", "demo-mock-sign"]
+
+[[example]]
+name = "generate_lab_prod_sealed"
+required-features = ["pq-seal-provisioning", "ml-dsa-65"]
+
+[[example]]
+name = "dump_reference_attestation_vk"
+required-features = ["test-support"]

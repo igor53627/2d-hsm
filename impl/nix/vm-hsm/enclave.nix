@@ -24,6 +24,10 @@ rustPlatform.buildRustPackage {
   buildFeatures = buildFeatures;
   buildType = if staging || labProd then "debug" else "release";
 
+  # Custom cargo profiles skip PROFILE=release; enforce key-safety compile_errors on prod builds.
+  env.TWOD_HSM_STRICT_RELEASE_GUARDS =
+    if (!staging && !labProd) then "1" else null;
+
   cargoBuildFlags = [ "--bin ${pname}" ];
 
   # Reference/staging keys must not ship in release artifacts (enforced in lib.rs too).

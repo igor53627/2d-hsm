@@ -12,6 +12,7 @@ GUEST_CID="${GUEST_CID:-42}"
 TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-180}"
 LOG="${VM_HSM_LOG:-/tmp/vm-hsm-guest-smoke.log}"
+VM_PID_FILE="${VM_PID_FILE:-${DISK_IMAGE}.pid}"
 
 if command -v nix >/dev/null; then
   [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] \
@@ -19,9 +20,14 @@ if command -v nix >/dev/null; then
 fi
 
 cleanup() {
-  pkill -f 'run-nixos-vm' 2>/dev/null || true
-  pkill -f 'qemu-system-x86_64.*-name vm-hsm' 2>/dev/null || true
-  sleep 2
+  if [[ -f "$VM_PID_FILE" ]]; then
+    old_pid="$(cat "$VM_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+      wait "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$VM_PID_FILE"
+  fi
 }
 trap cleanup EXIT
 
@@ -52,7 +58,8 @@ export QEMU_OPTS="${QEMU_OPTS:-} -display none -device vhost-vsock-pci,guest-cid
 
 nohup "$RUNNER" </dev/null >>"$LOG" 2>&1 &
 VM_PID=$!
-echo "VM pid=$VM_PID log=$LOG"
+echo "$VM_PID" >"$VM_PID_FILE"
+echo "VM pid=$VM_PID log=$LOG pidfile=$VM_PID_FILE"
 
 echo "[3/4] waiting for guest vsock (up to ${BOOT_TIMEOUT_SEC}s)"
 deadline=$((SECONDS + BOOT_TIMEOUT_SEC))

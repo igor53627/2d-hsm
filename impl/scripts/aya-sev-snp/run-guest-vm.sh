@@ -32,7 +32,6 @@ fi
 USE_SNP=0
 SEV_OPTS=""
 MACHINE_OPTS="q35"
-QEMU_CPU="${QEMU_CPU:-host}"
 
 if [[ "$SEV_MODE" == "none" ]]; then
   echo "KVM baseline (no SEV)"
@@ -51,6 +50,12 @@ else
   echo "Requested SEV_MODE=$SEV_MODE not supported by $QEMU_BIN"
   echo "Run ./install-qemu-snp.sh and ./prepare-snp-host.sh"
   exit 1
+fi
+
+if [[ "$USE_SNP" == 1 ]]; then
+  QEMU_CPU="${QEMU_CPU:-EPYC-v4,+la57,phys-bits=52}"
+else
+  QEMU_CPU="${QEMU_CPU:-host}"
 fi
 
 VSOCK="-device vhost-vsock-pci,guest-cid=${GUEST_CID}"

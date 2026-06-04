@@ -13,6 +13,7 @@ if ! command -v determinate-nixd >/dev/null; then
 fi
 
 TOKEN_FILE="${1:-}"
+CONSUME_TOKEN=0
 
 if [ -z "$TOKEN_FILE" ]; then
   echo "FlakeHub login for Determinate Nix"
@@ -25,6 +26,7 @@ if [ -z "$TOKEN_FILE" ]; then
   echo ""
   echo "2. Paste the token below (input hidden):"
   TOKEN_FILE="$(mktemp)"
+  CONSUME_TOKEN=1
   trap 'rm -f "$TOKEN_FILE"' EXIT
   read -r -s -p "FlakeHub token: " token
   echo
@@ -38,8 +40,10 @@ fi
 
 chmod 600 "$TOKEN_FILE"
 determinate-nixd auth login token --token-file "$TOKEN_FILE"
-rm -f "$TOKEN_FILE"
-trap - EXIT
+if [ "$CONSUME_TOKEN" = 1 ]; then
+  rm -f "$TOKEN_FILE"
+  trap - EXIT
+fi
 
 echo ""
 determinate-nixd status

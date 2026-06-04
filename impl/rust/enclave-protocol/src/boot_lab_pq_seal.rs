@@ -26,11 +26,7 @@ pub fn boot_install_lab_sealed_signer_from_file() -> Result<(), crate::ProtocolE
         TWOD_HSM_ENCLAVE_MEASUREMENT_FILE,
         LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
     ) {
-        Ok(path) => std::fs::read(path).map_err(|_| {
-            crate::ProtocolError::PqSigningUnavailable(
-                "failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE",
-            )
-        })?,
+        Ok(path) => read_measurement_file(path.as_ref())?,
         Err(_) => LAB_PROD_MEASUREMENT.to_vec(),
     };
     if measurement.is_empty() {
@@ -39,4 +35,24 @@ pub fn boot_install_lab_sealed_signer_from_file() -> Result<(), crate::ProtocolE
         ));
     }
     install_sealed_pq_signer(&blob, measurement.as_ref())
+}
+
+/// Read measurement bytes; strip a single trailing newline from text files.
+#[cfg(feature = "lab-pq-seal-from-file")]
+fn read_measurement_file(path: &std::path::Path) -> Result<Vec<u8>, crate::ProtocolError> {
+    let bytes = std::fs::read(path).map_err(|_| {
+        crate::ProtocolError::PqSigningUnavailable("failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE")
+    })?;
+    if bytes.ends_with(b"\n") {
+        let trimmed: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .take(bytes.len().saturating_sub(1))
+            .collect();
+        if trimmed.ends_with(b"\r") {
+            return Ok(trimmed[..trimmed.len().saturating_sub(1)].to_vec());
+        }
+        return Ok(trimmed);
+    }
+    Ok(bytes)
 }

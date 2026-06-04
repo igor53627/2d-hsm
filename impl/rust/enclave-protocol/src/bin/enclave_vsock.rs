@@ -54,15 +54,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use std::thread;
 
+    #[cfg(feature = "lab-pq-seal-from-file")]
+    {
+        boot_configure_pq_seal_v1_platform_root()
+            .map_err(|e| format!("PQ seal provisioning root: {e}"))?;
+        enclave_protocol::boot_lab_pq_seal::boot_install_lab_sealed_signer_from_file()
+            .map_err(|e| format!("lab sealed PQ signer: {e}"))?;
+        eprintln!("enclave-vsock: lab PQ seal root + sealed signer configured");
+    }
+    #[cfg(not(feature = "lab-pq-seal-from-file"))]
     match boot_configure_pq_seal_v1_platform_root() {
         Ok(()) => eprintln!("enclave-vsock: PQ seal v1 provisioning root configured"),
         Err(e) => eprintln!("enclave-vsock: platform provisioning root not configured: {e}"),
-    }
-
-    #[cfg(feature = "lab-pq-seal-from-file")]
-    match enclave_protocol::boot_lab_pq_seal::boot_install_lab_sealed_signer_from_file() {
-        Ok(()) => eprintln!("enclave-vsock: lab sealed PQ signer installed"),
-        Err(e) => eprintln!("enclave-vsock: lab sealed signer install failed: {e}"),
     }
 
     let (cid, port) = vsock_listen_addr_from_env()
@@ -101,6 +104,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if prev >= enclave_protocol::enclave_serve::MAX_CONCURRENT_SESSIONS {
             active.fetch_sub(1, Ordering::Relaxed);
             eprintln!("rejecting connection: at session cap");
+            drop(stream);
             continue;
         }
         let active = Arc::clone(&active);

@@ -48,6 +48,7 @@ compile_error!(
 );
 
 pub mod boot_lab_pq_seal;
+pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
 mod chain_proof_crypto;
 pub mod env_config;
 pub mod enclave_serve;
@@ -362,7 +363,7 @@ fn measurement_response() -> GetMeasurementResponse {
     #[cfg(any(feature = "staging-host", feature = "reference-test-key"))]
     let measurement = REFERENCE_STAGING_MEASUREMENT.to_vec();
     #[cfg(not(any(feature = "staging-host", feature = "reference-test-key")))]
-    let measurement = b"enclave-measurement-placeholder".to_vec();
+    let measurement = boot_lab_pq_seal::LAB_PROD_MEASUREMENT.to_vec();
 
     GetMeasurementResponse {
         measurement,
