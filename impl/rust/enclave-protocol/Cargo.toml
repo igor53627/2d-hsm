@@ -63,6 +63,8 @@ demo-mock-sign = ["test-support"]
 # AF_VSOCK transport (Linux). Staging binary pairs with staging-host.
 vsock-transport = ["dep:vsock"]
 staging-vsock = ["staging-host", "vsock-transport"]
+# Production AF_VSOCK server (release only; no reference seal / staging keys).
+production-vsock = ["ml-dsa-65", "vsock-transport"]
 enforce-forge-crosscheck = []
 #   When enabled, the automated cross-check tests (that verify
 #   `compute_canonical_ticket_hash` against the Solidity `abi.encode` + keccak256
@@ -101,6 +103,11 @@ required-features = ["staging-host"]
 name = "enclave-vsock-staging"
 path = "src/bin/enclave_vsock_staging.rs"
 required-features = ["staging-vsock"]
+
+[[bin]]
+name = "enclave-vsock"
+path = "src/bin/enclave_vsock.rs"
+required-features = ["production-vsock"]
 
 [[example]]
 name = "ticket_signing_demo"

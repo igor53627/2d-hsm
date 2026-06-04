@@ -16,6 +16,7 @@ dependencies:
   - TASK-2
   - TASK-3
 references:
+  - backlog/tasks/task-4 - NixOS-reproducible-TEE-image-primary-delivery-path.md
   - impl/rust/enclave-protocol
   - backlog/docs/implementation-plan-vsock-api-and-hard-fork.md
   - backlog/docs/authorization-tickets-precompile-spec-draft.md
@@ -95,7 +96,7 @@ Phase 1 – Architecture & Design (1-2 weeks)
 - Concrete spec for RecoveryTicket (precompile or contract), attestation binding, hot-standby readiness registration, and client-side rejection rules for invalid state transitions.
 
 Phase 2 – Core Implementation (3-5 weeks)
-- Skeleton + CI + reproducible build for the TEE image (Nix or equivalent for auditability).
+- Skeleton + CI + reproducible build for the TEE image — **primary path: TASK-4 (NixOS flake + measurement manifest)**; `cargo`/Ubuntu scripts remain dev-only fallback until TASK-4 AC #7–#8 are met.
 - Implementation of the first PQ algorithm (ML-DSA recommended; parameter sets matching 2d requirements).
 - Basic key management, sealing, and remote attestation support inside the TEE.
 - Minimal light-client / freshness verifier inside the enclave (genesis + recent headers as second factor).

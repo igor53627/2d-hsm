@@ -1,0 +1,46 @@
+name: nix-hsm
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    paths:
+      - 'impl/nix/vm-hsm/**'
+      - 'impl/rust/enclave-protocol/**'
+      - '.github/workflows/nix-hsm.yml'
+  pull_request:
+    paths:
+      - 'impl/nix/vm-hsm/**'
+      - 'impl/rust/enclave-protocol/**'
+      - '.github/workflows/nix-hsm.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: impl/nix/vm-hsm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Lock flake
+        run: nix flake lock
+
+      - name: Build production enclave
+        run: nix build .#enclave --print-out-paths
+
+      - name: Build staging enclave
+        run: nix build .#enclave-staging --print-out-paths
+
+      - name: Build measurement manifest
+        run: |
+          nix build .#measurement-manifest --out-link result
+          jq . result/manifest.json
+
+      - name: Upload measurement manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-hsm-measurement-manifest
+          path: impl/nix/vm-hsm/result/manifest.json
+          if-no-files-found: error

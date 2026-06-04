@@ -4,10 +4,11 @@ This directory contains the reference implementation of the vsock protocol and e
 
 **All code here is high-risk** (see root `AGENTS.md` and `.roborev.toml`).
 
-## Layout (as of 2026-06-02)
+## Layout (as of 2026-06-04)
 
 | Path | Role |
 |------|------|
+| `nix/vm-hsm/` | **Primary production path (TASK-4):** flake → `enclave-vsock` / manifest JSON — see `nix/vm-hsm/README.md` |
 | `rust/enclave-protocol/` | Canonical wire format, state machine, ticket hashing, `RecentChainProof` crypto (TASK-3) |
 | `rust/pq-seal-v1/` | Offline `pq-seal-v1` CLI for v1 sealed PQ blobs (provisioning workstation) |
 | `rust/enclave-protocol/src/wire.rs` | Spec-aligned CBOR with **integer map keys** for all four commands |
@@ -62,6 +63,18 @@ TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, 
 **Accepted debt (security PR sign-off, 2026-06):** `produce_pq_signature` may return 64-byte mocks only under `test-support` / `demo-mock-sign` (or `ml-dsa-65` tests **without** `reference-test-key`). With `reference-test-key`, unit tests fail closed if the sealed signer is not installed. Production vsock (Nitro/SEV) wiring is out of scope for this repo increment.
 
 ## Building and testing
+
+### Nix (production TEE binaries, Linux x86_64)
+
+```bash
+cd nix/vm-hsm
+nix flake lock   # first checkout
+nix build .#enclave .#enclave-staging .#measurement-manifest
+```
+
+CI publishes `manifest.json` from `.#measurement-manifest` (artifact `vm-hsm-measurement-manifest`). Use `enclave-staging` for aya vsock smokes; `enclave` is the release `enclave-vsock` binary (requires `2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE` at runtime).
+
+### Cargo (local dev)
 
 ```bash
 cd rust/enclave-protocol
@@ -166,7 +179,7 @@ cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Lin
 
 Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Build on Linux** (e.g. SEV dev host `aya`, CI, Nitro parent) — not a runnable vsock server on macOS (compile-only stub there). At runtime the host needs vsock enabled (`vmw_vsock_vmci_transport` / `vhost_vsock`); bind errors such as `Cannot assign requested address` mean CID/port are wrong for that machine.
 
-**Production** `enclave-vsock` (no `staging-host`, platform root + sealed PQ at boot) is blocked on hardware-backed `set_pq_seal_v1_provisioning_root` and enclave-provisioned `ProducerAttestationTrust`.
+**Production** `enclave-vsock` (`production-vsock`, release-only via `nix build .#enclave`): requires `2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE` (32-byte Ed25519 VK) at boot; platform PQ seal + sealed signer still need vTPM/SNP/Nitro hooks.
 
 ## Staging UDS (TASK-1, PR #4)
 

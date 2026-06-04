@@ -44,7 +44,7 @@ compile_error!(
 mod chain_proof_crypto;
 pub mod enclave_serve;
 #[cfg(feature = "ml-dsa-65")]
-mod platform_provisioning_boot;
+pub mod platform_provisioning_boot;
 mod uds_listen;
 #[cfg(feature = "vsock-transport")]
 pub mod vsock_listen;
