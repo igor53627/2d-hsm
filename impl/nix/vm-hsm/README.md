@@ -50,13 +50,26 @@ See `scripts/write-measurement-manifest.sh`. Fields include `git_revision`, `fla
 
 ## Phase B / TASK-5 guest profiles
 
-| Flake output | Guest binary | Use |
-|--------------|--------------|-----|
-| `vm` | `enclave-vsock-staging` | aya smokes (default) |
-| `vm-production` | `enclave-vsock` + lab `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` | prod transport smoke (`run-nix-vm-guest-smoke-prod.sh`) |
-| `vm-production-lab` | debug `lab-production-vsock` + PQ seal files | `pq_signing_ready` smoke (`run-nix-vm-guest-smoke-prod-lab.sh`) |
+> **Deployment warning:** None of the `vm-*` outputs below are mainnet Block Producer images.
+> They use **lab/reference** attestation trust and (for `-lab`) file-based PQ seal. Do not ship
+> `vm-production` or `vm-production-lab` to production without platform trust + SNP measurement (TASK-5 Phase 3).
 
-Release `vm-production` has no PQ seal. Lab seal uses `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` + `TWOD_HSM_PQ_SEALED_SIGNER_FILE` (debug build only). Real measurement still needs SNP/Nitro (TASK-5 Phase 3).
+| Flake output | Guest binary | Trust / seal | Use |
+|--------------|--------------|--------------|-----|
+| `vm` | `enclave-vsock-staging` | reference staging signer | Default aya guest smoke |
+| `vm-production` | release `enclave-vsock` | **lab** Ed25519 VK only (`lab-prod-fixtures`) | **Transport smoke** — release binary binds vsock; no PQ seal |
+| `vm-production-lab` | debug `lab-production-vsock` | lab VK + `TWOD_HSM_PQ_SEAL_*` files | Lab prod path; `pq_signing_ready` smoke |
+
+Why `vm-production` still injects a **lab** trust file: `enclave-vsock` fails closed at boot without
+`TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE`. Platform-provisioned production VK is TASK-5 #2 (not merged here).
+
+| | `vm-production` | `vm-production-lab` |
+|--|-----------------|---------------------|
+| Nix build type | release `enclave-vsock` | debug `lab-production-vsock` |
+| PQ seal | no | yes (file-based, lab only) |
+| Safe for mainnet | **no** | **no** |
+
+Real TEE `measurement` in `GET_MEASUREMENT` → TASK-5 Phase 3 (SNP/Nitro).
 
 ## Related
 

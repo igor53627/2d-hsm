@@ -39,7 +39,7 @@ Today (2026-06-05, branch `feat/task-1-vsock-staging-transport`):
 
 - Protocol + state machine + ML-DSA staging signer work in Rust.
 - NixOS guest runs **`enclave-vsock-staging`** with `TWOD_HSM_VSOCK_*` — host→guest vsock smoke passes (KVM).
-- Release **`enclave-vsock`** (`production-vsock`) builds via Nix but is **not** wired into the guest unit; platform PQ seal + `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` are not integrated in the VM image.
+- Release **`enclave-vsock`** runs in `.#vm-production` / `.#vm-production-lab` with **lab** attestation trust (transport / seal smokes). Platform trust + PQ root from vTPM/SNP remain open (Phase 3).
 - SNP launch on aya is not the smoke path; production `GET_MEASUREMENT` / manifest still use placeholder measurement labels.
 
 This task is the **operational production milestone** after TASK-4 Phase B (transport + guest shell).
@@ -60,6 +60,16 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 
 <!-- SECTION:DESCRIPTION:END -->
 
+## Phase status (2026-06-05, branch `feat/task-1-vsock-staging-transport`)
+
+| Phase | Scope | Status |
+|-------|--------|--------|
+| **1** | Prod `enclave-vsock` in NixOS guest (`.#vm-production`) | **Done** — transport smoke; lab trust VK only |
+| **2** | Lab PQ seal (`.#vm-production-lab`, fail-closed boot) | **Done** — aya `pq_signing_ready` smoke |
+| **3** | SNP launcher + real TEE measurement | **Open** |
+| **4** | BP vsock + live `RecentChainProof` | **Open** |
+| **5** | Review gate (Full matrix on material changes) | **Done** for PR #5 (roborev 6890–6900) |
+
 ## Acceptance Criteria
 
 <!-- AC:BEGIN -->
@@ -70,8 +80,8 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 - [ ] #4 `GET_MEASUREMENT` returns non-placeholder **`measurement`** for production profile when SNP/Nitro report is available; manifest schema documents artifact hash vs TEE measurement (roborev design debt closed or explicitly accepted).
 - [ ] #5 `run-vm-hsm.sh` (or successor) launches NixOS qcow2 with **SNP attempted** on aya; pass/fail recorded; KVM fallback documented.
 - [x] #6 `run-nix-vm-guest-smoke-prod-lab.sh` — prod guest + sealed blob + `VSOCK_SMOKE_REQUIRE_PQ_READY=1` (aya verify on merge).
-- [ ] #7 `impl/README.md` + `nix/vm-hsm/README.md` updated: production operator runbook (env, seal, trust, vsock CID).
-- [ ] #8 Reduced roborev matrix on `impl/nix/**` + any `impl/**/*.rs` changes to prod boot / trust loading; `roborev compact --wait`; HIGHs resolved.
+- [x] #7 `impl/README.md` + `nix/vm-hsm/README.md` updated: production operator runbook (env, seal, trust, vsock CID); `impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`.
+- [x] #8 Full roborev matrix (Reduced 6890–6892 + 2×3 6893–6898, compact 6900); doc resolution for lab-trust naming (not mainnet `vm-production`).
 - [ ] #9 TASK-4 notes link here for “prod enclave in guest + SNP + measurement” closure.
 
 <!-- AC:END -->
@@ -132,7 +142,7 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 |-------|--------|
 | `run-nix-enclave-staging.sh` loopback | ✅ |
 | `run-nix-vm-guest-smoke.sh` staging guest CID 42 | ✅ |
-| `run-nix-vm-guest-smoke-prod-lab.sh` (`.#vm-production-lab`) | 🔄 aya after push |
+| `run-nix-vm-guest-smoke-prod-lab.sh` (`.#vm-production-lab`) | ✅ aya (`73f9c98`) |
 | `run-nix-vm-guest-smoke-prod.sh` (transport only) | ✅ |
 | Prod `nix build .#enclave` | ✅ build; ✅ optional guest via `vm-production` |
 | SNP guest boot on aya | ❌ (KVM smokes only) |

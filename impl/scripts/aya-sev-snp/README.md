@@ -60,3 +60,19 @@ export SNP_BIOS=/opt/amde-ovmf/OVMF.fd
 ```
 
 Stock Ubuntu QEMU 8.2 only has legacy `sev-guest` (EPERM on this host).
+
+## NixOS vm-hsm smokes (TASK-4 Phase B)
+
+From repo root on aya (after `git pull`):
+
+```bash
+cd impl/scripts/aya-sev-snp
+./run-nix-enclave-staging.sh
+./run-nix-vm-guest-smoke.sh
+./run-nix-vm-guest-smoke-prod.sh
+./run-nix-vm-guest-smoke-prod-lab.sh
+```
+
+Pass criteria (bytes, markers, `pq_signing_ready`): see [SMOKE-PASS-CRITERIA.md](./SMOKE-PASS-CRITERIA.md).
+
+`vm-production` is **transport smoke only** (lab trust VK) — not a mainnet guest image. See `impl/nix/vm-hsm/README.md`.

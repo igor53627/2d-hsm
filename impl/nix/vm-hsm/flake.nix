@@ -69,8 +69,8 @@
             echo "  nix build .#enclave-staging  # staging vsock (aya smokes)"
             echo "  nix build .#measurement-manifest"
             echo "  nix build .#vm               # Phase B NixOS guest (staging)"
-            echo "  nix build .#vm-production       # prod enclave-vsock + lab trust VK"
-            echo "  nix build .#vm-production-lab   # prod + PQ seal (lab, pq_signing_ready)"
+            echo "  nix build .#vm-production       # TRANSPORT SMOKE ONLY (release bin + lab trust VK)"
+            echo "  nix build .#vm-production-lab   # lab prod (+ PQ seal, pq_signing_ready) — NOT mainnet"
           '';
         };
 

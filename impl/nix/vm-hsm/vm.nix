@@ -12,6 +12,8 @@ let
   labFixtures = import ./lab-prod-fixtures.nix {
     pkgs = nixpkgs.legacyPackages.${system};
   };
+  # Both prod profiles use lab attestation VK until platform trust is provisioned (TASK-5 #2).
+  # vm-production = transport smoke only; vm-production-lab = + file PQ seal. NOT mainnet-ready.
   isProd = guestProfile == "production" || guestProfile == "production-lab";
   isProdLab = guestProfile == "production-lab";
   enclavePackage =
