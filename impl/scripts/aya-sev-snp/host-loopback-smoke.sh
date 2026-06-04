@@ -3,7 +3,7 @@
 set -euo pipefail
 
 BIN="${HSM_BIN:-/root/2d-hsm/impl/rust/enclave-protocol/target/debug/enclave-vsock-staging}"
-PORT="${HSM_VSOCK_PORT:-5000}"
+PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "Build first: cd impl/rust/enclave-protocol && cargo build --bin enclave-vsock-staging --features staging-vsock"
@@ -13,14 +13,14 @@ fi
 pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true
 sleep 2
 
-env 2D_HSM_VSOCK_CID=1 "2D_HSM_VSOCK_PORT=$PORT" nohup "$BIN" >/tmp/enclave-vsock-staging.log 2>&1 &
+env TWOD_HSM_VSOCK_CID=1 "TWOD_HSM_VSOCK_PORT=$PORT" nohup "$BIN" >/tmp/enclave-vsock-staging.log 2>&1 &
 sleep 1
 grep -q listening /tmp/enclave-vsock-staging.log || { cat /tmp/enclave-vsock-staging.log; exit 1; }
 
-export HSM_VSOCK_PORT="$PORT"
+export TWOD_HSM_VSOCK_PORT="$PORT"
 python3 <<'PY'
 import os, socket, struct
-port = int(os.environ["HSM_VSOCK_PORT"])
+port = int(os.environ["TWOD_HSM_VSOCK_PORT"])
 payload = bytes([0xA1, 0x01, 0x01])  # CBOR {1: 1}
 body = bytes([1, 0x01]) + payload
 frame = struct.pack(">I", len(body)) + body

@@ -4,11 +4,11 @@ set -euo pipefail
 
 GUEST_CID="${GUEST_CID:-42}"
 export GUEST_CID="${GUEST_CID:-42}"
-export HSM_VSOCK_PORT="${HSM_VSOCK_PORT:-5000}"
+export TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 python3 <<'PY'
 import os, socket, struct
 cid = int(os.environ["GUEST_CID"])
-port = int(os.environ["HSM_VSOCK_PORT"])
+port = int(os.environ["TWOD_HSM_VSOCK_PORT"])
 payload = bytes([0xA1, 0x01, 0x01])
 body = bytes([1, 0x01]) + payload
 frame = struct.pack(">I", len(body)) + body

@@ -46,9 +46,9 @@
       echo "[vm-hsm] starting enclave-vsock-staging" >/dev/console
     '';
     environment = {
-      # systemd cannot set env names starting with a digit; use HSM_VSOCK_* (see vsock_listen.rs).
-      HSM_VSOCK_CID = "42";
-      HSM_VSOCK_PORT = "5000";
+      # Must match QEMU vhost-vsock-pci guest-cid; TWOD_* (not 2D_*) is valid in systemd.
+      TWOD_HSM_VSOCK_CID = "42";
+      TWOD_HSM_VSOCK_PORT = "5000";
     };
   };
 

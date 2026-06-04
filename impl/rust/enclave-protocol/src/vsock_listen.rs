@@ -6,12 +6,16 @@ use std::io;
 use vsock::{VsockAddr, VsockListener};
 
 /// Default Nitro-style enclave CID (many Nitro setups use CID 3 for the enclave listener).
-/// On generic Linux dev hosts (e.g. SEV loopback on **aya**), use `2D_HSM_VSOCK_CID=1` or `4294967295`.
+/// On generic Linux dev hosts (e.g. SEV loopback on **aya**), use `TWOD_HSM_VSOCK_CID=1` or `4294967295`.
 pub const DEFAULT_VSOCK_CID: u32 = 3;
 /// Loopback-friendly CID (`VMADDR_CID_LOCAL`) for `vsock_loopback` on dev Linux.
 pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
-/// Default vsock service port for the signing service (override via `2D_HSM_VSOCK_PORT`).
+/// Default vsock service port (override via `TWOD_HSM_VSOCK_PORT`).
 pub const DEFAULT_VSOCK_PORT: u32 = 5000;
+
+/// Env keys for vsock bind (systemd-safe: no leading digit — use `TWOD_`, not `2D_`).
+pub const ENV_VSOCK_CID: &[&str] = &["TWOD_HSM_VSOCK_CID", "HSM_VSOCK_CID", "2D_HSM_VSOCK_CID"];
+pub const ENV_VSOCK_PORT: &[&str] = &["TWOD_HSM_VSOCK_PORT", "HSM_VSOCK_PORT", "2D_HSM_VSOCK_PORT"];
 
 fn env_u32(names: &[&str], default: u32) -> Result<u32, String> {
     for name in names {
@@ -26,12 +30,11 @@ fn env_u32(names: &[&str], default: u32) -> Result<u32, String> {
 
 /// Resolve `(cid, port)` from env or defaults.
 ///
-/// Prefers `HSM_VSOCK_CID` / `HSM_VSOCK_PORT` (valid for **systemd** `Environment=`).
-/// Also accepts `2D_HSM_VSOCK_*` for shell/scripts (`env 2D_HSM_…=…`); names starting with
-/// a digit are not passed through systemd.
+/// Canonical keys: `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT` (`2D` → `TWOD` for systemd/shell).
+/// Legacy aliases `HSM_VSOCK_*` and `2D_HSM_VSOCK_*` are still accepted.
 pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
-    let cid = env_u32(&["HSM_VSOCK_CID", "2D_HSM_VSOCK_CID"], DEFAULT_VSOCK_CID)?;
-    let port = env_u32(&["HSM_VSOCK_PORT", "2D_HSM_VSOCK_PORT"], DEFAULT_VSOCK_PORT)?;
+    let cid = env_u32(ENV_VSOCK_CID, DEFAULT_VSOCK_CID)?;
+    let port = env_u32(ENV_VSOCK_PORT, DEFAULT_VSOCK_PORT)?;
     Ok((cid, port))
 }
 

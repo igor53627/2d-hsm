@@ -8,7 +8,7 @@ FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
 VM_LINK="${VM_LINK:-/tmp/vm-hsm-runner}"
 DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm-smoke.qcow2}"
 GUEST_CID="${GUEST_CID:-42}"
-HSM_VSOCK_PORT="${HSM_VSOCK_PORT:-5000}"
+TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-180}"
 LOG="${VM_HSM_LOG:-/tmp/vm-hsm-guest-smoke.log}"
 
@@ -63,7 +63,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     exit 1
   fi
   # Enclave logs go to journal, not always serial — probe vsock directly.
-  if GUEST_CID="$GUEST_CID" HSM_VSOCK_PORT="$HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
+  if GUEST_CID="$GUEST_CID" TWOD_HSM_VSOCK_PORT="$TWOD_HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
     ok=1
     break
   fi

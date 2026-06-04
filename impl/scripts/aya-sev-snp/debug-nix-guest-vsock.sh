@@ -8,7 +8,7 @@ FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
 VM_LINK="${VM_LINK:-/tmp/vm-hsm-runner}"
 DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm-debug.qcow2}"
 GUEST_CID="${GUEST_CID:-42}"
-HSM_VSOCK_PORT="${HSM_VSOCK_PORT:-5000}"
+TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 SSH_PORT="${SSH_PORT:-2223}"
 LOG="${VM_HSM_LOG:-/tmp/vm-hsm-debug.log}"
 
@@ -38,7 +38,7 @@ vsock_probe() {
   python3 <<'PY'
 import os, socket, struct, sys
 cid = int(os.environ.get("PROBE_CID", "42"))
-port = int(os.environ.get("HSM_VSOCK_PORT", "5000"))
+port = int(os.environ.get("TWOD_HSM_VSOCK_PORT", "5000"))
 AF_VSOCK = 40
 print(f"probe cid={cid} port={port}")
 try:
@@ -89,7 +89,7 @@ for i in $(seq 1 40); do
 done
 
 echo "=== [4] host vsock probe (CID 1, 3, 42) ==="
-for c in 1 3 42; do PROBE_CID=$c HSM_VSOCK_PORT=$HSM_VSOCK_PORT vsock_probe; done
+for c in 1 3 42; do PROBE_CID=$c TWOD_HSM_VSOCK_PORT=$TWOD_HSM_VSOCK_PORT vsock_probe; done
 
 echo "=== [5] SSH guest (password smoke, if openssh enabled in module) ==="
 if command -v sshpass >/dev/null; then
@@ -124,7 +124,7 @@ if command -v sshpass >/dev/null; then
     -o PreferredAuthentications=password -o PubkeyAuthentication=no \
     -p "$SSH_PORT" root@127.0.0.1 bash -s <<'GUEST' 2>&1 || true
 pkill -x enclave-vsock-staging 2>/dev/null || true
-env 2D_HSM_VSOCK_CID=42 2D_HSM_VSOCK_PORT=5000 enclave-vsock-staging >/tmp/enclave-manual.log 2>&1 &
+env TWOD_HSM_VSOCK_CID=42 TWOD_HSM_VSOCK_PORT=5000 enclave-vsock-staging >/tmp/enclave-manual.log 2>&1 &
 sleep 2
 pgrep -a enclave || true
 head -5 /tmp/enclave-manual.log || true

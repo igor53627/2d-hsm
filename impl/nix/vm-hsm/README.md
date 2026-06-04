@@ -39,7 +39,7 @@ Pre-built `nixpkgs#legacyPackages.x86_64-linux.*` may work from cache; **compili
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE` | yes | 32-byte Ed25519 verifying key (producer attestation, not PQ key) |
-| `2D_HSM_VSOCK_CID` / `2D_HSM_VSOCK_PORT` | no | vsock bind (see `impl/README.md`) |
+| `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT` | no | vsock bind (`2D_*` legacy; see `impl/README.md`) |
 | Platform PQ seal / sealed signer | platform | `boot_configure_pq_seal_v1_platform_root` + `install_sealed_pq_signer` |
 
 ## Manifest schema (v1)

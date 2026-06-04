@@ -41,7 +41,7 @@ SEV_MODE=sev MEMORY=4096 VCPUS=2 ./run-guest-vm.sh
 ./host-guest-vsock-smoke.sh
 ```
 
-**Inside the guest**, bind uses `2D_HSM_VSOCK_CID=4294967295` (`VMADDR_CID_ANY`). **On the host**, connect to `GUEST_CID=42` (QEMU `vhost-vsock-pci`).
+**Inside the guest**, bind uses `TWOD_HSM_VSOCK_CID=42` (must match QEMU `guest-cid`). **On the host**, connect to `GUEST_CID=42` (`vhost-vsock-pci`). Use `TWOD_*`, not `2D_*` — env names cannot start with a digit (systemd).
 
 **SNP host prep** (once per machine):
 

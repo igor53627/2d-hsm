@@ -172,8 +172,8 @@ cd ../../elixir-shim && mix test
 ```bash
 cd rust/enclave-protocol
 cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Linux only
-# Nitro-style: 2D_HSM_VSOCK_CID=3 2D_HSM_VSOCK_PORT=5000
-# SEV dev host (aya, vsock_loopback): 2D_HSM_VSOCK_CID=1 2D_HSM_VSOCK_PORT=5000
+# Nitro-style: TWOD_HSM_VSOCK_CID=3 TWOD_HSM_VSOCK_PORT=5000
+# SEV dev host (aya, vsock_loopback): TWOD_HSM_VSOCK_CID=1 TWOD_HSM_VSOCK_PORT=5000
 ./target/debug/enclave-vsock-staging
 ```
 
