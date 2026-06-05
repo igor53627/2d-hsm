@@ -6,8 +6,9 @@ Closes **TASK-1 / TASK-4 Phase B** (vsock staging + NixOS guest KVM smokes) and 
 
 - AF_VSOCK staging + NixOS guest (`nix build .#vm`) with `TWOD_HSM_VSOCK_*` (systemd-safe)
 - Host↔guest smokes on aya: Nix KVM (staging, prod transport, prod-lab) + **SEV-SNP Ubuntu guest** (`run-snp-smoke.sh`)
-- `TWOD_*` env canonical names; vsock spec §2.4; review fixes through `d6a0cd2`
-- **Smoke cache** (`TWOD_HSM_CACHE`, `warm-smoke-cache.sh`): nix out-links, qcow2, SNP golden disk — routine smokes ~60s on aya
+- `TWOD_*` env canonical names; vsock spec §2.4; smoke cache (`TWOD_HSM_CACHE`, `warm-smoke-cache.sh`)
+- **Transport hardening** (`7567206`…`a399826`): shared accept loop, idle read deadlines, poison→`exit(1)`, oversize close without wire frame, fail-closed `ARM_FOR_PRODUCTION` when `!pq_signing_ready`
+- **Docs/backlog** (`3c4ecc3`, TASK-4/5): manifest ≠ on-chain TEE measurement; SNP launcher deferred to TASK-5 Phase 3
 
 ### Guest outputs (read before deploy)
 
@@ -22,8 +23,9 @@ Platform production trust + SNP measurement → TASK-5 Phase 3 (follow-up PR).
 ### Not in this PR
 
 - vTPM/SNP provisioning root (non-file)
-- Real TEE measurement in `GET_MEASUREMENT` / manifest binding
+- Real TEE measurement in `GET_MEASUREMENT` / on-chain whitelist from manifest
 - BP Elixir vsock E2E with live chain proof
+- NixOS unified SNP launcher (`run-vm-hsm.sh` KVM-only today)
 
 ## Smoke cache (aya operators)
 
@@ -50,16 +52,26 @@ cd impl/scripts/aya-sev-snp
 
 | Step | Jobs / status |
 |------|----------------|
-| Reduced matrix | 6890 codex/security, 6891 gemini/security, 6892 claude/design |
-| Full 2×3 floor | 6893–6898 (`pse-review-2x3.sh --dirty`) |
-| Compact | **6900** — lab trust naming, phase table, smoke criteria |
-| Post-`d6a0cd2` | Smoke-cache + SNP fixes (`679805a`…`d0ccd39`): infra/scripts; **aya 5/5 green** on `d0ccd39` (2026-06-05, two runs) |
+| Reduced matrix (PR core) | 6890–6892 + 2×3 6893–6898; compact **6900** |
+| Branch design | **6983** claude/design Pass |
+| Branch security | codex/gemini branch jobs degraded (UTF-8 binaries / gemini quota); retried on commits |
+| Post-transport (`611de83`…`a399826`) | **7012** codex/security Pass, **7013** cursor+gemini-3.1-pro/security Pass, **7014** claude/design Pass; compact **7015** → fixed in `c630aa8`; compact **7025** Low closed in `a399826` |
+| Roborev diff excludes | `.roborev.toml`: `**/*.sealed`, `**/*.bin` only (lockfiles in scope) |
 
-High-risk paths: `impl/nix/**`, `impl/rust/enclave-protocol/**` (vsock, prod boot, lab seal).
+High-risk paths: `impl/nix/**`, `impl/rust/enclave-protocol/**`, `backlog/docs/*vsock*`.
 
-Incremental matrix on latest dirty optional before merge; core protocol/matrix covered at `d6a0cd2` + operator verification below.
+## Unit tests (local / CI)
 
-## Test plan (aya, HEAD `d0ccd39`)
+```bash
+cd impl/rust/enclave-protocol
+cargo test                                    # default profile
+cargo test --features test-support,demo-mock-sign
+cargo test --features reference-test-key      # ML-DSA + wire-ARM shared-state test
+```
+
+Notable: `shared_enclave_state_wire_arm_rejects_second_hardfork_mldsa` — wire ARM on shared `EnclaveState`, then second hard-fork rejected across lock scopes.
+
+## Test plan (aya, HEAD `a399826`)
 
 ```bash
 cd /root/2d-hsm && git fetch && git checkout feat/task-1-vsock-staging-transport && git pull
@@ -72,12 +84,12 @@ cd impl/scripts/aya-sev-snp
 ./run-snp-smoke.sh                     # SNP ~2013 B, pq_signing_ready=true
 ```
 
-**Verified 2026-06-05 on aya:** all five scripts passed twice in ~60–67s total with cache hits.
+**Verified 2026-06-05 on aya:** all five scripts passed twice in ~60–67s total with cache hits (baseline `d0ccd39`; re-run after merge if transport binaries changed).
 
 Details: `impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`, `impl/scripts/aya-sev-snp/README.md`
 
 ## Tasks
 
 - TASK-1: vsock staging transport ✅
-- TASK-4: Phase B NixOS guest + KVM smoke ✅
+- TASK-4: Phase B NixOS guest + KVM smoke ✅ (In Progress in backlog; SNP → TASK-5)
 - TASK-5: Phase 1 ✅ Phase 2 ✅ Phase 3+ open (SNP launcher / platform seal → follow-up PR)
