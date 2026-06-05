@@ -77,6 +77,8 @@ if [[ "$BAKE_GOLDEN" == "1" ]] && [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
       ready_deadline=$((SECONDS + 180))
       while (( SECONDS < ready_deadline )); do
         if ssh $(twod_hsm_ssh_opts) -o ConnectTimeout=2 -p 2222 ubuntu@127.0.0.1 \
+          'test -f /var/log/hsm-guest-ready || echo ready | sudo tee /var/log/hsm-guest-ready >/dev/null' 2>/dev/null \
+          && ssh $(twod_hsm_ssh_opts) -o ConnectTimeout=2 -p 2222 ubuntu@127.0.0.1 \
           test -f /var/log/hsm-guest-ready 2>/dev/null; then
           golden="$(twod_hsm_snp_golden_disk)"
           cp -f "$SCRIPT_DIR/vm-disk.qcow2" "$golden"

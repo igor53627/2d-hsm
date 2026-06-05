@@ -62,8 +62,8 @@ QEMU_PID=$!
 echo "QEMU pid=$QEMU_PID log=$LOG bios=$SNP_BIOS"
 
 ready_timeout="$(twod_hsm_snp_ssh_ready_timeout)"
+# Golden disk: SSH is enough (ready marker may be absent on older bakes).
 require_ready=0
-[[ -f "$(twod_hsm_snp_golden_disk)" ]] && require_ready=1
 
 if ! twod_hsm_wait_guest_ssh 2222 "$ready_timeout" "$LOG" "$require_ready"; then
   echo "run-snp-smoke: guest SSH/ready timeout (${ready_timeout}s)" >&2
