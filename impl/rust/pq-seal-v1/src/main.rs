@@ -183,7 +183,7 @@ fn cmd_seal(args: SealArgs) -> Result<(), CliError> {
             pk.len()
         )));
     }
-    let blob = seal_mldsa65_keypair_v1_with_root(sk.as_ref(), pk.as_ref(), &measurement, root.as_ref())?;
+    let blob = seal_mldsa65_keypair_v1_with_root(sk.as_ref(), pk.as_ref(), &measurement, &*root)?;
     if blob.len() != pq_seal_v1_expected_blob_len() {
         return Err(CliError::Msg("internal error: unexpected sealed blob length".into()));
     }
@@ -204,7 +204,7 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), CliError> {
     let measurement = read_measurement(&args.measurement_file, &args.measurement_hex)?;
     let root = read_root_32(&args.provisioning_root_file)?;
     let blob = fs::read(&args.sealed_blob_file)?;
-    verify_sealed_blob_v1_with_root(&blob, &measurement, root.as_ref())?;
+    verify_sealed_blob_v1_with_root(&blob, &measurement, &*root)?;
     eprintln!("ok: sealed blob verifies for measurement and provisioning root");
     Ok(())
 }
