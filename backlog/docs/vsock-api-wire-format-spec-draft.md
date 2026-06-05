@@ -32,7 +32,7 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Message form** | **Pure ML-DSA** over the raw 32-byte `ticketHash` (or block digest) — **not** HashML-DSA pre-hash |
 | **Context `ctx`** | Empty (`len(ctx) = 0`) unless a future spec version defines a non-empty domain string (both enclave and 2d precompile must match) |
 | **RNG** | Hedged signing requires a CSPRNG inside the TEE (platform TRNG / NSM-seeded `getrandom`); silent RNG failure must abort sign (fail closed) |
-| **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
+| **Wire sizes (production)** | `pq_pubkey` **1952** bytes when `pq_signing_ready == true`, else **empty** (`b''`); `signature` **3309** bytes per ML-DSA-65 |
 | **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1**); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1**). Stay on **v1** until an external deployment exists; use `pq_signing_ready` + signature length (3309 B) to detect mock-era peers |
 
 **Default / production reference builds** do not embed a PQ secret key: `pq_signing_ready` is **false** and `SIGN_AUTHORIZATION_TICKET` returns `PqSigningUnavailable`. For local demos only, enable `test-support` + `demo-mock-sign` (64-byte mock PQ sig; `pq_signing_ready` stays **false**). For `cargo test` with real ML-DSA-65 sizes, enable `reference-test-key` (implies `ml-dsa-65`): tests install the NIST test-vector key via the v0 sealed-blob path — **not** a production signer and **not** enabled in standalone binaries. Hosts and precompiles **must not** treat 64-byte PQ signatures as valid on-chain.
@@ -102,7 +102,11 @@ The reference enclave listens on **AF_VSOCK** before accepting framed commands (
 
 **Host connect address (untrusted orchestrator):** The host connects to the guest using the hypervisor-assigned guest CID (e.g. QEMU `-device vhost-vsock-pci,guest-cid=42` → host uses CID **42**, while the guest may bind with `TWOD_HSM_VSOCK_CID=42` on virtio-vsock). Nitro loopback dev hosts often use CID `1` or `4294967295` (`VMADDR_CID_ANY`) for bind; production QEMU/SEV guests must match `guest-cid`.
 
+**Addressing only:** `TWOD_HSM_VSOCK_CID` selects which local vsock address the enclave **binds** — it is **not** an authentication boundary. Default `VMADDR_CID_ANY` means “accept on whichever guest CID the hypervisor assigned”; security rests on TEE measurement, sealed PQ provisioning, and command invariants (§9), not on pinning this integer.
+
 **Security:** Vsock is still an untrusted channel for *request content*; only the enclave-side bind + TEE measurement establish which process speaks the protocol. Framing and command semantics are unchanged by transport env.
+
+**Fatal state (reference socket servers):** If the shared `EnclaveState` mutex is poisoned (panic while holding the lock), the reference `enclave-protocol` socket servers call `process::exit(1)` so a supervisor restarts a clean process (NixOS module: `Restart = "always"`). This is fail-closed: corrupted in-memory authorization state is not served. `exit` does not run Rust destructors; PQ key material relies on TEE memory teardown / platform guarantees rather than `Drop`-time zeroization.
 
 ## 3. Design Principles
 
@@ -163,8 +167,9 @@ Response:
 {
   "measurement": h'....',           // raw SEV-SNP measurement or Nitro PCRs
   "attestation": h'....',           // TEE remote attestation document (platform — not §9 Ed25519)
-  "pq_pubkey": h'....',             // ML-DSA-65 public key (1952 bytes in production)
-  "supported_ticket_types": [0, 1]  // static capability list (see formal CBOR section)
+  "pq_pubkey": h'....',             // empty when pq_signing_ready is false; 1952 bytes (ML-DSA-65) when true
+  "supported_ticket_types": [0, 1], // static capability list (see formal CBOR section)
+  "pq_signing_ready": false
 }
 ```
 
@@ -297,6 +302,8 @@ Every message on the vsock is:
 
 **Maximum frame size (normative):** `total_length` MUST NOT exceed **1 MiB** (`1_048_576` bytes). Host and enclave implementations MUST reject larger length prefixes before allocating the remainder of the frame. Reference constant: `enclave-protocol::MAX_MESSAGE_SIZE` (Rust); Elixir shim compares the same limit against `total_len` in `EnclaveProtocol.Framing`.
 
+**Oversize length prefix (peer-visible behavior):** After reading the 4-byte `total_length`, if the value exceeds 1 MiB the implementation MUST NOT allocate the body. The reference **socket servers** (UDS/vsock `serve_framed_connection`) **close the connection without sending an application CBOR frame** (the request type is unknown — only the length prefix was read). Host clients building frames locally (Elixir `Framing`, smoke scripts) MUST reject oversize before send and return a local error (e.g. `{:frame_too_large, len}`) without transmitting the frame. In-process stdio/test helpers may encode a wire `Error` map when a full frame is already buffered; that path is not used on the production socket transport.
+
 We will use **canonical CBOR** (RFC 7049 section 3.9) for all payloads where determinism matters.
 
 ---
@@ -328,7 +335,7 @@ Error = {
   1: 1,                    ; version
   2: bytes,                ; measurement (raw SEV-SNP measurement or equivalent)
   3: bytes,                ; attestation document (full, as returned by the platform)
-  4: bytes,                ; pq_pubkey (ML-DSA-65: 1952 bytes production)
+  4: bytes,                ; pq_pubkey — empty (0 bytes) when key 6 is false; 1952 bytes (ML-DSA-65) when key 6 is true
   5: [int]                 ; supported_ticket_types (e.g. [0, 1])
   6: bool                  ; pq_signing_ready (false unless TEE has operational ML-DSA-65 signing key)
 }

@@ -1,4 +1,7 @@
 //! Shared connection loop for stateful enclave transports (UDS, vsock).
+//!
+//! Poisoned [`EnclaveState`] mutex: `process::exit(1)` for supervisor restart (fail-closed).
+//! `exit` skips destructors; PQ secrets rely on TEE teardown, not `Drop` zeroization here.
 
 use crate::{
     process_framed_with_shared_state, read_framed_message_with_idle_deadline, write_framed_message,
