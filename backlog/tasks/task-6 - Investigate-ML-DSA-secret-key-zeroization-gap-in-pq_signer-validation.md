@@ -1,10 +1,10 @@
 ---
 id: TASK-6
 title: Investigate ML-DSA secret-key zeroization gap in pq_signer validation
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-05 19:23'
-updated_date: '2026-06-05 21:34'
+updated_date: '2026-06-05 23:06'
 labels:
   - security
   - tee
