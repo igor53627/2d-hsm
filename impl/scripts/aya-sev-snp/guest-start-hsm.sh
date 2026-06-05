@@ -23,8 +23,12 @@ if ! twod_hsm_wait_guest_ssh "$SSH_PORT" "$READY_TIMEOUT" "" "$WAIT_READY"; then
   exit 1
 fi
 
-ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" "sudo mkdir -p ${GUEST_DIR} && sudo chown ubuntu:ubuntu ${GUEST_DIR}"
-scp $SSH_OPTS -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:${GUEST_DIR}/enclave-vsock-staging"
+ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
+  "sudo mkdir -p ${GUEST_DIR} && sudo chown ubuntu:ubuntu ${GUEST_DIR}"
+# Upload via /tmp (avoids permission errors overwriting prior smoke binaries).
+scp $SSH_OPTS -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:/tmp/enclave-vsock-staging.upload"
+ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
+  "sudo install -m755 -o ubuntu -g ubuntu /tmp/enclave-vsock-staging.upload ${GUEST_DIR}/enclave-vsock-staging && rm -f /tmp/enclave-vsock-staging.upload"
 
 ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
   "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \

@@ -94,6 +94,7 @@ twod_hsm_default_hsm_bin() {
     printf '%s' "$HSM_BIN"
     return 0
   fi
+  twod_hsm_nix_init
   local flake_dir link
   flake_dir="${repo_root}/impl/nix/vm-hsm"
   if [[ -d "$flake_dir" ]] && command -v nix >/dev/null; then
