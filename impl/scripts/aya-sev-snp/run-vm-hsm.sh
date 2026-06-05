@@ -3,6 +3,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
 FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
 VM_LINK="${VM_LINK:-/tmp/vm-hsm-runner}"
 DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm.qcow2}"

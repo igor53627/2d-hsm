@@ -16,10 +16,12 @@ let
   # vm-production = transport smoke only; vm-production-lab = + file PQ seal. NOT mainnet-ready.
   isProd = guestProfile == "production" || guestProfile == "production-lab";
   isProdLab = guestProfile == "production-lab";
+  # vm-production uses the lab debug enclave build: release enclave-vsock ignores
+  # TWOD_HSM_TRANSPORT_ONLY_MODE; transport smoke needs non-release boot (see enclave_vsock.rs).
   enclavePackage =
     if guestProfile == "staging" then
       enclave-staging
-    else if isProdLab then
+    else if isProdLab || guestProfile == "production" then
       enclave-production-lab
     else
       enclave;
