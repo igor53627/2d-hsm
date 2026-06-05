@@ -5,7 +5,7 @@
 **Status**: Draft **v0.2** — post-TASK-3 crypto gate; ML-DSA-65 + dual-path aligned with 2d TASK-122 / theory-378 TASK-92.1.8  
 **Goal**: Define the communication protocol between the 2D host (Block Producer) and the minimal post-quantum signing service running inside a TEE (Nitro Enclave / SEV-SNP).
 
-**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). §2.4 AF_VSOCK bind env (`TWOD_HSM_VSOCK_*`, not `2D_HSM_*` — systemd-safe). Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
+**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). §2.4 AF_VSOCK bind env (`TWOD_HSM_VSOCK_*`, not `2D_HSM_*` — systemd-safe). Empty `pq_pubkey` when `pq_signing_ready == false` (transport/bootstrap); attestation↔key binding applies only when a signer is installed. Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
 
 ## 1. Why this API exists
 
@@ -57,7 +57,7 @@ Reference implementation status: v1 **unseal + install** in `ml-dsa-65` builds w
 **Scope of ML-DSA-65 inside this enclave:**
 - Canonical block-root / header-digest signing (BlockProducer hot path).
 - All `AuthorizationTicket` signatures (`SIGN_AUTHORIZATION_TICKET`).
-- `pq_pubkey` returned by `GET_MEASUREMENT` / armed state.
+- `pq_pubkey` returned by `GET_MEASUREMENT` / armed state (empty until PQ signer installed — see §8 GET_MEASUREMENT).
 
 ### 2.2 Dual-path policy (hot vs slow)
 
@@ -106,7 +106,7 @@ The reference enclave listens on **AF_VSOCK** before accepting framed commands (
 
 **Security:** Vsock is still an untrusted channel for *request content*; only the enclave-side bind + TEE measurement establish which process speaks the protocol. Framing and command semantics are unchanged by transport env.
 
-**Fatal state (reference socket servers):** If the shared `EnclaveState` mutex is poisoned (panic while holding the lock), the reference `enclave-protocol` socket servers call `process::exit(1)` so a supervisor restarts a clean process (NixOS module: `Restart = "always"`). This is fail-closed: corrupted in-memory authorization state is not served. `exit` does not run Rust destructors; PQ key material relies on TEE memory teardown / platform guarantees rather than `Drop`-time zeroization.
+**Fatal state (reference socket servers):** If the shared `EnclaveState` mutex is poisoned (panic while holding the lock), the reference `enclave-protocol` socket servers call `process::exit(1)` so a supervisor restarts a clean process (NixOS module: `Restart = "always"`, `RestartSec = 3`). This is fail-closed: corrupted in-memory authorization state is not served. Recovery assumes the poison trigger is not replayed on every reconnect (otherwise exit→restart cycles degrade availability). `exit` does not run Rust destructors; PQ key material relies on TEE memory teardown / platform guarantees rather than `Drop`-time zeroization.
 
 ## 3. Design Principles
 
@@ -175,7 +175,7 @@ Response:
 
 `supported_ticket_types` is a static capability list, not current readiness. Type 1 additionally requires armed state (`GET_STATUS`).
 
-Security invariant: The enclave must only return a measurement + key that are bound together in the **TEE remote attestation** document (§2.3).
+Security invariant: When `pq_signing_ready == true`, `measurement` and `pq_pubkey` MUST be bound together in the **TEE remote attestation** document (§2.3). When `pq_signing_ready == false`, `pq_pubkey` is empty (`b''`); hosts use `measurement` + `attestation` for image identity only — no operational PQ key is advertised yet.
 
 #### 2. `SIGN_AUTHORIZATION_TICKET`
 
@@ -347,7 +347,7 @@ Error = {
 
 **Error Response:** standard Error map.
 
-**Security note:** The enclave must ensure that `measurement` + `pq_pubkey` are bound together in the attestation document.
+**Security note:** When key `6` (`pq_signing_ready`) is **true**, `measurement` and `pq_pubkey` MUST be bound in the platform attestation document. When key `6` is **false**, key `4` is empty and hosts MUST NOT require a PQ key binding — only measurement/attestation image identity applies until provisioning completes.
 
 ---
 
@@ -441,7 +441,7 @@ Encode/decode with integer map keys is implemented in `impl/rust/enclave-protoco
 ```
 
 **Security Invariants (updated after Codex security review + Claude-code design review, 2026-06-05):**
-- The enclave **must** verify that the `pq_pubkey` + `measurement` combination is consistent with its own attestation.
+- When an operational PQ signer is installed (`pq_signing_ready == true`), the enclave **must** verify that `pq_pubkey` + `measurement` are consistent with its own attestation. When no signer is installed, `GET_MEASUREMENT` returns empty `pq_pubkey` and this binding does not apply.
 - `recent_chain_proof` **MUST NOT be null** for `ARM_FOR_PRODUCTION` (and for signing hard-fork tickets). A compromised host must not be able to arm the enclave or obtain signatures under a stale or attacker-chosen view.
 - The enclave **must** reject (fail closed) if the proof is absent, stale, not properly rooted, or does not prove the expected authorization state.
 - For HARD_FORK_ACTIVATION specifically: the enclave **must currently be armed** as the active producer **and** the `pq_pubkey` in the request **must** match the armed key (strong AND, not OR).
