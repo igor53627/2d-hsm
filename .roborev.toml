@@ -10,12 +10,10 @@
 agent = "codex"
 model = "gpt-5.5"
 
-# Exclude binary / lock blobs from review prompts (codex UTF-8 failures on branch diff).
+# Exclude binary blobs from review prompts (codex UTF-8 failures). Lockfiles stay in scope.
 exclude_patterns = [
   "**/*.sealed",
   "**/*.bin",
-  "**/flake.lock",
-  "impl/rust/enclave-protocol/Cargo.lock",
 ]
 
 [ci]

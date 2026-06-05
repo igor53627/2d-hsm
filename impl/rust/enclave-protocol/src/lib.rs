@@ -682,7 +682,6 @@ pub fn arm_for_production(
         }
     }
 
-    #[cfg(feature = "ml-dsa-65")]
     if !pq_signing_ready() {
         return Err(ProtocolError::PqSigningUnavailable(
             "ARM_FOR_PRODUCTION requires operational PQ signing (pq_signing_ready)",
@@ -1564,7 +1563,7 @@ mod tests {
 
     #[cfg(not(feature = "ml-dsa-65"))]
     fn arm_test_pq_setup() -> Option<Vec<u8>> {
-        Some(vec![0xAB; 48])
+        None
     }
 
     fn signed_recent_chain_proof(
@@ -1584,13 +1583,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn get_status_wire_roundtrip_matches_spec_integer_keys() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq,
             measurement: b"m".to_vec(),
@@ -2019,13 +2016,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn arm_and_hardfork_reject_unsigned_proof() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq.clone(),
             measurement: b"m".to_vec(),
@@ -2102,13 +2097,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn arm_rejects_measurement_mismatch_after_signing() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq,
             measurement: b"legit-meas".to_vec(),
@@ -2134,13 +2127,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn re_arm_requires_strictly_fresher_finalized_height() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq,
             measurement: b"m".to_vec(),
@@ -2209,14 +2200,41 @@ mod tests {
     }
 
     #[test]
+    fn arm_for_production_rejects_when_pq_signing_not_ready_on_default_profile() {
+        assert!(!pq_signing_ready());
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: vec![0xAB; 48],
+            measurement: b"meas".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
+        let err = arm_for_production(
+            &EnclaveState::Unarmed,
+            ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: signed_recent_chain_proof(
+                    150,
+                    [0xFE; 32],
+                    vec![[0xAA; 32]],
+                    &authorized,
+                ),
+            },
+            test_attestation_trust(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::PqSigningUnavailable(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn arm_for_production_transitions_state_on_valid_proof() {
         // Basic test for the new arm_for_production function (AC #7)
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let initial = EnclaveState::Unarmed;
 
         let authorized = AuthorizedProducerState {
@@ -2246,14 +2264,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn dispatch_arm_for_production_updates_state() {
         // Demonstrates using the stateful dispatcher (the new recommended path)
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let authorized = AuthorizedProducerState {
@@ -2297,13 +2313,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn get_status_reflects_armed_state() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let authorized = AuthorizedProducerState {
@@ -2338,13 +2352,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn arm_for_production_fails_with_invalid_proof() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let bad_req = ArmForProductionRequest {
@@ -2385,13 +2397,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn stateful_sign_second_hardfork_while_armed_fails() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
@@ -2617,13 +2627,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn stateful_arm_then_sign_hardfork_succeeds() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let arm_resp = dispatch_command_with_state(
@@ -2679,13 +2687,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn stateful_sign_hardfork_wrong_pubkey_fails() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
@@ -2708,13 +2714,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn stateful_sign_hardfork_stale_activation_height_fails() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
@@ -2734,13 +2738,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml-dsa-65")]
     fn stateful_framing_roundtrip_hardfork_after_arm() {
-        #[cfg(feature = "ml-dsa-65")]
         let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
             return;
         };
-        #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
