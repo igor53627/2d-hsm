@@ -72,11 +72,24 @@ if [[ "$BAKE_GOLDEN" == "1" ]] && [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
       wait "$QEMU_PID" 2>/dev/null || true
     }
     trap cleanup_bake EXIT
-    if twod_hsm_wait_guest_ssh 2222 "$(twod_hsm_snp_ssh_ready_timeout)" "$LOG" 1; then
-      golden="$(twod_hsm_snp_golden_disk)"
-      cp -f "$SCRIPT_DIR/vm-disk.qcow2" "$golden"
-      echo "golden disk: $golden"
-    else
+    ssh_timeout="$(twod_hsm_snp_ssh_ready_timeout)"
+    if twod_hsm_wait_guest_ssh 2222 "$ssh_timeout" "$LOG" 0; then
+      ready_deadline=$((SECONDS + 180))
+      while (( SECONDS < ready_deadline )); do
+        if ssh $(twod_hsm_ssh_opts) -o ConnectTimeout=2 -p 2222 ubuntu@127.0.0.1 \
+          test -f /var/log/hsm-guest-ready 2>/dev/null; then
+          golden="$(twod_hsm_snp_golden_disk)"
+          cp -f "$SCRIPT_DIR/vm-disk.qcow2" "$golden"
+          echo "golden disk: $golden"
+          break
+        fi
+        sleep 5
+      done
+      if [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
+        echo "WARN: SSH up but hsm-guest-ready missing after 180s" >&2
+      fi
+    fi
+    if [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
       echo "WARN: golden bake failed — run-snp-smoke will use base overlay + longer timeout" >&2
       tail -20 "$LOG" >&2 || true
     fi

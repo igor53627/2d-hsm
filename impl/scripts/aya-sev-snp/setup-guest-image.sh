@@ -58,9 +58,7 @@ write_files:
       #!/bin/sh
       exit 0
 runcmd:
-  - systemctl disable --now ssh.socket || true
-  - systemctl enable ssh.service
-  - systemctl restart ssh.service
+  - systemctl enable --now ssh.socket
   - echo ready > /var/log/hsm-guest-ready
 EOF
   cat >"${SCRIPT_DIR}/cloud-init-meta-data" <<'META'
