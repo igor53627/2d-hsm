@@ -30,7 +30,8 @@ if [[ "${TWOD_HSM_SKIP_CLOUDINIT:-0}" != "1" && ! -f "$CLOUDINIT" ]]; then
 fi
 
 if [[ ! -f "$SNP_BIOS" ]]; then
-  SNP_BIOS="/usr/share/ovmf/OVMF.amdsev.fd"
+  echo "Missing SNP BIOS: ${SNP_BIOS:-<unset>} (set SNP_BIOS)" >&2
+  exit 1
 fi
 
 USE_SNP=0
@@ -92,10 +93,16 @@ OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS="/usr/share/OVMF/OVMF_VARS_4M.fd"
 cp -f "$OVMF_VARS" ./ovmf-vars.fd
 
+NON_SNP_DRIVES=(-drive "file=$DISK,format=qcow2,if=virtio")
+if [[ "${TWOD_HSM_SKIP_CLOUDINIT:-0}" != "1" ]]; then
+  NON_SNP_DRIVES+=(-drive "file=$CLOUDINIT,format=raw,if=virtio")
+else
+  echo "non-SNP boot: golden disk (no cloud-init seed)"
+fi
+
 exec $QEMU_BIN \
   -enable-kvm -cpu "$QEMU_CPU" -smp "$VCPUS" -m "$MEMORY" -machine "$MACHINE_OPTS" \
   -drive if=pflash,format=raw,unit=0,file="$OVMF_CODE",readonly=on \
   -drive if=pflash,format=raw,unit=1,file=./ovmf-vars.fd \
-  -drive "file=$DISK,format=qcow2,if=virtio" \
-  -drive "file=$CLOUDINIT,format=raw,if=virtio" \
+  "${NON_SNP_DRIVES[@]}" \
   $NET $VSOCK -nographic $SEV_OPTS

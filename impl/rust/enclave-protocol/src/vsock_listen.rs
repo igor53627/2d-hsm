@@ -19,6 +19,7 @@ pub const DEFAULT_VSOCK_PORT: u32 = 5000;
 
 fn env_u32_twod(primary: &str, legacy: &str, default: u32) -> Result<u32, String> {
     match var_twod(primary, legacy) {
+        Ok(s) if s.is_empty() => Ok(default),
         Ok(s) => s
             .parse::<u32>()
             .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u32")),

@@ -28,3 +28,9 @@ Thumbs.db
 impl/solidity/.forge-crosscheck/
 impl/solidity/out/
 result
+
+# SEV-SNP / QEMU smoke artifacts (setup-guest-image.sh, run-guest-vm.sh)
+impl/scripts/aya-sev-snp/vm-disk.qcow2
+impl/scripts/aya-sev-snp/cloud-init-user-data
+impl/scripts/aya-sev-snp/cloud-init.iso
+impl/scripts/aya-sev-snp/ovmf-vars.fd

@@ -19,13 +19,24 @@ VM_PID_FILE="${VM_PID_FILE:-${DISK_IMAGE}.pid}"
 
 twod_hsm_ensure_python_cbor2
 
+twod_hsm_kill_vm_pid_if_ours() {
+  local pid=$1
+  [[ -n "$pid" ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  local cmdline=""
+  if [[ -r "/proc/${pid}/cmdline" ]]; then
+    cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline")"
+  fi
+  if [[ "$cmdline" == *qemu-system* ]] || [[ "$cmdline" == *run-*-vm* ]] || [[ "$cmdline" == *run*nixos* ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
   if [[ -f "$VM_PID_FILE" ]]; then
     old_pid="$(cat "$VM_PID_FILE" 2>/dev/null || true)"
-    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-      kill "$old_pid" 2>/dev/null || true
-      wait "$old_pid" 2>/dev/null || true
-    fi
+    twod_hsm_kill_vm_pid_if_ours "$old_pid"
     rm -f "$VM_PID_FILE"
   fi
 }

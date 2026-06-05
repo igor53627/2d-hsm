@@ -36,6 +36,11 @@ jobs:
       - name: Build NixOS vm runner (Phase B)
         run: nix build .#vm --print-out-paths
 
+      - name: Build production NixOS vm runners
+        run: |
+          nix build .#vm-production --print-out-paths
+          nix build .#vm-production-lab --print-out-paths
+
       - name: Build measurement manifest
         run: |
           nix build .#measurement-manifest --out-link result

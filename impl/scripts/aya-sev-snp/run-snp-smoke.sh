@@ -72,6 +72,7 @@ if ! twod_hsm_wait_guest_ssh 2222 "$ready_timeout" "$LOG" "$require_ready"; then
 fi
 
 export HSM_BIN GUEST_WAIT_READY=0 GUEST_READY_TIMEOUT=30
+export VSOCK_SMOKE_REQUIRE_PQ_READY="${VSOCK_SMOKE_REQUIRE_PQ_READY:-1}"
 ./guest-start-hsm.sh
 ./host-guest-vsock-smoke.sh
 echo "run-snp-smoke: all passed (SEV_MODE=$SEV_MODE)"

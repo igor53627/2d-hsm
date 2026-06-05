@@ -356,8 +356,7 @@ fn validate_ticket_pq_pubkey_matches_signer(
 }
 
 fn measurement_response() -> GetMeasurementResponse {
-    let pq_pubkey = active_signing_public_key_bytes()
-        .unwrap_or_else(|| vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    let pq_pubkey = active_signing_public_key_bytes().unwrap_or_default();
 
     // Advertise the same measurement the reference/staging signer is sealed under.
     #[cfg(any(feature = "staging-host", feature = "reference-test-key"))]

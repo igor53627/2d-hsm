@@ -9,10 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const MAX_CONCURRENT_SESSIONS: usize = 32;
-pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
-pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Max idle time between complete frames on one connection (slowloris bound).
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Socket read timeout must be at least the inter-frame idle budget (see serve_framed_connection).
+pub const READ_TIMEOUT: Duration = SESSION_IDLE_TIMEOUT;
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One enclave process: shared authorization state across all transport connections.
 pub struct SharedEnclaveRuntime {
@@ -64,8 +65,7 @@ fn lock_enclave_state(
     state: &Arc<Mutex<EnclaveState>>,
 ) -> Result<std::sync::MutexGuard<'_, EnclaveState>, ProtocolError> {
     state.lock().map_err(|_| {
-        eprintln!("FATAL: shared enclave state mutex poisoned — exiting");
-        std::process::exit(1);
+        ProtocolError::WireProtocol("shared enclave state mutex poisoned")
     })
 }
 

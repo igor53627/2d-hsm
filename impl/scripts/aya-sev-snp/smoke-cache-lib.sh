@@ -53,6 +53,12 @@ twod_hsm_nix_outlink_hit() {
   esac
 }
 
+twod_hsm_nix_build_stamp() {
+  local flake_dir=$1
+  { cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null; } \
+    | sha256sum | awk '{print $1}'
+}
+
 # Usage: link=$(twod_hsm_nix_ensure "$flake_dir" attr cache-name)
 twod_hsm_nix_ensure() {
   local flake_dir=$1 attr=$2 name=$3
@@ -62,13 +68,20 @@ twod_hsm_nix_ensure() {
     echo "twod_hsm_nix_ensure: nix not found" >&2
     return 1
   fi
-  local link
+  local link stamp want
   link="$(twod_hsm_cache_nix)/${name}"
-  if twod_hsm_nix_outlink_hit "$link" "$attr"; then
+  stamp="${link}.build-stamp"
+  want="$(twod_hsm_nix_build_stamp "$flake_dir")"
+  if twod_hsm_nix_outlink_hit "$link" "$attr" \
+    && [[ -f "$stamp" && "$(cat "$stamp")" == "$want" ]]; then
     echo "nix cache hit: .#${attr} -> ${link}" >&2
   else
     echo "nix build: .#${attr} -> ${link}" >&2
-    (cd "$flake_dir" && nix build ".#${attr}" --out-link "$link")
+    if ! (cd "$flake_dir" && nix build ".#${attr}" --out-link "$link"); then
+      echo "twod_hsm_nix_ensure: nix build .#${attr} failed" >&2
+      return 1
+    fi
+    printf '%s' "$want" >"$stamp"
   fi
   printf '%s' "$link"
 }
@@ -165,7 +178,13 @@ twod_hsm_snp_ovmf_path() {
     printf '%s' /opt/amde-ovmf/share/qemu/OVMF.fd
     return 0
   fi
-  printf '%s' /usr/share/ovmf/OVMF.amdsev.fd
+  local fallback=/usr/share/ovmf/OVMF.amdsev.fd
+  if [[ -f "$fallback" ]]; then
+    printf '%s' "$fallback"
+    return 0
+  fi
+  echo "twod_hsm_snp_ovmf_path: no SEV-SNP OVMF found (set SNP_BIOS or run prepare-snp-host.sh)" >&2
+  return 1
 }
 
 twod_hsm_link_firmware_cache() {
@@ -212,7 +231,7 @@ twod_hsm_wait_guest_ssh() {
   local ssh_common
   ssh_common="$(twod_hsm_ssh_opts)"
   while (( SECONDS < deadline )); do
-    if [[ -n "$log" ]] && grep -qE "does not accept value|failed to initialize|Error while" "$log" 2>/dev/null; then
+    if [[ -n "$log" ]] && grep -qE "does not accept value|failed to initialize|Error while loading" "$log" 2>/dev/null; then
       tail -20 "$log" >&2 || true
       return 1
     fi
@@ -249,11 +268,13 @@ twod_hsm_snp_ssh_ready_timeout() {
   fi
 }
 
-# SNP/ubuntu smokes share guest-cid=42; stop stale QEMU before Nix vm-hsm boots.
+# SNP/ubuntu smokes share guest-cid=42; stop only our guest-cid QEMU (not unrelated VMs).
 twod_hsm_stop_stale_qemu() {
-  if pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
-    echo "stopping leftover qemu (free vsock CID ${GUEST_CID:-42})" >&2
-    pkill -f qemu-system-x86_64 2>/dev/null || true
+  local cid="${GUEST_CID:-42}"
+  local pattern="guest-cid=${cid}"
+  if pgrep -f "$pattern" >/dev/null 2>&1; then
+    echo "stopping leftover qemu (${pattern})" >&2
+    pkill -f "$pattern" 2>/dev/null || true
     sleep 2
   fi
 }
