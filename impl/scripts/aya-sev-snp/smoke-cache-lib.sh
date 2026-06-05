@@ -257,3 +257,9 @@ twod_hsm_stop_stale_qemu() {
     sleep 2
   fi
 }
+
+# Avoid broad pkill patterns that can disrupt the parent ssh session on some hosts.
+twod_hsm_kill_all_qemu() {
+  pkill -f qemu-system-x86_64 2>/dev/null || true
+  sleep 2
+}

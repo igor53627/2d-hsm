@@ -14,6 +14,9 @@ twod_hsm_ensure_cache_dirs
 twod_hsm_nix_init
 twod_hsm_ensure_python_cbor2
 
+echo "[0/5] cargo enclave-vsock-staging (Ubuntu guest glibc; SNP smoke)"
+twod_hsm_snp_hsm_bin "$ROOT" >/dev/null
+
 echo "=== warm-smoke-cache: $(twod_hsm_cache_root) ==="
 
 echo "[1/5] nix out-links (enclave-staging, vm, vm-production, vm-production-lab)"

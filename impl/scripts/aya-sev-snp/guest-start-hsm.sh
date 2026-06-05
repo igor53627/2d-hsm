@@ -10,7 +10,7 @@ SSH_PORT="${SSH_PORT:-2222}"
 VM_HOST="${VM_HOST:-127.0.0.1}"
 SSH_OPTS="$(twod_hsm_ssh_opts)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-BIN="${HSM_BIN:-$(twod_hsm_default_hsm_bin "$ROOT")}"
+BIN="${HSM_BIN:-$(twod_hsm_snp_hsm_bin "$ROOT")}"
 GUEST_DIR="${GUEST_DIR:-/opt/2d-hsm}"
 # Inside the VM, bind VMADDR_CID_ANY; host still connects to QEMU guest-cid (default 42).
 BIND_CID="${TWOD_HSM_VSOCK_BIND_CID:-4294967295}"
@@ -32,10 +32,19 @@ scp $SSH_OPTS -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:/tmp/enclave-vsock-stagin
 ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
   "sudo install -m755 -o ubuntu -g ubuntu /tmp/enclave-vsock-staging.upload ${GUEST_DIR}/enclave-vsock-staging && rm -f /tmp/enclave-vsock-staging.upload"
 
-ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
-  "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \
-   nohup env TWOD_HSM_VSOCK_CID=${BIND_CID} TWOD_HSM_VSOCK_PORT=5000 \
-   ${GUEST_DIR}/enclave-vsock-staging > /tmp/enclave-vsock-staging.log 2>&1 & \
-   sleep 2; cat /tmp/enclave-vsock-staging.log" || true
+if ! ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" bash -s <<GUEST_START
+set -e
+pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true
+: > /tmp/enclave-vsock-staging.log
+nohup env TWOD_HSM_VSOCK_CID=${BIND_CID} TWOD_HSM_VSOCK_PORT=5000 \
+  ${GUEST_DIR}/enclave-vsock-staging >>/tmp/enclave-vsock-staging.log 2>&1 </dev/null &
+sleep 3
+cat /tmp/enclave-vsock-staging.log
+pgrep -fa enclave-vsock-staging
+GUEST_START
+then
+  echo "guest-start-hsm: failed to start enclave in guest" >&2
+  exit 1
+fi
 
 echo "guest-start-hsm: server should be listening inside SEV guest"
