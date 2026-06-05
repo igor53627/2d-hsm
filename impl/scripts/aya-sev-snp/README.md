@@ -13,8 +13,37 @@ Three levels (in order):
 ## Prerequisites (aya)
 
 - SEV enabled: `/dev/sev`, `kvm_amd` `sev=Y` (see `plinko-rs/tee-test/01-verify-sev-snp.sh`)
-- Built binary: `impl/rust/enclave-protocol` with `staging-vsock`
-- `qemu-system-x86_64`, `cloud-image-utils`, `wget`
+- Determinate Nix (for cached `nix build` artifacts)
+- `qemu-system-x86_64`, `cloud-image-utils`, `wget`, `python3-cbor2`
+
+## Smoke cache (recommended)
+
+Heavy assets live under **`TWOD_HSM_CACHE`** (default `/var/cache/2d-hsm`):
+
+| Path | Content |
+|------|---------|
+| `nix/` | Nix out-links (`enclave-staging`, `vm-hsm-runner-*`) |
+| `images/` | Ubuntu cloud img, Nix `qcow2`, SNP golden disk |
+| `firmware/` | Symlink to AMD `OVMF.fd` when installed |
+
+**One-time warm-up** (download ~600MB image, `nix build` all smoke attrs, optional SNP golden disk bake):
+
+```bash
+cd impl/scripts/aya-sev-snp
+./warm-smoke-cache.sh
+```
+
+After warm-up, routine smokes skip rebuilds and reuse disks:
+
+```bash
+./run-nix-enclave-staging.sh
+./run-nix-vm-guest-smoke.sh
+./run-nix-vm-guest-smoke-prod.sh
+./run-nix-vm-guest-smoke-prod-lab.sh
+./run-snp-smoke.sh    # fast if golden disk exists (~1–3 min)
+```
+
+Force refresh: `TWOD_HSM_REGEN_SNPDISK=1 ./setup-guest-image.sh` or `TWOD_HSM_REGEN_CLOUDINIT=1`.
 
 ## Quick start
 
@@ -63,7 +92,7 @@ Stock Ubuntu QEMU 8.2 only has legacy `sev-guest` (EPERM on this host).
 
 ## NixOS vm-hsm smokes (TASK-4 Phase B)
 
-From repo root on aya (after `git pull`):
+From repo root on aya (after `git pull`): run `./warm-smoke-cache.sh` once, then:
 
 ```bash
 cd impl/scripts/aya-sev-snp

@@ -2,22 +2,26 @@
 # Copy enclave-vsock-staging into running guest and start listener (VMADDR_CID_ANY)
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
+
 SSH_PORT="${SSH_PORT:-2222}"
-VM_HOST="${VM_HOST:-localhost}"
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
-BIN="${HSM_BIN:-/root/2d-hsm/impl/rust/enclave-protocol/target/debug/enclave-vsock-staging}"
+VM_HOST="${VM_HOST:-127.0.0.1}"
+SSH_OPTS="$(twod_hsm_ssh_opts)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+BIN="${HSM_BIN:-$(twod_hsm_default_hsm_bin "$ROOT")}"
 GUEST_DIR="${GUEST_DIR:-/opt/2d-hsm}"
+WAIT_READY="${GUEST_WAIT_READY:-1}"
+READY_TIMEOUT="${GUEST_READY_TIMEOUT:-120}"
 
 [[ -x "$BIN" ]] || { echo "Missing binary: $BIN"; exit 1; }
 
 echo "Waiting for guest SSH on port ${SSH_PORT}..."
-for i in $(seq 1 60); do
-  if ssh $SSH_OPTS -o ConnectTimeout=2 -p "$SSH_PORT" "ubuntu@${VM_HOST}" "echo ok" 2>/dev/null; then
-    break
-  fi
-  sleep 5
-  [[ "$i" == 60 ]] && { echo "SSH timeout"; exit 1; }
-done
+if ! twod_hsm_wait_guest_ssh "$SSH_PORT" "$READY_TIMEOUT" "" "$WAIT_READY"; then
+  echo "guest-start-hsm: SSH/ready timeout" >&2
+  exit 1
+fi
 
 ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" "sudo mkdir -p ${GUEST_DIR} && sudo chown ubuntu:ubuntu ${GUEST_DIR}"
 scp $SSH_OPTS -P "$SSH_PORT" "$BIN" "ubuntu@${VM_HOST}:${GUEST_DIR}/enclave-vsock-staging"

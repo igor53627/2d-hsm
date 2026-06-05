@@ -3,14 +3,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
-OUT_LINK="${NIX_ENCLAVE_STAGING_LINK:-/root/enclave-staging}"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
 
-if command -v nix >/dev/null; then
-  # shellcheck source=/dev/null
-  [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] \
-    && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-fi
+OUT_LINK="${NIX_ENCLAVE_STAGING_LINK:-$(twod_hsm_cache_nix)/enclave-staging}"
 
 if ! command -v nix >/dev/null; then
   echo "nix not found; install Determinate Nix first" >&2
@@ -19,8 +17,8 @@ fi
 
 cd "$FLAKE_DIR"
 
-echo "[1/3] nix build .#enclave-staging -> $OUT_LINK"
-nix build .#enclave-staging --out-link "$OUT_LINK"
+echo "[1/3] nix .#enclave-staging -> $OUT_LINK"
+OUT_LINK="$(twod_hsm_nix_ensure "$FLAKE_DIR" enclave-staging enclave-staging)"
 
 export HSM_BIN="$OUT_LINK/bin/enclave-vsock-staging"
 echo "[2/3] host-loopback-smoke (HSM_BIN=$HSM_BIN)"

@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# One-time: Ubuntu 24.04 cloud image + cloud-init for SSH on :2222
+# One-time: Ubuntu 24.04 cloud image + cloud-init for SSH on :2222 (cached under TWOD_HSM_CACHE).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
 
 IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-IMAGE_FILE="ubuntu-24.04-cloudimg.qcow2"
-DISK_FILE="vm-disk.qcow2"
+IMAGE_FILE="$(twod_hsm_snp_ubuntu_image)"
+BASE_DISK="$(twod_hsm_snp_base_disk)"
+CLOUD_ISO="$(twod_hsm_snp_cloudinit_iso)"
+WORK_DISK="${SCRIPT_DIR}/vm-disk.qcow2"
 
-if [[ -f "$DISK_FILE" ]]; then
-  echo "VM disk already exists: $DISK_FILE"
-  exit 0
+twod_hsm_ensure_cache_dirs
+
+if [[ -f "$BASE_DISK" && "${TWOD_HSM_REGEN_SNPDISK:-0}" != "1" ]]; then
+  echo "SNP base disk cached: $BASE_DISK"
+else
+  if [[ ! -f "$IMAGE_FILE" ]]; then
+    echo "Downloading cloud image -> $IMAGE_FILE"
+    wget -O "$IMAGE_FILE" "$IMAGE_URL"
+  fi
+  echo "Creating base overlay -> $BASE_DISK (20G)"
+  qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$BASE_DISK" 20G
 fi
-
-if [[ ! -f "$IMAGE_FILE" ]]; then
-  echo "Downloading cloud image..."
-  wget -O "$IMAGE_FILE" "$IMAGE_URL"
-fi
-
-echo "Creating ${DISK_FILE} (20G overlay)..."
-qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$DISK_FILE" 20G
 
 SSH_KEY="${SSH_KEY:-}"
 if [[ -z "$SSH_KEY" ]]; then
@@ -34,7 +38,8 @@ if [[ -z "$SSH_KEY" ]]; then
   fi
 fi
 
-cat > cloud-init-user-data <<EOF
+if [[ ! -f "$CLOUD_ISO" || "${TWOD_HSM_REGEN_CLOUDINIT:-0}" == "1" ]]; then
+  cat >"${SCRIPT_DIR}/cloud-init-user-data" <<EOF
 #cloud-config
 hostname: hsm-sev-guest
 users:
@@ -44,15 +49,29 @@ users:
     ssh_authorized_keys:
       - ${SSH_KEY}
 packages:
+  - openssh-server
   - rsync
+write_files:
+  - path: /var/lib/cloud/instance/scripts/00-noop.sh
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      exit 0
 runcmd:
+  - systemctl disable --now ssh.socket || true
+  - systemctl enable ssh.service
+  - systemctl restart ssh.service
   - echo ready > /var/log/hsm-guest-ready
 EOF
-
-cat > cloud-init-meta-data <<'META'
-instance-id: hsm-sev-guest-1
+  cat >"${SCRIPT_DIR}/cloud-init-meta-data" <<'META'
+instance-id: hsm-sev-guest-cache-1
 local-hostname: hsm-sev-guest
 META
+  cloud-localds "$CLOUD_ISO" "${SCRIPT_DIR}/cloud-init-user-data" \
+    "${SCRIPT_DIR}/cloud-init-meta-data"
+  echo "cloud-init iso: $CLOUD_ISO"
+fi
 
-cloud-localds cloud-init.iso cloud-init-user-data cloud-init-meta-data
-echo "setup-guest-image: OK"
+ln -sf "$CLOUD_ISO" "${SCRIPT_DIR}/cloud-init.iso"
+cp -f "$BASE_DISK" "$WORK_DISK"
+echo "setup-guest-image: OK (base=$BASE_DISK work=$WORK_DISK)"

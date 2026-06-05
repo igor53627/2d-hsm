@@ -5,24 +5,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
+
 VM_FLAKE_ATTR="${VM_FLAKE_ATTR:-vm}"
-VM_LINK="${VM_LINK:-/tmp/vm-hsm-runner}"
-DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm-smoke.qcow2}"
+VM_LINK="${VM_LINK:-$(twod_hsm_nix_vm_link "$VM_FLAKE_ATTR")}"
+DISK_IMAGE="${NIX_DISK_IMAGE:-$(twod_hsm_nix_vm_disk "$VM_FLAKE_ATTR")}"
 GUEST_CID="${GUEST_CID:-42}"
 TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-180}"
-LOG="${VM_HSM_LOG:-/tmp/vm-hsm-guest-smoke.log}"
+LOG="${VM_HSM_LOG:-/tmp/vm-hsm-guest-smoke-${VM_FLAKE_ATTR}.log}"
 VM_PID_FILE="${VM_PID_FILE:-${DISK_IMAGE}.pid}"
 
-if command -v nix >/dev/null; then
-  [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] \
-    && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-fi
-
-if ! python3 -c "import cbor2" 2>/dev/null; then
-  echo "vsock smoke needs python3-cbor2 (e.g. apt install python3-cbor2)" >&2
-  exit 1
-fi
+twod_hsm_ensure_python_cbor2
 
 cleanup() {
   if [[ -f "$VM_PID_FILE" ]]; then
@@ -37,11 +32,12 @@ cleanup() {
 trap cleanup EXIT
 
 cleanup
+twod_hsm_stop_stale_qemu
 : >"$LOG"
 
 cd "$FLAKE_DIR"
-echo "[1/4] nix build .#${VM_FLAKE_ATTR} -> $VM_LINK"
-nix build ".#${VM_FLAKE_ATTR}" --out-link "$VM_LINK"
+echo "[1/4] nix .#${VM_FLAKE_ATTR} -> $VM_LINK"
+VM_LINK="$(twod_hsm_nix_ensure "$FLAKE_DIR" "$VM_FLAKE_ATTR" "vm-hsm-runner-${VM_FLAKE_ATTR}")"
 
 RUNNER=""
 for candidate in "$VM_LINK"/bin/run-*-vm "$VM_LINK"/bin/*run*nixos*; do
@@ -75,8 +71,8 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     tail -40 "$LOG" >&2 || true
     exit 1
   fi
-  # Enclave logs go to journal, not always serial — probe vsock directly.
-  if GUEST_CID="$GUEST_CID" TWOD_HSM_VSOCK_PORT="$TWOD_HSM_VSOCK_PORT" "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
+  if GUEST_CID="$GUEST_CID" TWOD_HSM_VSOCK_PORT="$TWOD_HSM_VSOCK_PORT" \
+    "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
     ok=1
     break
   fi

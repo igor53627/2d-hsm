@@ -3,25 +3,39 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$SCRIPT_DIR"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
 
 export QEMU_BIN="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
 export SEV_MODE="${SEV_MODE:-snp}"
 export MEMORY="${MEMORY:-2048}"
 export VCPUS="${VCPUS:-2}"
 export GUEST_CID="${GUEST_CID:-42}"
-export HSM_BIN="${HSM_BIN:-/root/2d-hsm/impl/rust/enclave-protocol/target/debug/enclave-vsock-staging}"
+export SNP_BIOS
+SNP_BIOS="$(twod_hsm_snp_ovmf_path)"
+export HSM_BIN
+HSM_BIN="$(twod_hsm_default_hsm_bin "$ROOT")"
 
 if [[ ! -x "$QEMU_BIN" ]] || ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-guest; then
-  echo "Run ./install-qemu-snp.sh first (need sev-snp-guest)"
+  echo "Run ./install-qemu-snp.sh first (need sev-snp-guest)" >&2
   exit 1
 fi
 
-[[ -f vm-disk.qcow2 ]] || ./setup-guest-image.sh
+if ! twod_hsm_snp_prepare_work_disk "$SCRIPT_DIR"; then
+  ./setup-guest-image.sh
+  twod_hsm_snp_prepare_work_disk "$SCRIPT_DIR"
+fi
+ci_iso="$(twod_hsm_snp_cloudinit_iso)"
+[[ -f "$ci_iso" ]] && ln -sf "$ci_iso" "${SCRIPT_DIR}/cloud-init.iso"
+
 [[ -x "$HSM_BIN" ]] || {
-  echo "Build: cd impl/rust/enclave-protocol && cargo build --bin enclave-vsock-staging --features staging-vsock"
+  echo "Missing HSM binary: $HSM_BIN (run ./warm-smoke-cache.sh)" >&2
   exit 1
 }
+
+twod_hsm_stop_stale_qemu
 
 QEMU_PID=""
 cleanup() {
@@ -33,23 +47,22 @@ cleanup() {
 trap cleanup EXIT
 
 LOG=/tmp/hsm-snp-qemu.log
+: >"$LOG"
 nohup ./run-guest-vm.sh >"$LOG" 2>&1 &
 QEMU_PID=$!
-echo "QEMU pid=$QEMU_PID log=$LOG"
+echo "QEMU pid=$QEMU_PID log=$LOG bios=$SNP_BIOS"
 
-for i in $(seq 1 90); do
-  if grep -qE "does not accept value|failed to initialize|Error while" "$LOG" 2>/dev/null; then
-    tail -20 "$LOG"
-    exit 1
-  fi
-  if ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
-    -p 2222 ubuntu@localhost "echo ok" 2>/dev/null; then
-    break
-  fi
-  sleep 5
-  [[ "$i" == 90 ]] && { tail -30 "$LOG"; exit 1; }
-done
+ready_timeout="$(twod_hsm_snp_ssh_ready_timeout)"
+require_ready=0
+[[ -f "$(twod_hsm_snp_golden_disk)" ]] && require_ready=1
 
+if ! twod_hsm_wait_guest_ssh 2222 "$ready_timeout" "$LOG" "$require_ready"; then
+  echo "run-snp-smoke: guest SSH/ready timeout (${ready_timeout}s)" >&2
+  echo "  Hint: ./warm-smoke-cache.sh (bakes golden disk + fixes cloud-init)" >&2
+  exit 1
+fi
+
+export HSM_BIN
 ./guest-start-hsm.sh
 ./host-guest-vsock-smoke.sh
 echo "run-snp-smoke: all passed (SEV_MODE=$SEV_MODE)"
