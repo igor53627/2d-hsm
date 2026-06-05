@@ -53,7 +53,9 @@ jobs:
 
       - name: Elixir shim integration tests
         run: |
-          cd impl/rust/enclave-protocol
+          cd impl/elixir-shim
+          mix deps.get
+          cd ../rust/enclave-protocol
           cargo build --bin enclave-uds-server --bin enclave-stdio-session \
             --features test-support,demo-mock-sign
           cd ../../elixir-shim
