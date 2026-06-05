@@ -23,12 +23,21 @@ if [[ ! -x "$QEMU_BIN" ]] || ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-g
   exit 1
 fi
 
+use_golden=0
+if [[ -f "$(twod_hsm_snp_golden_disk)" ]]; then
+  use_golden=1
+  export TWOD_HSM_SKIP_CLOUDINIT=1
+fi
 if ! twod_hsm_snp_prepare_work_disk "$SCRIPT_DIR"; then
   ./setup-guest-image.sh
   twod_hsm_snp_prepare_work_disk "$SCRIPT_DIR"
+  use_golden=0
+  unset TWOD_HSM_SKIP_CLOUDINIT
 fi
-ci_iso="$(twod_hsm_snp_cloudinit_iso)"
-[[ -f "$ci_iso" ]] && ln -sf "$ci_iso" "${SCRIPT_DIR}/cloud-init.iso"
+if [[ "$use_golden" != "1" ]]; then
+  ci_iso="$(twod_hsm_snp_cloudinit_iso)"
+  [[ -f "$ci_iso" ]] && ln -sf "$ci_iso" "${SCRIPT_DIR}/cloud-init.iso"
+fi
 
 [[ -x "$HSM_BIN" ]] || {
   echo "Missing HSM binary: $HSM_BIN (run ./warm-smoke-cache.sh)" >&2

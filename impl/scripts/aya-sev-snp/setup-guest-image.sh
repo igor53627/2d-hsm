@@ -51,12 +51,6 @@ users:
 packages:
   - openssh-server
   - rsync
-write_files:
-  - path: /var/lib/cloud/instance/scripts/00-noop.sh
-    permissions: '0755'
-    content: |
-      #!/bin/sh
-      exit 0
 runcmd:
   - systemctl enable --now ssh.socket
   - echo ready > /var/log/hsm-guest-ready

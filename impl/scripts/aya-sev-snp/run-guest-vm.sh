@@ -20,10 +20,14 @@ else
   QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 fi
 
-[[ -f "$DISK" && -f "$CLOUDINIT" ]] || {
-  echo "Run ./setup-guest-image.sh first"
+[[ -f "$DISK" ]] || {
+  echo "Missing disk: $DISK (run ./setup-guest-image.sh)" >&2
   exit 1
 }
+if [[ "${TWOD_HSM_SKIP_CLOUDINIT:-0}" != "1" && ! -f "$CLOUDINIT" ]]; then
+  echo "Missing cloud-init: $CLOUDINIT (run ./setup-guest-image.sh)" >&2
+  exit 1
+fi
 
 if [[ ! -f "$SNP_BIOS" ]]; then
   SNP_BIOS="/usr/share/ovmf/OVMF.amdsev.fd"
@@ -64,13 +68,19 @@ NET="-netdev user,id=vmnic,hostfwd=tcp::${SSH_PORT}-:22 -device virtio-net-pci,n
 echo "Starting VM: ${VCPUS} vCPU, ${MEMORY}MB RAM, SSH localhost:${SSH_PORT}, vsock guest-cid=${GUEST_CID}"
 echo "Ctrl+A X to exit QEMU console"
 
+SNP_EXTRA_DRIVES=(-drive "file=$DISK,format=qcow2,if=virtio")
+if [[ "${TWOD_HSM_SKIP_CLOUDINIT:-0}" != "1" ]]; then
+  SNP_EXTRA_DRIVES+=(-drive "file=$CLOUDINIT,format=raw,if=virtio")
+else
+  echo "SNP boot: golden disk (no cloud-init seed)"
+fi
+
 if [[ "$USE_SNP" == 1 ]]; then
   exec $QEMU_BIN \
     -enable-kvm -cpu "$QEMU_CPU" -machine q35 \
     -smp "$VCPUS" -m "${MEMORY}M,slots=5,maxmem=$((MEMORY + 8192))M" -no-reboot \
     -bios "$SNP_BIOS" \
-    -drive "file=$DISK,format=qcow2,if=virtio" \
-    -drive "file=$CLOUDINIT,format=raw,if=virtio" \
+    "${SNP_EXTRA_DRIVES[@]}" \
     $NET $VSOCK -nographic \
     -machine confidential-guest-support=sev0,vmport=off \
     -object "memory-backend-memfd,id=ram1,size=${MEMORY}M,share=true,prealloc=false" \
