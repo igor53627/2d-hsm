@@ -53,22 +53,48 @@ twod_hsm_nix_outlink_hit() {
   esac
 }
 
+# One sha256 over the enclave sources per shell (warm-smoke-cache calls ensure 4×).
 twod_hsm_nix_build_stamp() {
   local flake_dir=$1
+  if [[ -n "${_TWOD_HSM_NIX_BUILD_STAMP:-}" ]]; then
+    printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"
+    return 0
+  fi
   local repo_root rust_dir
   repo_root="$(cd "${flake_dir}/../../.." && pwd)"
   rust_dir="${repo_root}/impl/rust/enclave-protocol"
-  {
-    cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null
-    cat "${flake_dir}/"*.nix 2>/dev/null
-    [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
-    [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
-    if [[ -d "${rust_dir}/src" ]]; then
-      find "${rust_dir}/src" -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort | while read -r f; do
-        cat "$f"
-      done
+  _TWOD_HSM_NIX_BUILD_STAMP=$(
+    {
+      cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null
+      cat "${flake_dir}/"*.nix 2>/dev/null
+      [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
+      [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
+      if [[ -d "${rust_dir}/src" ]]; then
+        find "${rust_dir}/src" -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort | while read -r f; do
+          cat "$f"
+        done
+      fi
+    } | sha256sum | awk '{print $1}'
+  )
+  printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"
+}
+
+# Resolve NixOS `run-*-vm` runner under a vm out-link.
+twod_hsm_find_vm_runner() {
+  local vm_link=$1
+  local candidate runner=""
+  for candidate in "$vm_link"/bin/run-*-vm "$vm_link"/bin/*run*nixos*; do
+    if [[ -e "$candidate" ]]; then
+      runner=$(readlink -f "$candidate")
+      break
     fi
-  } | sha256sum | awk '{print $1}'
+  done
+  if [[ -z "$runner" || ! -x "$runner" ]]; then
+    echo "twod_hsm_find_vm_runner: no run-nixos-vm under ${vm_link}/bin" >&2
+    ls -la "$vm_link/bin" >&2 || true
+    return 1
+  fi
+  printf '%s' "$runner"
 }
 
 # Usage: link=$(twod_hsm_nix_ensure "$flake_dir" attr cache-name)
@@ -83,6 +109,22 @@ twod_hsm_nix_ensure() {
   local link stamp want
   link="$(twod_hsm_cache_nix)/${name}"
   stamp="${link}.build-stamp"
+  if twod_hsm_nix_outlink_hit "$link" "$attr"; then
+    if [[ -f "$stamp" ]]; then
+      want="$(twod_hsm_nix_build_stamp "$flake_dir")"
+      if [[ "$(cat "$stamp")" == "$want" ]]; then
+        echo "nix cache hit: .#${attr} -> ${link}" >&2
+        printf '%s' "$link"
+        return 0
+      fi
+    else
+      want="$(twod_hsm_nix_build_stamp "$flake_dir")"
+      printf '%s' "$want" >"$stamp"
+      echo "nix cache hit: .#${attr} -> ${link}" >&2
+      printf '%s' "$link"
+      return 0
+    fi
+  fi
   want="$(twod_hsm_nix_build_stamp "$flake_dir")"
   if twod_hsm_nix_outlink_hit "$link" "$attr" \
     && [[ -f "$stamp" && "$(cat "$stamp")" == "$want" ]]; then

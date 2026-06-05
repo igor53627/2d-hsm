@@ -19,17 +19,7 @@ cd "$FLAKE_DIR"
 echo "[1/2] nix build .#vm -> $VM_LINK"
 nix build .#vm --out-link "$VM_LINK"
 
-RUNNER=""
-for candidate in "$VM_LINK"/bin/run-*-vm "$VM_LINK"/bin/*run*nixos*; do
-  if [ -e "$candidate" ]; then
-    RUNNER=$(readlink -f "$candidate")
-    break
-  fi
-done
-if [ -z "$RUNNER" ] || [ ! -x "$RUNNER" ]; then
-  echo "could not find run-nixos-vm under $VM_LINK/bin" >&2
-  exit 1
-fi
+RUNNER="$(twod_hsm_find_vm_runner "$VM_LINK")"
 
 export NIX_DISK_IMAGE="$DISK_IMAGE"
 

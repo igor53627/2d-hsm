@@ -47,6 +47,7 @@ compile_error!(
     "lab file provisioning features are for debug/integration builds only, not release"
 );
 
+mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
 mod chain_proof_crypto;

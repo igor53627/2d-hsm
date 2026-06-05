@@ -43,11 +43,10 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
 
 #[cfg(all(feature = "ml-dsa-65", feature = "platform-provisioning-from-file"))]
 fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], ProtocolError> {
-    let bytes = std::fs::read(path).map_err(|_| {
-        ProtocolError::PqSigningUnavailable(
-            "failed to read TWOD_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
-        )
-    })?;
+    let bytes = crate::boot_input::read_boot_file(
+        path,
+        "failed to read TWOD_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
+    )?;
     bytes.try_into().map_err(|_| {
         ProtocolError::PqSigningUnavailable(
             "provisioning root file must be exactly 32 bytes",

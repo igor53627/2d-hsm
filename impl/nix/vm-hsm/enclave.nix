@@ -33,7 +33,8 @@ rustPlatform.buildRustPackage {
 
   cargoBuildFlags = [ "--bin ${pname}" ];
 
-  # Reference/staging keys must not ship in release artifacts (enforced in lib.rs too).
+  # No checkPhase here: release artifact must not run tests that need reference-test-key.
+  # ARM/signing regression tests run in CI via `cargo test` (see .github/workflows/nix-hsm.yml).
   doCheck = false;
 
   meta = with lib; {

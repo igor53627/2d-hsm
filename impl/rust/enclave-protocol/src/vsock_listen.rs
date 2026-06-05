@@ -56,7 +56,7 @@ pub fn bind_vsock_listener(cid: u32, port: u32) -> Result<VsockListener, io::Err
     VsockListener::bind(&addr)
 }
 
-/// Apply the same session I/O timeouts as UDS staging (prevents slot exhaustion on idle peers).
+/// Apply session I/O timeouts (per-read [`READ_TIMEOUT`]; inter-frame idle in `serve_framed_connection`).
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub fn configure_vsock_session_timeouts(
     stream: &mut vsock::VsockStream,

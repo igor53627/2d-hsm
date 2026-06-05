@@ -7,8 +7,7 @@ use enclave_protocol::enclave_serve::{
     configure_unix_session_timeouts, run_incoming_accept_loop, SharedEnclaveRuntime,
 };
 use enclave_protocol::{
-    bind_unix_listener, default_dev_socket_dir, install_reference_sealed_signer_staging,
-    is_sealed_signer_installed, pq_signing_ready, reference_test_attestation_trust,
+    bind_unix_listener, default_dev_socket_dir, is_sealed_signer_installed, pq_signing_ready,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,8 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let private_dir = default_dev_socket_dir();
     let listener = bind_unix_listener(&path, &private_dir)?;
 
-    install_reference_sealed_signer_staging()?;
-    let runtime = Arc::new(SharedEnclaveRuntime::new(reference_test_attestation_trust()));
+    let runtime = SharedEnclaveRuntime::staging_with_reference_signer()?;
     eprintln!(
         "enclave-uds-staging listening on {} (ML-DSA sealed signer installed={}, pq_signing_ready={})",
         path.display(),

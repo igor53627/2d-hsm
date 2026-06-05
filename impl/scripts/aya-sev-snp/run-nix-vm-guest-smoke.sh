@@ -50,18 +50,7 @@ cd "$FLAKE_DIR"
 echo "[1/4] nix .#${VM_FLAKE_ATTR} -> $VM_LINK"
 VM_LINK="$(twod_hsm_nix_ensure "$FLAKE_DIR" "$VM_FLAKE_ATTR" "vm-hsm-runner-${VM_FLAKE_ATTR}")"
 
-RUNNER=""
-for candidate in "$VM_LINK"/bin/run-*-vm "$VM_LINK"/bin/*run*nixos*; do
-  if [ -e "$candidate" ]; then
-    RUNNER=$(readlink -f "$candidate")
-    break
-  fi
-done
-if [ -z "$RUNNER" ] || [ ! -x "$RUNNER" ]; then
-  echo "could not find run-nixos-vm under $VM_LINK/bin" >&2
-  ls -la "$VM_LINK/bin" >&2 || true
-  exit 1
-fi
+RUNNER="$(twod_hsm_find_vm_runner "$VM_LINK")"
 echo "[2/4] starting NixOS vm-hsm (runner=$RUNNER, disk=$DISK_IMAGE, cid=$GUEST_CID)"
 
 export NIX_DISK_IMAGE="$DISK_IMAGE"

@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=smoke-cache-lib.sh
+source "$SCRIPT_DIR/smoke-cache-lib.sh"
 FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
 VM_LINK="${VM_LINK:-/tmp/vm-hsm-runner}"
 DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm-debug.qcow2}"
@@ -20,18 +22,6 @@ fi
 stop_vm() {
   pgrep -f 'qemu-system-x86_64.*-name vm-hsm' | xargs -r kill 2>/dev/null || true
   sleep 2
-}
-
-find_runner() {
-  local r=""
-  for candidate in "$VM_LINK"/bin/run-*-vm "$VM_LINK"/bin/*run*nixos*; do
-    if [ -e "$candidate" ]; then
-      r=$(readlink -f "$candidate")
-      break
-    fi
-  done
-  [ -n "$r" ] && [ -x "$r" ] || { echo "no run-nixos-vm under $VM_LINK/bin" >&2; exit 1; }
-  echo "$r"
 }
 
 vsock_probe() {
@@ -53,7 +43,7 @@ vsock_probe() {
 echo "=== [1] nix build .#vm ==="
 cd "$FLAKE_DIR"
 nix build .#vm --out-link "$VM_LINK"
-RUNNER=$(find_runner)
+RUNNER="$(twod_hsm_find_vm_runner "$VM_LINK")"
 echo "runner=$RUNNER"
 
 echo "=== [2] stop old VM, start fresh (disk=$DISK_IMAGE) ==="

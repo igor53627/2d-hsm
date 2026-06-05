@@ -4,8 +4,9 @@
 //! `exit` skips destructors; PQ secrets rely on TEE teardown, not `Drop` zeroization here.
 
 use crate::{
-    process_framed_with_shared_state, read_framed_message_with_idle_deadline, write_framed_message,
-    EnclaveState, ProducerAttestationTrust, ProtocolError,
+    decode_message, is_wire_error_payload, process_framed_with_shared_state,
+    read_framed_message_with_idle_deadline, write_framed_message, EnclaveState,
+    ProducerAttestationTrust, ProtocolError,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,10 +15,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const MAX_CONCURRENT_SESSIONS: usize = 32;
-/// Max idle time between complete frames on one connection (slowloris bound).
+/// Max idle time between **successful** application frames on one connection (slowloris bound).
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-/// Socket read timeout must be at least the inter-frame idle budget (see serve_framed_connection).
-pub const READ_TIMEOUT: Duration = SESSION_IDLE_TIMEOUT;
+/// Per-syscall read timeout (shorter than session idle; `read_exact_with_idle_deadline` also checks the idle instant).
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One enclave process: shared authorization state across all transport connections.
@@ -38,6 +39,13 @@ impl SharedEnclaveRuntime {
     #[cfg(any(test, feature = "test-support"))]
     pub fn reference_test() -> Self {
         Self::new(crate::reference_test_attestation_trust())
+    }
+
+    /// Staging vsock/UDS: install reference sealed signer + reference attestation trust.
+    #[cfg(feature = "staging-host")]
+    pub fn staging_with_reference_signer() -> Result<Arc<Self>, ProtocolError> {
+        crate::install_reference_sealed_signer_staging()?;
+        Ok(Arc::new(Self::new(crate::reference_test_attestation_trust())))
     }
 }
 
@@ -122,7 +130,6 @@ where
             Err(ProtocolError::MessageTooLarge(_)) => break,
             Err(e) => return Err(e),
         };
-        idle_deadline = Instant::now() + SESSION_IDLE_TIMEOUT;
         let mut state = lock_enclave_state(&runtime.state)?;
         let response = process_framed_with_shared_state(
             &frame,
@@ -131,6 +138,14 @@ where
         )?;
         drop(state);
         write_framed_message(stream, &response)?;
+        // Wire-error responses are still "complete frames" but must not extend the idle budget
+        // (otherwise a peer can hold a slot by dribbling parseable garbage forever).
+        let reset_idle = decode_message(&response)
+            .map(|framed| !is_wire_error_payload(&framed.payload))
+            .unwrap_or(false);
+        if reset_idle {
+            idle_deadline = Instant::now() + SESSION_IDLE_TIMEOUT;
+        }
     }
     Ok(())
 }

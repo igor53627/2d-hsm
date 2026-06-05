@@ -20,10 +20,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use enclave_protocol::enclave_serve::{run_incoming_accept_loop, SharedEnclaveRuntime};
-    use enclave_protocol::{
-        install_reference_sealed_signer_staging, is_sealed_signer_installed, pq_signing_ready,
-        reference_test_attestation_trust, ProtocolError,
-    };
+    use enclave_protocol::{is_sealed_signer_installed, pq_signing_ready, ProtocolError};
     use enclave_protocol::vsock_listen::{
         bind_vsock_listener, configure_vsock_session_timeouts, vsock_listen_addr_from_env,
     };
@@ -33,8 +30,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = bind_vsock_listener(cid, port)?;
 
-    install_reference_sealed_signer_staging()?;
-    let runtime = Arc::new(SharedEnclaveRuntime::new(reference_test_attestation_trust()));
+    let runtime = SharedEnclaveRuntime::staging_with_reference_signer()?;
     eprintln!(
         "enclave-vsock-staging listening on vsock cid={cid} port={port} (installed={}, pq_signing_ready={})",
         is_sealed_signer_installed(),
