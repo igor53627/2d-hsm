@@ -63,9 +63,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("enclave-vsock: lab PQ seal root + sealed signer configured");
     }
     #[cfg(not(feature = "lab-pq-seal-from-file"))]
-    match boot_configure_pq_seal_v1_platform_root() {
-        Ok(()) => eprintln!("enclave-vsock: PQ seal v1 provisioning root configured"),
-        Err(e) => eprintln!("enclave-vsock: platform provisioning root not configured: {e}"),
+    {
+        use enclave_protocol::env_config::transport_only_mode_enabled;
+        match boot_configure_pq_seal_v1_platform_root() {
+            Ok(()) => eprintln!("enclave-vsock: PQ seal v1 provisioning root configured"),
+            Err(e) if transport_only_mode_enabled() => {
+                eprintln!(
+                    "enclave-vsock: transport-only mode (TWOD_HSM_TRANSPORT_ONLY_MODE=1); \
+                     PQ signing unavailable until platform hook: {e}"
+                );
+            }
+            Err(e) => {
+                return Err(format!(
+                    "PQ platform provisioning root required (set TWOD_HSM_TRANSPORT_ONLY_MODE=1 only for lab transport smoke): {e}"
+                )
+                .into());
+            }
+        }
     }
 
     let (cid, port) = vsock_listen_addr_from_env()

@@ -29,6 +29,7 @@ let
   pqSealProvisioningRootFile =
     if isProdLab then labFixtures.pqSealProvisioningRootFile else null;
   pqSealedSignerFile = if isProdLab then labFixtures.pqSealedSignerFile else null;
+  enclaveTransportOnly = guestProfile == "production";
 in
 nixpkgs.lib.nixosSystem {
   inherit system;
@@ -39,6 +40,7 @@ nixpkgs.lib.nixosSystem {
       producerAttestationTrustFile
       pqSealProvisioningRootFile
       pqSealedSignerFile
+      enclaveTransportOnly
       ;
   };
   modules = [

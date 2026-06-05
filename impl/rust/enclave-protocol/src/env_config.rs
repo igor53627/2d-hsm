@@ -31,3 +31,14 @@ pub const LEGACY_HSM_PQ_SEALED_SIGNER_FILE: &str = "2D_HSM_PQ_SEALED_SIGNER_FILE
 
 pub const TWOD_HSM_ENCLAVE_MEASUREMENT_FILE: &str = "TWOD_HSM_ENCLAVE_MEASUREMENT_FILE";
 pub const LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE: &str = "2D_HSM_ENCLAVE_MEASUREMENT_FILE";
+
+/// When `1`, allow boot without platform PQ root (transport-only smoke; NOT mainnet).
+pub const TWOD_HSM_TRANSPORT_ONLY_MODE: &str = "TWOD_HSM_TRANSPORT_ONLY_MODE";
+pub const LEGACY_HSM_TRANSPORT_ONLY_MODE: &str = "2D_HSM_TRANSPORT_ONLY_MODE";
+
+pub fn transport_only_mode_enabled() -> bool {
+    var_twod(TWOD_HSM_TRANSPORT_ONLY_MODE, LEGACY_HSM_TRANSPORT_ONLY_MODE)
+        .ok()
+        .as_deref()
+        == Some("1")
+}

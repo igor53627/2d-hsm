@@ -13,6 +13,8 @@ Explicit expectations for PR #5 / TASK-4 Phase B verification. Scripts live in t
 
 Common: `GUEST_CID=42` matches QEMU `guest-cid=42` and guest `TWOD_HSM_VSOCK_CID=42`.
 
+`vsock_smoke_client.py` decodes the GET_MEASUREMENT CBOR map (requires `cbor2`: `apt install python3-cbor2`).
+
 ## Ubuntu guest path (legacy)
 
 | Script | Pass |

@@ -19,6 +19,11 @@ if command -v nix >/dev/null; then
     && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 fi
 
+if ! python3 -c "import cbor2" 2>/dev/null; then
+  echo "vsock smoke needs python3-cbor2 (e.g. apt install python3-cbor2)" >&2
+  exit 1
+fi
+
 cleanup() {
   if [[ -f "$VM_PID_FILE" ]]; then
     old_pid="$(cat "$VM_PID_FILE" 2>/dev/null || true)"

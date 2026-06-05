@@ -8,6 +8,7 @@
   producerAttestationTrustFile ? null,
   pqSealProvisioningRootFile ? null,
   pqSealedSignerFile ? null,
+  enclaveTransportOnly ? false,
   ...
 }:
 
@@ -80,6 +81,9 @@ in
       ) {
         TWOD_HSM_PQ_SEAL_V1_ROOT_FILE = "${pqSealProvisioningRootFile}";
         TWOD_HSM_PQ_SEALED_SIGNER_FILE = "${pqSealedSignerFile}";
+      }
+      // lib.optionalAttrs (isProd && enclaveTransportOnly) {
+        TWOD_HSM_TRANSPORT_ONLY_MODE = "1";
       };
   };
 

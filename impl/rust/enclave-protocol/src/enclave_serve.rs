@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 pub const MAX_CONCURRENT_SESSIONS: usize = 32;
 pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Wall-clock cap per connection (slowloris / byte-at-a-time idle reads).
-pub const SESSION_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Max idle time between complete frames on one connection (slowloris bound).
+pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One enclave process: shared authorization state across all transport connections.
 pub struct SharedEnclaveRuntime {
@@ -34,9 +34,9 @@ pub fn serve_framed_connection<S>(stream: &mut S, runtime: &SharedEnclaveRuntime
 where
     S: Read + Write,
 {
-    let session_deadline = Instant::now() + SESSION_TOTAL_TIMEOUT;
+    let mut idle_deadline = Instant::now() + SESSION_IDLE_TIMEOUT;
     loop {
-        let frame = match read_framed_message_before(stream, session_deadline) {
+        let frame = match read_framed_message_before(stream, idle_deadline) {
             Ok(f) => f,
             Err(ProtocolError::Io(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
@@ -47,10 +47,8 @@ where
             }
             Err(e) => return Err(e),
         };
-        let mut state = runtime
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::PqSigningUnavailable("shared enclave state mutex poisoned"))?;
+        idle_deadline = Instant::now() + SESSION_IDLE_TIMEOUT;
+        let mut state = lock_enclave_state(&runtime.state)?;
         let response = process_framed_with_shared_state(
             &frame,
             &mut state,
@@ -60,6 +58,15 @@ where
         write_framed_message(stream, &response)?;
     }
     Ok(())
+}
+
+fn lock_enclave_state(
+    state: &Arc<Mutex<EnclaveState>>,
+) -> Result<std::sync::MutexGuard<'_, EnclaveState>, ProtocolError> {
+    state.lock().map_err(|_| {
+        eprintln!("FATAL: shared enclave state mutex poisoned — exiting");
+        std::process::exit(1);
+    })
 }
 
 fn read_framed_message_before<R: Read>(
@@ -95,7 +102,7 @@ fn read_exact_before_deadline<R: Read>(
         if Instant::now() >= deadline {
             return Err(ProtocolError::Io(std::io::Error::new(
                 ErrorKind::TimedOut,
-                "session total timeout exceeded",
+                "session idle timeout exceeded",
             )));
         }
         match reader.read(&mut buf[off..]) {

@@ -23,8 +23,14 @@ fi
   exit 1
 }
 
-killall qemu-system-x86_64 2>/dev/null || true
-sleep 2
+QEMU_PID=""
+cleanup() {
+  if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
+    kill "$QEMU_PID" 2>/dev/null || true
+    wait "$QEMU_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 LOG=/tmp/hsm-snp-qemu.log
 nohup ./run-guest-vm.sh >"$LOG" 2>&1 &
