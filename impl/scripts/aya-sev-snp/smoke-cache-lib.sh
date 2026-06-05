@@ -53,28 +53,40 @@ twod_hsm_nix_outlink_hit() {
   esac
 }
 
-# One sha256 over the enclave sources per shell (warm-smoke-cache calls ensure 4×).
+# One sha256 over the enclave, flake, fixture, and smoke harness inputs per shell
+# (warm-smoke-cache calls ensure 4×).
+twod_hsm_cat_tree() {
+  local dir=$1
+  shift
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -type f "$@" 2>/dev/null | LC_ALL=C sort | while read -r f; do
+    printf '%s\0' "${f#$dir/}"
+    cat "$f"
+  done
+}
+
 twod_hsm_nix_build_stamp() {
   local flake_dir=$1
   if [[ -n "${_TWOD_HSM_NIX_BUILD_STAMP:-}" ]]; then
     printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"
     return 0
   fi
-  local repo_root rust_dir
+  local repo_root rust_dir script_dir
   repo_root="$(cd "${flake_dir}/../../.." && pwd)"
   rust_dir="${repo_root}/impl/rust/enclave-protocol"
+  script_dir="${repo_root}/impl/scripts/aya-sev-snp"
   _TWOD_HSM_NIX_BUILD_STAMP=$(
     {
       cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null
       cat "${flake_dir}/"*.nix 2>/dev/null
-    [[ -f "${rust_dir}/Cargo.toml" ]] && cat "${rust_dir}/Cargo.toml"
-    [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
-    [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
-      if [[ -d "${rust_dir}/src" ]]; then
-        find "${rust_dir}/src" -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort | while read -r f; do
-          cat "$f"
-        done
-      fi
+      twod_hsm_cat_tree "${flake_dir}/scripts" -name '*.sh'
+      [[ -f "${rust_dir}/Cargo.toml" ]] && cat "${rust_dir}/Cargo.toml"
+      [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
+      [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
+      twod_hsm_cat_tree "${rust_dir}/src" -name '*.rs'
+      twod_hsm_cat_tree "${rust_dir}/examples" -name '*.rs'
+      twod_hsm_cat_tree "${rust_dir}/testvectors" -type f
+      twod_hsm_cat_tree "${script_dir}" \( -name '*.sh' -o -name '*.py' -o -name '*.md' \)
     } | sha256sum | awk '{print $1}'
   )
   printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"

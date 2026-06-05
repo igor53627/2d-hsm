@@ -7,13 +7,36 @@ cd "$SCRIPT_DIR"
 # shellcheck source=smoke-cache-lib.sh
 source "$SCRIPT_DIR/smoke-cache-lib.sh"
 
-IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+IMAGE_BASE_URL="${TWOD_HSM_UBUNTU_IMAGE_BASE_URL:-https://cloud-images.ubuntu.com/noble/current}"
+IMAGE_NAME="${TWOD_HSM_UBUNTU_IMAGE_NAME:-noble-server-cloudimg-amd64.img}"
+IMAGE_URL="${IMAGE_BASE_URL}/${IMAGE_NAME}"
+IMAGE_SHA256="${TWOD_HSM_UBUNTU_IMAGE_SHA256:-}"
 IMAGE_FILE="$(twod_hsm_snp_ubuntu_image)"
 BASE_DISK="$(twod_hsm_snp_base_disk)"
 CLOUD_ISO="$(twod_hsm_snp_cloudinit_iso)"
 WORK_DISK="${SCRIPT_DIR}/vm-disk.qcow2"
 
 twod_hsm_ensure_cache_dirs
+
+verify_ubuntu_image() {
+  local image=$1 expected actual sums
+  expected="$IMAGE_SHA256"
+  if [[ -z "$expected" ]]; then
+    sums="$(curl -fsSL "${IMAGE_BASE_URL}/SHA256SUMS")"
+    expected="$(printf '%s\n' "$sums" | awk -v f="${IMAGE_NAME}" '$2 == "*" f || $2 == f { print $1; exit }')"
+  fi
+  if [[ -z "$expected" ]]; then
+    echo "setup-guest-image: no sha256 for ${IMAGE_NAME}; set TWOD_HSM_UBUNTU_IMAGE_SHA256" >&2
+    return 1
+  fi
+  actual="$(sha256sum "$image" | awk '{ print $1 }')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "setup-guest-image: sha256 mismatch for $(basename "$image")" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    return 1
+  fi
+}
 
 if [[ -f "$BASE_DISK" && "${TWOD_HSM_REGEN_SNPDISK:-0}" != "1" ]]; then
   echo "SNP base disk cached: $BASE_DISK"
@@ -22,6 +45,7 @@ else
     echo "Downloading cloud image -> $IMAGE_FILE"
     wget -O "$IMAGE_FILE" "$IMAGE_URL"
   fi
+  verify_ubuntu_image "$IMAGE_FILE"
   echo "Creating base overlay -> $BASE_DISK (20G)"
   qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$BASE_DISK" 20G
 fi

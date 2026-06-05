@@ -121,7 +121,12 @@ where
             Ok(f) => f,
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             // Session idle exhausted (see read_exact_with_idle_deadline); per-read retries stay inner.
-            Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(ProtocolError::Io(e))
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                break
+            }
             // Oversize length prefix: request type unknown; close without an application frame.
             Err(ProtocolError::MessageTooLarge(_)) => break,
             Err(e) => return Err(e),

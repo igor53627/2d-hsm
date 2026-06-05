@@ -44,6 +44,9 @@ After warm-up, routine smokes skip rebuilds and reuse disks:
 ```
 
 Force refresh: `TWOD_HSM_REGEN_SNPDISK=1 ./setup-guest-image.sh` or `TWOD_HSM_REGEN_CLOUDINIT=1`.
+`setup-guest-image.sh` verifies the Ubuntu cloud image against upstream `SHA256SUMS`; set
+`TWOD_HSM_UBUNTU_IMAGE_BASE_URL`, `TWOD_HSM_UBUNTU_IMAGE_NAME`, and
+`TWOD_HSM_UBUNTU_IMAGE_SHA256` together when pinning a dated image.
 
 ## Quick start
 

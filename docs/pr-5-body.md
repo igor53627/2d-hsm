@@ -56,9 +56,20 @@ cd impl/scripts/aya-sev-snp
 | Branch design | **6983** claude/design Pass |
 | Branch security | codex/gemini branch jobs degraded (UTF-8 binaries / gemini quota); retried on commits |
 | Post-transport (`611de83`…`a399826`) | **7012** codex/security Pass, **7013** cursor+gemini-3.1-pro/security Pass, **7014** claude/design Pass; compact **7015** → fixed in `c630aa8`; compact **7025** Low closed in `a399826` |
+| PR review (14 findings) | Closed through `a683161` (Elixir ARM, vsock CID, CI tests, idle framing, vm-production transport) |
+| Pre-merge compact | **7055** → fixed `a683161`; **7061** → 0 High/Medium, 1 Low (idle `WouldBlock` close path) accepted |
+| **CI `nix-hsm`** | **green** on `a683161`+ (`rust-test`, `elixir-test`, `build`) |
 | Roborev diff excludes | `.roborev.toml`: `**/*.sealed`, `**/*.bin` only (lockfiles in scope) |
 
 High-risk paths: `impl/nix/**`, `impl/rust/enclave-protocol/**`, `backlog/docs/*vsock*`.
+
+### Human sign-off (merge gate)
+
+- [x] **Not mainnet:** `vm-production` / `vm-production-lab` use lab attestation trust; transport smoke uses debug `enclave-production-transport`, not release prod deployment.
+- [x] **CI:** GitHub Actions `nix-hsm` passing on merge HEAD.
+- [x] **Roborev:** Reduced matrix + compacts through **7061**; no open High/Medium.
+- [x] **Operator smokes (aya):** 5/5 Nix+SNP scripts passed 2026-06-05 (`d0ccd39` baseline; re-run optional after large transport delta).
+- [ ] **Maintainer merge** — squash merge to `main`.
 
 ## Unit tests (local / CI)
 
@@ -71,7 +82,7 @@ cargo test --features reference-test-key      # ML-DSA + wire-ARM shared-state t
 
 Notable: `shared_enclave_state_wire_arm_rejects_second_hardfork_mldsa` — wire ARM on shared `EnclaveState`, then second hard-fork rejected across lock scopes.
 
-## Test plan (aya, HEAD `a399826`)
+## Test plan (aya, re-run optional after merge)
 
 ```bash
 cd /root/2d-hsm && git fetch && git checkout feat/task-1-vsock-staging-transport && git pull

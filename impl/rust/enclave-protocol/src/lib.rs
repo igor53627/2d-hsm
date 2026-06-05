@@ -1388,6 +1388,15 @@ fn read_exact_with_idle_deadline<R: std::io::Read>(
             {
                 continue
             }
+            Err(e)
+                if (e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock)
+                    && idle_deadline.is_some_and(|d| std::time::Instant::now() >= d) =>
+            {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "session idle timeout exceeded",
+                )));
+            }
             Err(e) => return Err(ProtocolError::from(e)),
         }
     }
