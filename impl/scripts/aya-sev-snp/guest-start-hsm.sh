@@ -12,8 +12,8 @@ SSH_OPTS="$(twod_hsm_ssh_opts)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BIN="${HSM_BIN:-$(twod_hsm_default_hsm_bin "$ROOT")}"
 GUEST_DIR="${GUEST_DIR:-/opt/2d-hsm}"
-WAIT_READY="${GUEST_WAIT_READY:-1}"
-READY_TIMEOUT="${GUEST_READY_TIMEOUT:-120}"
+WAIT_READY="${GUEST_WAIT_READY:-0}"
+READY_TIMEOUT="${GUEST_READY_TIMEOUT:-60}"
 
 [[ -x "$BIN" ]] || { echo "Missing binary: $BIN"; exit 1; }
 
