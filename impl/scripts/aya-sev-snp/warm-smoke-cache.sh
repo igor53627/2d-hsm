@@ -10,6 +10,11 @@ source "$SCRIPT_DIR/smoke-cache-lib.sh"
 FLAKE_DIR="$ROOT/impl/nix/vm-hsm"
 BAKE_GOLDEN="${TWOD_HSM_BAKE_SNPDISK:-1}"
 
+# Lab cache-warming: setup-guest-image.sh (called below) hard-fails without a trust
+# decision. Default to the integrity-only upstream SHA256SUMS fetch unless the operator
+# pinned a SHA or explicitly opted out (TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=0).
+export TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS="${TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS:-1}"
+
 twod_hsm_ensure_cache_dirs
 twod_hsm_nix_init
 twod_hsm_ensure_python_cbor2

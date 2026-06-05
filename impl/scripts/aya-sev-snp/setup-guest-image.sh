@@ -76,13 +76,23 @@ else
   if [[ "$image_verified" != "1" ]]; then
     verify_ubuntu_image "$IMAGE_FILE"
   fi
-  if [[ -f "$BASE_DISK" ]]; then
-    stale_base="$(mktemp "${BASE_DISK}.stale.XXXXXX")"
-    echo "Moving stale SNP base disk -> $stale_base"
-    mv "$BASE_DISK" "$stale_base"
-  fi
   echo "Creating base overlay -> $BASE_DISK (20G)"
-  qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$BASE_DISK" 20G
+  tmp_base="$(mktemp "${BASE_DISK}.tmp.XXXXXX")"
+  if ! qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$tmp_base" 20G; then
+    rm -f "$tmp_base"
+    exit 1
+  fi
+  # Atomic replace: a failed create above never clobbers the existing base, and the
+  # rename keeps any running VM's open inode intact (no leaked *.stale.* copies).
+  mv "$tmp_base" "$BASE_DISK"
+  # A golden disk was baked from the previous base/image; it takes precedence in
+  # run-snp-smoke.sh and twod_hsm_snp_prepare_work_disk and would silently shadow this
+  # rebuild, so drop it. warm-smoke-cache.sh re-bakes it on the next run.
+  golden_disk="$(twod_hsm_snp_golden_disk)"
+  if [[ -f "$golden_disk" ]]; then
+    echo "Invalidating stale SNP golden disk -> $golden_disk"
+    rm -f "$golden_disk"
+  fi
 fi
 
 SSH_KEY="${SSH_KEY:-}"

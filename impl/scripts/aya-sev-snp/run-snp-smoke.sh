@@ -8,6 +8,11 @@ cd "$SCRIPT_DIR"
 # shellcheck source=smoke-cache-lib.sh
 source "$SCRIPT_DIR/smoke-cache-lib.sh"
 
+# Lab smoke: setup-guest-image.sh (invoked below when no disk is cached) hard-fails
+# without a trust decision. Default to the integrity-only upstream SHA256SUMS fetch
+# unless the operator pinned a SHA or set TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=0.
+export TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS="${TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS:-1}"
+
 export QEMU_BIN="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
 export SEV_MODE="${SEV_MODE:-snp}"
 export MEMORY="${MEMORY:-2048}"
