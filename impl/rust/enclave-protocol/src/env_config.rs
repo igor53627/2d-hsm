@@ -5,8 +5,16 @@
 //! Reference binaries still accept deprecated `2D_HSM_*` names for one transition period.
 
 /// Read `primary`, then deprecated `legacy` (`2D_HSM_*`).
+///
+/// Falls back to `legacy` only when `primary` is unset. A `primary` set to a
+/// non-UTF-8 value is a misconfiguration and is surfaced (fail closed) rather
+/// than masked by a stale legacy value.
 pub fn var_twod(primary: &str, legacy: &str) -> Result<String, std::env::VarError> {
-    std::env::var(primary).or_else(|_| std::env::var(legacy))
+    match std::env::var(primary) {
+        Ok(v) => Ok(v),
+        Err(std::env::VarError::NotPresent) => std::env::var(legacy),
+        Err(e) => Err(e),
+    }
 }
 
 pub const TWOD_HSM_VSOCK_CID: &str = "TWOD_HSM_VSOCK_CID";

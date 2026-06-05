@@ -19,17 +19,15 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use enclave_protocol::enclave_serve::{serve_framed_connection, SharedEnclaveRuntime};
+    use enclave_protocol::enclave_serve::{run_incoming_accept_loop, SharedEnclaveRuntime};
     use enclave_protocol::{
         install_reference_sealed_signer_staging, is_sealed_signer_installed, pq_signing_ready,
-        reference_test_attestation_trust,
+        reference_test_attestation_trust, ProtocolError,
     };
     use enclave_protocol::vsock_listen::{
         bind_vsock_listener, configure_vsock_session_timeouts, vsock_listen_addr_from_env,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::thread;
 
     let (cid, port) = vsock_listen_addr_from_env()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -43,40 +41,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         pq_signing_ready()
     );
 
-    struct SessionSlotGuard(Arc<AtomicUsize>);
-    impl Drop for SessionSlotGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    let active = Arc::new(AtomicUsize::new(0));
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("accept error: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = configure_vsock_session_timeouts(&mut stream) {
-            eprintln!("vsock timeout setup failed: {e}");
-            continue;
-        }
-        let prev = active.fetch_add(1, Ordering::Relaxed);
-        if prev >= enclave_protocol::enclave_serve::MAX_CONCURRENT_SESSIONS {
-            active.fetch_sub(1, Ordering::Relaxed);
-            eprintln!("rejecting connection: at session cap");
-            continue;
-        }
-        let active = Arc::clone(&active);
-        let runtime = Arc::clone(&runtime);
-        thread::spawn(move || {
-            let _guard = SessionSlotGuard(active);
-            if let Err(e) = serve_framed_connection(&mut stream, &runtime) {
-                eprintln!("session error: {e}");
-            }
-        });
-    }
+    run_incoming_accept_loop(listener.incoming(), runtime, |stream| {
+        configure_vsock_session_timeouts(stream).map_err(ProtocolError::from)
+    });
     Ok(())
 }

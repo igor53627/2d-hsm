@@ -1,11 +1,13 @@
-//! Shared connection loop for stateful enclave transports (UDS, vsock, stdio-session).
+//! Shared connection loop for stateful enclave transports (UDS, vsock).
 
 use crate::{
-    process_framed_with_shared_state, read_framed_message, write_framed_message, EnclaveState,
-    ProducerAttestationTrust, ProtocolError,
+    process_framed_with_shared_state, read_framed_message_with_idle_deadline, write_framed_message,
+    EnclaveState, ProducerAttestationTrust, ProtocolError,
 };
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const MAX_CONCURRENT_SESSIONS: usize = 32;
@@ -28,6 +30,73 @@ impl SharedEnclaveRuntime {
             attestation_trust,
         }
     }
+
+    /// Dev / `test-support` UDS server: reference Ed25519 attestation trust anchor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reference_test() -> Self {
+        Self::new(crate::reference_test_attestation_trust())
+    }
+}
+
+struct SessionSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for SessionSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Blocking accept loop: one thread per connection, capped at [`MAX_CONCURRENT_SESSIONS`].
+///
+/// `prepare_connection` runs on the accept thread before spawn (e.g. socket I/O timeouts).
+/// Rejected connections (cap or setup failure) are dropped explicitly.
+pub fn run_incoming_accept_loop<I, S, F>(
+    incoming: I,
+    runtime: Arc<SharedEnclaveRuntime>,
+    mut prepare_connection: F,
+)
+where
+    I: Iterator<Item = Result<S, std::io::Error>>,
+    S: Read + Write + Send + 'static,
+    F: FnMut(&mut S) -> Result<(), ProtocolError>,
+{
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in incoming {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = prepare_connection(&mut stream) {
+            eprintln!("connection setup failed: {e}");
+            continue;
+        }
+        let prev = active.fetch_add(1, Ordering::Relaxed);
+        if prev >= MAX_CONCURRENT_SESSIONS {
+            active.fetch_sub(1, Ordering::Relaxed);
+            eprintln!("rejecting connection: at session cap");
+            drop(stream);
+            continue;
+        }
+        let active = Arc::clone(&active);
+        let runtime = Arc::clone(&runtime);
+        thread::spawn(move || {
+            let _guard = SessionSlotGuard(active);
+            if let Err(e) = serve_framed_connection(&mut stream, &runtime) {
+                eprintln!("session error: {e}");
+            }
+        });
+    }
+}
+
+/// Apply UDS session I/O timeouts (must be at least [`READ_TIMEOUT`] for idle framing).
+#[cfg(unix)]
+pub fn configure_unix_session_timeouts(stream: &mut std::os::unix::net::UnixStream) -> Result<(), ProtocolError> {
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    Ok(())
 }
 
 /// Serve framed host requests on one connection until EOF, timeout, or I/O error.
@@ -37,7 +106,7 @@ where
 {
     let mut idle_deadline = Instant::now() + SESSION_IDLE_TIMEOUT;
     loop {
-        let frame = match read_framed_message_before(stream, idle_deadline) {
+        let frame = match read_framed_message_with_idle_deadline(stream, Some(idle_deadline)) {
             Ok(f) => f,
             Err(ProtocolError::Io(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
@@ -46,6 +115,8 @@ where
             {
                 break;
             }
+            // Oversize length prefix: request type unknown; close without an application frame.
+            Err(ProtocolError::MessageTooLarge(_)) => break,
             Err(e) => return Err(e),
         };
         idle_deadline = Instant::now() + SESSION_IDLE_TIMEOUT;
@@ -61,64 +132,17 @@ where
     Ok(())
 }
 
+/// Panic while holding this lock may leave [`EnclaveState`] inconsistent — fail closed via process exit.
 fn lock_enclave_state(
     state: &Arc<Mutex<EnclaveState>>,
 ) -> Result<std::sync::MutexGuard<'_, EnclaveState>, ProtocolError> {
-    state.lock().map_err(|_| {
-        eprintln!(
-            "FATAL: shared enclave state mutex poisoned — stateful requests will fail until supervisor restart"
-        );
-        ProtocolError::WireProtocol("shared enclave state mutex poisoned")
-    })
-}
-
-fn read_framed_message_before<R: Read>(
-    reader: &mut R,
-    deadline: Instant,
-) -> Result<Vec<u8>, ProtocolError> {
-    use crate::ProtocolError;
-    use std::io::{ErrorKind, Read};
-
-    let mut len_buf = [0u8; 4];
-    read_exact_before_deadline(reader, &mut len_buf, deadline)?;
-    let total_len = u32::from_be_bytes(len_buf) as usize;
-    if total_len > crate::MAX_MESSAGE_SIZE as usize {
-        return Err(ProtocolError::MessageTooLarge(total_len as u32));
-    }
-    let mut body = vec![0u8; total_len];
-    read_exact_before_deadline(reader, &mut body, deadline)?;
-    let mut frame = Vec::with_capacity(4 + total_len);
-    frame.extend_from_slice(&len_buf);
-    frame.extend_from_slice(&body);
-    Ok(frame)
-}
-
-fn read_exact_before_deadline<R: Read>(
-    reader: &mut R,
-    buf: &mut [u8],
-    deadline: Instant,
-) -> Result<(), ProtocolError> {
-    use std::io::{ErrorKind, Read};
-
-    let mut off = 0;
-    while off < buf.len() {
-        if Instant::now() >= deadline {
-            return Err(ProtocolError::Io(std::io::Error::new(
-                ErrorKind::TimedOut,
-                "session idle timeout exceeded",
-            )));
-        }
-        match reader.read(&mut buf[off..]) {
-            Ok(0) => {
-                return Err(ProtocolError::Io(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "connection closed while reading frame",
-                )));
-            }
-            Ok(n) => off += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(ProtocolError::from(e)),
+    match state.lock() {
+        Ok(guard) => Ok(guard),
+        Err(_) => {
+            eprintln!(
+                "FATAL: shared enclave state mutex poisoned — exiting for supervisor restart"
+            );
+            std::process::exit(1);
         }
     }
-    Ok(())
 }

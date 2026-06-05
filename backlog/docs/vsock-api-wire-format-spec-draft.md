@@ -95,7 +95,7 @@ The reference enclave listens on **AF_VSOCK** before accepting framed commands (
 
 | Variable | Required | Default (reference) | Semantics |
 |----------|----------|---------------------|-----------|
-| `TWOD_HSM_VSOCK_CID` | no | `3` (Nitro-style) | VSock CID the enclave **binds** inside the guest |
+| `TWOD_HSM_VSOCK_CID` | no | `4294967295` (`VMADDR_CID_ANY`) | VSock CID the enclave **binds** inside the guest (Nitro dev may use `3`; QEMU/SEV guests often set explicitly, e.g. `42`) |
 | `TWOD_HSM_VSOCK_PORT` | no | `5000` | VSock port (service listener) |
 
 **Naming rule:** Use the `TWOD_` prefix, not `2D_`. POSIX and **systemd** reject environment keys that start with a digit, so `2D_HSM_VSOCK_CID` in a unit file is silently ignored and the process falls back to defaults (misconfiguration). The reference implementation also accepts deprecated `2D_HSM_VSOCK_*` for one transition period when set via `env(1)` or shells that allow it.

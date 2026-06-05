@@ -9,9 +9,8 @@ use crate::env_config::{
     var_twod, LEGACY_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_PORT, TWOD_HSM_VSOCK_CID, TWOD_HSM_VSOCK_PORT,
 };
 
-/// Default Nitro-style enclave CID (many Nitro setups use CID 3 for the enclave listener).
-/// On generic Linux dev hosts (e.g. SEV loopback on **aya**), use `TWOD_HSM_VSOCK_CID=1` or `4294967295`.
-pub const DEFAULT_VSOCK_CID: u32 = 3;
+/// Default bind CID: `VMADDR_CID_ANY` (guest accepts connections on any assigned guest CID).
+pub const DEFAULT_VSOCK_CID: u32 = 4_294_967_295;
 /// Loopback-friendly CID (`VMADDR_CID_LOCAL`) for `vsock_loopback` on dev Linux.
 pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
 /// Default vsock service port (override via `TWOD_HSM_VSOCK_PORT`).
@@ -23,8 +22,23 @@ fn env_u32_twod(primary: &str, legacy: &str, default: u32) -> Result<u32, String
         Ok(s) => s
             .parse::<u32>()
             .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u32")),
-        Err(_) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("{primary} (or legacy {legacy}): {e}")),
     }
+}
+
+fn validate_vsock_listen_addr(cid: u32, port: u32) -> Result<(u32, u32), String> {
+    if cid == 0 {
+        return Err(format!(
+            "{TWOD_HSM_VSOCK_CID} must not be 0 (hypervisor reserved); set an explicit guest CID"
+        ));
+    }
+    if port == 0 {
+        return Err(format!(
+            "{TWOD_HSM_VSOCK_PORT} must not be 0; set an explicit service port"
+        ));
+    }
+    Ok((cid, port))
 }
 
 /// Resolve `(cid, port)` from env or defaults.
@@ -33,7 +47,7 @@ fn env_u32_twod(primary: &str, legacy: &str, default: u32) -> Result<u32, String
 pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
     let cid = env_u32_twod(TWOD_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_CID, DEFAULT_VSOCK_CID)?;
     let port = env_u32_twod(TWOD_HSM_VSOCK_PORT, LEGACY_HSM_VSOCK_PORT, DEFAULT_VSOCK_PORT)?;
-    Ok((cid, port))
+    validate_vsock_listen_addr(cid, port)
 }
 
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]

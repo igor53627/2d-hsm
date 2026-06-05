@@ -6,11 +6,19 @@ import os
 import socket
 import struct
 import sys
+import time
 
 
 def recv_until(sock: socket.socket, n: int, timeout: float) -> bytes:
+    deadline = time.monotonic() + timeout
     buf = b""
     while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout(
+                "recv_until: %.1fs deadline exceeded (got %d/%d bytes)" % (timeout, len(buf), n)
+            )
+        sock.settimeout(remaining)
         chunk = sock.recv(min(8192, n - len(buf)))
         if not chunk:
             raise ConnectionError("peer closed before %d bytes (got %d)" % (n, len(buf)))
@@ -64,6 +72,8 @@ def get_measurement(
     s.sendall(frame)
     resp = recv_until(s, 4, connect_timeout)
     total = struct.unpack(">I", resp[:4])[0]
+    if total > 1 << 20:
+        raise ValueError("frame length %d exceeds 1 MiB cap" % total)
     resp += recv_until(s, 4 + total - 4, connect_timeout)
 
     fields = _decode_framed_get_measurement(resp)

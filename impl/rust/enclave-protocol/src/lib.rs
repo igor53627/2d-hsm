@@ -1270,7 +1270,10 @@ fn protocol_error_to_wire_body(e: &ProtocolError) -> Result<Vec<u8>, ProtocolErr
     encode_wire_error(code, &reason)
 }
 
-fn encode_wire_error_frame(msg_type: MessageType, e: ProtocolError) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) fn encode_wire_error_frame(
+    msg_type: MessageType,
+    e: ProtocolError,
+) -> Result<Vec<u8>, ProtocolError> {
     let body = protocol_error_to_wire_body(&e)?;
     encode_message(msg_type, &body)
 }
@@ -1346,24 +1349,76 @@ fn try_process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     encode_message(MessageType::GetMeasurement, &body)
 }
 
-/// Read one length-prefixed frame from a stream (blocking).
-pub fn read_framed_message<R: std::io::Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
-    use std::io::Read;
+fn read_exact_with_idle_deadline<R: std::io::Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    idle_deadline: Option<std::time::Instant>,
+) -> Result<(), ProtocolError> {
+    use std::io::ErrorKind;
+
+    let mut off = 0;
+    while off < buf.len() {
+        if let Some(deadline) = idle_deadline {
+            if std::time::Instant::now() >= deadline {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "session idle timeout exceeded",
+                )));
+            }
+        }
+        match reader.read(&mut buf[off..]) {
+            Ok(0) => {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "connection closed while reading frame",
+                )));
+            }
+            Ok(n) => off += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(ProtocolError::from(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Read one length-prefixed frame from a stream.
+///
+/// When `idle_deadline` is [`Some`], each `read` is bounded by that instant (inter-frame
+/// slowloris defense). When [`None`], uses blocking `read_exact` (stdio and legacy callers).
+pub fn read_framed_message_with_idle_deadline<R: std::io::Read>(
+    reader: &mut R,
+    idle_deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
-        .map_err(ProtocolError::from)?;
+    if idle_deadline.is_some() {
+        read_exact_with_idle_deadline(reader, &mut len_buf, idle_deadline)?;
+    } else {
+        use std::io::Read;
+        reader
+            .read_exact(&mut len_buf)
+            .map_err(ProtocolError::from)?;
+    }
     let total_len = u32::from_be_bytes(len_buf);
     if total_len > MAX_MESSAGE_SIZE {
         return Err(ProtocolError::MessageTooLarge(total_len));
     }
     let total_len = total_len as usize;
     let mut body = vec![0u8; total_len];
-    reader.read_exact(&mut body).map_err(ProtocolError::from)?;
+    if idle_deadline.is_some() {
+        read_exact_with_idle_deadline(reader, &mut body, idle_deadline)?;
+    } else {
+        use std::io::Read;
+        reader.read_exact(&mut body).map_err(ProtocolError::from)?;
+    }
     let mut frame = Vec::with_capacity(4 + total_len);
     frame.extend_from_slice(&len_buf);
     frame.extend_from_slice(&body);
     Ok(frame)
+}
+
+/// Read one length-prefixed frame from a stream (blocking, no inter-read idle deadline).
+pub fn read_framed_message<R: std::io::Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
+    read_framed_message_with_idle_deadline(reader, None)
 }
 
 /// Write one length-prefixed frame to a stream.

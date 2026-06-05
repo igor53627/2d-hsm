@@ -23,6 +23,10 @@ Thumbs.db
 # Rust specific
 **/.cargo/
 
+# Python
+__pycache__/
+*.pyc
+
 # Other generated
 *.log
 impl/solidity/.forge-crosscheck/
