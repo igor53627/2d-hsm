@@ -10,6 +10,14 @@
 agent = "codex"
 model = "gpt-5.5"
 
+# Exclude binary / lock blobs from review prompts (codex UTF-8 failures on branch diff).
+exclude_patterns = [
+  "**/*.sealed",
+  "**/*.bin",
+  "**/flake.lock",
+  "impl/rust/enclave-protocol/Cargo.lock",
+]
+
 [ci]
 # PR CI: three vendors × two lenses (6 cells). Per-agent models are not
 # configurable on `roborev ci review` — pin gemini/claude locally via scripts.
