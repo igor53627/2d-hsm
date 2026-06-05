@@ -682,6 +682,13 @@ pub fn arm_for_production(
         }
     }
 
+    #[cfg(feature = "ml-dsa-65")]
+    if !pq_signing_ready() {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "ARM_FOR_PRODUCTION requires operational PQ signing (pq_signing_ready)",
+        ));
+    }
+
     validate_recent_chain_proof(&req.recent_chain_proof, &req.authorized_state, &trust)?;
 
     expect_pq_pubkey_matches_active_signer(&req.authorized_state.pq_pubkey)?;
@@ -1539,6 +1546,27 @@ mod tests {
         guard
     }
 
+    /// Installs the reference sealed signer when needed. `None` = skip test (`ml-dsa-65` without `reference-test-key`).
+    /// Caller must keep `_guard` alive through `ARM_FOR_PRODUCTION`.
+    #[cfg(feature = "ml-dsa-65")]
+    fn arm_test_pq_setup() -> Option<(pq_signer::SealedSignerTestGuard, Vec<u8>)> {
+        #[cfg(not(feature = "reference-test-key"))]
+        {
+            return None;
+        }
+        #[cfg(feature = "reference-test-key")]
+        {
+            let guard = install_reference_sealed_signer_for_tests();
+            let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
+            Some((guard, pk))
+        }
+    }
+
+    #[cfg(not(feature = "ml-dsa-65"))]
+    fn arm_test_pq_setup() -> Option<Vec<u8>> {
+        Some(vec![0xAB; 48])
+    }
+
     fn signed_recent_chain_proof(
         finalized_height: u64,
         finalized_header_hash: [u8; 32],
@@ -1557,8 +1585,14 @@ mod tests {
 
     #[test]
     fn get_status_wire_roundtrip_matches_spec_integer_keys() {
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
-            pq_pubkey: vec![0x01; 48],
+            pq_pubkey: pq,
             measurement: b"m".to_vec(),
             activated_at_height: 5,
             source_ticket_hash: [0x02; 32],
@@ -1986,14 +2020,12 @@ mod tests {
 
     #[test]
     fn arm_and_hardfork_reject_unsigned_proof() {
-        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
-        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let _guard = install_reference_sealed_signer_for_tests();
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let pq = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
-        #[cfg(not(all(feature = "ml-dsa-65", feature = "reference-test-key")))]
-        let pq = vec![0xAB; 48];
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq.clone(),
             measurement: b"m".to_vec(),
@@ -2071,8 +2103,14 @@ mod tests {
 
     #[test]
     fn arm_rejects_measurement_mismatch_after_signing() {
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
-            pq_pubkey: vec![0xAB; 48],
+            pq_pubkey: pq,
             measurement: b"legit-meas".to_vec(),
             activated_at_height: 100,
             source_ticket_hash: [0xCC; 32],
@@ -2098,8 +2136,11 @@ mod tests {
     #[test]
     fn re_arm_requires_strictly_fresher_finalized_height() {
         #[cfg(feature = "ml-dsa-65")]
-        let _no_signer = clear_sealed_signer_for_mock_pubkey_tests();
-        let pq = vec![0xEE; 48];
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let authorized = AuthorizedProducerState {
             pq_pubkey: pq,
             measurement: b"m".to_vec(),
@@ -2170,10 +2211,16 @@ mod tests {
     #[test]
     fn arm_for_production_transitions_state_on_valid_proof() {
         // Basic test for the new arm_for_production function (AC #7)
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let initial = EnclaveState::Unarmed;
 
         let authorized = AuthorizedProducerState {
-            pq_pubkey: vec![1; 48],
+            pq_pubkey: pq,
             measurement: b"meas".to_vec(),
             activated_at_height: 100,
             source_ticket_hash: [0xAA; 32],
@@ -2201,10 +2248,16 @@ mod tests {
     #[test]
     fn dispatch_arm_for_production_updates_state() {
         // Demonstrates using the stateful dispatcher (the new recommended path)
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let authorized = AuthorizedProducerState {
-            pq_pubkey: vec![1; 48],
+            pq_pubkey: pq,
             measurement: b"meas".to_vec(),
             activated_at_height: 100,
             source_ticket_hash: [0xAA; 32],
@@ -2245,10 +2298,16 @@ mod tests {
 
     #[test]
     fn get_status_reflects_armed_state() {
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let authorized = AuthorizedProducerState {
-            pq_pubkey: vec![0xAA; 48],
+            pq_pubkey: pq.clone(),
             measurement: b"armed-measurement-v1".to_vec(),
             activated_at_height: 200,
             source_ticket_hash: [0xBB; 32],
@@ -2272,7 +2331,7 @@ mod tests {
 
         assert!(status_resp.armed);
         assert_eq!(status_resp.authorized_measurement, b"armed-measurement-v1");
-        assert_eq!(status_resp.authorized_pq_pubkey, vec![0xAA; 48]);
+        assert_eq!(status_resp.authorized_pq_pubkey, pq);
         assert_eq!(status_resp.authorized_activated_at_height, Some(200));
         assert_eq!(status_resp.proof_finalized_height, Some(250));
         assert_eq!(status_resp.source_ticket_hash, Some([0xBB; 32]));
@@ -2280,18 +2339,24 @@ mod tests {
 
     #[test]
     fn arm_for_production_fails_with_invalid_proof() {
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let bad_req = ArmForProductionRequest {
             authorized_state: AuthorizedProducerState {
-                pq_pubkey: vec![1; 48],
+                pq_pubkey: pq.clone(),
                 measurement: b"meas".to_vec(),
                 activated_at_height: 100,
                 source_ticket_hash: [0xAA; 32],
             },
             recent_chain_proof: {
                 let authorized = AuthorizedProducerState {
-                    pq_pubkey: vec![1; 48],
+                    pq_pubkey: pq,
                     measurement: b"meas".to_vec(),
                     activated_at_height: 100,
                     source_ticket_hash: [0xAA; 32],
@@ -2321,14 +2386,12 @@ mod tests {
 
     #[test]
     fn stateful_sign_second_hardfork_while_armed_fails() {
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let _guard = install_reference_sealed_signer_for_tests();
-        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
-        let _no_signer = clear_sealed_signer_for_mock_pubkey_tests();
         #[cfg(feature = "ml-dsa-65")]
-        let pq = pq_signer::sealed_signer_public_key_bytes().unwrap_or_else(|| vec![0xDE; 48]);
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
         #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = vec![0xDE; 48];
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
@@ -2555,16 +2618,12 @@ mod tests {
 
     #[test]
     fn stateful_arm_then_sign_hardfork_succeeds() {
-        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
-        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let _pq_guard = install_reference_sealed_signer_for_tests();
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let pq = pq_signer::sealed_signer_public_key_bytes().expect("sealed signer");
-        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
-        let pq = vec![0xDE; 48];
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
         #[cfg(not(feature = "ml-dsa-65"))]
-        let pq = vec![0xDE; 48];
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         let arm_resp = dispatch_command_with_state(
@@ -2621,57 +2680,41 @@ mod tests {
 
     #[test]
     fn stateful_sign_hardfork_wrong_pubkey_fails() {
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        {
-            let _guard = install_reference_sealed_signer_for_tests();
-            let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed signer");
-            dispatch_command_with_state(
-                Command::ArmForProduction(sample_arm_request(pk.clone(), 10_000_000, 10_000_050)),
-                &mut state,
-                test_attestation_trust(),
-            );
-            let mut wrong_pk = pk.clone();
-            wrong_pk[0] ^= 0xFF;
-            let ticket = sample_hardfork_ticket(wrong_pk, 10_000_100);
-            let resp = dispatch_command_with_state(
-                Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-                &mut state,
-                test_attestation_trust(),
-            );
-            match resp {
-                Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
-                _ => panic!("expected pubkey mismatch error"),
-            }
-        }
-
-        #[cfg(not(all(feature = "ml-dsa-65", feature = "reference-test-key")))]
-        {
-            let pq = vec![0xDE; 48];
-            dispatch_command_with_state(
-                Command::ArmForProduction(sample_arm_request(pq, 10_000_000, 10_000_050)),
-                &mut state,
-                test_attestation_trust(),
-            );
-            let ticket = sample_hardfork_ticket(vec![0xCD; 48], 10_000_100);
-            let resp = dispatch_command_with_state(
-                Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-                &mut state,
-                test_attestation_trust(),
-            );
-            match resp {
-                Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
-                _ => panic!("expected pubkey mismatch error"),
-            }
+        dispatch_command_with_state(
+            Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
+            &mut state,
+            test_attestation_trust(),
+        );
+        let mut wrong_pk = pq;
+        wrong_pk[0] ^= 0xFF;
+        let ticket = sample_hardfork_ticket(wrong_pk, 10_000_100);
+        let resp = dispatch_command_with_state(
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
+            &mut state,
+            test_attestation_trust(),
+        );
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("pq_pubkey")),
+            _ => panic!("expected pubkey mismatch error"),
         }
     }
 
     #[test]
     fn stateful_sign_hardfork_stale_activation_height_fails() {
         #[cfg(feature = "ml-dsa-65")]
-        let _no_signer = clear_sealed_signer_for_mock_pubkey_tests();
-        let pq = vec![0xDE; 48];
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
@@ -2692,14 +2735,12 @@ mod tests {
 
     #[test]
     fn stateful_framing_roundtrip_hardfork_after_arm() {
-        #[cfg(all(feature = "ml-dsa-65", not(feature = "reference-test-key")))]
-        let _signer_lock = clear_sealed_signer_for_mock_pubkey_tests();
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let _guard = install_reference_sealed_signer_for_tests();
-        #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
-        let pq = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
-        #[cfg(not(all(feature = "ml-dsa-65", feature = "reference-test-key")))]
-        let pq = vec![0xEE; 48];
+        #[cfg(feature = "ml-dsa-65")]
+        let Some((_pq_guard, pq)) = arm_test_pq_setup() else {
+            return;
+        };
+        #[cfg(not(feature = "ml-dsa-65"))]
+        let pq = arm_test_pq_setup().expect("pq");
         let mut state = EnclaveState::Unarmed;
 
         dispatch_command_with_state(
@@ -2779,6 +2820,33 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("sign_authorization_ticket failed")),
             _ => panic!("expected Error response"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "ml-dsa-65")]
+    fn arm_rejects_when_pq_signing_not_ready() {
+        let _cleared = clear_sealed_signer_for_mock_pubkey_tests();
+        assert!(!pq_signing_ready());
+        let pq = vec![0xAB; 48];
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pq,
+            measurement: b"m".to_vec(),
+            activated_at_height: 1,
+            source_ticket_hash: [0xCC; 32],
+        };
+        let err = arm_for_production(
+            &EnclaveState::Unarmed,
+            ArmForProductionRequest {
+                authorized_state: authorized.clone(),
+                recent_chain_proof: signed_recent_chain_proof(10, [0xDD; 32], vec![], &authorized),
+            },
+            test_attestation_trust(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::PqSigningUnavailable(_)
+        ));
     }
 
     #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]

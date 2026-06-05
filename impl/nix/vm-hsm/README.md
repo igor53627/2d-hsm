@@ -46,7 +46,15 @@ Pre-built `nixpkgs#legacyPackages.x86_64-linux.*` may work from cache; **compili
 
 See `scripts/write-measurement-manifest.sh`. Fields include `git_revision`, `flake_lock` (hash of `flake.lock`), `artifacts.production.sha256`, and `fork_spec_hash_input` for 2d tooling.
 
-**Note:** `protocol_measurement_label` for production is still `enclave-measurement-placeholder` until platform SNP/Nitro measurement is wired into `GET_MEASUREMENT`. Staging uses `prod-enclave-v1` (reference signer).
+**Not a TEE measurement source (until TASK-5 #4):** The manifest records **reproducible build inputs** (artifact SHA256 + git + lock hash). `protocol_measurement_label` for production is a **placeholder** (`enclave-measurement-placeholder`) matching the reference enclave until SNP/Nitro measurement is wired into `GET_MEASUREMENT`.
+
+| Do | Do not |
+|----|--------|
+| Use `fork_spec_hash_input` for hard-fork **build reproducibility** tickets | Whitelist on-chain producer `measurement` from manifest JSON alone |
+| Compare CI artifact SHA256 across rebuilds | Treat `protocol_measurement_label` as live attestation |
+| Wait for TASK-5 #4 for BP whitelist against real TEE `measurement` | Deploy `vm-production` to mainnet (lab trust only — see below) |
+
+Staging manifest label `prod-enclave-v1` matches the reference staging signer image, not production PQ provisioning.
 
 ## Phase B / TASK-5 guest profiles
 

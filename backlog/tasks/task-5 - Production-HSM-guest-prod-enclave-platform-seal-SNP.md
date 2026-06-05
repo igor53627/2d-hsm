@@ -77,12 +77,13 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 - [x] #1 NixOS guest can run **`enclave-vsock`** (prod) behind flake output `.#vm-production` (`guestProfile` staging|production); default `.#vm` stays staging.
 - [ ] #2 Guest image provisions **`TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE`** from sealed store or build-time secret injection policy (documented; never from vsock at runtime).
 - [x] #3 Lab path: `lab-production-vsock` + `TWOD_HSM_PQ_SEAL_*` / sealed blob in `.#vm-production-lab` (file-based; **not** release). Platform vTPM/SNP hook still open.
-- [ ] #4 `GET_MEASUREMENT` returns non-placeholder **`measurement`** for production profile when SNP/Nitro report is available; manifest schema documents artifact hash vs TEE measurement (roborev design debt closed or explicitly accepted).
+- [ ] #4 `GET_MEASUREMENT` returns non-placeholder **`measurement`** for production profile when SNP/Nitro report is available; manifest schema documents artifact hash vs TEE measurement (TASK-4 README + `write-measurement-manifest.sh` updated; live measurement still open here).
 - [ ] #5 `run-vm-hsm.sh` (or successor) launches NixOS qcow2 with **SNP attempted** on aya; pass/fail recorded; KVM fallback documented.
 - [x] #6 `run-nix-vm-guest-smoke-prod-lab.sh` — prod guest + sealed blob + `VSOCK_SMOKE_REQUIRE_PQ_READY=1` (aya verify on merge).
 - [x] #7 `impl/README.md` + `nix/vm-hsm/README.md` updated: production operator runbook (env, seal, trust, vsock CID); `impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`.
 - [x] #8 Full roborev matrix (Reduced 6890–6892 + 2×3 6893–6898, compact 6900); doc resolution for lab-trust naming (not mainnet `vm-production`).
-- [ ] #9 TASK-4 notes link here for “prod enclave in guest + SNP + measurement” closure.
+- [x] #9 TASK-4 notes link here for “prod enclave in guest + SNP + measurement” closure (TASK-4 In Progress; SNP + real measurement remain in this task).
+- [ ] #10 **Mainnet gate:** NixOS module or flake refuses **lab** `ProducerAttestationTrust` / lab PQ seal when `services.twod-hsm.productionMode = true` (or equivalent); `vm-production` / `vm-production-lab` outputs remain explicitly non-mainnet until platform trust + measurement ship.
 
 <!-- AC:END -->
 
@@ -90,7 +91,7 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 
 <!-- SECTION:PLAN:BEGIN -->
 
-### Phase 1 — Prod binary in guest (~3–5 days)
+### Phase 1 — Prod binary in guest (~3–5 days) — **Done** (transport smoke)
 
 - Extend `nixos-module.nix`: `services.twod-hsm.enclavePackage` / mode switch (`staging` vs `production`).
 - Systemd unit for `enclave-vsock` + required env (`TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE`, `TWOD_HSM_VSOCK_*`).
@@ -103,7 +104,7 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 
 ### Phase 3 — SNP launcher + measurement (~1 week)
 
-- Align `run-vm-hsm.sh` with yolo `memfd-private` / `sev-snp-guest` QEMU line.
+- SNP path: extend or replace `run-vm-hsm.sh` (today **KVM-only**, exits for `SEV_MODE=snp`); align with yolo `memfd-private` / `sev-snp-guest` QEMU line or keep Ubuntu `run-snp-smoke.sh` until unified.
 - Plumb platform report into `GET_MEASUREMENT`; update `write-measurement-manifest.sh` fields.
 - Re-run aya smokes; document SNP vs KVM in task notes.
 

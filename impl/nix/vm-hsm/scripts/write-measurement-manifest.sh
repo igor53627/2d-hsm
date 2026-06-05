@@ -15,6 +15,8 @@ PROD_SHA="$(sha256sum "$PROD" | awk '{print $1}')"
 STAGING_SHA="$(sha256sum "$STAGING" | awk '{print $1}')"
 
 # prod_protocol_measurement must match boot_lab_pq_seal::LAB_PROD_MEASUREMENT (enclave-protocol).
+# This label is NOT live TEE measurement — do not use for on-chain producer whitelist (TASK-5 #4).
+# fork_spec_hash_input binds reproducible *build* identity (artifact sha256 + git + flake_lock).
 jq -n \
   --arg schema_version "1" \
   --arg git_revision "$GIT_REVISION" \
