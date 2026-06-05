@@ -10,6 +10,12 @@
 agent = "codex"
 model = "gpt-5.5"
 
+# Exclude binary blobs from review prompts (codex UTF-8 failures). Lockfiles stay in scope.
+exclude_patterns = [
+  "**/*.sealed",
+  "**/*.bin",
+]
+
 [ci]
 # PR CI: three vendors × two lenses (6 cells). Per-agent models are not
 # configurable on `roborev ci review` — pin gemini/claude locally via scripts.

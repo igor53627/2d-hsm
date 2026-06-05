@@ -39,19 +39,21 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     assert byte_size(sign.ticket_hash) == 32
   end
 
-  test "ARM → GET_STATUS armed over UDS", %{socket_path: socket_path, session_bin: session_bin} do
+  test "ARM refused when pq_signing_ready is false (mock UDS server)", %{
+    socket_path: socket_path,
+    session_bin: session_bin
+  } do
     assert {:ok, session} = EnclaveProtocol.Session.connect(socket_path)
     on_exit(fn -> EnclaveProtocol.Session.close(session) end)
 
     assert {:ok, arm_frame} = EnclaveProtocol.TestFixtures.arm_frame(session_bin)
-    assert {:ok, %{status: "armed"}} = EnclaveProtocol.Session.arm_for_production(session, arm_frame)
+    assert {:ok, %{status: "refused"}} = EnclaveProtocol.Session.arm_for_production(session, arm_frame)
 
     assert {:ok, status} = EnclaveProtocol.Session.get_status(session)
-    assert status.armed
-    assert status.proof_finalized_height == 10_000_050
+    refute status.armed
   end
 
-  test "second hard-fork on another UDS connection is rejected (shared enclave state)",
+  test "hard-fork sign requires armed state on mock server (wire ARM fail-closed)",
        %{socket_path: socket_path, session_bin: session_bin} do
     assert {:ok, conn_a} = EnclaveProtocol.Session.connect(socket_path)
     assert {:ok, conn_b} = EnclaveProtocol.Session.connect(socket_path)
@@ -61,19 +63,22 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     end)
 
     assert {:ok, arm_frame} = EnclaveProtocol.TestFixtures.arm_frame(session_bin)
-    assert {:ok, %{status: "armed"}} =
+    assert {:ok, %{status: "refused"}} =
              EnclaveProtocol.Session.arm_for_production(conn_a, arm_frame)
 
     assert {:ok, hf1} = EnclaveProtocol.TestFixtures.hardfork_sign_frame(session_bin)
-    assert {:ok, sign} = EnclaveProtocol.Session.sign_authorization_ticket(conn_a, hf1)
-    assert byte_size(sign.signature) == 64
+
+    assert {:error, {:wire_error, %{reason: reason}}} =
+             EnclaveProtocol.Session.sign_authorization_ticket(conn_a, hf1)
+
+    assert reason =~ "requires the enclave to be armed" or reason =~ "sign_authorization_ticket"
 
     assert {:ok, hf2} = EnclaveProtocol.TestFixtures.second_hardfork_sign_frame(session_bin)
 
-    assert {:error, {:wire_error, %{code: 1, reason: reason}}} =
+    assert {:error, {:wire_error, %{reason: reason2}}} =
              EnclaveProtocol.Session.sign_authorization_ticket(conn_b, hf2)
 
-    assert reason =~ "only one HARD_FORK_ACTIVATION"
+    assert reason2 =~ "requires the enclave to be armed" or reason2 =~ "sign_authorization_ticket"
   end
 
   defp unique_socket_path do
@@ -113,7 +118,7 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
         :binary,
         :exit_status,
         {:args, []},
-        {:env, [{~c"2D_HSM_ENCLAVE_SOCKET", to_charlist(socket_path)}]}
+        {:env, [{~c"TWOD_HSM_ENCLAVE_SOCKET", to_charlist(socket_path)}]}
       ])
 
     Process.put(:enclave_uds_port, port)
@@ -121,11 +126,47 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
   end
 
   defp stop_uds_server(socket_path) do
-    if port = Process.get(:enclave_uds_port) do
-      Port.close(port)
+    try do
+      if port = Process.get(:enclave_uds_port) do
+        terminate_uds_port!(port)
+      end
+    rescue
+      _ -> :ok
+    after
+      Process.delete(:enclave_uds_port)
+      kill_uds_holders!(socket_path)
+      File.rm(socket_path)
+    end
+  end
+
+  # Port.close alone can leave enclave-uds-server running on macOS (orphan accumulation).
+  defp terminate_uds_port!(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} when is_integer(pid) and pid > 0 ->
+        _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+        Process.sleep(50)
+
+      _ ->
+        :ok
     end
 
-    File.rm(socket_path)
+    if Port.info(port) do
+      Port.close(port)
+    end
+  end
+
+  defp kill_uds_holders!(socket_path) do
+    case System.cmd("lsof", ["-t", socket_path], stderr_to_stdout: true) do
+      {out, 0} ->
+        for pid <- String.split(out, "\n", trim: true), pid != "" do
+          _ = System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+        end
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
   end
 
   defp wait_for_socket(path, 0), do: flunk("UDS server did not create #{path}")

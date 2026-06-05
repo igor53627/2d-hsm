@@ -4,10 +4,11 @@ This directory contains the reference implementation of the vsock protocol and e
 
 **All code here is high-risk** (see root `AGENTS.md` and `.roborev.toml`).
 
-## Layout (as of 2026-06-02)
+## Layout (as of 2026-06-04)
 
 | Path | Role |
 |------|------|
+| `nix/vm-hsm/` | **Primary production path (TASK-4):** flake → `enclave-vsock` / manifest JSON — see `nix/vm-hsm/README.md` |
 | `rust/enclave-protocol/` | Canonical wire format, state machine, ticket hashing, `RecentChainProof` crypto (TASK-3) |
 | `rust/pq-seal-v1/` | Offline `pq-seal-v1` CLI for v1 sealed PQ blobs (provisioning workstation) |
 | `rust/enclave-protocol/src/wire.rs` | Spec-aligned CBOR with **integer map keys** for all four commands |
@@ -63,6 +64,18 @@ TASK-3 crypto verification used reduced matrix + compact (`2d136ac`, `fddd3f0`, 
 
 ## Building and testing
 
+### Nix (production TEE binaries, Linux x86_64)
+
+```bash
+cd nix/vm-hsm
+nix flake lock   # first checkout
+nix build .#enclave .#enclave-staging .#measurement-manifest
+```
+
+CI publishes `manifest.json` from `.#measurement-manifest` (artifact `vm-hsm-measurement-manifest`). Use `enclave-staging` for aya vsock smokes; `enclave` is the release `enclave-vsock` binary (requires `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` at runtime).
+
+### Cargo (local dev)
+
 ```bash
 cd rust/enclave-protocol
 # Seal/provisioning CLI + ML-DSA unit tests (no reference-key / staging-host)
@@ -75,8 +88,8 @@ cargo test --features test-support,demo-mock-sign
 cargo test --features reference-test-key
 cargo build --bin enclave-uds-staging --features staging-host   # debug only; release + staging-host fails at compile time
 ./target/debug/enclave-uds-staging
-# Optional socket override (do not use 2D_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
-# 2D_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
+# Optional socket override (do not use TWOD_HSM_ENCLAVE_SOCKET — that is for the mock dev server):
+# TWOD_HSM_ENCLAVE_STAGING_SOCKET=~/.2d-hsm/my-staging.sock ./target/debug/enclave-uds-staging
 ```
 
 | Profile | Features | SIGN signature | Binaries |
@@ -127,7 +140,7 @@ At boot (production):
 1. Platform integration calls `set_pq_seal_v1_provisioning_root(root)` **once** (from vTPM / SNP VMPL / Nitro — not from vsock), or `boot_configure_pq_seal_v1_platform_root()` once a platform hook is linked.
 2. `install_sealed_pq_signer(sealed_blob, enclave_measurement)` with a **v1** blob (`2DHSMV1` magic).
 
-Labs (debug only): feature `platform-provisioning-from-file` reads `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo profile name `release`** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`. Custom Cargo profiles that do not report `PROFILE=release` are not covered; use a deploy-time feature audit until a second gate lands.
+Labs (debug only): feature `platform-provisioning-from-file` reads `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` (32 bytes). **Cargo profile name `release`** (`build.rs` → `release_build` cfg) triggers `compile_error!` if `reference-seal-v1-root`, `reference-test-key`, `staging-host`, or `platform-provisioning-from-file` are enabled — including `RUSTFLAGS='-C debug-assertions=on'`. Custom Cargo profiles that do not report `PROFILE=release` are not covered; use a deploy-time feature audit until a second gate lands.
 
 Staging/CI may use `reference-seal-v1-root` or `cargo test` (embedded test root). v0 XOR is **unit-test only**. **Do not** ship `reference-seal-v1-root` in deployment images.
 
@@ -154,13 +167,27 @@ cargo build --bin enclave-stdio-session --bin enclave-uds-server --features test
 cd ../../elixir-shim && mix test
 ```
 
+## Staging vsock (TASK-1 / production transport slice, Linux)
+
+```bash
+cd rust/enclave-protocol
+cargo build --bin enclave-vsock-staging --features staging-vsock   # debug + Linux only
+# Nitro-style: TWOD_HSM_VSOCK_CID=3 TWOD_HSM_VSOCK_PORT=5000
+# SEV dev host (aya, vsock_loopback): TWOD_HSM_VSOCK_CID=1 TWOD_HSM_VSOCK_PORT=5000
+./target/debug/enclave-vsock-staging
+```
+
+Same shared `EnclaveState` + ML-DSA staging signer as `enclave-uds-staging`. **Build on Linux** (e.g. SEV dev host `aya`, CI, Nitro parent) — not a runnable vsock server on macOS (compile-only stub there). At runtime the host needs vsock enabled (`vmw_vsock_vmci_transport` / `vhost_vsock`); bind errors such as `Cannot assign requested address` mean CID/port are wrong for that machine.
+
+**Production** `enclave-vsock` (`production-vsock`, release-only via `nix build .#enclave`): requires `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` (32-byte Ed25519 VK) at boot; platform PQ seal + sealed signer still need vTPM/SNP/Nitro hooks.
+
 ## Staging UDS (TASK-1, PR #4)
 
 ```bash
 cd rust/enclave-protocol
 cargo build --bin enclave-uds-staging --features staging-host
 ./target/debug/enclave-uds-staging   # default ~/.2d-hsm/enclave-staging.sock
-# Override: 2D_HSM_ENCLAVE_STAGING_SOCKET — operator must use a private parent (mode 0700,
+# Override: TWOD_HSM_ENCLAVE_STAGING_SOCKET — operator must use a private parent (mode 0700,
 # owned by the server UID); the binary does not enforce this on custom paths.
 ```
 
@@ -169,6 +196,8 @@ cargo build --bin enclave-uds-staging --features staging-host
 - Hardware-backed root derivation (vTPM / SNP VMPL / Nitro) wired into `boot_configure_pq_seal_v1_platform_root`
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
-- Production **AF_VSOCK** transport (Unix socket + stdio are reference dev paths)
+- **Mainnet production guest:** platform attestation trust + SNP measurement (see `nix/vm-hsm/README.md`; `.#vm-production` is lab-trust transport smoke only)
+
+Host↔guest **AF_VSOCK** smokes are green via Nix (`impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`). Unix socket + stdio remain dev paths.
 
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` for phased roadmap.

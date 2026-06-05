@@ -5,7 +5,7 @@
 **Status**: Draft **v0.2** — post-TASK-3 crypto gate; ML-DSA-65 + dual-path aligned with 2d TASK-122 / theory-378 TASK-92.1.8  
 **Goal**: Define the communication protocol between the 2D host (Block Producer) and the minimal post-quantum signing service running inside a TEE (Nitro Enclave / SEV-SNP).
 
-**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
+**Changelog v0.2:** §2 cryptography profile (ML-DSA-65), dual-path (hot TEE vs slow MAYO-iO), terminology (TEE remote attestation vs Producer Chain Attestation). Wire sizes for PQ signatures (TASK-1). §2.4 AF_VSOCK bind env (`TWOD_HSM_VSOCK_*`, not `2D_HSM_*` — systemd-safe). Empty `pq_pubkey` when `pq_signing_ready == false` (transport/bootstrap); attestation↔key binding applies only when a signer is installed. Host migration: empty `pq_pubkey` is valid on the wire when `pq_signing_ready == false`. Legacy `2D_HSM_*` env names accepted until **protocol v2** (no removal date before first external deployment). Ready for roborev Reduced matrix on `backlog/docs/*vsock*`.
 
 ## 1. Why this API exists
 
@@ -32,7 +32,7 @@ The only communication channel we trust is **vsock** (AF_VSOCK).
 | **Message form** | **Pure ML-DSA** over the raw 32-byte `ticketHash` (or block digest) — **not** HashML-DSA pre-hash |
 | **Context `ctx`** | Empty (`len(ctx) = 0`) unless a future spec version defines a non-empty domain string (both enclave and 2d precompile must match) |
 | **RNG** | Hedged signing requires a CSPRNG inside the TEE (platform TRNG / NSM-seeded `getrandom`); silent RNG failure must abort sign (fail closed) |
-| **Wire sizes (production)** | `pq_pubkey` **1952** bytes; `signature` **3309** bytes per ML-DSA-65 |
+| **Wire sizes (production)** | `pq_pubkey` **1952** bytes when `pq_signing_ready == true`, else **empty** (`b''`); `signature` **3309** bytes per ML-DSA-65 |
 | **Protocol version** | Two layers (must stay in sync): (1) **framed** byte after the 4-byte length prefix (`PROTOCOL_VERSION`, currently **1**); (2) **inner** CBOR map key `1` on ARM / GET_STATUS / SIGN payloads (also **1**). Stay on **v1** until an external deployment exists; use `pq_signing_ready` + signature length (3309 B) to detect mock-era peers |
 
 **Default / production reference builds** do not embed a PQ secret key: `pq_signing_ready` is **false** and `SIGN_AUTHORIZATION_TICKET` returns `PqSigningUnavailable`. For local demos only, enable `test-support` + `demo-mock-sign` (64-byte mock PQ sig; `pq_signing_ready` stays **false**). For `cargo test` with real ML-DSA-65 sizes, enable `reference-test-key` (implies `ml-dsa-65`): tests install the NIST test-vector key via the v0 sealed-blob path — **not** a production signer and **not** enabled in standalone binaries. Hosts and precompiles **must not** treat 64-byte PQ signatures as valid on-chain.
@@ -57,7 +57,7 @@ Reference implementation status: v1 **unseal + install** in `ml-dsa-65` builds w
 **Scope of ML-DSA-65 inside this enclave:**
 - Canonical block-root / header-digest signing (BlockProducer hot path).
 - All `AuthorizationTicket` signatures (`SIGN_AUTHORIZATION_TICKET`).
-- `pq_pubkey` returned by `GET_MEASUREMENT` / armed state.
+- `pq_pubkey` returned by `GET_MEASUREMENT` / armed state (empty until PQ signer installed — see §8 GET_MEASUREMENT).
 
 ### 2.2 Dual-path policy (hot vs slow)
 
@@ -88,6 +88,27 @@ Do **not** conflate them:
 - The Ed25519 verifying key (`ProducerAttestationTrust`) is **not** derived from `pq_pubkey` (see §9.3).
 
 User and bridge transactions on 2d remain **secp256k1** until a separate wallet PQ migration (2d TASK-24). This service does not sign Ethereum-style user txs.
+
+### 2.4 AF_VSOCK transport (bind address)
+
+The reference enclave listens on **AF_VSOCK** before accepting framed commands (§5+). Operator configuration uses environment variables on the **guest** (TEE VM / enclave process):
+
+| Variable | Required | Default (reference) | Semantics |
+|----------|----------|---------------------|-----------|
+| `TWOD_HSM_VSOCK_CID` | no | `4294967295` (`VMADDR_CID_ANY`) | VSock CID the enclave **binds** inside the guest (Nitro dev may use `3`; QEMU/SEV guests often set explicitly, e.g. `42`) |
+| `TWOD_HSM_VSOCK_PORT` | no | `5000` | VSock port (service listener) |
+
+**Naming rule:** Use the `TWOD_` prefix, not `2D_`. POSIX and **systemd** reject environment keys that start with a digit, so `2D_HSM_VSOCK_CID` in a unit file is silently ignored and the process falls back to defaults (misconfiguration).
+
+**Legacy `2D_HSM_*` (sunset):** The reference crate accepts deprecated `2D_HSM_*` only when the canonical `TWOD_HSM_*` variable is unset (`env_config::var_twod`). Removal is planned for **wire/protocol v2** (next breaking version after the first external deployment); until v1 is retired in the field, operators must migrate unit files to `TWOD_*`.
+
+**Host connect address (untrusted orchestrator):** The host connects to the guest using the hypervisor-assigned guest CID (e.g. QEMU `-device vhost-vsock-pci,guest-cid=42` → host uses CID **42**, while the guest may bind with `TWOD_HSM_VSOCK_CID=42` on virtio-vsock). Nitro loopback dev hosts often use CID `1` or `4294967295` (`VMADDR_CID_ANY`) for bind; production QEMU/SEV guests must match `guest-cid`.
+
+**Addressing only:** `TWOD_HSM_VSOCK_CID` selects which local vsock address the enclave **binds** — it is **not** an authentication boundary. Default `VMADDR_CID_ANY` means “accept on whichever guest CID the hypervisor assigned”; security rests on TEE measurement, sealed PQ provisioning, and command invariants (§9), not on pinning this integer.
+
+**Security:** Vsock is still an untrusted channel for *request content*; only the enclave-side bind + TEE measurement establish which process speaks the protocol. Framing and command semantics are unchanged by transport env.
+
+**Fatal state (reference socket servers):** If the shared `EnclaveState` mutex is poisoned (panic while holding the lock), the reference `enclave-protocol` socket servers call `process::exit(1)` so a supervisor restarts a clean process (NixOS module: `Restart = "always"`, `RestartSec = 3`). This is fail-closed: corrupted in-memory authorization state is not served. Recovery assumes the poison trigger is not replayed on every reconnect (otherwise exit→restart cycles degrade availability). `exit` does not run Rust destructors; PQ key material relies on TEE memory teardown / platform guarantees rather than `Drop`-time zeroization.
 
 ## 3. Design Principles
 
@@ -148,14 +169,17 @@ Response:
 {
   "measurement": h'....',           // raw SEV-SNP measurement or Nitro PCRs
   "attestation": h'....',           // TEE remote attestation document (platform — not §9 Ed25519)
-  "pq_pubkey": h'....',             // ML-DSA-65 public key (1952 bytes in production)
-  "supported_ticket_types": [0, 1]  // static capability list (see formal CBOR section)
+  "pq_pubkey": h'....',             // empty when pq_signing_ready is false; 1952 bytes (ML-DSA-65) when true
+  "supported_ticket_types": [0, 1], // static capability list (see formal CBOR section)
+  "pq_signing_ready": false
 }
 ```
 
 `supported_ticket_types` is a static capability list, not current readiness. Type 1 additionally requires armed state (`GET_STATUS`).
 
-Security invariant: The enclave must only return a measurement + key that are bound together in the **TEE remote attestation** document (§2.3).
+Security invariant: When `pq_signing_ready == true`, `measurement` and `pq_pubkey` MUST be bound together in the **TEE remote attestation** document (§2.3). When `pq_signing_ready == false`, `pq_pubkey` is empty (`b''`); hosts use `measurement` + `attestation` for image identity only — no operational PQ key is advertised yet.
+
+**Operational readiness:** If `pq_signing_ready == false`, the enclave is **non-operational** for producer duties. Hosts and precompiles **MUST NOT** call `ARM_FOR_PRODUCTION`, register the enclave as the active producer, or expect valid on-chain PQ signatures. The enclave **MUST** reject `ARM_FOR_PRODUCTION` with a wire error until an operational PQ signer is installed.
 
 #### 2. `SIGN_AUTHORIZATION_TICKET`
 
@@ -282,6 +306,8 @@ Every message on the vsock is:
 
 **Maximum frame size (normative):** `total_length` MUST NOT exceed **1 MiB** (`1_048_576` bytes). Host and enclave implementations MUST reject larger length prefixes before allocating the remainder of the frame. Reference constant: `enclave-protocol::MAX_MESSAGE_SIZE` (Rust); Elixir shim compares the same limit against `total_len` in `EnclaveProtocol.Framing`.
 
+**Oversize length prefix (peer-visible behavior):** After reading the 4-byte `total_length`, if the value exceeds 1 MiB the implementation MUST NOT allocate the body. The reference **socket servers** (UDS/vsock `serve_framed_connection`) **close the connection without sending an application CBOR frame** (the request type is unknown — only the length prefix was read). Host clients building frames locally (Elixir `Framing`, smoke scripts) MUST reject oversize before send and return a local error (e.g. `{:frame_too_large, len}`) without transmitting the frame. In-process stdio/test helpers may encode a wire `Error` map when a full frame is already buffered; that path is not used on the production socket transport.
+
 We will use **canonical CBOR** (RFC 7049 section 3.9) for all payloads where determinism matters.
 
 ---
@@ -313,7 +339,7 @@ Error = {
   1: 1,                    ; version
   2: bytes,                ; measurement (raw SEV-SNP measurement or equivalent)
   3: bytes,                ; attestation document (full, as returned by the platform)
-  4: bytes,                ; pq_pubkey (ML-DSA-65: 1952 bytes production)
+  4: bytes,                ; pq_pubkey — empty (0 bytes) when key 6 is false; 1952 bytes (ML-DSA-65) when key 6 is true
   5: [int]                 ; supported_ticket_types (e.g. [0, 1])
   6: bool                  ; pq_signing_ready (false unless TEE has operational ML-DSA-65 signing key)
 }
@@ -325,7 +351,7 @@ Error = {
 
 **Error Response:** standard Error map.
 
-**Security note:** The enclave must ensure that `measurement` + `pq_pubkey` are bound together in the attestation document.
+**Security note:** When key `6` (`pq_signing_ready`) is **true**, `measurement` and `pq_pubkey` MUST be bound in the platform attestation document. When key `6` is **false**, key `4` is empty and hosts MUST NOT require a PQ key binding — only measurement/attestation image identity applies until provisioning completes. Hosts **MUST NOT** arm or treat the enclave as the signing producer while key `6` is **false**.
 
 ---
 
@@ -404,6 +430,8 @@ For both types:
 
 Encode/decode with integer map keys is implemented in `impl/rust/enclave-protocol/src/wire.rs` (`encode_arm_for_production_request` / `decode_arm_for_production_request`).
 
+**Precondition:** `pq_signing_ready` MUST be **true** (operational ML-DSA signer installed). If **false**, the enclave MUST return a wire error and hosts MUST NOT send this command.
+
 **Success Response:**
 ```cbor
 { 1: "armed" }
@@ -419,7 +447,8 @@ Encode/decode with integer map keys is implemented in `impl/rust/enclave-protoco
 ```
 
 **Security Invariants (updated after Codex security review + Claude-code design review, 2026-06-05):**
-- The enclave **must** verify that the `pq_pubkey` + `measurement` combination is consistent with its own attestation.
+- When an operational PQ signer is installed (`pq_signing_ready == true`), the enclave **must** verify that `pq_pubkey` + `measurement` are consistent with its own attestation. When no signer is installed, `GET_MEASUREMENT` returns empty `pq_pubkey` and this binding does not apply.
+- **`ARM_FOR_PRODUCTION` requires `pq_signing_ready == true`:** hosts **must not** arm a non-operational enclave; the enclave **must** reject the command otherwise (fail closed).
 - `recent_chain_proof` **MUST NOT be null** for `ARM_FOR_PRODUCTION` (and for signing hard-fork tickets). A compromised host must not be able to arm the enclave or obtain signatures under a stale or attacker-chosen view.
 - The enclave **must** reject (fail closed) if the proof is absent, stale, not properly rooted, or does not prove the expected authorization state.
 - For HARD_FORK_ACTIVATION specifically: the enclave **must currently be armed** as the active producer **and** the `pq_pubkey` in the request **must** match the armed key (strong AND, not OR).

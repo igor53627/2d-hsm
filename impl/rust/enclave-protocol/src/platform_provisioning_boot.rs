@@ -10,7 +10,7 @@ use crate::ProtocolError;
 ///
 /// Production: link a platform hook or call [`set_pq_seal_v1_provisioning_root`] directly from
 /// Nitro/SEV startup code. With feature `platform-provisioning-from-file`, reads
-/// `2D_HSM_PQ_SEAL_V1_ROOT_FILE` (32 raw bytes) for integration testing only.
+/// `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` (32 raw bytes) for integration testing only.
 #[cfg(feature = "ml-dsa-65")]
 pub fn boot_configure_pq_seal_v1_platform_root() -> Result<(), ProtocolError> {
     let root = derive_platform_provisioning_root_v1()?;
@@ -21,12 +21,15 @@ pub fn boot_configure_pq_seal_v1_platform_root() -> Result<(), ProtocolError> {
 fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
     #[cfg(feature = "platform-provisioning-from-file")]
     {
-        use std::env;
-        let path = env::var("2D_HSM_PQ_SEAL_V1_ROOT_FILE").map_err(|_| {
-            ProtocolError::PqSigningUnavailable(
-                "2D_HSM_PQ_SEAL_V1_ROOT_FILE not set (expected path to 32-byte provisioning root)",
-            )
-        })?;
+        use crate::env_config::{
+            var_twod, LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE, TWOD_HSM_PQ_SEAL_V1_ROOT_FILE,
+        };
+        let path = var_twod(TWOD_HSM_PQ_SEAL_V1_ROOT_FILE, LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE)
+            .map_err(|_| {
+                ProtocolError::PqSigningUnavailable(
+                    "TWOD_HSM_PQ_SEAL_V1_ROOT_FILE not set (expected path to 32-byte provisioning root)",
+                )
+            })?;
         return read_provisioning_root_file(path.as_ref());
     }
     #[cfg(not(feature = "platform-provisioning-from-file"))]
@@ -40,11 +43,10 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
 
 #[cfg(all(feature = "ml-dsa-65", feature = "platform-provisioning-from-file"))]
 fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], ProtocolError> {
-    let bytes = std::fs::read(path).map_err(|_| {
-        ProtocolError::PqSigningUnavailable(
-            "failed to read 2D_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
-        )
-    })?;
+    let bytes = crate::boot_input::read_boot_file(
+        path,
+        "failed to read TWOD_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
+    )?;
     bytes.try_into().map_err(|_| {
         ProtocolError::PqSigningUnavailable(
             "provisioning root file must be exactly 32 bytes",

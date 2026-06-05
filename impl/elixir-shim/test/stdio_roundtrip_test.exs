@@ -34,7 +34,7 @@ defmodule EnclaveProtocol.StdioRoundtripTest do
     assert resp.attestation == "attestation-placeholder"
     assert resp.supported_ticket_types == [0, 1]
     assert resp.pq_signing_ready == false
-    assert byte_size(resp.pq_pubkey) >= 4
+    assert resp.pq_pubkey == ""
   end
 
   test "framing roundtrip without bridge" do

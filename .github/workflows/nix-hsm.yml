@@ -1,0 +1,99 @@
+name: nix-hsm
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    paths:
+      - 'impl/nix/vm-hsm/**'
+      - 'impl/rust/enclave-protocol/**'
+      - 'impl/elixir-shim/**'
+      - '.github/workflows/nix-hsm.yml'
+  pull_request:
+    paths:
+      - 'impl/nix/vm-hsm/**'
+      - 'impl/rust/enclave-protocol/**'
+      - 'impl/elixir-shim/**'
+      - '.github/workflows/nix-hsm.yml'
+
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: impl/rust/enclave-protocol
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Default unit tests
+        run: cargo test
+
+      - name: ARM / PQ path (reference-test-key)
+        run: cargo test --features reference-test-key
+
+      - name: Mock UDS profile (test-support, demo-mock-sign)
+        run: cargo test --features test-support,demo-mock-sign
+
+  elixir-test:
+    runs-on: ubuntu-latest
+    needs: rust-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.17"
+          otp-version: "27"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Elixir shim integration tests
+        run: |
+          cd impl/elixir-shim
+          mix deps.get
+          cd ../rust/enclave-protocol
+          cargo build --bin enclave-uds-server --bin enclave-stdio-session \
+            --features test-support,demo-mock-sign
+          cd ../../elixir-shim
+          mix test
+
+  build:
+    needs: [rust-test, elixir-test]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: impl/nix/vm-hsm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v3
+
+      - name: Build production enclave
+        run: nix build --no-update-lock-file .#enclave --print-out-paths
+
+      - name: Build staging enclave
+        run: nix build --no-update-lock-file .#enclave-staging --print-out-paths
+
+      - name: Build NixOS vm runner (Phase B)
+        run: nix build --no-update-lock-file .#vm --print-out-paths
+
+      - name: Build production NixOS vm runners
+        run: |
+          nix build --no-update-lock-file .#vm-production --print-out-paths
+          nix build --no-update-lock-file .#vm-production-lab --print-out-paths
+
+      - name: Build measurement manifest
+        run: |
+          nix build --no-update-lock-file .#measurement-manifest --out-link result
+          jq . result/manifest.json
+
+      - name: Upload measurement manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-hsm-measurement-manifest
+          path: impl/nix/vm-hsm/result/manifest.json
+          if-no-files-found: error
