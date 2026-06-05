@@ -70,7 +70,7 @@ SEV_MODE=sev MEMORY=4096 VCPUS=2 ./run-guest-vm.sh
 ./host-guest-vsock-smoke.sh
 ```
 
-**Inside the guest**, bind uses `TWOD_HSM_VSOCK_CID=42` (must match QEMU `guest-cid`). **On the host**, connect to `GUEST_CID=42` (`vhost-vsock-pci`). All operator env vars use the `TWOD_` prefix (not `2D_`) — see vsock spec §2.4 and `impl/rust/enclave-protocol/src/env_config.rs`.
+**On the host**, connect to `GUEST_CID=42` (`vhost-vsock-pci`, same as QEMU `guest-cid`). **Inside the Ubuntu SNP cloud guest**, the enclave binds `TWOD_HSM_VSOCK_BIND_CID=4294967295` (`VMADDR_CID_ANY`). NixOS vm-hsm uses `TWOD_HSM_VSOCK_CID=42` in-module (that kernel accepts it). All operator env vars use the `TWOD_` prefix — see `impl/rust/enclave-protocol/src/vsock_listen.rs`.
 
 **SNP host prep** (once per machine):
 

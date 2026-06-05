@@ -12,6 +12,8 @@ SSH_OPTS="$(twod_hsm_ssh_opts)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BIN="${HSM_BIN:-$(twod_hsm_default_hsm_bin "$ROOT")}"
 GUEST_DIR="${GUEST_DIR:-/opt/2d-hsm}"
+# Inside the VM, bind VMADDR_CID_ANY; host still connects to QEMU guest-cid (default 42).
+BIND_CID="${TWOD_HSM_VSOCK_BIND_CID:-4294967295}"
 WAIT_READY="${GUEST_WAIT_READY:-0}"
 READY_TIMEOUT="${GUEST_READY_TIMEOUT:-60}"
 
@@ -32,7 +34,7 @@ ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
 
 ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
   "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \
-   nohup env TWOD_HSM_VSOCK_CID=42 TWOD_HSM_VSOCK_PORT=5000 \
+   nohup env TWOD_HSM_VSOCK_CID=${BIND_CID} TWOD_HSM_VSOCK_PORT=5000 \
    ${GUEST_DIR}/enclave-vsock-staging > /tmp/enclave-vsock-staging.log 2>&1 & \
    sleep 2; cat /tmp/enclave-vsock-staging.log" || true
 
