@@ -1715,20 +1715,20 @@ mod tests {
 
     #[cfg(all(feature = "test-support", feature = "demo-mock-sign"))]
     #[test]
-    fn process_framed_session_arm_status_sign_hardfork() {
+    fn process_framed_session_rejects_arm_when_pq_signing_not_ready() {
         use crate::host_test_fixtures::sample_arm_for_production_frame;
         use crate::{
             decode_arm_for_production_response, decode_get_status_response,
-            decode_sign_authorization_ticket_response, encode_get_status_request,
-            encode_sign_authorization_ticket_request,
+            encode_get_status_request, is_wire_error_payload,
         };
 
+        assert!(!pq_signing_ready());
         let mut session = HostSession::reference_test();
         let arm_frame = sample_arm_for_production_frame();
         let arm_resp_frame = process_framed_with_session(&arm_frame, &mut session).unwrap();
         let arm_decoded = decode_message(&arm_resp_frame).unwrap();
         let arm_body = decode_arm_for_production_response(&arm_decoded.payload).unwrap();
-        assert_eq!(arm_body.status, "armed");
+        assert_eq!(arm_body.status, "refused");
 
         let status_payload =
             encode_get_status_request(&GetStatusRequest { version: 1 }).unwrap();
@@ -1738,30 +1738,7 @@ mod tests {
             process_framed_with_session(&status_frame, &mut session).unwrap();
         let status_decoded = decode_message(&status_resp_frame).unwrap();
         let status = decode_get_status_response(&status_decoded.payload).unwrap();
-        assert!(status.armed);
-
-        let pq = vec![0xDE; 48];
-        let ticket = AuthorizationTicketPayload {
-            ticket_type: 1,
-            nonce: 99,
-            context_hash: [0xAB; 32],
-            activation_height: 10_500_000,
-            new_measurement: b"hf-meas".to_vec(),
-            pq_pubkey: pq,
-            fork_spec_hash: Some([0xEF; 32]),
-            new_header_version: Some(3),
-        };
-        let sign_payload =
-            encode_sign_authorization_ticket_request(&SignAuthorizationTicketRequest { ticket })
-                .unwrap();
-        let sign_frame =
-            encode_message(MessageType::SignAuthorizationTicket, &sign_payload).unwrap();
-        let sign_resp_frame = process_framed_with_session(&sign_frame, &mut session).unwrap();
-        let sign_decoded = decode_message(&sign_resp_frame).unwrap();
-        let sign_resp =
-            decode_sign_authorization_ticket_response(&sign_decoded.payload).unwrap();
-        assert_eq!(sign_resp.signature.len(), 64);
-        assert_eq!(sign_resp.ticket_hash.len(), 32);
+        assert!(!status.armed);
     }
 
     #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
@@ -1847,7 +1824,6 @@ mod tests {
     #[cfg(all(feature = "test-support", feature = "demo-mock-sign"))]
     #[test]
     fn shared_enclave_state_across_connections_rejects_second_hardfork() {
-        use crate::host_test_fixtures::sample_arm_for_production_frame;
         use crate::{
             decode_sign_authorization_ticket_response, decode_wire_error, encode_message,
             encode_sign_authorization_ticket_request, is_wire_error_payload, peek_msg_type_from_frame,
@@ -1856,15 +1832,30 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let trust = HostSession::reference_test().attestation_trust;
-        let state = Arc::new(Mutex::new(EnclaveState::Unarmed));
-
-        let arm_frame = sample_arm_for_production_frame();
-        {
-            let mut guard = state.lock().unwrap();
-            process_framed_with_shared_state(&arm_frame, &mut guard, trust).unwrap();
-        }
-
         let pq = vec![0xDE; 48];
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pq.clone(),
+            measurement: b"m".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
+        let proof = signed_recent_chain_proof(
+            10_000_050,
+            [0xFE; 32],
+            vec![[0xAA; 32]],
+            &authorized,
+        );
+        // demo-mock-sign cannot ARM over the wire (pq_signing_ready is false); seed armed state
+        // directly to exercise second hard-fork rejection while "armed".
+        let state = Arc::new(Mutex::new(EnclaveState::Armed(EnclaveArmedState {
+            proof,
+            attestation_trust: trust,
+            authorized_activated_at_height: authorized.activated_at_height,
+            authorized_measurement: authorized.measurement,
+            authorized_pq_pubkey: authorized.pq_pubkey,
+            source_ticket_hash: authorized.source_ticket_hash,
+            pending_hard_fork_height: None,
+        })));
         let first_ticket = AuthorizationTicketPayload {
             ticket_type: 1,
             nonce: 1,
@@ -2200,6 +2191,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "ml-dsa-65"))]
     fn arm_for_production_rejects_when_pq_signing_not_ready_on_default_profile() {
         assert!(!pq_signing_ready());
         let authorized = AuthorizedProducerState {
