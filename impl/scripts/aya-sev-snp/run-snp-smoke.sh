@@ -16,7 +16,7 @@ export GUEST_CID="${GUEST_CID:-42}"
 export SNP_BIOS
 SNP_BIOS="$(twod_hsm_snp_ovmf_path)"
 export HSM_BIN
-HSM_BIN="$(twod_hsm_default_hsm_bin "$ROOT")"
+HSM_BIN="$(twod_hsm_snp_hsm_bin "$ROOT")"
 
 if [[ ! -x "$QEMU_BIN" ]] || ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-guest; then
   echo "Run ./install-qemu-snp.sh first (need sev-snp-guest)" >&2

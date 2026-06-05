@@ -88,6 +88,29 @@ twod_hsm_nix_vm_link() {
   printf '%s/vm-hsm-runner-%s' "$(twod_hsm_cache_nix)" "$attr"
 }
 
+# Ubuntu SNP cloud guest needs a host-glibc binary (not Nix-store interpreter).
+twod_hsm_snp_hsm_bin() {
+  local repo_root=$1
+  if [[ -n "${SNP_HSM_BIN:-}" && -x "${SNP_HSM_BIN}" ]]; then
+    printf '%s' "$SNP_HSM_BIN"
+    return 0
+  fi
+  local cargo_bin
+  cargo_bin="${repo_root}/impl/rust/enclave-protocol/target/debug/enclave-vsock-staging"
+  if [[ -x "$cargo_bin" ]]; then
+    printf '%s' "$cargo_bin"
+    return 0
+  fi
+  if command -v cargo >/dev/null; then
+    echo "building enclave-vsock-staging for SNP guest (cargo)..." >&2
+    (cd "${repo_root}/impl/rust/enclave-protocol" \
+      && cargo build --bin enclave-vsock-staging --features staging-vsock) >&2
+    [[ -x "$cargo_bin" ]] && printf '%s' "$cargo_bin" && return 0
+  fi
+  echo "twod_hsm_snp_hsm_bin: need cargo-built enclave-vsock-staging on Ubuntu guest" >&2
+  return 1
+}
+
 twod_hsm_default_hsm_bin() {
   local repo_root=$1
   if [[ -n "${HSM_BIN:-}" && -x "${HSM_BIN}" ]]; then
