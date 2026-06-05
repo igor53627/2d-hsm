@@ -127,10 +127,38 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
 
   defp stop_uds_server(socket_path) do
     if port = Process.get(:enclave_uds_port) do
-      Port.close(port)
+      terminate_uds_port!(port)
+      Process.delete(:enclave_uds_port)
     end
 
+    kill_uds_holders!(socket_path)
     File.rm(socket_path)
+  end
+
+  # Port.close alone can leave enclave-uds-server running on macOS (orphan accumulation).
+  defp terminate_uds_port!(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} when is_integer(pid) and pid > 0 ->
+        _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+        Process.sleep(50)
+
+      _ ->
+        :ok
+    end
+
+    Port.close(port)
+  end
+
+  defp kill_uds_holders!(socket_path) do
+    case System.cmd("lsof", ["-t", socket_path], stderr_to_stdout: true) do
+      {out, 0} ->
+        for pid <- String.split(out, "\n", trim: true), pid != "" do
+          _ = System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   defp wait_for_socket(path, 0), do: flunk("UDS server did not create #{path}")
