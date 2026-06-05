@@ -27,3 +27,4 @@ Thumbs.db
 *.log
 impl/solidity/.forge-crosscheck/
 impl/solidity/out/
+result
