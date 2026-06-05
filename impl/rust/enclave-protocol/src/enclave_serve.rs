@@ -65,6 +65,9 @@ fn lock_enclave_state(
     state: &Arc<Mutex<EnclaveState>>,
 ) -> Result<std::sync::MutexGuard<'_, EnclaveState>, ProtocolError> {
     state.lock().map_err(|_| {
+        eprintln!(
+            "FATAL: shared enclave state mutex poisoned — stateful requests will fail until supervisor restart"
+        );
         ProtocolError::WireProtocol("shared enclave state mutex poisoned")
     })
 }

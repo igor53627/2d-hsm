@@ -40,8 +40,8 @@ Heavy assets live on the host at **`TWOD_HSM_CACHE`** (default `/var/cache/2d-hs
 ```bash
 cd impl/scripts/aya-sev-snp
 ./warm-smoke-cache.sh
-# Optional SNP golden bake (needs /opt/amde-ovmf/OVMF.fd):
-# TWOD_HSM_BAKE_SNPDISK=1 ./warm-smoke-cache.sh
+# Skip SNP golden bake (default is on when no golden disk exists; needs /opt/amde-ovmf/OVMF.fd):
+# TWOD_HSM_BAKE_SNPDISK=0 ./warm-smoke-cache.sh
 ```
 
 **SNP Ubuntu guest notes:** cargo `enclave-vsock-staging` (glibc), bind `VMADDR_CID_ANY` (`4294967295`) inside VM; host connects to QEMU `guest-cid=42`. Golden boot skips cloud-init seed.

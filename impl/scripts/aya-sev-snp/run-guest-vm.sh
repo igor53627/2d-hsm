@@ -29,11 +29,6 @@ if [[ "${TWOD_HSM_SKIP_CLOUDINIT:-0}" != "1" && ! -f "$CLOUDINIT" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$SNP_BIOS" ]]; then
-  echo "Missing SNP BIOS: ${SNP_BIOS:-<unset>} (set SNP_BIOS)" >&2
-  exit 1
-fi
-
 USE_SNP=0
 SEV_OPTS=""
 MACHINE_OPTS="q35"
@@ -77,6 +72,10 @@ else
 fi
 
 if [[ "$USE_SNP" == 1 ]]; then
+  if [[ ! -f "$SNP_BIOS" ]]; then
+    echo "Missing SNP BIOS: ${SNP_BIOS:-<unset>} (set SNP_BIOS)" >&2
+    exit 1
+  fi
   exec $QEMU_BIN \
     -enable-kvm -cpu "$QEMU_CPU" -machine q35 \
     -smp "$VCPUS" -m "${MEMORY}M,slots=5,maxmem=$((MEMORY + 8192))M" -no-reboot \

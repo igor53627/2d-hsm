@@ -15,8 +15,14 @@ export VCPUS="${VCPUS:-2}"
 export GUEST_CID="${GUEST_CID:-42}"
 export SNP_BIOS
 SNP_BIOS="$(twod_hsm_snp_ovmf_path)"
+if [[ -n "${HSM_BIN:-}" && -x "${HSM_BIN}" ]]; then
+  :
+elif [[ -n "${SNP_HSM_BIN:-}" && -x "${SNP_HSM_BIN}" ]]; then
+  HSM_BIN="$SNP_HSM_BIN"
+else
+  HSM_BIN="$(twod_hsm_snp_hsm_bin "$ROOT")"
+fi
 export HSM_BIN
-HSM_BIN="$(twod_hsm_snp_hsm_bin "$ROOT")"
 
 if [[ ! -x "$QEMU_BIN" ]] || ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-guest; then
   echo "Run ./install-qemu-snp.sh first (need sev-snp-guest)" >&2
@@ -61,11 +67,17 @@ nohup ./run-guest-vm.sh >"$LOG" 2>&1 &
 QEMU_PID=$!
 echo "QEMU pid=$QEMU_PID log=$LOG bios=$SNP_BIOS"
 
+if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+  echo "run-snp-smoke: QEMU exited immediately after launch" >&2
+  tail -30 "$LOG" >&2 || true
+  exit 1
+fi
+
 ready_timeout="$(twod_hsm_snp_ssh_ready_timeout)"
 # Golden disk: SSH is enough (ready marker may be absent on older bakes).
 require_ready=0
 
-if ! twod_hsm_wait_guest_ssh 2222 "$ready_timeout" "$LOG" "$require_ready"; then
+if ! twod_hsm_wait_guest_ssh 2222 "$ready_timeout" "$LOG" "$require_ready" "$QEMU_PID"; then
   echo "run-snp-smoke: guest SSH/ready timeout (${ready_timeout}s)" >&2
   echo "  Hint: ./warm-smoke-cache.sh (bakes golden disk + fixes cloud-init)" >&2
   exit 1

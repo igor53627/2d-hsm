@@ -35,12 +35,30 @@ ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
 if ! ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" bash -s <<GUEST_START
 set -e
 pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true
+for _ in \$(seq 1 15); do
+  pgrep -f '[/]enclave-vsock-staging' >/dev/null || break
+  sleep 1
+done
 : > /tmp/enclave-vsock-staging.log
 nohup env TWOD_HSM_VSOCK_CID=${BIND_CID} TWOD_HSM_VSOCK_PORT=5000 \
   ${GUEST_DIR}/enclave-vsock-staging >>/tmp/enclave-vsock-staging.log 2>&1 </dev/null &
+HSM_PID=\$!
 sleep 3
+if ! kill -0 "\$HSM_PID" 2>/dev/null; then
+  echo "enclave-vsock-staging exited during startup" >&2
+  cat /tmp/enclave-vsock-staging.log >&2
+  exit 1
+fi
+cmdline=\$(tr '\\0' ' ' </proc/\$HSM_PID/cmdline)
+case "\$cmdline" in
+  *"${GUEST_DIR}/enclave-vsock-staging"*) ;;
+  *)
+    echo "unexpected enclave cmdline: \$cmdline" >&2
+    exit 1
+    ;;
+esac
 cat /tmp/enclave-vsock-staging.log
-pgrep -fa enclave-vsock-staging
+echo "enclave pid=\$HSM_PID"
 GUEST_START
 then
   echo "guest-start-hsm: failed to start enclave in guest" >&2

@@ -76,30 +76,35 @@ if [[ "$BAKE_GOLDEN" == "1" ]] && [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
     }
     trap cleanup_bake EXIT
     ssh_timeout="$(twod_hsm_snp_ssh_ready_timeout)"
-    if twod_hsm_wait_guest_ssh 2222 "$ssh_timeout" "$LOG" 0; then
+    golden_ready=0
+    if twod_hsm_wait_guest_ssh 2222 "$ssh_timeout" "$LOG" 0 "$QEMU_PID"; then
       ready_deadline=$((SECONDS + 180))
       while (( SECONDS < ready_deadline )); do
+        if [[ -n "$QEMU_PID" ]] && ! kill -0 "$QEMU_PID" 2>/dev/null; then
+          echo "WARN: QEMU exited before hsm-guest-ready" >&2
+          break
+        fi
         if ssh $(twod_hsm_ssh_opts) -o ConnectTimeout=2 -p 2222 ubuntu@127.0.0.1 \
-          'test -f /var/log/hsm-guest-ready || echo ready | sudo tee /var/log/hsm-guest-ready >/dev/null' 2>/dev/null \
-          && ssh $(twod_hsm_ssh_opts) -o ConnectTimeout=2 -p 2222 ubuntu@127.0.0.1 \
           test -f /var/log/hsm-guest-ready 2>/dev/null; then
-          golden="$(twod_hsm_snp_golden_disk)"
-          cp -f "$SCRIPT_DIR/vm-disk.qcow2" "$golden"
-          echo "golden disk: $golden"
+          golden_ready=1
           break
         fi
         sleep 5
       done
-      if [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
-        echo "WARN: SSH up but hsm-guest-ready missing after 180s" >&2
+      if [[ "$golden_ready" != "1" ]]; then
+        echo "WARN: SSH up but /var/log/hsm-guest-ready missing after 180s" >&2
       fi
-    fi
-    if [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
-      echo "WARN: golden bake failed — run-snp-smoke will use base overlay + longer timeout" >&2
-      tail -20 "$LOG" >&2 || true
     fi
     trap - EXIT
     cleanup_bake
+    if [[ "$golden_ready" == "1" ]]; then
+      golden="$(twod_hsm_snp_golden_disk)"
+      cp -f "$SCRIPT_DIR/vm-disk.qcow2" "$golden"
+      echo "golden disk: $golden (QEMU stopped before copy)"
+    elif [[ ! -f "$(twod_hsm_snp_golden_disk)" ]]; then
+      echo "WARN: golden bake failed — run-snp-smoke will use base overlay + longer timeout" >&2
+      tail -20 "$LOG" >&2 || true
+    fi
   fi
 else
   echo "[5/5] skip SNP golden bake (TWOD_HSM_BAKE_SNPDISK=0 or golden exists)"

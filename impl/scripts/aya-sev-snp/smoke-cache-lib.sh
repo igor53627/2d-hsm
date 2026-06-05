@@ -55,8 +55,20 @@ twod_hsm_nix_outlink_hit() {
 
 twod_hsm_nix_build_stamp() {
   local flake_dir=$1
-  { cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null; } \
-    | sha256sum | awk '{print $1}'
+  local repo_root rust_dir
+  repo_root="$(cd "${flake_dir}/../../.." && pwd)"
+  rust_dir="${repo_root}/impl/rust/enclave-protocol"
+  {
+    cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null
+    cat "${flake_dir}/"*.nix 2>/dev/null
+    [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
+    [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
+    if [[ -d "${rust_dir}/src" ]]; then
+      find "${rust_dir}/src" -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort | while read -r f; do
+        cat "$f"
+      done
+    fi
+  } | sha256sum | awk '{print $1}'
 }
 
 # Usage: link=$(twod_hsm_nix_ensure "$flake_dir" attr cache-name)
@@ -225,12 +237,18 @@ twod_hsm_ssh_opts() {
 }
 
 # Wait for guest SSH (and optionally /var/log/hsm-guest-ready).
+# Optional 5th arg: host QEMU PID — abort if that process exits before SSH is up.
 twod_hsm_wait_guest_ssh() {
-  local port=${1:-2222} max_sec=${2:-120} log=${3:-} require_ready=${4:-0}
+  local port=${1:-2222} max_sec=${2:-120} log=${3:-} require_ready=${4:-0} qemu_pid=${5:-}
   local deadline=$((SECONDS + max_sec))
   local ssh_common
   ssh_common="$(twod_hsm_ssh_opts)"
   while (( SECONDS < deadline )); do
+    if [[ -n "$qemu_pid" ]] && ! kill -0 "$qemu_pid" 2>/dev/null; then
+      echo "twod_hsm_wait_guest_ssh: QEMU pid ${qemu_pid} exited before SSH ready" >&2
+      [[ -n "$log" ]] && tail -30 "$log" >&2 || true
+      return 1
+    fi
     if [[ -n "$log" ]] && grep -qE "does not accept value|failed to initialize|Error while loading" "$log" 2>/dev/null; then
       tail -20 "$log" >&2 || true
       return 1
@@ -268,12 +286,12 @@ twod_hsm_snp_ssh_ready_timeout() {
   fi
 }
 
-# SNP/ubuntu smokes share guest-cid=42; stop only our guest-cid QEMU (not unrelated VMs).
+# SNP/ubuntu smokes share guest-cid=42; stop only our guest-cid QEMU (not guest-cid=420, etc.).
 twod_hsm_stop_stale_qemu() {
   local cid="${GUEST_CID:-42}"
-  local pattern="guest-cid=${cid}"
+  local pattern="guest-cid=${cid}([^0-9]|$)"
   if pgrep -f "$pattern" >/dev/null 2>&1; then
-    echo "stopping leftover qemu (${pattern})" >&2
+    echo "stopping leftover qemu (guest-cid=${cid})" >&2
     pkill -f "$pattern" 2>/dev/null || true
     sleep 2
   fi
