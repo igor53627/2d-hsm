@@ -67,6 +67,8 @@ mod host_test_fixtures;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
 mod pq_signer;
+/// SEV-SNP attestation report fetch (configfs-tsm) + launch-measurement extraction (TASK-5 Phase 3).
+pub mod snp_report;
 mod wire;
 
 use serde::{Deserialize, Serialize};
