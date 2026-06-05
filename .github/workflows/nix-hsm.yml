@@ -9,12 +9,14 @@ on:
     paths:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
+      - 'impl/rust/pq-seal-v1/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
   pull_request:
     paths:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
+      - 'impl/rust/pq-seal-v1/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
 
@@ -37,6 +39,13 @@ jobs:
 
       - name: Mock UDS profile (test-support, demo-mock-sign)
         run: cargo test --features test-support,demo-mock-sign
+
+      # Offline provisioning tool: not a workspace member, so it only gets
+      # rebuilt here. Catches enclave-protocol API drift (e.g. seal/verify
+      # signature changes) before it rots the tool.
+      - name: pq-seal-v1 provisioning tool builds
+        working-directory: impl/rust/pq-seal-v1
+        run: cargo build
 
   elixir-test:
     runs-on: ubuntu-latest
