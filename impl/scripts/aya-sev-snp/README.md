@@ -43,10 +43,22 @@ After warm-up, routine smokes skip rebuilds and reuse disks:
 ./run-snp-smoke.sh    # fast if golden disk exists (~1–3 min)
 ```
 
-Force refresh: `TWOD_HSM_REGEN_SNPDISK=1 ./setup-guest-image.sh` or `TWOD_HSM_REGEN_CLOUDINIT=1`.
-`setup-guest-image.sh` verifies the Ubuntu cloud image against upstream `SHA256SUMS`; set
-`TWOD_HSM_UBUNTU_IMAGE_BASE_URL`, `TWOD_HSM_UBUNTU_IMAGE_NAME`, and
-`TWOD_HSM_UBUNTU_IMAGE_SHA256` together when pinning a dated image.
+Force refresh (lab): `TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=1 TWOD_HSM_REGEN_SNPDISK=1 ./setup-guest-image.sh` or `TWOD_HSM_REGEN_CLOUDINIT=1`. The `run-*-smoke.sh` / `warm-smoke-cache.sh` wrappers already default this trust flag, so only direct `setup-guest-image.sh` invocations need it.
+Existing runners that relied on implicit upstream checksum fetches must now set either
+`TWOD_HSM_UBUNTU_IMAGE_SHA256` with a dated image URL/name (preferred) or lab-only
+`TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=1`.
+`setup-guest-image.sh` requires `TWOD_HSM_UBUNTU_IMAGE_SHA256` for trusted builds; pin
+`TWOD_HSM_UBUNTU_IMAGE_BASE_URL` / `TWOD_HSM_UBUNTU_IMAGE_NAME` to a dated image directory
+at the same time. A bare SHA against the default Ubuntu `noble/current` URL is discouraged
+(the script warns) because `current` moves when Ubuntu respins images.
+For lab-only convenience, `TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=1` fetches `SHA256SUMS` from the
+same image directory (integrity-only, not authenticity against a compromised mirror; real authenticity
+requires obtaining the pinned SHA or verifying `SHA256SUMS.gpg` via a trusted Ubuntu signing key path).
+If a bad image was cached, delete `$TWOD_HSM_CACHE/images/ubuntu-24.04-cloudimg.qcow2`
+(default `/var/cache/2d-hsm/images/ubuntu-24.04-cloudimg.qcow2`) and rerun with
+`TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=1 TWOD_HSM_REGEN_SNPDISK=1` (or a pinned
+`TWOD_HSM_UBUNTU_IMAGE_SHA256`). The rebuild writes the new base overlay atomically and drops the
+stale golden disk (`vm-disk-snp-ready.qcow2`), which would otherwise shadow the new image.
 
 ## Quick start
 
@@ -60,8 +72,8 @@ cargo build --bin enclave-vsock-staging --features staging-vsock
 cd ../../scripts/aya-sev-snp
 ./host-loopback-smoke.sh
 
-# One-time (~700MB download):
-./setup-guest-image.sh
+# One-time (~700MB download; lab integrity-only checksum fetch):
+TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=1 ./setup-guest-image.sh
 
 # Terminal A — guest VM (SEV-ES; use SEV_MODE=none for KVM-only debug)
 SEV_MODE=sev MEMORY=4096 VCPUS=2 ./run-guest-vm.sh

@@ -21,8 +21,24 @@ twod_hsm_ensure_cache_dirs
 verify_ubuntu_image() {
   local image=$1 expected actual sums
   expected="$IMAGE_SHA256"
+  case "${IMAGE_BASE_URL%/}" in
+    */current)
+      if [[ -n "$expected" ]]; then
+        echo "setup-guest-image: warning: pinned SHA with moving current URL; prefer a dated image URL" >&2
+      fi
+      ;;
+  esac
   if [[ -z "$expected" ]]; then
-    sums="$(curl -fsSL "${IMAGE_BASE_URL}/SHA256SUMS")"
+    if [[ "${TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS:-0}" != "1" ]]; then
+      echo "setup-guest-image: set TWOD_HSM_UBUNTU_IMAGE_SHA256 for trusted builds" >&2
+      echo "  lab-only fallback: TWOD_HSM_TRUST_UPSTREAM_SHA256SUMS=1 fetches ${IMAGE_BASE_URL}/SHA256SUMS" >&2
+      return 1
+    fi
+    echo "setup-guest-image: lab-only SHA256SUMS fallback is integrity-only; it does not protect against a compromised mirror" >&2
+    if ! sums="$(curl -fsSL "${IMAGE_BASE_URL}/SHA256SUMS")"; then
+      echo "setup-guest-image: failed to fetch ${IMAGE_BASE_URL}/SHA256SUMS" >&2
+      return 1
+    fi
     expected="$(printf '%s\n' "$sums" | awk -v f="${IMAGE_NAME}" '$2 == "*" f || $2 == f { print $1; exit }')"
   fi
   if [[ -z "$expected" ]]; then
@@ -34,20 +50,49 @@ verify_ubuntu_image() {
     echo "setup-guest-image: sha256 mismatch for $(basename "$image")" >&2
     echo "  expected: $expected" >&2
     echo "  actual:   $actual" >&2
+    echo "  recovery: delete $IMAGE_FILE and rerun with TWOD_HSM_REGEN_SNPDISK=1" >&2
     return 1
   fi
 }
 
-if [[ -f "$BASE_DISK" && "${TWOD_HSM_REGEN_SNPDISK:-0}" != "1" ]]; then
+if [[ -f "$BASE_DISK" && -f "$IMAGE_FILE" && "${TWOD_HSM_REGEN_SNPDISK:-0}" != "1" ]]; then
   echo "SNP base disk cached: $BASE_DISK"
 else
+  image_verified=0
   if [[ ! -f "$IMAGE_FILE" ]]; then
     echo "Downloading cloud image -> $IMAGE_FILE"
-    wget -O "$IMAGE_FILE" "$IMAGE_URL"
+    tmp_image="$(mktemp "${IMAGE_FILE}.tmp.XXXXXX")"
+    if ! wget -O "$tmp_image" "$IMAGE_URL"; then
+      rm -f "$tmp_image"
+      exit 1
+    fi
+    if ! verify_ubuntu_image "$tmp_image"; then
+      rm -f "$tmp_image"
+      exit 1
+    fi
+    mv "$tmp_image" "$IMAGE_FILE"
+    image_verified=1
   fi
-  verify_ubuntu_image "$IMAGE_FILE"
+  if [[ "$image_verified" != "1" ]]; then
+    verify_ubuntu_image "$IMAGE_FILE"
+  fi
   echo "Creating base overlay -> $BASE_DISK (20G)"
-  qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$BASE_DISK" 20G
+  tmp_base="$(mktemp "${BASE_DISK}.tmp.XXXXXX")"
+  if ! qemu-img create -f qcow2 -F qcow2 -b "$IMAGE_FILE" "$tmp_base" 20G; then
+    rm -f "$tmp_base"
+    exit 1
+  fi
+  # Atomic replace: a failed create above never clobbers the existing base, and the
+  # rename keeps any running VM's open inode intact (no leaked *.stale.* copies).
+  mv "$tmp_base" "$BASE_DISK"
+  # A golden disk was baked from the previous base/image; it takes precedence in
+  # run-snp-smoke.sh and twod_hsm_snp_prepare_work_disk and would silently shadow this
+  # rebuild, so drop it. warm-smoke-cache.sh re-bakes it on the next run.
+  golden_disk="$(twod_hsm_snp_golden_disk)"
+  if [[ -f "$golden_disk" ]]; then
+    echo "Invalidating stale SNP golden disk -> $golden_disk"
+    rm -f "$golden_disk"
+  fi
 fi
 
 SSH_KEY="${SSH_KEY:-}"

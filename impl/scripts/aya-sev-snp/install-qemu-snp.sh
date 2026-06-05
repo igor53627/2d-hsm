@@ -46,9 +46,19 @@ TARBALL="${BUILD_ROOT}/qemu-${VERSION}.tar.xz"
 if [[ ! -d "$SRC" ]]; then
   if [[ ! -f "$TARBALL" ]]; then
     echo "Downloading QEMU ${VERSION}..."
-    curl -fsSL "https://download.qemu.org/qemu-${VERSION}.tar.xz" -o "$TARBALL"
+    tmp_tarball="$(mktemp "${TARBALL}.tmp.XXXXXX")"
+    if ! curl -fsSL "https://download.qemu.org/qemu-${VERSION}.tar.xz" -o "$tmp_tarball"; then
+      rm -f "$tmp_tarball"
+      exit 1
+    fi
+    if ! verify_qemu_tarball "$tmp_tarball"; then
+      rm -f "$tmp_tarball"
+      exit 1
+    fi
+    mv "$tmp_tarball" "$TARBALL"
+  else
+    verify_qemu_tarball "$TARBALL"
   fi
-  verify_qemu_tarball "$TARBALL"
   tar -C "$BUILD_ROOT" -xf "$TARBALL"
 fi
 

@@ -59,8 +59,8 @@ twod_hsm_cat_tree() {
   local dir=$1
   shift
   [[ -d "$dir" ]] || return 0
-  find "$dir" -type f "$@" 2>/dev/null | LC_ALL=C sort | while read -r f; do
-    printf '%s\0' "${f#$dir/}"
+  find "$dir" -type f "$@" -print0 2>/dev/null | LC_ALL=C sort -z | while IFS= read -r -d '' f; do
+    printf '%s\0' "${f#"$dir"/}"
     cat "$f"
   done
 }
@@ -86,7 +86,8 @@ twod_hsm_nix_build_stamp() {
       twod_hsm_cat_tree "${rust_dir}/src" -name '*.rs'
       twod_hsm_cat_tree "${rust_dir}/examples" -name '*.rs'
       twod_hsm_cat_tree "${rust_dir}/testvectors" -type f
-      twod_hsm_cat_tree "${script_dir}" \( -name '*.sh' -o -name '*.py' -o -name '*.md' \)
+      # Script-dir markdown docs are intentionally excluded: they do not affect Nix build outputs.
+      twod_hsm_cat_tree "${script_dir}" \( -name '*.sh' -o -name '*.py' \)
     } | sha256sum | awk '{print $1}'
   )
   printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"
