@@ -60,7 +60,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("lab sealed PQ signer: {e}"))?;
         eprintln!("enclave-vsock: lab PQ seal root + sealed signer configured");
     }
-    #[cfg(not(feature = "lab-pq-seal-from-file"))]
+    #[cfg(all(not(feature = "lab-pq-seal-from-file"), release_build))]
+    {
+        boot_configure_pq_seal_v1_platform_root()
+            .map_err(|e| format!("PQ platform provisioning root required in release builds: {e}"))?;
+        eprintln!("enclave-vsock: PQ seal v1 provisioning root configured");
+    }
+    #[cfg(all(not(feature = "lab-pq-seal-from-file"), not(release_build)))]
     {
         use enclave_protocol::env_config::transport_only_mode_enabled;
         match boot_configure_pq_seal_v1_platform_root() {
@@ -73,7 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 return Err(format!(
-                    "PQ platform provisioning root required (set TWOD_HSM_TRANSPORT_ONLY_MODE=1 only for lab transport smoke): {e}"
+                    "PQ platform provisioning root required (set TWOD_HSM_TRANSPORT_ONLY_MODE=1 only for non-release lab smoke): {e}"
                 )
                 .into());
             }

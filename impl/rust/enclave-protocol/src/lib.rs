@@ -1396,26 +1396,14 @@ pub fn read_framed_message_with_idle_deadline<R: std::io::Read>(
     idle_deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
-    if idle_deadline.is_some() {
-        read_exact_with_idle_deadline(reader, &mut len_buf, idle_deadline)?;
-    } else {
-        use std::io::Read;
-        reader
-            .read_exact(&mut len_buf)
-            .map_err(ProtocolError::from)?;
-    }
+    read_exact_with_idle_deadline(reader, &mut len_buf, idle_deadline)?;
     let total_len = u32::from_be_bytes(len_buf);
     if total_len > MAX_MESSAGE_SIZE {
         return Err(ProtocolError::MessageTooLarge(total_len));
     }
     let total_len = total_len as usize;
     let mut body = vec![0u8; total_len];
-    if idle_deadline.is_some() {
-        read_exact_with_idle_deadline(reader, &mut body, idle_deadline)?;
-    } else {
-        use std::io::Read;
-        reader.read_exact(&mut body).map_err(ProtocolError::from)?;
-    }
+    read_exact_with_idle_deadline(reader, &mut body, idle_deadline)?;
     let mut frame = Vec::with_capacity(4 + total_len);
     frame.extend_from_slice(&len_buf);
     frame.extend_from_slice(&body);
@@ -1559,11 +1547,6 @@ mod tests {
             let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
             Some((guard, pk))
         }
-    }
-
-    #[cfg(not(feature = "ml-dsa-65"))]
-    fn arm_test_pq_setup() -> Option<Vec<u8>> {
-        None
     }
 
     fn signed_recent_chain_proof(

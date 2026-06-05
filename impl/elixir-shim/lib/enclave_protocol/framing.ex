@@ -90,6 +90,9 @@ defmodule EnclaveProtocol.Framing do
   Decode response payload: wire error first, else command-specific success decoder.
   """
   @spec decode_response_payload(non_neg_integer(), binary()) :: {:ok, map()} | {:error, term()}
+  def decode_response_payload(@msg_arm_for_production, payload),
+    do: decode_arm_for_production_response(payload)
+
   def decode_response_payload(msg_type, payload) do
     case decode_wire_error(payload) do
       {:ok, err} -> {:error, {:wire_error, err}}
@@ -120,13 +123,17 @@ defmodule EnclaveProtocol.Framing do
     end
   end
 
-  @doc "Parse ARM_FOR_PRODUCTION response (`armed` or wire error via decode_response_payload)."
+  @doc "Parse ARM_FOR_PRODUCTION response (`armed` or refused; refuse uses wire-error CBOR shape)."
   @spec decode_arm_for_production_response(binary()) :: {:ok, map()} | {:error, term()}
   def decode_arm_for_production_response(payload) when is_binary(payload) do
     with {:ok, map} <- decode_exact_map(payload) do
       case Map.get(map, 1) do
         "armed" ->
           {:ok, %{status: "armed"}}
+
+        code when is_integer(code) ->
+          reason = Map.get(map, 2) || "arm refused (code #{code})"
+          {:ok, %{status: "refused", reason: reason}}
 
         _ ->
           {:error, :invalid_arm_response}

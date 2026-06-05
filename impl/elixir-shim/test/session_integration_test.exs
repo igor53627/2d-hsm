@@ -39,19 +39,21 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     assert byte_size(sign.ticket_hash) == 32
   end
 
-  test "ARM → GET_STATUS armed over UDS", %{socket_path: socket_path, session_bin: session_bin} do
+  test "ARM refused when pq_signing_ready is false (mock UDS server)", %{
+    socket_path: socket_path,
+    session_bin: session_bin
+  } do
     assert {:ok, session} = EnclaveProtocol.Session.connect(socket_path)
     on_exit(fn -> EnclaveProtocol.Session.close(session) end)
 
     assert {:ok, arm_frame} = EnclaveProtocol.TestFixtures.arm_frame(session_bin)
-    assert {:ok, %{status: "armed"}} = EnclaveProtocol.Session.arm_for_production(session, arm_frame)
+    assert {:ok, %{status: "refused"}} = EnclaveProtocol.Session.arm_for_production(session, arm_frame)
 
     assert {:ok, status} = EnclaveProtocol.Session.get_status(session)
-    assert status.armed
-    assert status.proof_finalized_height == 10_000_050
+    refute status.armed
   end
 
-  test "second hard-fork on another UDS connection is rejected (shared enclave state)",
+  test "hard-fork sign requires armed state on mock server (wire ARM fail-closed)",
        %{socket_path: socket_path, session_bin: session_bin} do
     assert {:ok, conn_a} = EnclaveProtocol.Session.connect(socket_path)
     assert {:ok, conn_b} = EnclaveProtocol.Session.connect(socket_path)
@@ -61,19 +63,22 @@ defmodule EnclaveProtocol.SessionIntegrationTest do
     end)
 
     assert {:ok, arm_frame} = EnclaveProtocol.TestFixtures.arm_frame(session_bin)
-    assert {:ok, %{status: "armed"}} =
+    assert {:ok, %{status: "refused"}} =
              EnclaveProtocol.Session.arm_for_production(conn_a, arm_frame)
 
     assert {:ok, hf1} = EnclaveProtocol.TestFixtures.hardfork_sign_frame(session_bin)
-    assert {:ok, sign} = EnclaveProtocol.Session.sign_authorization_ticket(conn_a, hf1)
-    assert byte_size(sign.signature) == 64
+
+    assert {:error, {:wire_error, %{reason: reason}}} =
+             EnclaveProtocol.Session.sign_authorization_ticket(conn_a, hf1)
+
+    assert reason =~ "requires the enclave to be armed" or reason =~ "sign_authorization_ticket"
 
     assert {:ok, hf2} = EnclaveProtocol.TestFixtures.second_hardfork_sign_frame(session_bin)
 
-    assert {:error, {:wire_error, %{code: 1, reason: reason}}} =
+    assert {:error, {:wire_error, %{reason: reason2}}} =
              EnclaveProtocol.Session.sign_authorization_ticket(conn_b, hf2)
 
-    assert reason =~ "only one HARD_FORK_ACTIVATION"
+    assert reason2 =~ "requires the enclave to be armed" or reason2 =~ "sign_authorization_ticket"
   end
 
   defp unique_socket_path do

@@ -64,13 +64,23 @@ in
       RestartSec = "3";
       StandardOutput = "journal+console";
       StandardError = "journal+console";
+      NoNewPrivileges = true;
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      PrivateTmp = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      RestrictSUIDSGID = true;
+      LockPersonality = true;
     };
     preStart = ''
       echo "[vm-hsm] starting ${binName} (${mode})" >/dev/console
     '';
     environment =
       {
-        TWOD_HSM_VSOCK_CID = "42";
+        # VMADDR_CID_ANY — accept on hypervisor-assigned guest CID (see vsock spec §2.4).
+        TWOD_HSM_VSOCK_CID = "4294967295";
         TWOD_HSM_VSOCK_PORT = "5000";
       }
       // lib.optionalAttrs isProd {

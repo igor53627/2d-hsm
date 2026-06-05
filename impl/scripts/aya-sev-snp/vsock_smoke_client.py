@@ -90,7 +90,7 @@ def get_measurement(
 
 def main() -> None:
     cid = int(os.environ.get("GUEST_CID", os.environ.get("VSOCK_CID", "1")))
-    port = int(os.environ["TWOD_HSM_VSOCK_PORT"])
+    port = int(os.environ.get("TWOD_HSM_VSOCK_PORT", "5000"))
     marker_s = os.environ.get("VSOCK_SMOKE_MEASUREMENT_MARKER")
     marker = marker_s.encode() if marker_s else None
     pq = os.environ.get("VSOCK_SMOKE_REQUIRE_PQ_READY") == "1"
