@@ -68,7 +68,7 @@
       in
       {
         packages = {
-          inherit enclave enclave-staging measurement-manifest;
+          inherit enclave enclave-staging enclave-production-transport measurement-manifest;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;

@@ -15,7 +15,7 @@ Closes **TASK-1 / TASK-4 Phase B** (vsock staging + NixOS guest KVM smokes) and 
 | Output | Purpose | Mainnet-safe? |
 |--------|---------|---------------|
 | `vm` | staging enclave | no (dev) |
-| `vm-production` | release `enclave-vsock` + **lab** attestation VK | **no** — transport smoke only |
+| `vm-production` | debug `enclave-production-transport` + **lab** attestation VK (`TRANSPORT_ONLY_MODE`) | **no** — transport smoke only |
 | `vm-production-lab` | lab PQ seal + `pq_signing_ready` smoke | **no** |
 
 Platform production trust + SNP measurement → TASK-5 Phase 3 (follow-up PR).

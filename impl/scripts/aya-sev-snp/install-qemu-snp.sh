@@ -23,11 +23,33 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev \
   libslirp-dev libcap-ng-dev libattr1-dev libusb-1.0-0-dev
 
+verify_qemu_tarball() {
+  local tarball=$1
+  local sums expected actual
+  sums="$(curl -fsSL "https://download.qemu.org/sha256sum")"
+  expected="$(printf '%s\n' "$sums" | awk -v f="qemu-${VERSION}.tar.xz" '$2 == f { print $1; exit }')"
+  if [[ -z "$expected" ]]; then
+    echo "install-qemu-snp: no upstream sha256 for qemu-${VERSION}.tar.xz" >&2
+    return 1
+  fi
+  actual="$(sha256sum "$tarball" | awk '{ print $1 }')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "install-qemu-snp: sha256 mismatch for $(basename "$tarball")" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    return 1
+  fi
+}
+
 mkdir -p "$BUILD_ROOT"
+TARBALL="${BUILD_ROOT}/qemu-${VERSION}.tar.xz"
 if [[ ! -d "$SRC" ]]; then
-  echo "Downloading QEMU ${VERSION}..."
-  curl -fsSL "https://download.qemu.org/qemu-${VERSION}.tar.xz" -o "${BUILD_ROOT}/qemu-${VERSION}.tar.xz"
-  tar -C "$BUILD_ROOT" -xf "${BUILD_ROOT}/qemu-${VERSION}.tar.xz"
+  if [[ ! -f "$TARBALL" ]]; then
+    echo "Downloading QEMU ${VERSION}..."
+    curl -fsSL "https://download.qemu.org/qemu-${VERSION}.tar.xz" -o "$TARBALL"
+  fi
+  verify_qemu_tarball "$TARBALL"
+  tar -C "$BUILD_ROOT" -xf "$TARBALL"
 fi
 
 cd "$SRC"

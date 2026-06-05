@@ -67,8 +67,9 @@ twod_hsm_nix_build_stamp() {
     {
       cat "${flake_dir}/flake.lock" "${flake_dir}/flake.nix" 2>/dev/null
       cat "${flake_dir}/"*.nix 2>/dev/null
-      [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
-      [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
+    [[ -f "${rust_dir}/Cargo.toml" ]] && cat "${rust_dir}/Cargo.toml"
+    [[ -f "${rust_dir}/Cargo.lock" ]] && cat "${rust_dir}/Cargo.lock"
+    [[ -f "${rust_dir}/build.rs" ]] && cat "${rust_dir}/build.rs"
       if [[ -d "${rust_dir}/src" ]]; then
         find "${rust_dir}/src" -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort | while read -r f; do
           cat "$f"

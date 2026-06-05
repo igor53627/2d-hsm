@@ -73,22 +73,22 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v3
 
       - name: Build production enclave
-        run: nix build .#enclave --print-out-paths
+        run: nix build --no-update-lock-file .#enclave --print-out-paths
 
       - name: Build staging enclave
-        run: nix build .#enclave-staging --print-out-paths
+        run: nix build --no-update-lock-file .#enclave-staging --print-out-paths
 
       - name: Build NixOS vm runner (Phase B)
-        run: nix build .#vm --print-out-paths
+        run: nix build --no-update-lock-file .#vm --print-out-paths
 
       - name: Build production NixOS vm runners
         run: |
-          nix build .#vm-production --print-out-paths
-          nix build .#vm-production-lab --print-out-paths
+          nix build --no-update-lock-file .#vm-production --print-out-paths
+          nix build --no-update-lock-file .#vm-production-lab --print-out-paths
 
       - name: Build measurement manifest
         run: |
-          nix build .#measurement-manifest --out-link result
+          nix build --no-update-lock-file .#measurement-manifest --out-link result
           jq . result/manifest.json
 
       - name: Upload measurement manifest

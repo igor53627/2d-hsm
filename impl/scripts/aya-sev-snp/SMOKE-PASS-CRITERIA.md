@@ -11,7 +11,7 @@ Explicit expectations for PR #5 / TASK-4 Phase B verification. Scripts live in t
 | `run-nix-vm-guest-smoke-prod.sh` | `.#vm-production` | OK cid=42; marker `enclave-measurement-placeholder`; ~80 bytes; **no** `pq_signing_ready` required |
 | `run-nix-vm-guest-smoke-prod-lab.sh` | `.#vm-production-lab` | OK cid=42; marker `enclave-measurement-placeholder`; ~2030 bytes; CBOR key 6 = true (`pq_signing_ready`) |
 
-Common: `GUEST_CID=42` matches QEMU `guest-cid=42` and guest `TWOD_HSM_VSOCK_CID=42`.
+Common: host `GUEST_CID=42` matches QEMU `guest-cid=42`. NixOS guest binds `TWOD_HSM_VSOCK_CID=4294967295` (`VMADDR_CID_ANY`); Ubuntu SNP guest may use `VMADDR_CID_ANY` via `guest-start-hsm.sh`.
 
 `vsock_smoke_client.py` decodes the GET_MEASUREMENT CBOR map (requires `cbor2`: `apt install python3-cbor2`).
 

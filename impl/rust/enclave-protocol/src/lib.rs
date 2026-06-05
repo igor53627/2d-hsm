@@ -1382,6 +1382,12 @@ fn read_exact_with_idle_deadline<R: std::io::Read>(
             }
             Ok(n) => off += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e)
+                if (e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock)
+                    && idle_deadline.is_some_and(|d| std::time::Instant::now() < d) =>
+            {
+                continue
+            }
             Err(e) => return Err(ProtocolError::from(e)),
         }
     }

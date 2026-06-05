@@ -30,16 +30,17 @@ Pre-built `nixpkgs#legacyPackages.x86_64-linux.*` may work from cache; **compili
 
 | Flake output | Binary | Features | Use |
 |--------------|--------|----------|-----|
-| `enclave` | `enclave-vsock` | `production-vsock` | Production CVM (trust file at boot) |
+| `enclave` | `enclave-vsock` | `production-vsock` (release) | Production CVM (trust file at boot) |
+| `enclave-production-transport` | `enclave-vsock` | `production-vsock` (debug) | `vm-production` guest only — transport smoke |
 | `enclave-staging` | `enclave-vsock-staging` | `staging-vsock` | aya vsock smokes, `prod-enclave-v1` |
-| `measurement-manifest` | `manifest.json` | — | Reproducibility + on-chain `forkSpecHash` helper |
+| `measurement-manifest` | `manifest.json` | — | Reproducibility + on-chain `forkSpecHash` helper (hashes release `.#enclave`, not transport debug) |
 
 ## Production runtime env
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` | yes | 32-byte Ed25519 verifying key (producer attestation, not PQ key) |
-| `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT` | no | vsock bind (must match QEMU `guest-cid`; see vsock spec §2.4) |
+| `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT` | no | vsock bind (NixOS guest defaults to `VMADDR_CID_ANY`; host uses QEMU `guest-cid`; see vsock spec §2.4) |
 | Platform PQ seal / sealed signer | platform | `boot_configure_pq_seal_v1_platform_root` + `install_sealed_pq_signer` |
 
 ## Manifest schema (v1)
@@ -65,7 +66,7 @@ Staging manifest label `prod-enclave-v1` matches the reference staging signer im
 | Flake output | Guest binary | Trust / seal | Use |
 |--------------|--------------|--------------|-----|
 | `vm` | `enclave-vsock-staging` | reference staging signer | Default aya guest smoke |
-| `vm-production` | release `enclave-vsock` | **lab** Ed25519 VK only (`lab-prod-fixtures`) | **Transport smoke** — release binary binds vsock; no PQ seal |
+| `vm-production` | debug `enclave-vsock` (`enclave-production-transport`) | **lab** Ed25519 VK only (`lab-prod-fixtures`) | **Transport smoke** — `TWOD_HSM_TRANSPORT_ONLY_MODE=1`; no PQ seal |
 | `vm-production-lab` | debug `lab-production-vsock` | lab VK + `TWOD_HSM_PQ_SEAL_*` files | Lab prod path; `pq_signing_ready` smoke |
 
 Why `vm-production` still injects a **lab** trust file: `enclave-vsock` fails closed at boot without
@@ -73,8 +74,8 @@ Why `vm-production` still injects a **lab** trust file: `enclave-vsock` fails cl
 
 | | `vm-production` | `vm-production-lab` |
 |--|-----------------|---------------------|
-| Nix build type | release `enclave-vsock` | debug `lab-production-vsock` |
-| PQ seal | no | yes (file-based, lab only) |
+| Nix enclave attr | `enclave-production-transport` (debug `production-vsock`) | `enclave-production-lab` (`lab-production-vsock`) |
+| PQ seal | no (`TRANSPORT_ONLY_MODE`) | yes (file-based, lab only) |
 | Safe for mainnet | **no** | **no** |
 
 Real TEE `measurement` in `GET_MEASUREMENT` → TASK-5 Phase 3 (SNP/Nitro).

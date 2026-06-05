@@ -120,17 +120,8 @@ where
         let frame = match read_framed_message_with_idle_deadline(stream, Some(idle_deadline)) {
             Ok(f) => f,
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            // Per-read socket timeout (READ_TIMEOUT) is shorter than SESSION_IDLE_TIMEOUT:
-            // retry until the inter-frame idle budget is exhausted.
-            Err(ProtocolError::Io(e))
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                if Instant::now() >= idle_deadline {
-                    break;
-                }
-                continue;
-            }
+            // Session idle exhausted (see read_exact_with_idle_deadline); per-read retries stay inner.
+            Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => break,
             // Oversize length prefix: request type unknown; close without an application frame.
             Err(ProtocolError::MessageTooLarge(_)) => break,
             Err(e) => return Err(e),
