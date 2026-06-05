@@ -34,6 +34,6 @@ ssh $SSH_OPTS -p "$SSH_PORT" "ubuntu@${VM_HOST}" \
   "pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true; \
    nohup env TWOD_HSM_VSOCK_CID=42 TWOD_HSM_VSOCK_PORT=5000 \
    ${GUEST_DIR}/enclave-vsock-staging > /tmp/enclave-vsock-staging.log 2>&1 & \
-   sleep 2; grep listening /tmp/enclave-vsock-staging.log || cat /tmp/enclave-vsock-staging.log"
+   sleep 2; cat /tmp/enclave-vsock-staging.log" || true
 
 echo "guest-start-hsm: server should be listening inside SEV guest"
