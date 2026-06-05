@@ -25,6 +25,9 @@
         enclave-production-lab = pkgs.callPackage ./enclave.nix {
           profile = "production-lab";
         };
+        enclave-production-transport = pkgs.callPackage ./enclave.nix {
+          profile = "production-transport";
+        };
         flakeMeta = {
           gitRevision = self.shortRev or self.dirtyShortRev or "dirty";
           flakeLock = builtins.hashFile "sha256" (self + "/flake.lock");
@@ -33,15 +36,33 @@
           inherit enclave enclave-staging flakeMeta;
         };
         nixosVmStaging = import ./vm.nix {
-          inherit nixpkgs enclave enclave-staging enclave-production-lab;
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
           guestProfile = "staging";
         };
         nixosVmProduction = import ./vm.nix {
-          inherit nixpkgs enclave enclave-staging enclave-production-lab;
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
           guestProfile = "production";
         };
         nixosVmProductionLab = import ./vm.nix {
-          inherit nixpkgs enclave enclave-staging enclave-production-lab;
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
           guestProfile = "production-lab";
         };
       in
@@ -69,7 +90,7 @@
             echo "  nix build .#enclave-staging  # staging vsock (aya smokes)"
             echo "  nix build .#measurement-manifest"
             echo "  nix build .#vm               # Phase B NixOS guest (staging)"
-            echo "  nix build .#vm-production       # TRANSPORT SMOKE ONLY (release bin + lab trust VK)"
+            echo "  nix build .#vm-production       # TRANSPORT SMOKE ONLY (debug prod bin + lab trust VK)"
             echo "  nix build .#vm-production-lab   # lab prod (+ PQ seal, pq_signing_ready) — NOT mainnet"
           '';
         };
