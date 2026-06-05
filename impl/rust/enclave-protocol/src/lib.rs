@@ -1786,6 +1786,114 @@ mod tests {
         assert_eq!(sign.signature.len(), ML_DSA65_SIGNATURE_LEN);
     }
 
+    /// Two logical connections share one `EnclaveState`: wire ARM on the first, then sign on
+    /// separate lock scopes (production vsock / UDS shared-state path).
+    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
+    #[test]
+    fn shared_enclave_state_wire_arm_rejects_second_hardfork_mldsa() {
+        use crate::host_test_fixtures::sample_arm_for_production_frame_with_pubkey;
+        use crate::{
+            decode_arm_for_production_response, decode_get_status_response,
+            decode_sign_authorization_ticket_response, decode_wire_error, encode_get_status_request,
+            encode_message, encode_sign_authorization_ticket_request, is_wire_error_payload,
+            peek_msg_type_from_frame, AuthorizationTicketPayload, MessageType,
+            SignAuthorizationTicketRequest,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let _guard = install_reference_sealed_signer_for_tests();
+        let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
+        let trust = reference_test_attestation_trust();
+        let state = Arc::new(Mutex::new(EnclaveState::Unarmed));
+
+        let arm_frame = sample_arm_for_production_frame_with_pubkey(pk.clone());
+        {
+            let mut guard = state.lock().unwrap();
+            let arm_resp =
+                process_framed_with_shared_state(&arm_frame, &mut guard, trust).unwrap();
+            let arm_decoded = decode_message(&arm_resp).unwrap();
+            let arm_body = decode_arm_for_production_response(&arm_decoded.payload).unwrap();
+            assert_eq!(arm_body.status, "armed");
+        }
+
+        {
+            let mut guard = state.lock().unwrap();
+            let status_frame = encode_message(
+                MessageType::GetStatus,
+                &encode_get_status_request(&GetStatusRequest { version: 1 }).unwrap(),
+            )
+            .unwrap();
+            let status_resp =
+                process_framed_with_shared_state(&status_frame, &mut guard, trust).unwrap();
+            let status = decode_get_status_response(
+                &decode_message(&status_resp).unwrap().payload,
+            )
+            .unwrap();
+            assert!(status.armed);
+            assert_eq!(status.proof_finalized_height, Some(10_000_050));
+        }
+
+        let first_ticket = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 1,
+            context_hash: [0x01; 32],
+            activation_height: 10_000_100,
+            new_measurement: b"hf-a".to_vec(),
+            pq_pubkey: pk.clone(),
+            fork_spec_hash: Some([0xEF; 32]),
+            new_header_version: Some(3),
+        };
+        let first_frame = encode_message(
+            MessageType::SignAuthorizationTicket,
+            &encode_sign_authorization_ticket_request(&SignAuthorizationTicketRequest {
+                ticket: first_ticket,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        {
+            let mut guard = state.lock().unwrap();
+            let resp = process_framed_with_shared_state(&first_frame, &mut guard, trust).unwrap();
+            let decoded = decode_message(&resp).unwrap();
+            assert!(!is_wire_error_payload(&decoded.payload));
+            let sign =
+                decode_sign_authorization_ticket_response(&decoded.payload).unwrap();
+            assert_eq!(sign.signature.len(), ML_DSA65_SIGNATURE_LEN);
+        }
+
+        let second_ticket = AuthorizationTicketPayload {
+            ticket_type: 1,
+            nonce: 2,
+            context_hash: [0x02; 32],
+            activation_height: 10_000_200,
+            new_measurement: b"hf-b".to_vec(),
+            pq_pubkey: pk,
+            fork_spec_hash: Some([0xEF; 32]),
+            new_header_version: Some(3),
+        };
+        let second_frame = encode_message(
+            MessageType::SignAuthorizationTicket,
+            &encode_sign_authorization_ticket_request(&SignAuthorizationTicketRequest {
+                ticket: second_ticket,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        {
+            let mut guard = state.lock().unwrap();
+            let resp =
+                process_framed_with_shared_state(&second_frame, &mut guard, trust).unwrap();
+            let decoded = decode_message(&resp).unwrap();
+            assert!(is_wire_error_payload(&decoded.payload));
+            let (code, reason) = decode_wire_error(&decoded.payload).unwrap();
+            assert_eq!(code, 1);
+            assert!(reason.contains("only one HARD_FORK_ACTIVATION"));
+            assert_eq!(peek_msg_type_from_frame(&resp), MessageType::SignAuthorizationTicket);
+        }
+    }
+
     #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
     #[test]
     fn staging_sign_hardfork_fails_without_sealed_signer() {
