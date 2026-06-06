@@ -1,10 +1,12 @@
 ---
 id: TASK-5
-title: Production HSM path — prod enclave in guest, platform PQ seal, SNP, real measurement
+title: >-
+  Production HSM path — prod enclave in guest, platform PQ seal, SNP, real
+  measurement
 status: In Progress
 assignee: []
 created_date: '2026-06-05'
-updated_date: '2026-06-05'
+updated_date: '2026-06-06 09:10'
 labels:
   - production
   - tee
@@ -26,13 +28,11 @@ references:
   - backlog/docs/authorization-tickets-precompile-spec-draft.md
 priority: high
 ordinal: 1600
-parent: TASK-4
 ---
 
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-
 Close the gap between **staging smokes green on aya** and a **deployable production 2d-hsm** inside a confidential VM.
 
 Today (2026-06-05, branch `feat/task-1-vsock-staging-transport`):
@@ -57,7 +57,6 @@ Normative split (vsock spec §2.1, §2.3, §9):
 Ed25519 does **not** replace PQ signing. The enclave **verifies** a 64-byte Ed25519 signature over `RecentChainProof` using a **pinned** `ProducerAttestationTrust` key that must **not** be derived from `pq_pubkey` (§9.3) — otherwise a host that knows the public PQ key could forge chain proofs and arm under a fake view.
 
 PQ for every arm would be possible in theory but is deferred: larger wire size (3309 B), different provisioning/rotation story, and intentional **key separation** (chain-view signer ≠ long-term PQ producer key).
-
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Phase status (2026-06-05, branch `feat/task-1-vsock-staging-transport`)
@@ -87,10 +86,9 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 
 <!-- AC:END -->
 
-## Implementation plan
+## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-
 ### Phase 1 — Prod binary in guest (~3–5 days) — **Done** (transport smoke)
 
 - Extend `nixos-module.nix`: `services.twod-hsm.enclavePackage` / mode switch (`staging` vs `production`).
@@ -116,27 +114,11 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 ### Phase 5 — Review gate
 
 - Full matrix if prod boot / arming gating changes materially (`AGENTS.md` rules); else Reduced + compact.
-
 <!-- SECTION:PLAN:END -->
-
-## Out of scope
-
-- Replacing Ed25519 Producer Chain Attestation with ML-DSA (design change; separate spec revision).
-- On-chain `MeasurementRegistry` precompile implementation (2d-solidity repo).
-- Nitro EIF packaging.
-- Mainnet fork ticket submission E2E (coordination with 2d BP team).
-
-## Related
-
-- **TASK-4** (parent) — Nix flake + NixOS guest shell; Phase B smokes ✅ KVM staging
-- **TASK-3** (Done) — Ed25519 `RecentChainProof` verification in enclave
-- **TASK-1** (In Progress) — ML-DSA signing + seal v1 in TEE
-- Branch: `feat/task-1-vsock-staging-transport` — merge before Phase 1
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-
 ### Current baseline (aya 2026-06-05)
 
 | Check | Status |
@@ -152,4 +134,19 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 
 Prod guest smoke green + manifest documents real TEE measurement (or signed waiver) → ready for BP integration testing, not mainnet alone.
 
+Phase 3 / AC#4 progress (branch feat/task-5-snp-report): SNP boot ALREADY works on aya (EPYC 9375F, QEMU 10 + AMD OVMF, golden disk boots with SEV-SNP active) — the old 0xfee00000 LAPIC blocker notes are stale. Attestation interface = configfs-tsm (/sys/kernel/config/tsm/report), pure file I/O, fits #![forbid(unsafe_code)]; report 1184B, version 5, measurement@0x90[48], report_data@0x50[64] (verified vs a real captured report, committed as testvectors/snp_report_golden_v5.bin). Gap: Ubuntu cloud image kernel 6.8.0-117 ships NO sev-guest module (needs linux-modules-extra + modprobe; NixOS gets boot.kernelModules += sev-guest). Implemented: src/snp_report.rs (fetch+parse+report_data binding=SHA3-512(domain||pq_pubkey)), boot_capture_snp_measurement() hook in enclave_vsock.rs, measurement_response() returns real 48B measurement + raw report with graceful placeholder fallback (KVM/dev). Tests: default 62/0, reference-test-key 89/0; prod+staging binaries build. LIVE VALIDATED on aya: dump_snp_measurement example run inside the SNP guest returned measurement=3e39e33a...6b488 == the raw configfs-tsm capture. Remaining: roborev+PR; VCEK cert chain (auxblob) in attestation; manifest split (build-hash vs TEE measurement); AC#5 NixOS-qcow2 SNP launcher for prod-guest live GET_MEASUREMENT.
 <!-- SECTION:NOTES:END -->
+
+## Out of scope
+
+- Replacing Ed25519 Producer Chain Attestation with ML-DSA (design change; separate spec revision).
+- On-chain `MeasurementRegistry` precompile implementation (2d-solidity repo).
+- Nitro EIF packaging.
+- Mainnet fork ticket submission E2E (coordination with 2d BP team).
+
+## Related
+
+- **TASK-4** (parent) — Nix flake + NixOS guest shell; Phase B smokes ✅ KVM staging
+- **TASK-3** (Done) — Ed25519 `RecentChainProof` verification in enclave
+- **TASK-1** (In Progress) — ML-DSA signing + seal v1 in TEE
+- Branch: `feat/task-1-vsock-staging-transport` — merge before Phase 1
