@@ -162,6 +162,16 @@ def main() -> None:
     )
     label = os.environ.get("VSOCK_SMOKE_LABEL", "vsock-smoke")
     print("%s: OK cid=%d port=%d bytes=%d" % (label, cid, port, len(resp)))
+    if os.environ.get("VSOCK_SMOKE_PRINT_MEASUREMENT") == "1":
+        # Print the GET_MEASUREMENT measurement (CBOR key 2) + attestation length so
+        # the SNP launch-measurement anchor can be captured for the manifest/verifier.
+        fields = _decode_framed_get_measurement(resp)
+        meas = fields.get(2)
+        att = fields.get(3)
+        meas_hex = meas.hex() if isinstance(meas, (bytes, bytearray)) else repr(meas)
+        att_len = len(att) if isinstance(att, (bytes, bytearray)) else "n/a"
+        print("%s: measurement=%s attestation_len=%s pq_ready=%s"
+              % (label, meas_hex, att_len, fields.get(6)))
 
 
 if __name__ == "__main__":

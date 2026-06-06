@@ -43,17 +43,45 @@ Pre-built `nixpkgs#legacyPackages.x86_64-linux.*` may work from cache; **compili
 | `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT` | no | vsock bind (NixOS guest defaults to `VMADDR_CID_ANY`; host uses QEMU `guest-cid`; see vsock spec §2.4) |
 | Platform PQ seal / sealed signer | platform | `boot_configure_pq_seal_v1_platform_root` + `install_sealed_pq_signer` |
 
-## Manifest schema (v1)
+## Manifest schema (v2) — build identity vs TEE measurement (TASK-5 AC#4)
 
-See `scripts/write-measurement-manifest.sh`. Fields include `git_revision`, `flake_lock` (hash of `flake.lock`), `artifacts.production.sha256`, and `fork_spec_hash_input` for 2d tooling.
+See `scripts/write-measurement-manifest.sh`. The manifest keeps **two identities strictly
+separate**:
 
-**Not a TEE measurement source (until TASK-5 #4):** The manifest records **reproducible build inputs** (artifact SHA256 + git + lock hash). `protocol_measurement_label` for production is a **placeholder** (`enclave-measurement-placeholder`) matching the reference enclave until SNP/Nitro measurement is wired into `GET_MEASUREMENT`.
+**1. Build identity (this manifest, reproducible):** `git_revision`, `flake_lock` (hash of
+`flake.lock`), `artifacts.*.sha256`, `enclave_derivation`, and `fork_spec_hash_input` for 2d
+tooling. `artifacts.*.protocol_measurement_label` is a **software-protocol label** (`label_kind`
+says so) — the value the enclave advertises **absent SNP** (`enclave-measurement-placeholder`
+for prod, `prod-enclave-v1` for staging) — **not** a TEE measurement.
+
+**2. TEE measurement (runtime, `tee_measurement` block — descriptor only, no value):** the
+SEV-SNP **launch measurement** returned live by `GET_MEASUREMENT` (CBOR key 2, 48 bytes, report
+offset `0x90`). It is **not** a build output and is intentionally **not** emitted in the manifest
+because it is OVMF-dependent (see below). The PQ producer key is bound into the report separately
+via `report_data` (offset `0x50`, 64 bytes) `= SHA3-512("2d-hsm-snp-report-data-v1" || pq_pubkey)`.
+
+### Why the launch measurement ≠ build identity (measured on aya, 2026-06-06)
+
+The NixOS prod guest (`.#disk-production-lab`) and the Ubuntu staging guest produce the **identical**
+SEV-SNP launch measurement under the same OVMF:
+
+```
+3e39e33ab71f37ec9391fb285620dc5e50b67dd7cb59447726138596f9c502ed971ae0d095ea2ab3f93a8b8f6016b488
+```
+
+So the launch measurement anchors the **OVMF launch firmware + SNP launch config** (memory, vCPUs,
+policy) — **not** the guest disk image / enclave binary / kernel, which OVMF loads *after* the
+measurement is taken. Binding the actual enclave identity needs the build `sha256` (above) +
+`report_data` key binding, and (to bind the running image) measured boot / dm-verity — tracked in
+the forthcoming verifier policy / VCEK cert-chain work. The value above is OVMF-specific (AMDSEV
+OVMF on aya) and belongs in the verifier policy/runbook, not this build manifest.
 
 | Do | Do not |
 |----|--------|
-| Use `fork_spec_hash_input` for hard-fork **build reproducibility** tickets | Whitelist on-chain producer `measurement` from manifest JSON alone |
+| Use `fork_spec_hash_input` for hard-fork **build reproducibility** tickets | Whitelist an on-chain producer from this manifest's labels |
 | Compare CI artifact SHA256 across rebuilds | Treat `protocol_measurement_label` as live attestation |
-| Wait for TASK-5 #4 for BP whitelist against real TEE `measurement` | Deploy `vm-production` to mainnet (lab trust only — see below) |
+| Whitelist against the **live-attested** measurement + `report_data` + VCEK chain (verifier policy) | Assume the launch measurement pins the guest image (it pins OVMF; same value across guests) |
+| Capture the live value via `VSOCK_SMOKE_PRINT_MEASUREMENT=1 ./run-nix-snp-guest-smoke.sh` | Deploy `vm-production` / `disk-production*` to mainnet (lab trust only — see below) |
 
 Staging manifest label `prod-enclave-v1` matches the reference staging signer image, not production PQ provisioning.
 
