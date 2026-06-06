@@ -27,7 +27,7 @@ Common: host `GUEST_CID=42` matches QEMU `guest-cid=42`. NixOS guest binds `TWOD
 
 | Script | Flake disk | Pass signals |
 |--------|------------|--------------|
-| `run-nix-snp-guest-smoke.sh` | `.#disk-production-lab` | `[PASS] ... real_measurement=1, pq_ready=1`; CID 42; CBOR key 2 = **48 raw bytes** (not `enclave-measurement-placeholder` / `prod-enclave-v1`); key 3 = real SNP report (≥1184 B, not `attestation-placeholder`); key 6 = true |
+| `run-nix-snp-guest-smoke.sh` | `.#disk-production-lab` | `[PASS] ... real_measurement=1, pq_ready=1`; CID 42; CBOR key 2 = **48 raw bytes** (not `enclave-measurement-placeholder` / `prod-enclave-v1`); key 3 = real SNP report (≥1184 B, not `attestation-placeholder`); key 6 = true; key 7 = cert_chain (`cert_chain_len=0` on aya — provider doesn't populate `auxblob`). Response ≈ **3212 B** (48 + 1184 + 1952 pubkey + CBOR + empty key 7) |
 | `SEV_MODE=none run-nix-snp-guest-smoke.sh` | `.#disk-production-lab` | KVM fallback boots; gate auto-relaxes to `require_real=0`, matches placeholder label; `pq_ready=1` (lab signer present even off-SNP) |
 | `DISK_ATTR=disk-production run-nix-snp-guest-smoke.sh` | `.#disk-production` | boot-only (transport); auto `require_real=0 require_pq=0` (no operational signer ⇒ placeholder) |
 
