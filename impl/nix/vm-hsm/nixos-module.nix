@@ -36,6 +36,11 @@ in
   boot.kernelModules = [
     "vsock"
     "vmw_vsock_virtio_transport"
+    # SEV-SNP guest attestation provider: registers configfs-tsm
+    # (/sys/kernel/config/tsm/report) and /dev/sev-guest so the enclave can fetch
+    # the launch measurement for GET_MEASUREMENT (TASK-5 Phase 3 / AC#4). Inert on
+    # non-SNP launches (KVM): the module just does not bind.
+    "sev-guest"
   ];
   boot.kernelParams = [ "console=ttyS0" ];
 
