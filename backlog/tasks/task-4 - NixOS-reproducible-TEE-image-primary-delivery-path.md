@@ -39,7 +39,7 @@ parent: TASK-1
 |-------|---------|------------------------------|
 | Enclave binary build | `nix build .#enclave` (flake, lockfile) | `cargo build --release` for fast local edit |
 | Guest CVM image | NixOS minimal (`nix build .#vm` → qcow2) | Ubuntu cloud image + `impl/scripts/aya-sev-snp` (KVM smoke only) |
-| SNP launch | **TASK-5 Phase 3** — `run-snp-smoke.sh` / Ubuntu guest today | `run-vm-hsm.sh` = **KVM only** (`SEV_MODE=snp` exits 2 until unified launcher) |
+| SNP launch | **TASK-5 Phase 3 (done)** — `run-nix-snp-guest-smoke.sh` boots the NixOS `.#disk-production-lab` under SNP (live on aya) | `run-vm-hsm.sh` is KVM; `SEV_MODE=snp` now hands off to the dedicated SNP launcher |
 | Host (BP orchestrator) | **Unchanged** — Ubuntu + Elixir shim | Nix on BP host is out of scope |
 | On-chain binding | TEE `measurement` + `forkSpecHash(manifest)` | — |
 
@@ -52,7 +52,7 @@ Rationale: TASK-1 Phase 2 requires a reproducible TEE image; Authorization Ticke
 Deliver `impl/nix/vm-hsm/` so operators and CI can:
 
 1. Build enclave + NixOS guest from one flake with a pinned `flake.lock`.
-2. Publish a **build manifest** (artifact SHA256 + git/flake inputs for `forkSpecHash` helpers) — **not** a substitute for live TEE `measurement` until TASK-5 #4.
+2. Publish a **build manifest** (artifact SHA256 + git/flake inputs for `forkSpecHash` helpers) — **not** a substitute for live TEE `measurement` (now delivered separately by TASK-5 #4); the manifest stays build-identity-focused.
 3. Run the same vsock smokes on aya (KVM first, SNP when QEMU supports `memory-backend-memfd-private`).
 4. Feed BP integration: use manifest for **reproducible build identity** (`forkSpecHash` inputs); **on-chain producer `measurement` whitelist** must use TEE attestation from `GET_MEASUREMENT` (TASK-5 #4), not `protocol_measurement_label` in the JSON manifest.
 
@@ -64,9 +64,9 @@ Production measurement in tickets comes from **TEE attestation** (`GET_MEASUREME
 |--------|--------|-------------------|
 | **TEE `measurement`** | SNP/Nitro report via enclave (TASK-5 #4) | Producer whitelist, recovery tickets, arm binding |
 | **Manifest `artifacts.*.sha256`** | CI `measurement-manifest` derivation | Reproducibility, `forkSpecHash(manifest)` over build inputs |
-| **`protocol_measurement_label`** | Placeholder / staging label in JSON today | **Not** authoritative until TASK-5 wires real measurement |
+| **`protocol_measurement_label`** | Placeholder / staging label in JSON | **Never** authoritative — live measurement comes from `GET_MEASUREMENT` (TASK-5 #4, now wired) |
 
-The flake manifest closes the **operational build-attestation** side of authorization-tickets spec §11; it does **not** replace live TEE measurement for BP whitelist until TASK-5 Phase 3–4.
+The flake manifest closes the **operational build-attestation** side of authorization-tickets spec §11; it does **not** replace live TEE measurement for BP whitelist — live measurement is delivered by TASK-5 Phase 3 (done); BP whitelist integration is Phase 4.
 
 <!-- SECTION:DESCRIPTION:END -->
 
@@ -77,7 +77,7 @@ The flake manifest closes the **operational build-attestation** side of authoriz
 - [x] #1 `impl/nix/vm-hsm/flake.nix` exists with outputs: `packages.enclave`, `packages.vm` (qcow2 or vm runner), `devShell`.
 - [x] #2 `flake.lock` committed; CI workflow runs `nix build .#enclave` and `.#vm` on `x86_64-linux`.
 - [x] #3 Documented **measurement manifest** format (JSON): `git_revision`, `flake_lock`, artifact SHA256, `fork_spec_hash_input` — see `scripts/write-measurement-manifest.sh`.
-- [x] #4 Reproducibility: the measurement manifest (schema v2) publishes the production artifact SHA256 and the build is Nix-deterministic from the locked `flake.lock`. **Verified on aya (2026-06-06)**: `nix build .#enclave` then `nix build .#enclave --rebuild` rebuilt the derivation and the output was **byte-identical** (`checking outputs … REBUILD_OK`, no hash mismatch) — i.e. two builds → identical artifact. Production `enclave-vsock` sha256 = `772d63a132858015b7a515d1b6cdf97868d8236fa8939982614f7cb3e8805556`. TEE measurement is **real** (TASK-5 #4) and deterministic; note it pins **OVMF + launch-config, not the guest image** (identical across different guests — TASK-5 verifier-policy §3), so it is not an image fingerprint — image identity uses this artifact sha256 + `report_data`.
+- [x] #4 Reproducibility: the measurement manifest (schema v2) publishes the production artifact SHA256 and the build is Nix-deterministic from the locked `flake.lock`. **Verified on aya (2026-06-06)**: `nix build .#enclave` then `nix build .#enclave --rebuild` (the rebuild-and-compare flag, formerly `--check`; equivalent to building twice and diffing the output store path) rebuilt the derivation and the output was **byte-identical** (`checking outputs of '…enclave-vsock-0.1.0.drv'…`, no hash mismatch) — i.e. two builds → identical artifact. Production `enclave-vsock` sha256 = `772d63a132858015b7a515d1b6cdf97868d8236fa8939982614f7cb3e8805556`. TEE measurement is **real** (TASK-5 #4) and deterministic; note it pins **OVMF + launch-config, not the guest image** (identical across different guests — TASK-5 verifier-policy §3), so it is not an image fingerprint — image identity uses this artifact sha256 + `report_data`.
 - [x] #5 NixOS guest module: systemd unit for HSM binary, `TWOD_HSM_VSOCK_*` bind (not `2D_HSM_*`), minimal firewall; **no** SSH, no extraneous services; `boot.loader.grub.enable = false`.
 - [x] #6 `run-vm-hsm.sh` launches NixOS qcow2 on **KVM** (`SEV_MODE=none`); **SNP** explicitly deferred to TASK-5 #5 (script exits 2 for `SEV_MODE=snp`).
 - [x] #7 Smoke on aya: Nix guest vsock smokes pass on **KVM** (staging + prod transport + prod-lab PQ); SNP pass/fail tracked under TASK-5.
