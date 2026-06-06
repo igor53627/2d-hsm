@@ -40,6 +40,9 @@ jobs:
       - name: Mock UDS profile (test-support, demo-mock-sign)
         run: cargo test --features test-support,demo-mock-sign
 
+      - name: Reference SNP verifier (snp-verify, TASK-1 AC#3/#12)
+        run: cargo test --features snp-verify
+
       # Offline provisioning tool: not a workspace member, so it only gets
       # rebuilt here. Catches enclave-protocol API drift (e.g. seal/verify
       # signature changes) before it rots the tool.
