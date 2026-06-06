@@ -82,10 +82,13 @@ measurement alone:
 
 ## 4. Status in this repo
 
-- **Produced by the enclave:** the report (key 3) + VCEK cert chain (key 7, when the
-  provider populates `auxblob`) + the `report_data` key binding (verified at capture in
-  `snp_report::verify_and_extract_measurement`). Live on aya: report 1184 B, VCEK chain
-  via configfs-tsm `auxblob`.
+- **Produced by the enclave:** the report (key 3) + the `report_data` key binding (verified
+  at capture in `snp_report::verify_and_extract_measurement`) + VCEK cert chain (key 7)
+  **when the provider populates `auxblob`**. Live on aya (2026-06-06): report 1184 B,
+  `report_data` bound, but **`auxblob` is EMPTY → key 7 = empty (`cert_chain_len=0`)** on this
+  kernel/provider, and the GET_MEASUREMENT response is 3212 bytes. So on the current setup the
+  relying party **must** obtain the VCEK from the **AMD KDS** (step 2) — the on-host chain is not
+  available; key 7 is reserved for hosts/providers that do populate it.
 - **Relying-party verifier (steps 1–6):** specified here; implementation lives in the BP
   / on-chain consumer (out of scope for the enclave crate — it needs ECDSA-P384 + X.509
   + AMD KDS, deliberately kept off the `#![forbid(unsafe_code)]` signing path).

@@ -26,6 +26,11 @@ const TSM_ENTRY_NAME: &str = "twod-hsm";
 /// Domain separation for the `report_data` binding (so it is not a bare key hash).
 const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
 
+/// Upper bound on the configfs-tsm `auxblob` (VCEK→ASK→ARK chain) we will carry in
+/// GET_MEASUREMENT. A real chain is a few KB; this is generous headroom while staying well under
+/// `MAX_MESSAGE_SIZE` once the report + pq_pubkey are added.
+const MAX_CERT_CHAIN_LEN: usize = 64 * 1024;
+
 /// Extract the 48-byte launch measurement from a raw SNP `ATTESTATION_REPORT`.
 pub fn measurement_from_report(report: &[u8]) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
     if report.len() < MIN_REPORT_LEN {
@@ -112,9 +117,14 @@ fn fetch_report_inner(
             "SNP attestation: outblob shorter than ABI minimum",
         ));
     }
-    // VCEK→ASK→ARK cert chain. Best-effort: absent/empty auxblob is fine (the verifier can fetch
-    // the chain from AMD KDS by VCEK serial as a fallback); never fail the report on its account.
-    let cert_chain = fs::read(format!("{entry}/auxblob")).unwrap_or_default();
+    // VCEK→ASK→ARK cert chain. Best-effort: absent/unreadable auxblob is fine (the verifier can
+    // fetch the chain from AMD KDS by VCEK serial). A real chain is a few KB; cap it so an
+    // implausibly large auxblob can't push the GET_MEASUREMENT frame past MAX_MESSAGE_SIZE and
+    // break the whole response — drop to empty in that case rather than fail the report.
+    let cert_chain = match fs::read(format!("{entry}/auxblob")) {
+        Ok(c) if c.len() <= MAX_CERT_CHAIN_LEN => c,
+        _ => Vec::new(),
+    };
     Ok((report, cert_chain))
 }
 

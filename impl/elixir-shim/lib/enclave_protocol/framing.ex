@@ -101,7 +101,7 @@ defmodule EnclaveProtocol.Framing do
     end
   end
 
-  @doc "Parse GET_MEASUREMENT success response CBOR (integer keys 1–6)."
+  @doc "Parse GET_MEASUREMENT success response CBOR (integer keys 1–6, optional key 7 cert_chain)."
   @spec decode_get_measurement_response(binary()) :: {:ok, map()} | {:error, term()}
   def decode_get_measurement_response(payload) when is_binary(payload) do
     with {:ok, map} <- decode_exact_map(payload) do
