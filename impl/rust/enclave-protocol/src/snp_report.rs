@@ -11,13 +11,14 @@
 use crate::ProtocolError;
 
 // ---- ATTESTATION_REPORT field layout (bytes) ----
-const REPORT_DATA_OFFSET: usize = 0x50;
+// pub(crate) so the reference verifier (snp_verify) reuses the single source of truth for offsets.
+pub(crate) const REPORT_DATA_OFFSET: usize = 0x50;
 const REPORT_DATA_LEN: usize = 64;
-const MEASUREMENT_OFFSET: usize = 0x90;
+pub(crate) const MEASUREMENT_OFFSET: usize = 0x90;
 /// SNP launch measurement length (48 bytes, SHA-384-sized).
 pub const SNP_MEASUREMENT_LEN: usize = 48;
 /// Shortest report we accept: it must at least cover the measurement field.
-const MIN_REPORT_LEN: usize = MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN;
+pub(crate) const MIN_REPORT_LEN: usize = MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN;
 
 /// configfs-tsm report directory (Linux >= 6.7 with the SNP guest TSM provider loaded).
 const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";

@@ -14,7 +14,8 @@ fn main() {
     let iters: u32 = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2000);
+        .unwrap_or(2000)
+        .max(1); // avoid divide-by-zero on `... 0`
 
     let signer = enclave_protocol::MlDsa65Signer::generate_keypair();
     let digest = [0x5au8; 32];
