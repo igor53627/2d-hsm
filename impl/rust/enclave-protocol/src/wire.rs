@@ -40,12 +40,16 @@ fn decode_value(bytes: &[u8]) -> Result<Value, ProtocolError> {
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: u64) -> Result<&'a Value, ProtocolError> {
+    map_get_opt(map, key)
+        .ok_or(ProtocolError::RecentChainProofValidation("missing required CBOR map key"))
+}
+
+/// Optional CBOR map lookup — `None` when the key is absent. Used for additive, backward-compatible
+/// fields (a peer on an older schema simply omits the key). `map_get` is the required-key variant.
+fn map_get_opt<'a>(map: &'a [(Value, Value)], key: u64) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k == &Value::Integer(key.into()))
         .map(|(_, v)| v)
-        .ok_or_else(|| {
-            ProtocolError::RecentChainProofValidation("missing required CBOR map key")
-        })
 }
 
 fn value_to_u64(v: &Value) -> Result<u64, ProtocolError> {
@@ -247,7 +251,11 @@ pub fn decode_get_measurement_request(bytes: &[u8]) -> Result<GetMeasurementRequ
     })
 }
 
-/// CBOR-encode `GET_MEASUREMENT` response (spec keys 1–6).
+/// CBOR-encode `GET_MEASUREMENT` response (spec keys 1–7).
+///
+/// Key 7 (`cert_chain`) is the SNP VCEK→ASK→ARK certificate chain (configfs-tsm `auxblob`) so a
+/// relying party can verify the report signature to the AMD root; it is empty when no chain was
+/// captured. Older peers that only read keys 1–6 ignore it (additive, backward-compatible).
 pub fn encode_get_measurement_response(
     resp: &GetMeasurementResponse,
 ) -> Result<Vec<u8>, ProtocolError> {
@@ -263,6 +271,7 @@ pub fn encode_get_measurement_response(
         (Value::Integer(4.into()), Value::Bytes(resp.pq_pubkey.clone())),
         (Value::Integer(5.into()), Value::Array(ticket_types)),
         (Value::Integer(6.into()), Value::Bool(resp.pq_signing_ready)),
+        (Value::Integer(7.into()), Value::Bytes(resp.cert_chain.clone())),
     ]);
     encode_value(&value)
 }
@@ -295,12 +304,20 @@ pub fn decode_get_measurement_response(
             ))
         }
     };
+    // Key 7 (cert_chain) is optional for backward compatibility: a peer on the 1–6 schema omits it,
+    // and an explicit CBOR null is accepted as "no chain" (same lenient intent). A present non-null,
+    // non-bytes value is still a schema error.
+    let cert_chain = match map_get_opt(&map, 7) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => value_to_bytes(v)?,
+    };
     Ok(GetMeasurementResponse {
         measurement: value_to_bytes(map_get(&map, 2)?)?,
         attestation: value_to_bytes(map_get(&map, 3)?)?,
         pq_pubkey: value_to_bytes(map_get(&map, 4)?)?,
         supported_ticket_types: supported,
         pq_signing_ready: value_to_bool(map_get(&map, 6)?)?,
+        cert_chain,
     })
 }
 
@@ -644,6 +661,7 @@ mod tests {
             pq_pubkey: vec![0xDE, 0xAD],
             supported_ticket_types: vec![0, 1],
             pq_signing_ready: false,
+            cert_chain: vec![0xC7, 0xC8, 0xC9],
         };
         let bytes = encode_get_measurement_response(&resp).unwrap();
         let Value::Map(map) = decode_value(&bytes).unwrap() else {
@@ -654,6 +672,41 @@ mod tests {
         assert_eq!(decoded.measurement, b"meas");
         assert_eq!(decoded.supported_ticket_types, vec![0, 1]);
         assert!(!decoded.pq_signing_ready);
+        assert_eq!(decoded.cert_chain, vec![0xC7, 0xC8, 0xC9]);
+    }
+
+    #[test]
+    fn get_measurement_response_cert_chain_optional_back_compat() {
+        // A peer on the 1–6 schema omits key 7; decode must default cert_chain to empty.
+        let value = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+            (Value::Integer(2.into()), Value::Bytes(b"meas".to_vec())),
+            (Value::Integer(3.into()), Value::Bytes(b"att".to_vec())),
+            (Value::Integer(4.into()), Value::Bytes(vec![0x01])),
+            (Value::Integer(5.into()), Value::Array(vec![Value::Integer(0.into())])),
+            (Value::Integer(6.into()), Value::Bool(true)),
+        ]);
+        let bytes = encode_value(&value).unwrap();
+        let decoded = decode_get_measurement_response(&bytes).unwrap();
+        assert!(decoded.cert_chain.is_empty());
+        assert!(decoded.pq_signing_ready);
+    }
+
+    #[test]
+    fn get_measurement_response_cert_chain_null_is_empty() {
+        // An explicit CBOR null at key 7 means "no chain" — decode to empty, not an error.
+        let value = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+            (Value::Integer(2.into()), Value::Bytes(b"meas".to_vec())),
+            (Value::Integer(3.into()), Value::Bytes(b"att".to_vec())),
+            (Value::Integer(4.into()), Value::Bytes(vec![0x01])),
+            (Value::Integer(5.into()), Value::Array(vec![Value::Integer(0.into())])),
+            (Value::Integer(6.into()), Value::Bool(false)),
+            (Value::Integer(7.into()), Value::Null),
+        ]);
+        let bytes = encode_value(&value).unwrap();
+        let decoded = decode_get_measurement_response(&bytes).unwrap();
+        assert!(decoded.cert_chain.is_empty());
     }
 
     #[test]

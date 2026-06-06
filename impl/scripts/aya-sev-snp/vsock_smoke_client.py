@@ -168,10 +168,12 @@ def main() -> None:
         fields = _decode_framed_get_measurement(resp)
         meas = fields.get(2)
         att = fields.get(3)
+        certs = fields.get(7)
         meas_hex = meas.hex() if isinstance(meas, (bytes, bytearray)) else repr(meas)
         att_len = len(att) if isinstance(att, (bytes, bytearray)) else "n/a"
-        print("%s: measurement=%s attestation_len=%s pq_ready=%s"
-              % (label, meas_hex, att_len, fields.get(6)))
+        cert_len = len(certs) if isinstance(certs, (bytes, bytearray)) else 0
+        print("%s: measurement=%s attestation_len=%s cert_chain_len=%s pq_ready=%s"
+              % (label, meas_hex, att_len, cert_len, fields.get(6)))
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ defmodule EnclaveProtocol.Framing do
     end
   end
 
-  @doc "Parse GET_MEASUREMENT success response CBOR (integer keys 1–6)."
+  @doc "Parse GET_MEASUREMENT success response CBOR (integer keys 1–6, optional key 7 cert_chain)."
   @spec decode_get_measurement_response(binary()) :: {:ok, map()} | {:error, term()}
   def decode_get_measurement_response(payload) when is_binary(payload) do
     with {:ok, map} <- decode_exact_map(payload) do
@@ -174,6 +174,10 @@ defmodule EnclaveProtocol.Framing do
          pq_pubkey when is_binary(pq_pubkey) <- cbor_bytes(Map.get(map, 4)),
          {:ok, types} <- decode_u8_list(Map.get(map, 5)),
          ready when is_boolean(ready) <- Map.get(map, 6) do
+      # Key 7 (cert_chain) is optional/additive: SNP VCEK->ASK->ARK chain (auxblob), empty when
+      # absent or on a 1-6-schema peer.
+      cert_chain = cbor_bytes(Map.get(map, 7)) || <<>>
+
       {:ok,
        %{
          version: 1,
@@ -181,7 +185,8 @@ defmodule EnclaveProtocol.Framing do
          attestation: attestation,
          pq_pubkey: pq_pubkey,
          supported_ticket_types: types,
-         pq_signing_ready: ready
+         pq_signing_ready: ready,
+         cert_chain: cert_chain
        }}
     else
       _ -> {:error, :invalid_get_measurement_response}
