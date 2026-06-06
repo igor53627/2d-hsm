@@ -86,6 +86,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // TASK-5 Phase 3 (AC#4): capture the real SNP launch measurement bound to the installed PQ key
+    // so GET_MEASUREMENT reports it. Best-effort — on KVM/dev or without the sev-guest TSM provider
+    // it logs and continues, and GET_MEASUREMENT keeps the placeholder (graceful fallback).
+    match enclave_protocol::boot_capture_snp_measurement() {
+        Ok(()) => eprintln!("enclave-vsock: SNP launch measurement captured (attested GET_MEASUREMENT)"),
+        Err(e) => eprintln!("enclave-vsock: SNP measurement unavailable, using placeholder: {e}"),
+    }
+
     let (cid, port) = vsock_listen_addr_from_env()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = bind_vsock_listener(cid, port)?;

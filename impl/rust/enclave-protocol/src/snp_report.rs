@@ -122,6 +122,57 @@ pub fn fetch_measurement_and_report(
     Ok((measurement, report))
 }
 
+// ---- boot-time capture + cache ----
+
+struct CachedAttestation {
+    measurement: [u8; SNP_MEASUREMENT_LEN],
+    report: Vec<u8>,
+}
+
+/// One SNP report captured at enclave boot (bound to the installed PQ key).
+static SNP_ATTESTATION: std::sync::Mutex<Option<CachedAttestation>> =
+    std::sync::Mutex::new(None);
+
+/// Boot hook: fetch the SNP report bound to `pq_pubkey` once and cache `(measurement, report)`.
+/// Propagates the fetch error (e.g. interface absent) so the caller can log + fall back.
+pub fn boot_fetch_and_cache(pq_pubkey: &[u8]) -> Result<(), ProtocolError> {
+    let (measurement, report) = fetch_measurement_and_report(pq_pubkey)?;
+    let mut guard = SNP_ATTESTATION
+        .lock()
+        .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation cache poisoned"))?;
+    *guard = Some(CachedAttestation {
+        measurement,
+        report,
+    });
+    Ok(())
+}
+
+/// The boot-captured `(measurement, raw_report)`, if an SNP report was obtained at startup.
+pub fn cached_attestation() -> Option<([u8; SNP_MEASUREMENT_LEN], Vec<u8>)> {
+    let guard = SNP_ATTESTATION.lock().ok()?;
+    guard.as_ref().map(|c| (c.measurement, c.report.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_cached_attestation_for_tests(
+    measurement: [u8; SNP_MEASUREMENT_LEN],
+    report: Vec<u8>,
+) {
+    if let Ok(mut g) = SNP_ATTESTATION.lock() {
+        *g = Some(CachedAttestation {
+            measurement,
+            report,
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cached_attestation_for_tests() {
+    if let Ok(mut g) = SNP_ATTESTATION.lock() {
+        *g = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

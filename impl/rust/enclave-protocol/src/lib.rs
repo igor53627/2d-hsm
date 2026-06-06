@@ -358,21 +358,73 @@ fn validate_ticket_pq_pubkey_matches_signer(
     expect_pq_pubkey_matches_active_signer(&ticket.pq_pubkey)
 }
 
+/// Boot hook (production / AC#4): capture the real SEV-SNP launch measurement bound to the
+/// installed PQ key so `GET_MEASUREMENT` can return it. Best-effort — returns the fetch error so
+/// the caller logs and continues; `measurement_response` then falls back to the placeholder on
+/// non-SNP/dev hosts (no `sev-guest` / KVM).
+pub fn boot_capture_snp_measurement() -> Result<(), ProtocolError> {
+    let pq_pubkey = active_signing_public_key_bytes().ok_or(
+        ProtocolError::PqSigningUnavailable("no installed PQ signer to bind the SNP report to"),
+    )?;
+    snp_report::boot_fetch_and_cache(&pq_pubkey)
+}
+
 fn measurement_response() -> GetMeasurementResponse {
     let pq_pubkey = active_signing_public_key_bytes().unwrap_or_default();
-
-    // Advertise the same measurement the reference/staging signer is sealed under.
-    #[cfg(any(feature = "staging-host", feature = "reference-test-key"))]
-    let measurement = REFERENCE_STAGING_MEASUREMENT.to_vec();
-    #[cfg(not(any(feature = "staging-host", feature = "reference-test-key")))]
-    let measurement = boot_lab_pq_seal::LAB_PROD_MEASUREMENT.to_vec();
-
+    let (measurement, attestation) = resolve_measurement_and_attestation();
     GetMeasurementResponse {
         measurement,
-        attestation: b"attestation-placeholder".to_vec(),
+        attestation,
         pq_pubkey,
         supported_ticket_types: vec![0, 1],
         pq_signing_ready: pq_signing_ready(),
+    }
+}
+
+/// `(measurement, attestation)` for `GET_MEASUREMENT`. Staging/reference advertise the sealed
+/// label. Production returns the boot-captured SNP launch measurement + raw report when available,
+/// else gracefully falls back to the placeholder label (keeps KVM/dev/transport smokes working).
+fn resolve_measurement_and_attestation() -> (Vec<u8>, Vec<u8>) {
+    #[cfg(any(feature = "staging-host", feature = "reference-test-key"))]
+    {
+        (
+            REFERENCE_STAGING_MEASUREMENT.to_vec(),
+            b"attestation-placeholder".to_vec(),
+        )
+    }
+    #[cfg(not(any(feature = "staging-host", feature = "reference-test-key")))]
+    {
+        match snp_report::cached_attestation() {
+            Some((measurement, report)) => (measurement.to_vec(), report),
+            None => (
+                boot_lab_pq_seal::LAB_PROD_MEASUREMENT.to_vec(),
+                b"attestation-placeholder".to_vec(),
+            ),
+        }
+    }
+}
+
+#[cfg(all(test, not(any(feature = "staging-host", feature = "reference-test-key"))))]
+mod measurement_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn production_measurement_prefers_cached_snp_then_falls_back() {
+        snp_report::reset_cached_attestation_for_tests();
+        // No SNP report cached -> placeholder label + placeholder attestation (graceful fallback).
+        let (m, att) = resolve_measurement_and_attestation();
+        assert_eq!(m, boot_lab_pq_seal::LAB_PROD_MEASUREMENT.to_vec());
+        assert_eq!(att, b"attestation-placeholder".to_vec());
+
+        // With a boot-captured SNP report -> real 48-byte measurement + the raw report.
+        let meas = [0x5au8; snp_report::SNP_MEASUREMENT_LEN];
+        let report = vec![0xa5u8; 1184];
+        snp_report::set_cached_attestation_for_tests(meas, report.clone());
+        let (m2, att2) = resolve_measurement_and_attestation();
+        assert_eq!(m2, meas.to_vec());
+        assert_eq!(att2, report);
+
+        snp_report::reset_cached_attestation_for_tests();
     }
 }
 
