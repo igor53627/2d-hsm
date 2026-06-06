@@ -76,6 +76,15 @@ in
         "twod-hsm: productionMode cannot run transport-only (no operational PQ signer). "
         + "Use a profile that installs a sealed signer.";
     }
+    {
+      # Couple the env-gate and the unit-gate: sealRootSource="snp" points the enclave's root file at
+      # the tmpfs path the derive oneshot writes, but that oneshot only exists when snpDeriveRootPackage
+      # is set. Without it the enclave would read a file nothing writes — fail at eval, not at boot.
+      assertion = !(snpRoot && snpDeriveRootPackage == null);
+      message =
+        "twod-hsm: sealRootSource=\"snp\" requires snpDeriveRootPackage (the twod-hsm-snp-derive-seal-root "
+        + "oneshot writes the root file the enclave reads). Pass snp-derive-root to the image.";
+    }
   ];
 
   boot.loader.grub.enable = false;

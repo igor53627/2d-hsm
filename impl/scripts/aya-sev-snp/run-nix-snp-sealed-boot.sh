@@ -48,14 +48,24 @@ echo "SNP: qemu=$QEMU_BIN bios=$SNP_BIOS"
 # since the guest sets no TWOD_HSM_ENCLAVE_MEASUREMENT_FILE. Seal against the same bytes.
 MEAS_HEX="$(printf '%s' "enclave-measurement-placeholder" | od -An -v -tx1 | tr -d ' \n')"
 
-WORK1=""
+# All ceremony temp files (the console log that captures the printed root, the raw 32-byte root, the
+# disk overlay) live in a private 0700 dir that is SHREDDED on EVERY exit path — the derived
+# provisioning root must not linger in /tmp. The host-specific sealed blob is likewise unstaged +
+# removed on exit so it can never be committed (it is force-added only transiently for the build).
+CEREMONY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/2d-hsm-snp-ceremony-XXXXXX")"
+chmod 700 "$CEREMONY_TMP"
 QPID=""
 cleanup() {
   if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
     kill "$QPID" 2>/dev/null || true
     wait "$QPID" 2>/dev/null || true
   fi
-  [[ -n "$WORK1" ]] && rm -f "$WORK1"
+  if [[ -n "${CEREMONY_TMP:-}" && -d "$CEREMONY_TMP" ]]; then
+    find "$CEREMONY_TMP" -type f -exec shred -u {} + 2>/dev/null || true
+    rm -rf "$CEREMONY_TMP"
+  fi
+  ( cd "$ROOT_DIR" && git reset -q HEAD -- impl/nix/vm-hsm/ceremony-sealed-signer.bin >/dev/null 2>&1 || true )
+  rm -f "$CEREMONY_BLOB"
 }
 trap cleanup EXIT
 
@@ -63,8 +73,8 @@ trap cleanup EXIT
 echo "[1/4] build + boot .#disk-production-lab-print-ceremony → capture derived root"
 PRINT_LINK="$(twod_hsm_nix_ensure "$FLAKE_DIR" disk-production-lab-print-ceremony disk-production-lab-print-ceremony)"
 PRINT_QCOW2="$(twod_hsm_nix_disk_qcow2 "$PRINT_LINK")"
-WORK1="$(mktemp -u /tmp/2d-hsm-snp-ceremony-print-XXXXXX.qcow2)"
-LOG1="$(mktemp /tmp/2d-hsm-snp-ceremony-print-XXXXXX.log)"
+WORK1="$CEREMONY_TMP/print.qcow2"
+LOG1="$CEREMONY_TMP/print-console.log"
 twod_hsm_make_work_overlay "$PRINT_QCOW2" "$WORK1"
 twod_hsm_stop_stale_qemu
 
@@ -73,17 +83,19 @@ DISK="$WORK1" CLOUDINIT="" TWOD_HSM_SKIP_CLOUDINIT=1 \
   nohup "$SCRIPT_DIR/run-guest-vm.sh" </dev/null >"$LOG1" 2>&1 &
 QPID=$!
 
-# The console line is `<ts> snp-derive-root[pid]: <64-hex root>` (no other 64-hex follows that
-# prefix — the selftest commitment line has text after `]: `, not hex).
+# The console line is `<ts> <unit>[pid]: <64-hex root>` (systemd journal→console prefix). Match any
+# unit identifier (SyslogIdentifier may differ from the binary name) but require the `[pid]: <hex>`
+# structure, so a stray 64-hex elsewhere in the boot log isn't mistaken for the root.
 root_hex_from_log() {
-  grep -aoE 'snp-derive-root\[[0-9]+\]: [0-9a-f]{64}' "$LOG1" | tail -1 | grep -oE '[0-9a-f]{64}' || true
+  grep -aoE '[A-Za-z0-9_.-]+\[[0-9]+\]: [0-9a-f]{64}' "$LOG1" 2>/dev/null | tail -1 | grep -oE '[0-9a-f]{64}' || true
 }
 ROOT_HEX=""
 deadline=$((SECONDS + BOOT_TIMEOUT_SEC))
 while (( SECONDS < deadline )); do
   ROOT_HEX="$(root_hex_from_log)"
   [[ -n "$ROOT_HEX" ]] && break
-  kill -0 "$QPID" 2>/dev/null || { ROOT_HEX="$(root_hex_from_log)"; break; }
+  # If QEMU exited, give the serial log a moment to flush, then take one last look.
+  kill -0 "$QPID" 2>/dev/null || { sleep 1; ROOT_HEX="$(root_hex_from_log)"; break; }
   sleep 4
 done
 if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
@@ -92,18 +104,19 @@ if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
 fi
 QPID=""
 if [[ -z "$ROOT_HEX" ]]; then
-  echo "[FAIL] no derived root printed within ${BOOT_TIMEOUT_SEC}s; log tail:" >&2
-  tail -60 "$LOG1" >&2 || true
+  echo "[FAIL] no derived root printed within ${BOOT_TIMEOUT_SEC}s; console tail (root redacted):" >&2
+  # Redact any 64-hex so the secret root never reaches this script's stderr / the outer ceremony log.
+  tail -60 "$LOG1" 2>/dev/null | sed -E 's/[0-9a-f]{64}/<redacted-root>/g' >&2 || true
   exit 1
 fi
 echo "      derived root captured (64 hex; not echoed)"
 
 # --- Phase 2: seal the reference keypair against the derived root (offline) ------
 echo "[2/4] seal reference ML-DSA-65 keypair against the derived root (pq-seal-v1)"
-ROOTBIN="$(mktemp /tmp/2d-hsm-snp-ceremony-root-XXXXXX.bin)"
+ROOTBIN="$CEREMONY_TMP/root.bin"   # shredded with CEREMONY_TMP on exit (trap), plus explicitly below
 python3 -c "import binascii; open('$ROOTBIN','wb').write(binascii.unhexlify('$ROOT_HEX'))"
 sz="$(wc -c < "$ROOTBIN" | tr -d ' ')"
-[[ "$sz" == 32 ]] || { echo "[FAIL] derived root is $sz bytes, expected 32" >&2; rm -f "$ROOTBIN"; exit 1; }
+[[ "$sz" == 32 ]] || { echo "[FAIL] derived root is $sz bytes, expected 32" >&2; exit 1; }
 
 # pq-seal-v1 is a path-dep crate (on enclave-protocol), not a nix package; build with cargo (on PATH
 # or via the flake devShell, which guarantees the toolchain).
@@ -113,7 +126,7 @@ if command -v cargo >/dev/null 2>&1; then
 else
   nix develop "$FLAKE_DIR" -c bash -c "cd '$ROOT_DIR/impl/rust/pq-seal-v1' && cargo build --release"
 fi
-[[ -x "$PQSEAL" ]] || { echo "[FAIL] pq-seal-v1 not built at $PQSEAL" >&2; rm -f "$ROOTBIN"; exit 1; }
+[[ -x "$PQSEAL" ]] || { echo "[FAIL] pq-seal-v1 not built at $PQSEAL" >&2; exit 1; }
 
 rm -f "$CEREMONY_BLOB"
 "$PQSEAL" seal \

@@ -45,7 +45,9 @@ SMOKE_ERR="$(mktemp /tmp/2d-hsm-nixos-snp-smokeerr-XXXXXX.log)"
 # (transport disk has none); a real launch measurement needs BOTH that signer AND
 # an SNP host (off-SNP / transport ⇒ the enclave serves the placeholder label).
 case "$DISK_ATTR" in
-  *-lab) HAS_SIGNER=1 ;;
+  # All production-lab images ship the operational signer — including the derived variants
+  # (disk-production-lab-selftest / -snp-rooted / -print-ceremony), so match *-lab*, not just *-lab.
+  *-lab | *-lab-*) HAS_SIGNER=1 ;;
   *) HAS_SIGNER=0 ;;
 esac
 if [[ "$SEV_MODE" == "snp" && "$HAS_SIGNER" == 1 ]]; then
