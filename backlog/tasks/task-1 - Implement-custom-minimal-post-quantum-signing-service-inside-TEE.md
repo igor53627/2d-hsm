@@ -507,8 +507,22 @@ See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress up
   `measurement_root_commit=ed7e9900d618ae7f2839453ffd16b433665209f979ece5add435bc282a5e6202` — proving
   the ioctl returns a usable 32-byte key, the MEASUREMENT binding is effective, and the root is stable
   across reboots. (Commitment = SHA3-256 of the root, not the secret.) ✅ replaces the lab test-vector
-  root with a real platform-derived one. **Follow-up (not this PR):** fully sealed-boot mainnet artifact
-  (re-seal a blob against the derived root, bake it) — needs the operator ceremony; vTPM/Nitro later.
+  root with a real platform-derived one.
+- **Code review (`/code-review max`, commit `7c1906d`):** refuted a critical-sounding "kernel struct is
+  `__packed`" finding (verified `include/uapi/linux/sev-guest.h` v5.19→master: not packed, sizeof 32,
+  `0xC0205301` correct). Fixed: all-zero-key guard (`DeriveError::ZeroKey`) on the `--out`/prod path;
+  zeroize the firmware key + derived root + `--print` hex (added `zeroize` dep, matches pq-seal-v1);
+  `write_root_0600` now creates the parent dir + uses `create_new`/O_EXCL (no symlink-follow, guaranteed
+  0600); `--out` rejects a flag-looking path; **decoupled the selftest oneshot from the enclave**
+  (`wantedBy multi-user.target`, after `systemd-udev-settle`, dropped the spurious configfs dep) so a
+  failed diagnostic can't cancel the signer; `smoke-cache-lib` build-stamp now hashes the crate (no
+  stale re-validation). **Re-validated on aya** with the hardened code + decoupled unit: both boots PASS,
+  commitment byte-identical (`ed7e9900…6202`) ⇒ refactor didn't change the derivation.
+- **Follow-ups (not this PR):** (a) fully sealed-boot mainnet artifact — re-seal a blob against the
+  derived root + bake it (operator ceremony); (b) wire the production `--out` oneshot that writes the
+  enclave's root file; (c) low-severity review nits: `selftest()` honor `--field-select`/`--root-key`/
+  `--svn`, share the pq-seal domain constant with `enclave-protocol`, drop the dead `run()` branch,
+  use `hex::encode`; (d) vTPM/Nitro backends.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
