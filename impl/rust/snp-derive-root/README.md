@@ -29,8 +29,9 @@ Domain separation means the raw firmware key is never exposed and could feed oth
 ## Usage
 
 ```
-# Boot: write the root to a tmpfs file, mode 0600 (the intended production oneshot before the
-# enclave — NOT yet wired; today only --selftest runs at boot, see runbook §7.1).
+# Boot: write the root to a tmpfs file, mode 0600. Wired as the gating twod-hsm-snp-derive-seal-root
+# oneshot (before the enclave) when the guest profile sets sealRootSource="snp"; the enclave then
+# unseals against this derived root. See runbook §7.1 + run-nix-snp-sealed-boot.sh.
 snp-derive-root --out /run/twod-hsm/pq-seal-root.bin
 
 # Provisioning ceremony (run ONCE inside the target image; seal offline against this root):

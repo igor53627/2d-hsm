@@ -34,6 +34,10 @@ impl/solidity/.forge-crosscheck/
 impl/solidity/out/
 result
 
+# TASK-1.1 sealed-boot ceremony output: host-specific signer sealed against the SNP-derived root.
+# Never committed (per-platform); the ceremony script force-adds it into the validation worktree only.
+impl/nix/vm-hsm/ceremony-sealed-signer.bin
+
 # SEV-SNP / QEMU smoke artifacts (setup-guest-image.sh, run-guest-vm.sh)
 impl/scripts/aya-sev-snp/vm-disk.qcow2
 impl/scripts/aya-sev-snp/cloud-init-user-data

@@ -38,28 +38,13 @@ if [[ "$SEV_MODE" != "snp" ]]; then
 fi
 
 twod_hsm_nix_init
-if [[ -x /opt/qemu-snp/bin/qemu-system-x86_64 ]]; then
-  QEMU_BIN="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
-else
-  QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
-fi
-QEMU_BIN="$(command -v "$QEMU_BIN" || true)"
-[[ -n "$QEMU_BIN" ]] || { echo "qemu-system-x86_64 not found (set QEMU_BIN)" >&2; exit 1; }
-if ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-guest; then
-  echo "need QEMU with sev-snp-guest (run ./install-qemu-snp.sh)" >&2
-  exit 1
-fi
-SNP_BIOS="$(twod_hsm_snp_ovmf_path)"
-export SNP_BIOS QEMU_BIN
+twod_hsm_resolve_snp_qemu
 echo "SNP: qemu=$QEMU_BIN bios=$SNP_BIOS"
 
 echo "[1/3] nix .#${DISK_ATTR} (bootable EFI qcow2 with the selftest oneshot)"
 DISK_LINK="$(twod_hsm_nix_ensure "$FLAKE_DIR" "$DISK_ATTR" "${DISK_ATTR}")"
 SRC_QCOW2="$(twod_hsm_nix_disk_qcow2 "$DISK_LINK")"
 echo "      image: $SRC_QCOW2"
-
-QEMU_IMG="${QEMU_IMG:-$(dirname "$QEMU_BIN")/qemu-img}"
-[[ -x "$QEMU_IMG" ]] || QEMU_IMG="$(command -v qemu-img || true)"
 
 # Boot the image once and return the captured "snp-derive-root selftest:" console line.
 # Each boot uses a fresh thin overlay over the read-only store qcow2 (so a reboot is a genuinely
@@ -68,12 +53,7 @@ boot_once() {
   local label=$1 work log selftest_line=""
   work="$(mktemp -u "/tmp/2d-hsm-snp-selftest-${label}-XXXXXX.qcow2")"
   log="$(mktemp "/tmp/2d-hsm-snp-selftest-${label}-XXXXXX.log")"
-  rm -f "$work"
-  if [[ -n "$QEMU_IMG" && -x "$QEMU_IMG" ]]; then
-    "$QEMU_IMG" create -q -f qcow2 -F qcow2 -b "$SRC_QCOW2" "$work"
-  else
-    cp -f "$SRC_QCOW2" "$work"; chmod u+w "$work"
-  fi
+  twod_hsm_make_work_overlay "$SRC_QCOW2" "$work"
 
   GUEST_CID="$GUEST_CID" twod_hsm_stop_stale_qemu
   local qpid=""

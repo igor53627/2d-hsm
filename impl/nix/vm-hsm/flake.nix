@@ -98,6 +98,42 @@
           guestProfile = "production-lab";
           deriveRootSelftest = true;
         };
+        # TASK-1.1 sealed-boot ceremony (run on a trusted host; see run-nix-snp-sealed-boot.sh).
+        # PRINT image dumps the SECRET derived root to the console so the signer can be sealed against
+        # it offline. CEREMONY ONLY — never deploy this image (it leaks the provisioning root).
+        diskProductionLabPrintCeremony = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            snp-derive-root
+            ;
+          guestProfile = "production-lab";
+          deriveRootPrintCeremony = true;
+        };
+        # TASK-1.1 sealed-boot loop: the enclave unseals against the BOOT-DERIVED root (the derive
+        # oneshot writes /run/twod-hsm/pq-seal-root.bin; sealRootSource="snp"). The signer blob must be
+        # sealed against that derived root — supplied via ceremony-sealed-signer.bin (produced by the
+        # ceremony script and force-added in the validation worktree; gitignored so it never lands in a
+        # real commit). When absent (CI eval), it falls back to the lab fixture so the output still
+        # instantiates — but it will NOT unseal at boot until the matching ceremony blob is present.
+        ceremonySignerPath = ./ceremony-sealed-signer.bin;
+        diskProductionLabSnpRooted = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            snp-derive-root
+            ;
+          guestProfile = "production-lab";
+          sealRootSource = "snp";
+          pqSealedSignerOverride =
+            if builtins.pathExists ceremonySignerPath then ceremonySignerPath else null;
+        };
       in
       {
         packages = {
@@ -110,6 +146,9 @@
           disk-production = diskProduction;
           disk-production-lab = diskProductionLab;
           disk-production-lab-selftest = diskProductionLabSelftest;
+          # TASK-1.1 sealed-boot loop + ceremony (see run-nix-snp-sealed-boot.sh).
+          disk-production-lab-print-ceremony = diskProductionLabPrintCeremony;
+          disk-production-lab-snp-rooted = diskProductionLabSnpRooted;
           default = enclave;
         };
 

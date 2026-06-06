@@ -175,12 +175,19 @@ the root only as a file via `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`.
    The same value is reproduced on every boot of that image on that platform.
 2. Seal the producer key **offline** against that root + the same launch measurement using the
    `pq-seal-v1` CLI (§3.3 / §3.4, substituting the derived root for the test vector).
-3. Bake the sealed blob into the deploy artifact. On boot the enclave reads the root from
-   `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` and unseals. **Not yet wired:** the boot-time
-   `snp-derive-root --out <path>` oneshot that writes that file is a follow-up (TASK-1.1 item (b)) —
-   today only the `--selftest` diagnostic oneshot runs at boot (`disk-production-lab-selftest`). Until
-   the `--out` oneshot lands, the root file must be provided by the existing build-time/sealed-store
-   path (`guest-profile pqSealRootOverride`), exactly as for the lab fixtures.
+3. Bake the sealed blob into the deploy artifact. On boot, with `sealRootSource = "snp"`, the NixOS
+   module runs a gating `twod-hsm-snp-derive-seal-root` oneshot (`snp-derive-root --out
+   /run/twod-hsm/pq-seal-root.bin`, before the enclave) and points `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` at
+   that tmpfs path; the enclave reads it and unseals the baked blob. (With the default
+   `sealRootSource = "file"` the root still comes from the build-time file / `pqSealRootOverride`, as
+   for the lab fixtures.)
+
+**End-to-end demonstration** (`impl/scripts/aya-sev-snp/run-nix-snp-sealed-boot.sh`): automates the
+whole ceremony on a SEV-SNP host — boots `.#disk-production-lab-print-ceremony` to capture the derived
+root, seals the reference keypair against it offline, builds `.#disk-production-lab-snp-rooted` with
+that blob, and asserts the enclave reaches `pq_signing_ready` + a real measurement. NOTE the derived
+root is **platform-specific** (per VCEK / per chip), so a baked blob only unseals on the host it was
+sealed for; multi-host mainnet needs per-host sealing (or VMRK) — tracked as a follow-up.
 
 **Measurement binding ⇒ re-seal on image change:** because the root is bound to MEASUREMENT, any
 change to the enclave image (firmware, kernel, binary) changes the root and invalidates an existing

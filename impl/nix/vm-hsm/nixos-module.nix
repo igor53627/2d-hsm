@@ -17,6 +17,16 @@
   # console — used to validate the derived-key path on a real SNP host. Default off.
   snpDeriveRootPackage ? null,
   deriveRootSelftest ? false,
+  # TASK-1.1 (sealed-boot loop): where the enclave's pq-seal provisioning root comes from.
+  #   "file" (default) — the build-time file (lab fixture or operator override), as before.
+  #   "snp"            — derived at boot by `snp-derive-root --out`, written to a tmpfs file the
+  #                      enclave reads. The sealed signer MUST have been sealed against that derived
+  #                      root (provisioning ceremony) or unseal fails closed.
+  sealRootSource ? "file",
+  # CEREMONY ONLY: add a oneshot that PRINTS the secret derived root to the console (so an operator
+  # can seal the signer against it offline). Leaks the root to the serial log — never enable on a
+  # shipped image. Default off.
+  deriveRootPrintCeremony ? false,
   ...
 }:
 
@@ -25,6 +35,17 @@ let
   isProd = mode == "production";
   binName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
   unitName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
+  # Sealed-boot loop: the SNP-derived root lands here on tmpfs (written by the derive oneshot,
+  # mode 0600 under a 0700 dir the tool creates) and the enclave reads it instead of a baked file.
+  snpRoot = sealRootSource == "snp";
+  runtimeRootFile = "/run/twod-hsm/pq-seal-root.bin";
+  enclaveRootFile =
+    if snpRoot then
+      runtimeRootFile
+    else if pqSealProvisioningRootFile != null then
+      "${pqSealProvisioningRootFile}"
+    else
+      null;
   trustFile =
     if !isProd then
       null
@@ -136,10 +157,10 @@ in
       // lib.optionalAttrs isProd {
         TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE = "${trustFile}";
       }
-      // lib.optionalAttrs (
-        isProd && pqSealProvisioningRootFile != null && pqSealedSignerFile != null
-      ) {
-        TWOD_HSM_PQ_SEAL_V1_ROOT_FILE = "${pqSealProvisioningRootFile}";
+      // lib.optionalAttrs (isProd && pqSealedSignerFile != null && enclaveRootFile != null) {
+        # sealRootSource="snp" → enclaveRootFile is the tmpfs path the derive oneshot writes;
+        # otherwise it is the build-time root file. The sealed signer is always a baked blob.
+        TWOD_HSM_PQ_SEAL_V1_ROOT_FILE = enclaveRootFile;
         TWOD_HSM_PQ_SEALED_SIGNER_FILE = "${pqSealedSignerFile}";
       }
       // lib.optionalAttrs (isProd && enclaveTransportOnly) {
@@ -165,6 +186,45 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${snpDeriveRootPackage}/bin/snp-derive-root --selftest";
+        StandardOutput = "journal+console";
+        StandardError = "journal+console";
+      };
+    };
+
+  # TASK-1.1 (sealed-boot loop): derive the pq-seal root from the SNP firmware into a tmpfs file the
+  # enclave reads (sealRootSource="snp"). Unlike the selftest, this IS load-bearing — the enclave
+  # unseals its signer against this root — so it gates the enclave (requiredBy + before): if the
+  # derivation fails, the enclave could not unseal anyway, so failing closed is correct.
+  systemd.services."twod-hsm-snp-derive-seal-root" =
+    lib.mkIf (isProd && snpRoot && snpDeriveRootPackage != null) {
+      description = "2d-hsm SNP firmware-derived pq-seal root → ${runtimeRootFile} (TASK-1.1)";
+      requiredBy = [ "${unitName}.service" ];
+      before = [ "${unitName}.service" ];
+      # Opens the udev-created /dev/sev-guest node — wait for udev to settle (the enclave's barrier).
+      after = [ "systemd-modules-load.service" "systemd-udev-settle.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # The tool creates /run/twod-hsm (0700) and writes the root 0600; /run is tmpfs, so the
+        # secret root never touches persistent storage. The enclave (ProtectSystem=strict) reads it.
+        ExecStart = "${snpDeriveRootPackage}/bin/snp-derive-root --out ${runtimeRootFile}";
+        StandardOutput = "journal+console";
+        StandardError = "journal+console";
+      };
+    };
+
+  # CEREMONY ONLY — never enable on a shipped image. Prints the SECRET derived root to the console so
+  # an operator can seal the signer against it offline (runbook §7.1 step 1). This dumps the
+  # provisioning root to the serial log, so it is gated behind deriveRootPrintCeremony (default off)
+  # and only ever set by the sealed-boot ceremony script on a trusted host.
+  systemd.services."twod-hsm-snp-derive-root-print-ceremony" =
+    lib.mkIf (isProd && deriveRootPrintCeremony && snpDeriveRootPackage != null) {
+      description = "2d-hsm SNP derived pq-seal root PRINT (CEREMONY ONLY — leaks the secret root)";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-modules-load.service" "systemd-udev-settle.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${snpDeriveRootPackage}/bin/snp-derive-root --print";
         StandardOutput = "journal+console";
         StandardError = "journal+console";
       };
