@@ -176,7 +176,11 @@ the root only as a file via `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`.
 2. Seal the producer key **offline** against that root + the same launch measurement using the
    `pq-seal-v1` CLI (§3.3 / §3.4, substituting the derived root for the test vector).
 3. Bake the sealed blob into the deploy artifact. On boot the enclave reads the root from
-   `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` (written by a `snp-derive-root --out <path>` oneshot) and unseals.
+   `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` and unseals. **Not yet wired:** the boot-time
+   `snp-derive-root --out <path>` oneshot that writes that file is a follow-up (TASK-1.1 item (b)) —
+   today only the `--selftest` diagnostic oneshot runs at boot (`disk-production-lab-selftest`). Until
+   the `--out` oneshot lands, the root file must be provided by the existing build-time/sealed-store
+   path (`guest-profile pqSealRootOverride`), exactly as for the lab fixtures.
 
 **Measurement binding ⇒ re-seal on image change:** because the root is bound to MEASUREMENT, any
 change to the enclave image (firmware, kernel, binary) changes the root and invalidates an existing

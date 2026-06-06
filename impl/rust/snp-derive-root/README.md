@@ -29,7 +29,8 @@ Domain separation means the raw firmware key is never exposed and could feed oth
 ## Usage
 
 ```
-# Boot (NixOS oneshot, before the enclave): write the root to a tmpfs file, mode 0600.
+# Boot: write the root to a tmpfs file, mode 0600 (the intended production oneshot before the
+# enclave — NOT yet wired; today only --selftest runs at boot, see runbook §7.1).
 snp-derive-root --out /run/twod-hsm/pq-seal-root.bin
 
 # Provisioning ceremony (run ONCE inside the target image; seal offline against this root):
@@ -39,8 +40,10 @@ snp-derive-root --print
 snp-derive-root --selftest
 ```
 
-Options: `--field-select <measurement|policy|none|all|u64|0xHEX>` (default `measurement`),
-`--root-key <vcek|vmrk>` (default `vcek`), `--svn <n>` (default `0`). Run `--help` for details.
+Options: `--field-select <measurement|policy|none|all|policy+measurement|u64|0xHEX>` (default
+`measurement`), `--root-key <vcek|vmrk>` (default `vcek`), `--svn <n>` (default `0`). `--svn` only
+binds when the field mask includes `guest_svn` (bit 4); otherwise it is ignored (the tool warns).
+Run `--help` for details.
 
 `--selftest` confirms the derived key is non-zero, that selecting MEASUREMENT actually changes the
 key (so the offset and binding are correct), and emits a commitment that is stable across reboots iff
