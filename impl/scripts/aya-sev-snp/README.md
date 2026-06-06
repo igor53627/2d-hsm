@@ -120,3 +120,32 @@ cd impl/scripts/aya-sev-snp
 Pass criteria (bytes, markers, `pq_signing_ready`): see [SMOKE-PASS-CRITERIA.md](./SMOKE-PASS-CRITERIA.md).
 
 `vm-production` is **transport smoke only** (lab trust VK) — not a mainnet guest image. See `impl/nix/vm-hsm/README.md`.
+
+## NixOS guest under SEV-SNP (TASK-5 Phase 3 / AC#5)
+
+The `run-nix-vm-guest-smoke*.sh` scripts use the nixpkgs qemu-vm **runner** (KVM
+only — it embeds its own QEMU and cannot carry the SNP launch objects). To boot the
+**NixOS production guest under SEV-SNP** and get a *real* launch measurement from
+`GET_MEASUREMENT`, use the dedicated launcher, which builds a self-booting EFI qcow2
+(`.#disk-production-lab`) and boots it via the proven SNP QEMU line in
+`run-guest-vm.sh`:
+
+```bash
+cd impl/scripts/aya-sev-snp
+./run-nix-snp-guest-smoke.sh                 # SNP + real 48-byte measurement (lab PQ seal)
+SEV_MODE=none ./run-nix-snp-guest-smoke.sh   # KVM fallback: boots, placeholder measurement
+DISK_ATTR=disk-production ./run-nix-snp-guest-smoke.sh  # transport boot-only (no signer)
+```
+
+The real-measurement / pq-ready gates auto-adjust to the disk + mode (lab disk +
+SNP ⇒ require real; transport or off-SNP ⇒ placeholder), so no manual
+`VSOCK_SMOKE_*` env is needed; any gate can still be overridden via those vars.
+
+Unlike the Ubuntu SNP path (`run-snp-smoke.sh`: golden disk + `scp` *staging*
+binary), the NixOS image bakes the enclave as a systemd unit, so there is no
+SSH/scp step — boot, then host→guest vsock smoke. `run-vm-hsm.sh SEV_MODE=snp` now
+points here instead of exiting with a manual hint.
+
+Requires an SNP host (`/dev/sev`, `kvm_amd sev=Y`, `/opt/qemu-snp` with
+`sev-snp-guest`, AMD `OVMF.fd`). On a non-SNP host use `SEV_MODE=none` (KVM) — the
+real-measurement gate auto-relaxes, since only SNP yields a real measurement.

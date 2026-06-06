@@ -47,6 +47,14 @@ twod_hsm_nix_outlink_hit() {
       done
       return 1
       ;;
+    disk-production | disk-production-lab)
+      # make-disk-image emits a bootable qcow2 under the out path (TASK-5 AC#5).
+      local c
+      for c in "${link}"/*.qcow2; do
+        [[ -e "$c" ]] && return 0
+      done
+      return 1
+      ;;
     *)
       return 1
       ;;
@@ -109,6 +117,20 @@ twod_hsm_find_vm_runner() {
     return 1
   fi
   printf '%s' "$runner"
+}
+
+# Resolve the bootable qcow2 emitted by make-disk-image under a disk out-link.
+twod_hsm_nix_disk_qcow2() {
+  local disk_link=$1 candidate
+  for candidate in "$disk_link"/*.qcow2; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  echo "twod_hsm_nix_disk_qcow2: no *.qcow2 under ${disk_link}" >&2
+  ls -la "$disk_link" >&2 || true
+  return 1
 }
 
 # Usage: link=$(twod_hsm_nix_ensure "$flake_dir" attr cache-name)

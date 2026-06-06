@@ -30,14 +30,11 @@ export NIX_DISK_IMAGE="$DISK_IMAGE"
 VSOCK_DEV="-device vhost-vsock-pci,guest-cid=$GUEST_CID"
 case "$SEV_MODE" in
   snp)
-    QEMU_BIN="${QEMU:-/opt/qemu-snp/bin/qemu-system-x86_64}"
-    if [ ! -x "$QEMU_BIN" ]; then
-      echo "SEV_MODE=snp requires QEMU with memfd-private (e.g. /opt/qemu-snp on aya)" >&2
-      exit 1
-    fi
-    # qemu-vm runner embeds its own QEMU; SNP path is manual until we unify launchers.
-    echo "SEV_MODE=snp: use dedicated SNP launcher after qcow2 exists at $DISK_IMAGE" >&2
-    echo "  $QEMU_BIN ... -drive file=$DISK_IMAGE ... $VSOCK_DEV" >&2
+    # The nixpkgs qemu-vm runner embeds its own QEMU and injects the kernel
+    # directly — it cannot carry the SEV-SNP launch objects. The SNP path uses a
+    # self-booting EFI disk image (.#disk-production-lab) instead (TASK-5 AC#5).
+    echo "SEV_MODE=snp is not served by the qemu-vm runner; use the dedicated launcher:" >&2
+    echo "  $SCRIPT_DIR/run-nix-snp-guest-smoke.sh" >&2
     exit 2
     ;;
   none|*)
