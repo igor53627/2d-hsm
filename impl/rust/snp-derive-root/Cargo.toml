@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 sha3 = "0.12.0"
+# Scrub the firmware key + derived root from memory on drop (matches pq-seal-v1's Zeroizing use).
+zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

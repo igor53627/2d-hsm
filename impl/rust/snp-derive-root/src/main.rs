@@ -12,6 +12,7 @@ use snp_derive_root::{
     provisioning_root, selftest, FIELD_FAMILY_ID, FIELD_GUEST_POLICY, FIELD_GUEST_SVN,
     FIELD_IMAGE_ID, FIELD_MEASUREMENT, FIELD_TCB_VERSION, ROOT_KEY_VCEK, ROOT_KEY_VMRK,
 };
+use zeroize::Zeroizing;
 
 const USAGE: &str = "\
 snp-derive-root — derive the pq-seal v1 provisioning root from SEV-SNP firmware
@@ -66,11 +67,20 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--out" => out = Some(args.next().ok_or("--out needs a path")?),
+            "--out" => {
+                let p = args.next().ok_or("--out needs a path")?;
+                // Guard against eating the next flag as the path (e.g. `--out --print` writing the
+                // secret root to a file literally named "--print"); paths don't start with "--".
+                if p.starts_with("--") {
+                    return Err(format!("--out needs a path, got flag '{p}'"));
+                }
+                out = Some(p);
+            }
             "--print" => print = true,
             "--selftest" => do_selftest = true,
             "--field-select" => {
-                field_select = parse_field_select(&args.next().ok_or("--field-select needs a value")?)?
+                field_select =
+                    parse_field_select(&args.next().ok_or("--field-select needs a value")?)?
             }
             "--root-key" => {
                 root_key = match args.next().as_deref() {
@@ -112,7 +122,9 @@ fn run() -> Result<(), String> {
     }
 
     if out.is_none() && !print && !do_selftest {
-        return Err(format!("need --out <path>, --print, or --selftest\n\n{USAGE}"));
+        return Err(format!(
+            "need --out <path>, --print, or --selftest\n\n{USAGE}"
+        ));
     }
     if out.is_none() && !print {
         return Ok(());
@@ -125,27 +137,53 @@ fn run() -> Result<(), String> {
         eprintln!("snp-derive-root: wrote 32-byte provisioning root to {path} (field_select={field_select:#x})");
     }
     if print {
-        println!("{}", hex_lower(&root));
+        // Wrap the hex in Zeroizing so the heap copy of the secret is scrubbed after printing.
+        let hex = Zeroizing::new(hex_lower(&root[..]));
+        println!("{}", hex.as_str());
     }
     Ok(())
 }
 
 fn write_root_0600(path: &str, root: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
+    // Provision the parent dir (0700) so a documented target like /run/twod-hsm/pq-seal-root.bin
+    // works without a separate tmpfiles/RuntimeDirectory step.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+    // Defeat a pre-existing file/symlink at the target: drop it, then create fresh with O_EXCL
+    // (create_new). This never follows a planted symlink and never inherits loose perms — mode()
+    // applies only at creation, so writing through an existing inode would otherwise keep its mode.
+    let _ = std::fs::remove_file(path);
     let mut f = {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(path)?
         }
         #[cfg(not(unix))]
         {
-            std::fs::File::create(path)?
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?
         }
     };
     f.write_all(root)?;

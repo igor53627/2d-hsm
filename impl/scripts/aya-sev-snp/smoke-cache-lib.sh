@@ -80,9 +80,12 @@ twod_hsm_nix_build_stamp() {
     printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"
     return 0
   fi
-  local repo_root rust_dir script_dir
+  local repo_root rust_dir snp_dir script_dir
   repo_root="$(cd "${flake_dir}/../../.." && pwd)"
   rust_dir="${repo_root}/impl/rust/enclave-protocol"
+  # TASK-1.1: snp-derive-root is a separate crate baked into the disk-production-lab-selftest image,
+  # so it must contribute to the stamp — otherwise editing its sources leaves a stale cached image.
+  snp_dir="${repo_root}/impl/rust/snp-derive-root"
   script_dir="${repo_root}/impl/scripts/aya-sev-snp"
   _TWOD_HSM_NIX_BUILD_STAMP=$(
     {
@@ -95,6 +98,9 @@ twod_hsm_nix_build_stamp() {
       twod_hsm_cat_tree "${rust_dir}/src" -name '*.rs'
       twod_hsm_cat_tree "${rust_dir}/examples" -name '*.rs'
       twod_hsm_cat_tree "${rust_dir}/testvectors" -type f
+      [[ -f "${snp_dir}/Cargo.toml" ]] && cat "${snp_dir}/Cargo.toml"
+      [[ -f "${snp_dir}/Cargo.lock" ]] && cat "${snp_dir}/Cargo.lock"
+      twod_hsm_cat_tree "${snp_dir}/src" -name '*.rs'
       # Script-dir markdown docs are intentionally excluded: they do not affect Nix build outputs.
       twod_hsm_cat_tree "${script_dir}" \( -name '*.sh' -o -name '*.py' \)
     } | sha256sum | awk '{print $1}'

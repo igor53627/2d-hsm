@@ -147,17 +147,21 @@ in
       };
   };
 
-  # TASK-1.1: opt-in SNP firmware-derived pq-seal root self-check (default off). Runs before the
-  # enclave; logs PASS + a secret-free commitment to the console (for validating the derived-key
-  # path on a real SNP host). Does NOT feed the enclave's root yet — wiring the derived root into
-  # the sealed-boot needs the provisioning ceremony (re-seal against it), a follow-up.
+  # TASK-1.1: opt-in SNP firmware-derived pq-seal root self-check (default off). Runs at boot,
+  # independently of the enclave; logs PASS + a secret-free commitment to the console (for validating
+  # the derived-key path on a real SNP host). Does NOT feed the enclave's root yet — wiring the
+  # derived root into the sealed-boot needs the provisioning ceremony (re-seal against it), a follow-up.
   systemd.services."twod-hsm-snp-derive-root-selftest" =
     lib.mkIf (isProd && deriveRootSelftest && snpDeriveRootPackage != null) {
       description = "2d-hsm SNP derived pq-seal root self-check (TASK-1.1)";
-      after = [ "systemd-modules-load.service" "sys-kernel-config.mount" ];
-      requiredBy = [ "${unitName}.service" ];
-      before = [ "${unitName}.service" ];
-      unitConfig.RequiresMountsFor = "/sys/kernel/config";
+      # Standalone diagnostic: it must NOT gate the enclave. The check feeds the signer nothing yet,
+      # so a FAIL should log to the console — not cancel enclave-vsock's start job (which a
+      # requiredBy/Requires= coupling would do). Hence wantedBy multi-user.target, no before/requiredBy.
+      wantedBy = [ "multi-user.target" ];
+      # It opens the udev-created /dev/sev-guest node (not configfs-tsm), so wait for udev to settle —
+      # the same barrier the enclave unit uses. No /sys/kernel/config dependency: --selftest never
+      # touches configfs.
+      after = [ "systemd-modules-load.service" "systemd-udev-settle.service" ];
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${snpDeriveRootPackage}/bin/snp-derive-root --selftest";

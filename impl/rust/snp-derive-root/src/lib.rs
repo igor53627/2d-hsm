@@ -15,6 +15,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use sha3::{Digest, Sha3_256};
+use zeroize::Zeroizing;
 
 /// configfs has no derived-key interface; this is the only path (guest-only device).
 pub const DEV_SEV_GUEST: &str = "/dev/sev-guest";
@@ -39,12 +40,13 @@ const DERIVED_KEY_LEN: usize = 32;
 /// Domain separation: the provisioning root is NOT the bare firmware key.
 const ROOT_DOMAIN: &[u8] = b"2d-hsm-pq-seal-v1-root";
 
-/// `root = SHA3-256(domain || snp_derived_key)`. Pure — the testable core.
-pub fn derive_provisioning_root(snp_key: &[u8; 32]) -> [u8; 32] {
+/// `root = SHA3-256(domain || snp_derived_key)`. Pure — the testable core. Returned in a
+/// `Zeroizing` so the secret root is scrubbed from memory when the caller drops it.
+pub fn derive_provisioning_root(snp_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let mut h = Sha3_256::new();
     h.update(ROOT_DOMAIN);
     h.update(snp_key);
-    h.finalize().into()
+    Zeroizing::new(h.finalize().into())
 }
 
 #[derive(Debug)]
@@ -53,6 +55,9 @@ pub enum DeriveError {
     Unsupported,
     /// `/dev/sev-guest` could not be opened (not an SNP guest, or sev-guest module not loaded).
     OpenDevice(std::io::Error),
+    /// The firmware returned an all-zero derived key. Refused: `SHA3-256(domain ‖ 0…0)` is a public
+    /// constant, so sealing against it would lose the platform-secret binding.
+    ZeroKey,
     /// The SNP_GET_DERIVED_KEY ioctl failed (firmware/VMM error in exitinfo2).
     Ioctl {
         rc: i32,
@@ -67,6 +72,7 @@ impl std::fmt::Display for DeriveError {
         match self {
             DeriveError::Unsupported => write!(f, "SNP derived key is only available on Linux SEV-SNP guests"),
             DeriveError::OpenDevice(e) => write!(f, "cannot open {DEV_SEV_GUEST} (need an SEV-SNP guest with the sev-guest module): {e}"),
+            DeriveError::ZeroKey => write!(f, "SNP_GET_DERIVED_KEY returned an all-zero key (refusing: a zero key yields a public, non-secret root)"),
             DeriveError::Ioctl { rc, fw_error, vmm_error, errno } => write!(
                 f,
                 "SNP_GET_DERIVED_KEY ioctl failed (rc={rc}, fw_error={fw_error:#x}, vmm_error={vmm_error:#x}, errno={errno})"
@@ -103,8 +109,11 @@ struct SnpGuestRequestIoctl {
 const fn iowr(ty: u32, nr: u32, size: usize) -> u64 {
     (((3u32) << 30) | ((size as u32) << 16) | (ty << 8) | nr) as u64
 }
-const SNP_GET_DERIVED_KEY: u64 =
-    iowr(b'S' as u32, 0x1, core::mem::size_of::<SnpGuestRequestIoctl>());
+const SNP_GET_DERIVED_KEY: u64 = iowr(
+    b'S' as u32,
+    0x1,
+    core::mem::size_of::<SnpGuestRequestIoctl>(),
+);
 
 /// Fetch the raw 32-byte SEV-SNP firmware-derived key (NOT domain-separated — use
 /// [`provisioning_root`] for the value the enclave consumes).
@@ -113,8 +122,9 @@ pub fn fetch_snp_derived_key(
     field_select: u64,
     root_key_select: u32,
     guest_svn: u32,
-) -> Result<[u8; 32], DeriveError> {
+) -> Result<Zeroizing<[u8; 32]>, DeriveError> {
     use std::os::unix::io::AsRawFd;
+    use zeroize::Zeroize;
 
     let dev = std::fs::OpenOptions::new()
         .read(true)
@@ -156,9 +166,9 @@ pub fn fetch_snp_derived_key(
         });
     }
 
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&resp.data[DERIVED_KEY_OFFSET..DERIVED_KEY_OFFSET + DERIVED_KEY_LEN]);
-    resp.data.fill(0); // best-effort wipe of the response buffer
+    resp.data.zeroize(); // guaranteed (non-elided) wipe of the response buffer
     Ok(key)
 }
 
@@ -167,17 +177,21 @@ pub fn fetch_snp_derived_key(
     _field_select: u64,
     _root_key_select: u32,
     _guest_svn: u32,
-) -> Result<[u8; 32], DeriveError> {
+) -> Result<Zeroizing<[u8; 32]>, DeriveError> {
     Err(DeriveError::Unsupported)
 }
 
 /// Fetch the firmware key and return the domain-separated provisioning root the enclave consumes.
+/// Refuses an all-zero firmware key (defense-in-depth: a zero key yields a public, non-secret root).
 pub fn provisioning_root(
     field_select: u64,
     root_key_select: u32,
     guest_svn: u32,
-) -> Result<[u8; 32], DeriveError> {
+) -> Result<Zeroizing<[u8; 32]>, DeriveError> {
     let key = fetch_snp_derived_key(field_select, root_key_select, guest_svn)?;
+    if key.iter().all(|b| *b == 0) {
+        return Err(DeriveError::ZeroKey);
+    }
     Ok(derive_provisioning_root(&key))
 }
 
@@ -203,11 +217,11 @@ pub fn selftest() -> Result<SelfTest, DeriveError> {
     let commit = |k: &[u8; 32]| -> [u8; 32] {
         let mut h = Sha3_256::new();
         h.update(b"2d-hsm-snp-derive-root-selftest-commit");
-        h.update(derive_provisioning_root(k));
+        h.update(&derive_provisioning_root(k)[..]);
         h.finalize().into()
     };
     let nonzero = m_key.iter().any(|b| *b != 0);
-    let binding_changes = m_key != n_key;
+    let binding_changes = *m_key != *n_key;
     Ok(SelfTest {
         pass: nonzero && binding_changes,
         nonzero,
@@ -251,17 +265,23 @@ mod tests {
         let k = [0x5au8; 32];
         let r1 = derive_provisioning_root(&k);
         let r2 = derive_provisioning_root(&k);
-        assert_eq!(r1, r2, "deterministic");
-        assert_ne!(r1, k, "root must not be the bare firmware key");
-        assert_ne!(r1, derive_provisioning_root(&[0x5bu8; 32]), "different key -> different root");
+        assert_eq!(*r1, *r2, "deterministic");
+        assert_ne!(*r1, k, "root must not be the bare firmware key");
+        assert_ne!(
+            *r1,
+            *derive_provisioning_root(&[0x5bu8; 32]),
+            "different key -> different root"
+        );
     }
 
     #[test]
     fn fetch_off_snp_errors_gracefully() {
         // No panic off-SNP: non-Linux -> Unsupported; Linux without the device -> OpenDevice.
+        // (Match the Ok arm separately: the key is Zeroizing, which intentionally has no Debug.)
         match fetch_snp_derived_key(FIELD_MEASUREMENT, ROOT_KEY_VCEK, 0) {
             Err(DeriveError::Unsupported) | Err(DeriveError::OpenDevice(_)) => {}
-            other => panic!("expected Unsupported/OpenDevice off-SNP, got {other:?}"),
+            Err(e) => panic!("expected Unsupported/OpenDevice off-SNP, got {e:?}"),
+            Ok(_) => panic!("expected an error off-SNP, got a key"),
         }
     }
 }
