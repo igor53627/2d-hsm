@@ -10,6 +10,7 @@ on:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
+      - 'impl/rust/snp-derive-root/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
   pull_request:
@@ -17,6 +18,7 @@ on:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
+      - 'impl/rust/snp-derive-root/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
 
@@ -52,6 +54,15 @@ jobs:
       - name: pq-seal-v1 provisioning tool builds
         working-directory: impl/rust/pq-seal-v1
         run: cargo build
+
+      # TASK-1.1: SNP firmware-derived pq-seal root boot helper. Separate crate
+      # (owns the one ioctl enclave-protocol's forbid-unsafe can't). The ioctl
+      # path is Linux-gated, so the off-SNP tests here cover the repr(C) ABI
+      # sizes, the IOWR number, the domain-separated derivation, and the
+      # graceful no-device error; the in-guest path is validated on aya.
+      - name: snp-derive-root boot helper builds + tests
+        working-directory: impl/rust/snp-derive-root
+        run: cargo test
 
   elixir-test:
     runs-on: ubuntu-latest
@@ -101,6 +112,10 @@ jobs:
           nix build --no-update-lock-file .#vm-production --print-out-paths
           nix build --no-update-lock-file .#vm-production-lab --print-out-paths
 
+      # TASK-1.1: SNP firmware-derived pq-seal root boot helper (Nix package).
+      - name: Build snp-derive-root boot helper
+        run: nix build --no-update-lock-file .#snp-derive-root --print-out-paths
+
       # TASK-5 AC#5: validate the SEV-SNP disk image *evaluates* (instantiates the
       # make-disk-image derivation) without building it. The full build needs
       # vmTools.runInLinuxVM (requiredSystemFeatures = ["kvm"]), which GitHub-hosted
@@ -109,6 +124,8 @@ jobs:
         run: |
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab.drvPath
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production.drvPath
+          # TASK-1.1: derived-root self-check image (oneshot runs snp-derive-root --selftest in-guest).
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-selftest.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).

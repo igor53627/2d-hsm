@@ -28,6 +28,8 @@
         enclave-production-transport = pkgs.callPackage ./enclave.nix {
           profile = "production-transport";
         };
+        # TASK-1.1: SNP firmware-derived pq-seal provisioning root boot helper.
+        snp-derive-root = pkgs.callPackage ./snp-derive-root.nix { };
         flakeMeta = {
           gitRevision = self.shortRev or self.dirtyShortRev or "dirty";
           flakeLock = builtins.hashFile "sha256" (self + "/flake.lock");
@@ -82,10 +84,24 @@
         };
         diskProduction = diskImageFor "production";
         diskProductionLab = diskImageFor "production-lab";
+        # TASK-1.1: production-lab image + the SNP derived-root self-check oneshot (validates the
+        # derived-key path in-guest on a real SNP host; logs PASS + a secret-free commitment).
+        diskProductionLabSelftest = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            snp-derive-root
+            ;
+          guestProfile = "production-lab";
+          deriveRootSelftest = true;
+        };
       in
       {
         packages = {
-          inherit enclave enclave-staging enclave-production-transport measurement-manifest;
+          inherit enclave enclave-staging enclave-production-transport measurement-manifest snp-derive-root;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;
@@ -93,6 +109,7 @@
           # Bootable EFI qcow2 for the SEV-SNP launcher (run-nix-snp-guest-smoke.sh).
           disk-production = diskProduction;
           disk-production-lab = diskProductionLab;
+          disk-production-lab-selftest = diskProductionLabSelftest;
           default = enclave;
         };
 

@@ -1,0 +1,21 @@
+[package]
+name = "snp-derive-root"
+version = "0.1.0"
+edition = "2021"
+description = "Boot helper: derive the 2d-hsm pq-seal v1 provisioning root from the SEV-SNP firmware (SNP_GET_DERIVED_KEY) and write it for the enclave. Isolated from the forbid(unsafe) enclave crate."
+license = "MIT"
+
+# NOTE: deliberately NOT `#![forbid(unsafe_code)]` — this crate owns the one ioctl the enclave
+# (enclave-protocol, which IS forbid-unsafe) cannot do. It runs at guest boot before the enclave.
+
+[[bin]]
+name = "snp-derive-root"
+path = "src/main.rs"
+
+[dependencies]
+sha3 = "0.12.0"
+# Scrub the firmware key + derived root from memory on drop (matches pq-seal-v1's Zeroizing use).
+zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

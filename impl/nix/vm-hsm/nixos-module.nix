@@ -12,6 +12,11 @@
   # Mainnet gate (TASK-5 AC#10): productionMode asserts no lab fixtures are in use.
   productionMode ? false,
   labFixtures ? false,
+  # TASK-1.1: opt-in boot self-check of the SNP firmware-derived pq-seal root. When enabled (prod),
+  # a oneshot runs `snp-derive-root --selftest` and logs PASS + a (secret-free) commitment to the
+  # console — used to validate the derived-key path on a real SNP host. Default off.
+  snpDeriveRootPackage ? null,
+  deriveRootSelftest ? false,
   ...
 }:
 
@@ -141,6 +146,29 @@ in
         TWOD_HSM_TRANSPORT_ONLY_MODE = "1";
       };
   };
+
+  # TASK-1.1: opt-in SNP firmware-derived pq-seal root self-check (default off). Runs at boot,
+  # independently of the enclave; logs PASS + a secret-free commitment to the console (for validating
+  # the derived-key path on a real SNP host). Does NOT feed the enclave's root yet — wiring the
+  # derived root into the sealed-boot needs the provisioning ceremony (re-seal against it), a follow-up.
+  systemd.services."twod-hsm-snp-derive-root-selftest" =
+    lib.mkIf (isProd && deriveRootSelftest && snpDeriveRootPackage != null) {
+      description = "2d-hsm SNP derived pq-seal root self-check (TASK-1.1)";
+      # Standalone diagnostic: it must NOT gate the enclave. The check feeds the signer nothing yet,
+      # so a FAIL should log to the console — not cancel enclave-vsock's start job (which a
+      # requiredBy/Requires= coupling would do). Hence wantedBy multi-user.target, no before/requiredBy.
+      wantedBy = [ "multi-user.target" ];
+      # It opens the udev-created /dev/sev-guest node (not configfs-tsm), so wait for udev to settle —
+      # the same barrier the enclave unit uses. No /sys/kernel/config dependency: --selftest never
+      # touches configfs.
+      after = [ "systemd-modules-load.service" "systemd-udev-settle.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${snpDeriveRootPackage}/bin/snp-derive-root --selftest";
+        StandardOutput = "journal+console";
+        StandardError = "journal+console";
+      };
+    };
 
   system.stateVersion = "25.05";
 }

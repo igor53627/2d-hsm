@@ -2,8 +2,9 @@
 target/
 **/*.rs.bk
 Cargo.lock
-# Reproducible Nix builds (TASK-4) require a committed lockfile.
+# Reproducible Nix builds (TASK-4/1.1) require a committed lockfile.
 !impl/rust/enclave-protocol/Cargo.lock
+!impl/rust/snp-derive-root/Cargo.lock
 
 # Caches and outputs
 cache/
