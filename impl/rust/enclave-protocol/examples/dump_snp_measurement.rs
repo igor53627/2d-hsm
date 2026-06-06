@@ -11,9 +11,10 @@ fn main() {
         .unwrap_or_else(|| "dump-snp-measurement".to_string());
 
     match enclave_protocol::snp_report::fetch_measurement_and_report(pq_pubkey.as_bytes()) {
-        Ok((measurement, report)) => {
+        Ok((measurement, report, cert_chain)) => {
             println!("measurement={}", hex::encode(measurement));
             println!("report_len={}", report.len());
+            println!("cert_chain_len={}", cert_chain.len());
         }
         Err(e) => {
             eprintln!("snp report unavailable: {e}");
