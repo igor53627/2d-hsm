@@ -17,6 +17,9 @@
   enclave-production-lab,
   enclave-production-transport,
   guestProfile ? "production-lab",
+  # TASK-1.1: opt-in SNP derived-root self-check baked into the image (default off).
+  snp-derive-root ? null,
+  deriveRootSelftest ? false,
 }:
 
 let
@@ -36,7 +39,10 @@ let
 
   nixos = lib.nixosSystem {
     inherit system;
-    inherit (profile) specialArgs;
+    specialArgs = profile.specialArgs // {
+      snpDeriveRootPackage = snp-derive-root;
+      inherit deriveRootSelftest;
+    };
     modules = [
       ./nixos-module.nix
       (

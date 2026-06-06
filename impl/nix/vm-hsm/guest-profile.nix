@@ -98,5 +98,10 @@ in
       productionMode
       labFixtures
       ;
+    # nixos-module declares these (TASK-1.1 derived-root self-check); the NixOS module system
+    # requires every module arg to be present in specialArgs. Default off here; disk-image.nix
+    # overrides them for the self-check image output.
+    snpDeriveRootPackage = null;
+    deriveRootSelftest = false;
   };
 }

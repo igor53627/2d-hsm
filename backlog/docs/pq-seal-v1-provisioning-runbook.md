@@ -141,13 +141,56 @@ Enclave restart clears in-memory signer; persistent armed state is future work (
 
 ---
 
-## 7. Production differences (not automated yet)
+## 7. Production differences
 
 | Staging | Production |
 |---------|------------|
-| `seal_v1_provisioning_root.bin` test vector | Root from vTPM / SNP VMPL / Nitro integration |
+| `seal_v1_provisioning_root.bin` test vector | Root from **`snp-derive-root`** (SEV-SNP firmware); vTPM / Nitro are future backends |
 | `reference-seal-v1-root` feature in CI enclave | **Forbidden** in deploy artifacts |
 | Manual measurement file | Measurement from attestation / launch API |
+
+### 7.1 SEV-SNP firmware-derived root (`snp-derive-root`, TASK-1.1)
+
+On a SEV-SNP guest the production provisioning root is **derived from the platform firmware**, not
+supplied by the host. The `snp-derive-root` boot helper (`impl/rust/snp-derive-root`, Nix package
+`.#snp-derive-root`) issues `SNP_GET_DERIVED_KEY` on the guest-only `/dev/sev-guest` and returns
+
+```
+root = SHA3-256("2d-hsm-pq-seal-v1-root" ‖ snp_derived_key)
+```
+
+where `snp_derived_key` is the 32-byte key the PSP derives from a platform secret bound, by default,
+to the **launch MEASUREMENT** (`guest_field_select` bit 3) under the **VCEK** root key. The root is
+therefore secret to the platform (the host cannot compute it), stable for a given image (unseals
+across reboots), and image-specific (changes when the measurement changes). It lives in a separate
+crate because the ioctl needs `unsafe`, which `enclave-protocol` forbids; the enclave still consumes
+the root only as a file via `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`.
+
+**Provisioning ceremony (run ONCE inside the target image):**
+
+1. Boot the target enclave image under SEV-SNP. Inside the guest, obtain the root:
+   ```
+   snp-derive-root --print            # 64-hex-char root to stdout (MEASUREMENT-bound, VCEK)
+   ```
+   The same value is reproduced on every boot of that image on that platform.
+2. Seal the producer key **offline** against that root + the same launch measurement using the
+   `pq-seal-v1` CLI (§3.3 / §3.4, substituting the derived root for the test vector).
+3. Bake the sealed blob into the deploy artifact. On boot the enclave reads the root from
+   `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` (written by a `snp-derive-root --out <path>` oneshot) and unseals.
+
+**Measurement binding ⇒ re-seal on image change:** because the root is bound to MEASUREMENT, any
+change to the enclave image (firmware, kernel, binary) changes the root and invalidates an existing
+sealed blob. Re-run the ceremony for the new measurement (see §6 rotation).
+
+**In-guest validation:** `snp-derive-root --selftest` checks the derived-key path without revealing
+the secret — it confirms the key is non-zero, that MEASUREMENT binding actually changes the key, and
+prints a SHA3-256 **commitment** of the root (stable across reboots ⇒ derivation is stable). The
+`disk-production-lab-selftest` image runs this as a boot oneshot and logs PASS + the commitment to
+the console.
+
+> **Not yet automated end-to-end:** a fully sealed-boot mainnet artifact (blob sealed against the
+> derived root, baked in) still requires the operator ceremony above — tracked by the TASK-1.6
+> runbook / a provisioning step. vTPM and Nitro backends are future work (SNP first).
 
 Full operator runbook (hot standby, attestation verification, monitoring, incident response) remains **TASK-1** acceptance criterion #5 — this document is the **PQ seal v1 slice** only.
 
@@ -171,3 +214,4 @@ Full operator runbook (hot standby, attestation verification, monitoring, incide
 |------|--------|
 | 2026-06-02 | Initial staging runbook (platform root + `pq-seal-v1` CLI) |
 | 2026-06-02 | §5 poisoned-mutex troubleshooting; paths relative to `pq-seal-v1` cwd |
+| 2026-06-06 | §7 production root via `snp-derive-root` (SEV-SNP firmware); ceremony + selftest (TASK-1.1) |
