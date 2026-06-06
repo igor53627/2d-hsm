@@ -36,6 +36,11 @@ in
   boot.kernelModules = [
     "vsock"
     "vmw_vsock_virtio_transport"
+    # SEV-SNP guest attestation provider: registers configfs-tsm
+    # (/sys/kernel/config/tsm/report) and /dev/sev-guest so the enclave can fetch
+    # the launch measurement for GET_MEASUREMENT (TASK-5 Phase 3 / AC#4). Inert on
+    # non-SNP launches (KVM): the module just does not bind.
+    "sev-guest"
   ];
   boot.kernelParams = [ "console=ttyS0" ];
 
@@ -56,8 +61,14 @@ in
     after = [
       "systemd-modules-load.service"
       "systemd-udev-settle.service"
-    ];
+    ] ++ lib.optionals isProd [ "sys-kernel-config.mount" ];
     wantedBy = [ "multi-user.target" ];
+    # AC#4: ensure configfs (/sys/kernel/config) is mounted and ordered before the enclave so the
+    # SNP measurement capture via configfs-tsm does not fail (which would trip the release
+    # fail-closed gate). Prod only.
+    unitConfig = lib.optionalAttrs isProd {
+      RequiresMountsFor = "/sys/kernel/config";
+    };
     serviceConfig = {
       ExecStart = "${enclavePackage}/bin/${binName}";
       Restart = "always";
@@ -73,6 +84,14 @@ in
       ProtectControlGroups = true;
       RestrictSUIDSGID = true;
       LockPersonality = true;
+    }
+    // lib.optionalAttrs isProd {
+      # AC#4: the enclave fetches the SNP launch measurement via configfs-tsm at boot, which
+      # creates and writes /sys/kernel/config/tsm/report/*. Whitelist that subtree read-write so
+      # the hardening sandbox (ProtectSystem=strict / ProtectKernelTunables) does not block the
+      # capture and silently force the placeholder fallback. NOTE: needs live validation once the
+      # NixOS guest boots under SNP (TASK-5 AC#5).
+      ReadWritePaths = [ "/sys/kernel/config/tsm" ];
     };
     preStart = ''
       echo "[vm-hsm] starting ${binName} (${mode})" >/dev/console
