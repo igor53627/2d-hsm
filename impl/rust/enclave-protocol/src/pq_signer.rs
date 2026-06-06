@@ -249,17 +249,22 @@ mod v1_seal {
         h.finalize().into()
     }
 
-    pub(crate) fn resolve_provisioning_root() -> Result<[u8; 32], ProtocolError> {
+    // Returns the root in a `Zeroizing` so every caller scrubs it on drop — the bare-array form
+    // previously left an unzeroized copy of the secret provisioning root on the stack in the seal path.
+    pub(crate) fn resolve_provisioning_root() -> Result<zeroize::Zeroizing<[u8; 32]>, ProtocolError> {
+        use zeroize::Zeroizing;
         let guard = super::PLATFORM_PROVISIONING_ROOT
             .lock()
             .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
         if let Some(root) = *guard {
-            return Ok(root);
+            return Ok(Zeroizing::new(root));
         }
         drop(guard);
         #[cfg(any(test, feature = "reference-seal-v1-root"))]
         {
-            return Ok(*include_bytes!("../testvectors/seal_v1_provisioning_root.bin"));
+            return Ok(Zeroizing::new(*include_bytes!(
+                "../testvectors/seal_v1_provisioning_root.bin"
+            )));
         }
         #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
         {
@@ -288,8 +293,8 @@ mod v1_seal {
         sealed_blob: &[u8],
         enclave_measurement: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-        use zeroize::Zeroizing;
-        let root = Zeroizing::new(resolve_provisioning_root()?);
+        // resolve_provisioning_root already returns a Zeroizing<[u8; 32]>.
+        let root = resolve_provisioning_root()?;
         unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, &root)
     }
 
