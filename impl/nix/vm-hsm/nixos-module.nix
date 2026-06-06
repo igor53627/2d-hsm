@@ -9,6 +9,9 @@
   pqSealProvisioningRootFile ? null,
   pqSealedSignerFile ? null,
   enclaveTransportOnly ? false,
+  # Mainnet gate (TASK-5 AC#10): productionMode asserts no lab fixtures are in use.
+  productionMode ? false,
+  labFixtures ? false,
   ...
 }:
 
@@ -26,6 +29,29 @@ let
       throw "production guest requires producerAttestationTrustFile (lab: lab-prod-fixtures)";
 in
 {
+  # Mainnet gate (TASK-5 AC#10): a productionMode guest must NOT ship lab attestation
+  # trust / lab PQ seal, and must run an operational signer (not transport-only). These
+  # fail the build (eval) rather than silently booting a lab-trust image as "mainnet".
+  # The lab/dev outputs (vm-production*, disk-production*) keep productionMode = false and
+  # remain explicitly non-mainnet. Operator-provisioned trust comes from a sealed store /
+  # build-time secret injection (guest-profile *Override args), never from vsock — AC#2.
+  assertions = lib.optionals isProd [
+    {
+      assertion = !(productionMode && labFixtures);
+      message =
+        "twod-hsm: productionMode refuses lab ProducerAttestationTrust / lab PQ seal. "
+        + "Supply operator platform-provisioned trust + sealed signer "
+        + "(guest-profile trustFileOverride / pqSealRootOverride / pqSealedSignerOverride; "
+        + "build-time injection or sealed store, never via vsock). See nix/vm-hsm/README.md.";
+    }
+    {
+      assertion = !(productionMode && enclaveTransportOnly);
+      message =
+        "twod-hsm: productionMode cannot run transport-only (no operational PQ signer). "
+        + "Use a profile that installs a sealed signer.";
+    }
+  ];
+
   boot.loader.grub.enable = false;
   boot.initrd.availableKernelModules = [
     "virtio_pci"

@@ -96,6 +96,36 @@
           default = enclave;
         };
 
+        checks = {
+          # Exercise the mainnet gate (TASK-5 AC#10) logic so a regression in the labFixtures
+          # derivation / override handling is caught in CI — no productionMode=true output ships,
+          # so this is the only place the gate is evaluated. Asserts run at eval; the trivial
+          # build just materializes the pass.
+          mainnet-gate =
+            let
+              labArgs = guestProfile: {
+                inherit
+                  nixpkgs
+                  enclave
+                  enclave-staging
+                  enclave-production-lab
+                  enclave-production-transport
+                  guestProfile
+                  ;
+              };
+              gp = args: (import ./guest-profile.nix args).specialArgs;
+              labOf = args: (gp args).labFixtures;
+              labTrust = (import ./lab-prod-fixtures.nix { inherit pkgs; }).producerAttestationTrustFile;
+              real = { trustFileOverride = "/run/secrets/trust"; pqSealRootOverride = "/run/secrets/root"; pqSealedSignerOverride = "/run/secrets/signer"; };
+            in
+            assert labOf (labArgs "production");                                   # transport ⇒ lab trust
+            assert labOf (labArgs "production-lab");                               # lab trust + seal
+            assert !(gp (labArgs "production")).productionMode;                    # outputs default off
+            assert !(labOf (labArgs "production-lab" // real));                    # full real override ⇒ not lab
+            assert labOf (labArgs "production-lab" // real // { trustFileOverride = labTrust; }); # override AT lab file ⇒ still lab (no bypass)
+            pkgs.runCommand "twod-hsm-mainnet-gate-check" { } "echo gate-logic-ok > $out";
+        };
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustc

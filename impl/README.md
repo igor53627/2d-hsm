@@ -196,7 +196,7 @@ cargo build --bin enclave-uds-staging --features staging-host
 - Hardware-backed root derivation (vTPM / SNP VMPL / Nitro) wired into `boot_configure_pq_seal_v1_platform_root`
 - Live chain-tip refresh between arming and signing (arming-time snapshot only)
 - Full light-client proofs in `proof_data` (format `0x02+`)
-- **Mainnet production guest:** platform attestation trust + SNP measurement (see `nix/vm-hsm/README.md`; `.#vm-production` is lab-trust transport smoke only)
+- **Mainnet production guest:** the mainnet gate + build-time trust provisioning landed (TASK-5 AC#2/#10 — `productionMode` refuses lab trust/seal; `nix/vm-hsm/README.md`). Remaining: the platform-**derived** trust/seal root (vTPM/SNP/Nitro) that feeds the overrides, and runtime image binding (measured boot). `.#vm-production*` / `.#disk-production*` stay lab-trust (`productionMode = false`).
 - **Relying-party SNP verifier:** `GET_MEASUREMENT` now returns the VCEK→ASK→ARK cert chain (wire key 7, configfs-tsm `auxblob`); the verification procedure is specified in `backlog/docs/snp-attestation-verifier-policy.md` (the verifier runs on the BP / on-chain consumer, not the enclave). Note: the launch `measurement` pins OVMF, not the guest image.
 
 Host↔guest **AF_VSOCK** smokes are green via Nix (`impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`). Unix socket + stdio remain dev paths.

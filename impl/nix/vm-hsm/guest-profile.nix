@@ -15,18 +15,27 @@
   enclave-production-lab,
   enclave-production-transport,
   guestProfile ? "staging",
+  # Mainnet intent (TASK-5 AC#10): when true, the NixOS module refuses lab trust /
+  # lab PQ seal (see nixos-module.nix assertions) and requires operator-provided
+  # platform trust + sealed signer.
+  productionMode ? false,
+  # Build-time injection of platform-provisioned material (TASK-5 AC#2). When null,
+  # the prod *lab/dev* profiles fall back to the lab fixtures (NOT mainnet). A mainnet
+  # guest (productionMode = true) MUST supply real, non-lab files here — from a sealed
+  # store or build-time secret, never from vsock at runtime.
+  trustFileOverride ? null,
+  pqSealRootOverride ? null,
+  pqSealedSignerOverride ? null,
 }:
 
 let
   system = "x86_64-linux";
-  labFixtures = import ./lab-prod-fixtures.nix {
+  labFx = import ./lab-prod-fixtures.nix {
     pkgs = nixpkgs.legacyPackages.${system};
   };
-  # Both prod profiles use lab attestation VK until platform trust is provisioned (TASK-5 #2).
   # vm-production = transport smoke only; vm-production-lab = + file PQ seal. NOT mainnet-ready.
   isProd = guestProfile == "production" || guestProfile == "production-lab";
   isProdLab = guestProfile == "production-lab";
-  # vm-production: debug production-vsock only (no lab-pq-seal-from-file) + transport-only env.
   enclavePackage =
     if guestProfile == "staging" then
       enclave-staging
@@ -37,12 +46,44 @@ let
     else
       throw "guest-profile.nix: invalid guestProfile '${guestProfile}' (expected staging | production | production-lab)";
   enclaveMode = if isProdLab then "production" else guestProfile;
+
+  # An override counts as "lab" if it is absent OR points at the in-repo lab fixture — so the
+  # gate can't be bypassed by aiming an override at the lab file. Compared by store path.
+  usesLab = override: labFile: override == null || toString override == toString labFile;
+
+  # Resolve trust/seal: operator override > lab fixture (dev/lab only) > none.
+  # Seal material only exists on the operational (signer-installing) profile; seal overrides on
+  # a transport/staging profile are ignored (those profiles install no signer).
   producerAttestationTrustFile =
-    if isProd then labFixtures.producerAttestationTrustFile else null;
+    if !isProd then
+      null
+    else if trustFileOverride != null then
+      trustFileOverride
+    else
+      labFx.producerAttestationTrustFile;
   pqSealProvisioningRootFile =
-    if isProdLab then labFixtures.pqSealProvisioningRootFile else null;
-  pqSealedSignerFile = if isProdLab then labFixtures.pqSealedSignerFile else null;
+    if !isProdLab then
+      null
+    else if pqSealRootOverride != null then
+      pqSealRootOverride
+    else
+      labFx.pqSealProvisioningRootFile;
+  pqSealedSignerFile =
+    if !isProdLab then
+      null
+    else if pqSealedSignerOverride != null then
+      pqSealedSignerOverride
+    else
+      labFx.pqSealedSignerFile;
   enclaveTransportOnly = guestProfile == "production";
+
+  # True when ANY lab fixture is in use (operator did not override it, or pointed the override
+  # back at the lab file). The mainnet gate (nixos-module assertions) refuses this when
+  # productionMode = true.
+  labFixtures =
+    (isProd && usesLab trustFileOverride labFx.producerAttestationTrustFile)
+    || (isProdLab && usesLab pqSealRootOverride labFx.pqSealProvisioningRootFile)
+    || (isProdLab && usesLab pqSealedSignerOverride labFx.pqSealedSignerFile);
 in
 {
   inherit system;
@@ -54,6 +95,8 @@ in
       pqSealProvisioningRootFile
       pqSealedSignerFile
       enclaveTransportOnly
+      productionMode
+      labFixtures
       ;
   };
 }
