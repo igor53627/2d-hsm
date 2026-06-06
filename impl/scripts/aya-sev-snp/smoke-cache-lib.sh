@@ -294,6 +294,45 @@ twod_hsm_link_firmware_cache() {
   fi
 }
 
+# Resolve the SNP-capable QEMU + AMD OVMF and export QEMU_BIN + SNP_BIOS. Fails if QEMU lacks
+# sev-snp-guest or no OVMF is found. Shared by the SNP launcher scripts (run-nix-snp-*).
+twod_hsm_resolve_snp_qemu() {
+  local qemu
+  if [[ -x /opt/qemu-snp/bin/qemu-system-x86_64 ]]; then
+    qemu="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
+  else
+    qemu="${QEMU_BIN:-qemu-system-x86_64}"
+  fi
+  qemu="$(command -v "$qemu" || true)"
+  if [[ -z "$qemu" ]]; then
+    echo "qemu-system-x86_64 not found (set QEMU_BIN or run ./install-qemu-snp.sh)" >&2
+    return 1
+  fi
+  if ! "$qemu" -object help 2>&1 | grep -q sev-snp-guest; then
+    echo "QEMU lacks sev-snp-guest (run ./install-qemu-snp.sh)" >&2
+    return 1
+  fi
+  QEMU_BIN="$qemu"
+  SNP_BIOS="$(twod_hsm_snp_ovmf_path)" || return 1
+  export QEMU_BIN SNP_BIOS
+}
+
+# Create a writable work disk DST backed by the read-only store image SRC: a thin qcow2 overlay
+# (near-instant) when qemu-img is available, else a full writable copy. Shared by run-nix-snp-*.
+twod_hsm_make_work_overlay() {
+  local src=$1 dst=$2 qemu_img
+  rm -f "$dst"
+  qemu_img="${QEMU_IMG:-}"
+  [[ -n "$qemu_img" && -x "$qemu_img" ]] || qemu_img="$(dirname "${QEMU_BIN:-}")/qemu-img"
+  [[ -x "$qemu_img" ]] || qemu_img="$(command -v qemu-img || true)"
+  if [[ -n "$qemu_img" && -x "$qemu_img" ]]; then
+    "$qemu_img" create -q -f qcow2 -F qcow2 -b "$src" "$dst"
+  else
+    cp -f "$src" "$dst"
+    chmod u+w "$dst"
+  fi
+}
+
 twod_hsm_snp_prepare_work_disk() {
   local script_dir=$1
   local work golden

@@ -126,6 +126,10 @@ jobs:
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production.drvPath
           # TASK-1.1: derived-root self-check image (oneshot runs snp-derive-root --selftest in-guest).
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-selftest.drvPath
+          # TASK-1.1 sealed-boot loop: snp-rooted image (enclave unseals against the boot-derived root)
+          # + the ceremony print image. Eval only; the end-to-end boot ceremony runs on aya.
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-snp-rooted.drvPath
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-print-ceremony.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).

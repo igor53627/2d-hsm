@@ -20,6 +20,12 @@
   # TASK-1.1: opt-in SNP derived-root self-check baked into the image (default off).
   snp-derive-root ? null,
   deriveRootSelftest ? false,
+  # TASK-1.1 sealed-boot loop: "snp" makes the enclave unseal against the boot-derived root (see
+  # nixos-module). pqSealedSignerOverride supplies the signer blob sealed against that derived root
+  # (the ceremony output); deriveRootPrintCeremony is the ceremony-only secret-root print (default off).
+  sealRootSource ? "file",
+  deriveRootPrintCeremony ? false,
+  pqSealedSignerOverride ? null,
 }:
 
 let
@@ -31,6 +37,7 @@ let
       enclave-production-lab
       enclave-production-transport
       guestProfile
+      pqSealedSignerOverride
       ;
   };
   inherit (profile) system;
@@ -41,7 +48,7 @@ let
     inherit system;
     specialArgs = profile.specialArgs // {
       snpDeriveRootPackage = snp-derive-root;
-      inherit deriveRootSelftest;
+      inherit deriveRootSelftest sealRootSource deriveRootPrintCeremony;
     };
     modules = [
       ./nixos-module.nix
