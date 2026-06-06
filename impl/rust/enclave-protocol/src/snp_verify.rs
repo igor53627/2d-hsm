@@ -14,15 +14,17 @@
 //! signals this; do not treat a `PrevalidatedReport` as an attested report.
 
 use crate::snp_report::{
-    measurement_from_report, report_data_for_pubkey, report_data_from_report, MIN_REPORT_LEN,
-    SNP_MEASUREMENT_LEN,
+    measurement_from_report, report_data_for_pubkey, report_data_from_report, SNP_MEASUREMENT_LEN,
 };
 use crate::ProtocolError;
 
-// Field offsets snp_report does not expose (it reads report_data/measurement itself; offsets reused
-// from snp_report via MIN_REPORT_LEN below so they cannot drift).
+// Field offsets snp_report does not expose (it reads report_data/measurement itself).
 const VERSION_OFFSET: usize = 0x00; // u32 LE
 const POLICY_OFFSET: usize = 0x08; // u64 LE guest policy
+// A SEV-SNP ATTESTATION_REPORT is a fixed 1184 bytes (ABI v2–v5). Require the whole structure: the
+// VCEK signature + other fields the caller's signature step needs live at the end, so a truncated
+// buffer must not pre-validate (security: reject short/forged reports up front).
+const EXPECTED_REPORT_LEN: usize = 1184;
 // GUEST_POLICY.DEBUG is bit 19 — a debuggable guest is never acceptable for production.
 const POLICY_DEBUG_BIT: u64 = 1 << 19;
 // The report_data (0x50) / measurement (0x90) / policy (0x08) offsets are stable for SEV-SNP
@@ -55,9 +57,9 @@ pub fn prevalidate_report(
     expected_pq_pubkey: Option<&[u8]>,
     allowed_measurements: &[[u8; SNP_MEASUREMENT_LEN]],
 ) -> Result<PrevalidatedReport, ProtocolError> {
-    if report.len() < MIN_REPORT_LEN {
+    if report.len() < EXPECTED_REPORT_LEN {
         return Err(ProtocolError::WireProtocol(
-            "SNP report shorter than ABI minimum",
+            "SNP report shorter than the fixed 1184-byte ABI size (truncated)",
         ));
     }
 
@@ -76,7 +78,10 @@ pub fn prevalidate_report(
     }
 
     if let Some(pubkey) = expected_pq_pubkey {
-        let echoed = report_data_from_report(report)?;
+        // Map snp_report's PqSigningUnavailable to WireProtocol — in a relying-party verifier the
+        // failure is "malformed report", not "PQ signing unavailable".
+        let echoed = report_data_from_report(report)
+            .map_err(|_| ProtocolError::WireProtocol("malformed SNP report (report_data field)"))?;
         let expected = report_data_for_pubkey(pubkey);
         if echoed != expected {
             return Err(ProtocolError::WireProtocol(
@@ -85,7 +90,8 @@ pub fn prevalidate_report(
         }
     }
 
-    let measurement = measurement_from_report(report)?;
+    let measurement = measurement_from_report(report)
+        .map_err(|_| ProtocolError::WireProtocol("malformed SNP report (measurement field)"))?;
     if !allowed_measurements.iter().any(|m| *m == measurement) {
         return Err(ProtocolError::WireProtocol(
             "launch measurement not in allowlist",
@@ -127,7 +133,8 @@ mod tests {
 
     #[test]
     fn rejects_short_report() {
-        assert!(prevalidate_report(&GOLDEN[..MIN_REPORT_LEN - 1], None, &[golden_measurement()]).is_err());
+        // One byte short of the fixed 1184-byte report must be rejected as truncated.
+        assert!(prevalidate_report(&GOLDEN[..EXPECTED_REPORT_LEN - 1], None, &[golden_measurement()]).is_err());
     }
 
     #[test]
