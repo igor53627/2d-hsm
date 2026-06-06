@@ -256,16 +256,19 @@ mod v1_seal {
         let guard = super::PLATFORM_PROVISIONING_ROOT
             .lock()
             .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
-        // Read the guarded value straight into the Zeroizing (no bare named local to leave behind).
+        // copy_from_slice into a pre-zeroed Zeroizing buffer so the secret is never materialized as a
+        // bare `[u8;32]` Copy temporary on the stack (which has no Drop and would not be scrubbed).
         if let Some(root) = guard.as_ref() {
-            return Ok(zeroize::Zeroizing::new(*root));
+            let mut out = zeroize::Zeroizing::new([0u8; 32]);
+            out.copy_from_slice(root);
+            return Ok(out);
         }
         drop(guard);
         #[cfg(any(test, feature = "reference-seal-v1-root"))]
         {
-            return Ok(zeroize::Zeroizing::new(*include_bytes!(
-                "../testvectors/seal_v1_provisioning_root.bin"
-            )));
+            let mut out = zeroize::Zeroizing::new([0u8; 32]);
+            out.copy_from_slice(include_bytes!("../testvectors/seal_v1_provisioning_root.bin"));
+            return Ok(out);
         }
         #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
         {
