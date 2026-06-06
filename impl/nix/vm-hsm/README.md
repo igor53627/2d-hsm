@@ -135,6 +135,37 @@ Still **not mainnet**: lab trust + lab PQ seal; platform trust is TASK-5 #2/#10.
 Real TEE `measurement` in `GET_MEASUREMENT` → captured under SNP (AC#4); live NixOS
 guest boot under SNP is AC#5 (this launcher), validated on aya.
 
+## Mainnet gate & trust provisioning (TASK-5 AC#2 / AC#10)
+
+The `vm-production*` / `disk-production*` outputs are **lab/dev** (`productionMode = false`)
+and ship lab attestation trust + lab PQ seal — never mainnet. A mainnet guest must set
+`productionMode = true` and supply **operator-provisioned** material.
+
+**AC#10 — the gate.** `nixos-module.nix` has build-time assertions (fail `nix build`/eval,
+not a silent boot): with `productionMode = true` it refuses
+
+- any **lab fixture** in use (`labFixtures` — lab trust VK / lab PQ seal), and
+- a **transport-only** profile (no operational signer).
+
+`guest-profile.nix` derives `labFixtures` (true whenever an operator override is absent for a
+prod profile) and threads `productionMode` into the module. The lab/dev outputs keep
+`productionMode = false`, so the gate is inert for them (their derivations are unchanged).
+
+**AC#2 — provisioning policy.** Operator material is injected at **build time** via
+`guest-profile.nix` args — from a sealed store or a build-time secret, **never from vsock at
+runtime** (`TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` is read from the image, not the host):
+
+| Arg | Replaces | Source (mainnet) |
+|-----|----------|------------------|
+| `trustFileOverride` | lab `ProducerAttestationTrust` VK (32 B Ed25519, §9.3) | platform / build-time secret |
+| `pqSealRootOverride` | lab PQ seal provisioning root | platform (vTPM / SNP VMPL / Nitro) — *not yet wired* |
+| `pqSealedSignerOverride` | lab sealed ML-DSA signer (v1 blob) | offline `pq-seal-v1` against the platform root |
+
+A mainnet config builds a guest with all overrides set (so `labFixtures = false`) and
+`productionMode = true`; the gate then passes. The **platform-derived** root (vTPM/SNP/Nitro)
+is still future — until it ships, no `productionMode = true` output exists, and the gate keeps
+any lab-trust image from masquerading as mainnet.
+
 ## Related
 
 - `backlog/tasks/task-4 - NixOS-reproducible-TEE-image-primary-delivery-path.md`
