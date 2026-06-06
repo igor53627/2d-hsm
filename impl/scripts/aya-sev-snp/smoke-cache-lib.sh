@@ -47,8 +47,9 @@ twod_hsm_nix_outlink_hit() {
       done
       return 1
       ;;
-    disk-production | disk-production-lab)
-      # make-disk-image emits a bootable qcow2 under the out path (TASK-5 AC#5).
+    disk-production | disk-production-lab | disk-production-lab-selftest)
+      # make-disk-image emits a bootable qcow2 under the out path (TASK-5 AC#5;
+      # disk-production-lab-selftest adds the TASK-1.1 derived-root self-check oneshot).
       local c
       for c in "${link}"/*.qcow2; do
         [[ -e "$c" ]] && return 0
