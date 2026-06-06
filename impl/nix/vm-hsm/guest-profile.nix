@@ -47,7 +47,13 @@ let
       throw "guest-profile.nix: invalid guestProfile '${guestProfile}' (expected staging | production | production-lab)";
   enclaveMode = if isProdLab then "production" else guestProfile;
 
+  # An override counts as "lab" if it is absent OR points at the in-repo lab fixture — so the
+  # gate can't be bypassed by aiming an override at the lab file. Compared by store path.
+  usesLab = override: labFile: override == null || toString override == toString labFile;
+
   # Resolve trust/seal: operator override > lab fixture (dev/lab only) > none.
+  # Seal material only exists on the operational (signer-installing) profile; seal overrides on
+  # a transport/staging profile are ignored (those profiles install no signer).
   producerAttestationTrustFile =
     if !isProd then
       null
@@ -56,27 +62,28 @@ let
     else
       labFx.producerAttestationTrustFile;
   pqSealProvisioningRootFile =
-    if pqSealRootOverride != null then
+    if !isProdLab then
+      null
+    else if pqSealRootOverride != null then
       pqSealRootOverride
-    else if isProdLab then
-      labFx.pqSealProvisioningRootFile
     else
-      null;
+      labFx.pqSealProvisioningRootFile;
   pqSealedSignerFile =
-    if pqSealedSignerOverride != null then
+    if !isProdLab then
+      null
+    else if pqSealedSignerOverride != null then
       pqSealedSignerOverride
-    else if isProdLab then
-      labFx.pqSealedSignerFile
     else
-      null;
+      labFx.pqSealedSignerFile;
   enclaveTransportOnly = guestProfile == "production";
 
-  # True when ANY lab fixture is in use (operator did not override it). The mainnet gate
-  # (nixos-module assertions) refuses this when productionMode = true.
+  # True when ANY lab fixture is in use (operator did not override it, or pointed the override
+  # back at the lab file). The mainnet gate (nixos-module assertions) refuses this when
+  # productionMode = true.
   labFixtures =
-    (isProd && trustFileOverride == null)
-    || (isProdLab && pqSealRootOverride == null)
-    || (isProdLab && pqSealedSignerOverride == null);
+    (isProd && usesLab trustFileOverride labFx.producerAttestationTrustFile)
+    || (isProdLab && usesLab pqSealRootOverride labFx.pqSealProvisioningRootFile)
+    || (isProdLab && usesLab pqSealedSignerOverride labFx.pqSealedSignerFile);
 in
 {
   inherit system;

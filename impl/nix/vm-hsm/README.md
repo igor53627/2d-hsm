@@ -130,7 +130,9 @@ SEV_MODE=none ./run-nix-snp-guest-smoke.sh   # KVM fallback (placeholder; gate a
 
 `vm.nix` and `disk-image.nix` share the profile→enclave mapping (`guest-profile.nix`),
 so the SNP image runs the same binary/trust/seal as the KVM smoke for that profile.
-Still **not mainnet**: lab trust + lab PQ seal; platform trust is TASK-5 #2/#10.
+Still **not mainnet**: lab trust + lab PQ seal (`productionMode = false`). The mainnet gate +
+build-time trust provisioning (AC#2/#10) landed — see *Mainnet gate* below; the remaining
+dependency is the platform-**derived** root (vTPM/SNP/Nitro).
 
 Real TEE `measurement` in `GET_MEASUREMENT` → captured under SNP (AC#4); live NixOS
 guest boot under SNP is AC#5 (this launcher), validated on aya.
@@ -147,24 +149,46 @@ not a silent boot): with `productionMode = true` it refuses
 - any **lab fixture** in use (`labFixtures` — lab trust VK / lab PQ seal), and
 - a **transport-only** profile (no operational signer).
 
-`guest-profile.nix` derives `labFixtures` (true whenever an operator override is absent for a
-prod profile) and threads `productionMode` into the module. The lab/dev outputs keep
-`productionMode = false`, so the gate is inert for them (their derivations are unchanged).
+`guest-profile.nix` derives `labFixtures` and threads `productionMode` into the module.
+`labFixtures` is true when an override is absent **or points back at the in-repo lab fixture**
+(compared by store path), so the gate can't be bypassed by aiming an override at the lab file.
+The trust term applies to both prod profiles; the seal terms only to the operational
+(`production-lab`) profile. The lab/dev outputs keep `productionMode = false`, so the gate is
+inert for them (their derivations are byte-identical; the gate logic is regression-tested by
+`nix flake check` → `checks.mainnet-gate`). `productionMode` is a `guest-profile` arg (the
+"or equivalent" of `services.twod-hsm.productionMode`).
 
 **AC#2 — provisioning policy.** Operator material is injected at **build time** via
-`guest-profile.nix` args — from a sealed store or a build-time secret, **never from vsock at
-runtime** (`TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` is read from the image, not the host):
+`guest-profile.nix` args — from a sealed store or a build-time secret, **never fetched over vsock
+at runtime** (the systemd unit sets `TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE` to the in-image
+store path):
 
 | Arg | Replaces | Source (mainnet) |
 |-----|----------|------------------|
-| `trustFileOverride` | lab `ProducerAttestationTrust` VK (32 B Ed25519, §9.3) | platform / build-time secret |
+| `trustFileOverride` | lab `ProducerAttestationTrust` VK (32 B Ed25519) | platform / build-time secret |
 | `pqSealRootOverride` | lab PQ seal provisioning root | platform (vTPM / SNP VMPL / Nitro) — *not yet wired* |
 | `pqSealedSignerOverride` | lab sealed ML-DSA signer (v1 blob) | offline `pq-seal-v1` against the platform root |
 
-A mainnet config builds a guest with all overrides set (so `labFixtures = false`) and
-`productionMode = true`; the gate then passes. The **platform-derived** root (vTPM/SNP/Nitro)
-is still future — until it ships, no `productionMode = true` output exists, and the gate keeps
-any lab-trust image from masquerading as mainnet.
+Operator responsibilities (NOT enforced by the gate — it only checks the material isn't the lab
+fixture):
+
+- The trust VK **must be an independent producer attestation key — not derived from `pq_pubkey`**
+  (vsock spec §9.3); otherwise a host that knows the public PQ key could forge chain proofs.
+- Provide a valid 32-byte VK + a real v1 sealed signer; the enclave self-tests the signer at
+  install, but a malformed trust file only fails at runtime.
+- The seal overrides require the **operational** profile (`production-lab`-shaped, which installs
+  a signer); on the transport `production` profile they are ignored and the transport-only
+  assertion blocks `productionMode`.
+- **Runtime/image binding:** the gate is build-time. It does not by itself stop a host that can
+  tamper with the disk image from swapping the file — binding the running image needs measured
+  boot / dm-verity (the launch measurement pins OVMF, not the image; see
+  `snp-attestation-verifier-policy.md` §3).
+
+A mainnet config builds a guest with all overrides set to real, non-lab material (so
+`labFixtures = false`) and `productionMode = true`; the gate then passes. The
+platform-**derived** root (vTPM/SNP/Nitro) is still future — until it ships, no
+`productionMode = true` output exists, and the gate keeps any lab-trust image from masquerading
+as mainnet.
 
 ## Related
 
