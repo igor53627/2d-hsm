@@ -3,10 +3,10 @@ id: TASK-5
 title: >-
   Production HSM path — prod enclave in guest, platform PQ seal, SNP, real
   measurement
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-05'
-updated_date: '2026-06-06 09:53'
+updated_date: '2026-06-06 13:45'
 labels:
   - production
   - tee

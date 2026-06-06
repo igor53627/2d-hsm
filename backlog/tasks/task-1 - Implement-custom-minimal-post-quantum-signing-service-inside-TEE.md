@@ -105,7 +105,7 @@ Phase 2 – Core Implementation (3-5 weeks)
 Phase 3 – Integration & Validation (2-3 weeks)
 - Thin adapter or direct integration from the BlockProducer (producer namespace path — low latency, fixed digest shape) and Chain.Bridge.Signer (bridge paths).
 - End-to-end smoke tests using the existing pilot topology (including one simulated "primary down → recovery ticket → hot standby activation").
-- Performance baseline on B200 (single and multi-GPU where applicable for the signing service itself).
+- Performance baseline on the **SNP host CPU** (AMD EPYC, e.g. aya's 9375F): ML-DSA-65 sign+verify latency + throughput vs the ~2s block budget. (Hot-path signing is a CPU op inside the SEV-SNP enclave — no GPU. The earlier "B200" referred to the **GPU slow path** — MAYO-iO in theory-378 — which is a separate service and not measured here.)
 - Remote attestation verification in the caller + on-chain ticket path (reader node side).
 
 Phase 4 – Hardening & Documentation (1-2 weeks)
@@ -497,7 +497,7 @@ See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress up
 - [ ] #4 Basic failover scenario between at least two instances of the service (on different hosts/enclaves) is designed and documented
 - [ ] #5 Operational runbook exists covering: deployment into TEE, key provisioning/rotation inside TEE, attestation, monitoring, and incident response for TEE compromise or unavailability
 - [ ] #6 Integration with 2d's existing signing path (Chain.Bridge.Signer + OPA + Vault) is implemented and passes relevant tests
-- [ ] #7 Performance baseline is captured on target hardware (B200) for the supported post-quantum algorithm(s)
+- [ ] #7 Performance baseline captured on the **SNP host CPU** (AMD EPYC, e.g. aya's 9375F) for the hot-path PQ algorithm (ML-DSA-65 sign+verify latency + throughput vs the ~2s block budget). _Not a GPU/B200 workload — hot-path signing runs on the enclave CPU; the GPU "B200" path is the separate MAYO-iO slow path in theory-378._
 - [ ] #8 Design + document the full permissionless on-chain RecoveryTicket + hot-standby model (including concrete format, 1h threshold rationale with Solana comparison, TEE binding, network-as-2nd-factor in the enclave, and client rejection rules for malicious producer state transitions)
 - [ ] #9 Add/update reader node + light client verification spec that enforces authorized producer key + valid state transitions (covers 'stay transition' forgery case)
 <!-- DOD:END -->
