@@ -31,6 +31,9 @@ serde_json = "1.0"
 
 [features]
 default = []
+# Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
+# signing path — off by default so it is not compiled into the production enclave binary.
+snp-verify = []
 # ML-DSA-65 crypto (sealed-key provisioning). Does not embed a secret key by itself.
 ml-dsa-65 = [
     "dep:pqcrypto-mldsa",
@@ -130,3 +133,7 @@ required-features = ["pq-seal-provisioning", "ml-dsa-65"]
 [[example]]
 name = "dump_reference_attestation_vk"
 required-features = ["test-support"]
+
+[[example]]
+name = "bench_mldsa65"
+required-features = ["ml-dsa-65", "pq-seal-provisioning"]
