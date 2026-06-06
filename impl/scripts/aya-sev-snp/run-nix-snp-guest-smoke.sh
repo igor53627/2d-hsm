@@ -33,9 +33,12 @@ MEMORY="${MEMORY:-2048}"
 VCPUS="${VCPUS:-2}"
 TWOD_HSM_VSOCK_PORT="${TWOD_HSM_VSOCK_PORT:-5000}"
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-240}"
-# Per-PID work disk so concurrent runs don't clobber each other's live qemu disk.
-WORK_DISK="${WORK_DISK:-/tmp/2d-hsm-nixos-snp-${DISK_ATTR}-$$.qcow2}"
-LOG="${SNP_NIX_LOG:-/tmp/2d-hsm-nixos-snp-qemu.log}"
+# Work disk + logs: created with mktemp (unique per run, no predictable /tmp path
+# to symlink-attack — CWE-377 — and no clobbering between concurrent runs). The
+# WORK_DISK qcow2 is (re)created by qemu-img below; mktemp just reserves the name.
+WORK_DISK="${WORK_DISK:-$(mktemp -u "/tmp/2d-hsm-nixos-snp-${DISK_ATTR}-XXXXXX.qcow2")}"
+LOG="${SNP_NIX_LOG:-$(mktemp -u /tmp/2d-hsm-nixos-snp-qemu-XXXXXX.log)}"
+SMOKE_ERR="$(mktemp /tmp/2d-hsm-nixos-snp-smokeerr-XXXXXX.log)"
 
 # Gate defaults derived from the disk + launch mode so every documented invocation
 # works without manual env. Only the lab disk ships an operational PQ signer
@@ -61,13 +64,20 @@ fi
 twod_hsm_ensure_python_cbor2
 
 # --- QEMU + firmware (SNP only) -------------------------------------------------
+# Resolve QEMU_BIN to an absolute path: a bare name (the fallback) lives on PATH,
+# and `[[ -x bare-name ]]` would test ./bare-name in the cwd, not PATH.
+if [[ "$SEV_MODE" == "snp" && -x /opt/qemu-snp/bin/qemu-system-x86_64 ]]; then
+  QEMU_BIN="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
+else
+  QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+fi
+QEMU_BIN="$(command -v "$QEMU_BIN" || true)"
+if [[ -z "$QEMU_BIN" ]]; then
+  echo "qemu-system-x86_64 not found (set QEMU_BIN or run ./install-qemu-snp.sh)" >&2
+  exit 1
+fi
 if [[ "$SEV_MODE" == "snp" ]]; then
-  if [[ -x /opt/qemu-snp/bin/qemu-system-x86_64 ]]; then
-    QEMU_BIN="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
-  else
-    QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
-  fi
-  if [[ ! -x "$QEMU_BIN" ]] || ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-guest; then
+  if ! "$QEMU_BIN" -object help 2>&1 | grep -q sev-snp-guest; then
     echo "SEV_MODE=snp needs QEMU with sev-snp-guest (run ./install-qemu-snp.sh, or SEV_MODE=none)" >&2
     exit 1
   fi
@@ -75,7 +85,6 @@ if [[ "$SEV_MODE" == "snp" ]]; then
   export SNP_BIOS QEMU_BIN
   echo "SNP: qemu=$QEMU_BIN bios=$SNP_BIOS"
 else
-  QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
   export QEMU_BIN
   echo "KVM baseline (SEV_MODE=none): no real measurement expected"
 fi
@@ -108,7 +117,7 @@ cleanup() {
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
   fi
-  rm -f "$WORK_DISK"
+  rm -f "$WORK_DISK" "$SMOKE_ERR"
 }
 trap cleanup EXIT
 
@@ -131,11 +140,13 @@ while (( SECONDS < deadline )); do
     tail -40 "$LOG" >&2 || true
     exit 1
   fi
+  # Keep the latest smoke-client stderr so a permanent host-side failure (e.g.
+  # missing cbor2) is visible on timeout instead of a silent 240s wait.
   if GUEST_CID="$GUEST_CID" TWOD_HSM_VSOCK_PORT="$TWOD_HSM_VSOCK_PORT" \
      VSOCK_SMOKE_REQUIRE_REAL_MEASUREMENT="$REQUIRE_REAL" \
      VSOCK_SMOKE_REQUIRE_PQ_READY="$REQUIRE_PQ" \
      VSOCK_SMOKE_LABEL="run-nix-snp-guest-smoke" \
-     "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>/dev/null; then
+     "$SCRIPT_DIR/host-guest-vsock-smoke.sh" 2>"$SMOKE_ERR"; then
     ok=1
     break
   fi
@@ -143,7 +154,12 @@ while (( SECONDS < deadline )); do
 done
 
 if [[ "$ok" != 1 ]]; then
-  echo "[FAIL] guest vsock smoke timed out (${BOOT_TIMEOUT_SEC}s); log tail:" >&2
+  echo "[FAIL] guest vsock smoke timed out (${BOOT_TIMEOUT_SEC}s)" >&2
+  if [[ -s "$SMOKE_ERR" ]]; then
+    echo "last smoke-client error:" >&2
+    cat "$SMOKE_ERR" >&2 || true
+  fi
+  echo "qemu log tail:" >&2
   tail -100 "$LOG" >&2 || true
   exit 1
 fi

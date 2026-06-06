@@ -35,7 +35,7 @@ let
     else if isProdLab then
       enclave-production-lab
     else
-      enclave;
+      throw "guest-profile.nix: invalid guestProfile '${guestProfile}' (expected staging | production | production-lab)";
   enclaveMode = if isProdLab then "production" else guestProfile;
   producerAttestationTrustFile =
     if isProd then labFixtures.producerAttestationTrustFile else null;
