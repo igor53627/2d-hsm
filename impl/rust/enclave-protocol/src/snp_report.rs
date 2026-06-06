@@ -64,10 +64,13 @@ pub fn report_data_for_pubkey(pq_pubkey: &[u8]) -> [u8; REPORT_DATA_LEN] {
 
 /// Fetch a fresh SNP `ATTESTATION_REPORT` via configfs-tsm, binding `report_data` (64 bytes).
 ///
-/// Returns the raw report (the certificate chain, when present, lives in `auxblob` and is not read
-/// here). The error path includes "interface absent", so callers on non-SNP/dev hosts can fall back
-/// to a placeholder instead of hard-failing.
-pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<Vec<u8>, ProtocolError> {
+/// Returns `(report, cert_chain)` where `cert_chain` is the configfs-tsm `auxblob` — the
+/// VCEK→ASK→ARK certificate chain a relying party needs to verify the report's signature against
+/// the AMD root (see `backlog/docs/snp-attestation-verifier-policy.md`). The chain is best-effort:
+/// some providers / older kernels don't populate `auxblob`, so an absent/empty chain is returned as
+/// an empty `Vec` (NOT an error) — the report itself is the required output. The error path includes
+/// "interface absent", so callers on non-SNP/dev hosts can fall back to a placeholder.
+pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
     use std::fs;
 
     let entry = format!("{TSM_REPORT_DIR}/{TSM_ENTRY_NAME}");
@@ -89,7 +92,7 @@ pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<Vec<u8>, Prot
 fn fetch_report_inner(
     entry: &str,
     report_data: &[u8; REPORT_DATA_LEN],
-) -> Result<Vec<u8>, ProtocolError> {
+) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
     use std::fs;
     use std::io::Write;
 
@@ -109,17 +112,22 @@ fn fetch_report_inner(
             "SNP attestation: outblob shorter than ABI minimum",
         ));
     }
-    Ok(report)
+    // VCEK→ASK→ARK cert chain. Best-effort: absent/empty auxblob is fine (the verifier can fetch
+    // the chain from AMD KDS by VCEK serial as a fallback); never fail the report on its account.
+    let cert_chain = fs::read(format!("{entry}/auxblob")).unwrap_or_default();
+    Ok((report, cert_chain))
 }
 
-/// Fetch the SNP report bound to `pq_pubkey` and return `(measurement, raw_report)`.
-pub fn fetch_measurement_and_report(
-    pq_pubkey: &[u8],
-) -> Result<([u8; SNP_MEASUREMENT_LEN], Vec<u8>), ProtocolError> {
+/// Boot-captured SNP attestation: `(launch_measurement, raw_report, cert_chain)`.
+/// `cert_chain` (configfs-tsm `auxblob`) may be empty when the provider didn't populate it.
+pub type SnpAttestation = ([u8; SNP_MEASUREMENT_LEN], Vec<u8>, Vec<u8>);
+
+/// Fetch the SNP report bound to `pq_pubkey` and return `(measurement, raw_report, cert_chain)`.
+pub fn fetch_measurement_and_report(pq_pubkey: &[u8]) -> Result<SnpAttestation, ProtocolError> {
     let report_data = report_data_for_pubkey(pq_pubkey);
-    let report = fetch_report(&report_data)?;
+    let (report, cert_chain) = fetch_report(&report_data)?;
     let measurement = verify_and_extract_measurement(&report, &report_data)?;
-    Ok((measurement, report))
+    Ok((measurement, report, cert_chain))
 }
 
 /// Verify the report echoes the requested `report_data` (the key binding) before trusting its
@@ -143,41 +151,49 @@ fn verify_and_extract_measurement(
 struct CachedAttestation {
     measurement: [u8; SNP_MEASUREMENT_LEN],
     report: Vec<u8>,
+    cert_chain: Vec<u8>,
 }
 
 /// One SNP report captured at enclave boot (bound to the installed PQ key).
 static SNP_ATTESTATION: std::sync::Mutex<Option<CachedAttestation>> =
     std::sync::Mutex::new(None);
 
-/// Boot hook: fetch the SNP report bound to `pq_pubkey` once and cache `(measurement, report)`.
-/// Propagates the fetch error (e.g. interface absent) so the caller can log + fall back.
+/// Boot hook: fetch the SNP report bound to `pq_pubkey` once and cache
+/// `(measurement, report, cert_chain)`. Propagates the fetch error (e.g. interface absent) so the
+/// caller can log + fall back.
 pub fn boot_fetch_and_cache(pq_pubkey: &[u8]) -> Result<(), ProtocolError> {
-    let (measurement, report) = fetch_measurement_and_report(pq_pubkey)?;
+    let (measurement, report, cert_chain) = fetch_measurement_and_report(pq_pubkey)?;
     let mut guard = SNP_ATTESTATION
         .lock()
         .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation cache poisoned"))?;
     *guard = Some(CachedAttestation {
         measurement,
         report,
+        cert_chain,
     });
     Ok(())
 }
 
-/// The boot-captured `(measurement, raw_report)`, if an SNP report was obtained at startup.
-pub fn cached_attestation() -> Option<([u8; SNP_MEASUREMENT_LEN], Vec<u8>)> {
+/// The boot-captured `(measurement, raw_report, cert_chain)`, if an SNP report was obtained at
+/// startup. `cert_chain` may be empty when the provider did not populate `auxblob`.
+pub fn cached_attestation() -> Option<SnpAttestation> {
     let guard = SNP_ATTESTATION.lock().ok()?;
-    guard.as_ref().map(|c| (c.measurement, c.report.clone()))
+    guard
+        .as_ref()
+        .map(|c| (c.measurement, c.report.clone(), c.cert_chain.clone()))
 }
 
 #[cfg(test)]
 pub(crate) fn set_cached_attestation_for_tests(
     measurement: [u8; SNP_MEASUREMENT_LEN],
     report: Vec<u8>,
+    cert_chain: Vec<u8>,
 ) {
     if let Ok(mut g) = SNP_ATTESTATION.lock() {
         *g = Some(CachedAttestation {
             measurement,
             report,
+            cert_chain,
         });
     }
 }

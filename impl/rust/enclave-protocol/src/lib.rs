@@ -315,6 +315,11 @@ pub struct GetMeasurementResponse {
     pub supported_ticket_types: Vec<u8>,
     /// ML-DSA-65 signing operational in this build (true only with sealed key or explicit `ml-dsa-65` test key).
     pub pq_signing_ready: bool,
+    /// SNP VCEK→ASK→ARK certificate chain (configfs-tsm `auxblob`) for verifying `attestation` to
+    /// the AMD root (wire key 7). Empty when no chain was captured (non-SNP/dev, or a provider that
+    /// doesn't populate `auxblob` — the verifier then fetches it from AMD KDS by VCEK serial). See
+    /// `backlog/docs/snp-attestation-verifier-policy.md`.
+    pub cert_chain: Vec<u8>,
 }
 
 /// Whether this build can produce valid on-chain ML-DSA-65 signatures right now.
@@ -394,34 +399,38 @@ pub fn snp_attestation_boot_gate(
 
 fn measurement_response() -> GetMeasurementResponse {
     let pq_pubkey = active_signing_public_key_bytes().unwrap_or_default();
-    let (measurement, attestation) = resolve_measurement_and_attestation();
+    let (measurement, attestation, cert_chain) = resolve_measurement_and_attestation();
     GetMeasurementResponse {
         measurement,
         attestation,
         pq_pubkey,
         supported_ticket_types: vec![0, 1],
         pq_signing_ready: pq_signing_ready(),
+        cert_chain,
     }
 }
 
-/// `(measurement, attestation)` for `GET_MEASUREMENT`. Staging/reference advertise the sealed
-/// label. Production returns the boot-captured SNP launch measurement + raw report when available,
-/// else gracefully falls back to the placeholder label (keeps KVM/dev/transport smokes working).
-fn resolve_measurement_and_attestation() -> (Vec<u8>, Vec<u8>) {
+/// `(measurement, attestation, cert_chain)` for `GET_MEASUREMENT`. Staging/reference advertise the
+/// sealed label (no cert chain). Production returns the boot-captured SNP launch measurement + raw
+/// report + VCEK cert chain when available, else gracefully falls back to the placeholder label
+/// (keeps KVM/dev/transport smokes working).
+fn resolve_measurement_and_attestation() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     #[cfg(any(feature = "staging-host", feature = "reference-test-key"))]
     {
         (
             REFERENCE_STAGING_MEASUREMENT.to_vec(),
             b"attestation-placeholder".to_vec(),
+            Vec::new(),
         )
     }
     #[cfg(not(any(feature = "staging-host", feature = "reference-test-key")))]
     {
         match snp_report::cached_attestation() {
-            Some((measurement, report)) => (measurement.to_vec(), report),
+            Some((measurement, report, cert_chain)) => (measurement.to_vec(), report, cert_chain),
             None => (
                 boot_lab_pq_seal::LAB_PROD_MEASUREMENT.to_vec(),
                 b"attestation-placeholder".to_vec(),
+                Vec::new(),
             ),
         }
     }
@@ -434,18 +443,21 @@ mod measurement_wiring_tests {
     #[test]
     fn production_measurement_prefers_cached_snp_then_falls_back() {
         snp_report::reset_cached_attestation_for_tests();
-        // No SNP report cached -> placeholder label + placeholder attestation (graceful fallback).
-        let (m, att) = resolve_measurement_and_attestation();
+        // No SNP report cached -> placeholder label + placeholder attestation + empty cert chain.
+        let (m, att, certs) = resolve_measurement_and_attestation();
         assert_eq!(m, boot_lab_pq_seal::LAB_PROD_MEASUREMENT.to_vec());
         assert_eq!(att, b"attestation-placeholder".to_vec());
+        assert!(certs.is_empty());
 
-        // With a boot-captured SNP report -> real 48-byte measurement + the raw report.
+        // With a boot-captured SNP report -> real 48-byte measurement + raw report + cert chain.
         let meas = [0x5au8; snp_report::SNP_MEASUREMENT_LEN];
         let report = vec![0xa5u8; 1184];
-        snp_report::set_cached_attestation_for_tests(meas, report.clone());
-        let (m2, att2) = resolve_measurement_and_attestation();
+        let cert_chain = vec![0xc7u8; 64];
+        snp_report::set_cached_attestation_for_tests(meas, report.clone(), cert_chain.clone());
+        let (m2, att2, certs2) = resolve_measurement_and_attestation();
         assert_eq!(m2, meas.to_vec());
         assert_eq!(att2, report);
+        assert_eq!(certs2, cert_chain);
 
         snp_report::reset_cached_attestation_for_tests();
     }

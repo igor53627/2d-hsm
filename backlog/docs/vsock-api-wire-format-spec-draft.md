@@ -171,7 +171,8 @@ Response:
   "attestation": h'....',           // TEE remote attestation document (platform — not §9 Ed25519)
   "pq_pubkey": h'....',             // empty when pq_signing_ready is false; 1952 bytes (ML-DSA-65) when true
   "supported_ticket_types": [0, 1], // static capability list (see formal CBOR section)
-  "pq_signing_ready": false
+  "pq_signing_ready": false,
+  "cert_chain": h'....'             // key 7: SNP VCEK->ASK->ARK chain (auxblob); optional, empty when absent
 }
 ```
 
@@ -341,9 +342,12 @@ Error = {
   3: bytes,                ; attestation document (full, as returned by the platform)
   4: bytes,                ; pq_pubkey — empty (0 bytes) when key 6 is false; 1952 bytes (ML-DSA-65) when key 6 is true
   5: [int]                 ; supported_ticket_types (e.g. [0, 1])
-  6: bool                  ; pq_signing_ready (false unless TEE has operational ML-DSA-65 signing key)
+  6: bool,                 ; pq_signing_ready (false unless TEE has operational ML-DSA-65 signing key)
+  7: bytes                 ; cert_chain — SNP VCEK->ASK->ARK chain (configfs-tsm auxblob); OPTIONAL/additive, empty when absent
 }
 ```
+
+**Semantics of `cert_chain` (key 7):** the SEV-SNP **VCEK→ASK→ARK** certificate chain (configfs-tsm `auxblob`) the relying party needs to verify `attestation` (key 3) to the pinned AMD root. It is **additive and backward-compatible** — a peer on the 1–6 schema omits it, and a decoder MUST default it to empty when absent. It MAY be empty even on SNP (provider didn't populate `auxblob`); the verifier then fetches the VCEK from AMD KDS by `chip_id` + `reported_tcb`. Full verification procedure: [`snp-attestation-verifier-policy.md`](./snp-attestation-verifier-policy.md). Note the launch `measurement` (key 2) anchors the **OVMF launch firmware + config**, not the guest image — see that policy §3.
 
 **Semantics of `supported_ticket_types`:** This is a **static capability list** for the enclave image (which ticket types it can sign when all preconditions are met). It does **not** mean the enclave can sign type=1 right now. Readiness for hard-fork signing requires `GET_STATUS.armed == true` plus the rules in `SIGN_AUTHORIZATION_TICKET` below.
 
