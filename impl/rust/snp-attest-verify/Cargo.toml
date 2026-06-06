@@ -1,0 +1,44 @@
+[package]
+name = "snp-attest-verify"
+version = "0.1.0"
+edition = "2021"
+description = "Relying-party reference verifier for SEV-SNP attestation: report sig (ECDSA-P384) + VCEK→ASK→ARK cert chain (RSA-PSS) to the pinned AMD root. Implements snp-attestation-verifier-policy §2 step 2. Deliberately OFF the forbid(unsafe) enclave path."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# NOTE: deliberately NOT `#![forbid(unsafe_code)]` — this is the relying-party verifier; it needs
+# ECDSA-P384 + RSA-PSS + X.509 (their internals use unsafe). It never runs inside the enclave.
+
+[[bin]]
+name = "snp-attest-verify"
+path = "src/main.rs"
+
+[lib]
+name = "snp_attest_verify"
+path = "src/lib.rs"
+
+[dependencies]
+# Report signature: VCEK signs the ATTESTATION_REPORT with ECDSA-P384 / SHA-384.
+p384 = { version = "0.13", features = ["ecdsa"] }
+# Cert chain: AMD ARK/ASK sign with RSA-4096 RSASSA-PSS / SHA-384.
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+# X.509 parsing (cert TBS, SPKI, extensions).
+x509-cert = { version = "0.2", features = ["pem"] }
+der = "0.7"
+spki = "0.7"
+const-oid = "0.9"
+# Reuse the structural policy (prevalidate_report) + report_data key binding (report_data_for_pubkey).
+# NOTE: snp_report.rs's byte offsets are pub(crate), so the few offsets this crate needs (sig 0x2A0,
+# chip_id 0x1A0, reported_tcb 0x180) are re-declared here; keep them in sync (follow-up: export them).
+enclave-protocol = { path = "../enclave-protocol", features = ["snp-verify"] }
+hex = "0.4"
+thiserror = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+# Pure-Rust X.509 builder (no C deps) for a synthetic ECDSA-P384 ARK→ASK→VCEK chain — exercises the
+# chain-walk + pin + VCEK leaf + report binding end to end (AMD's real chain is RSA-PSS, covered by
+# the committed AMD certs).
+x509-cert = { version = "0.2", features = ["pem", "builder"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem"] }

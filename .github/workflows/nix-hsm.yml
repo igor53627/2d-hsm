@@ -11,6 +11,7 @@ on:
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
       - 'impl/rust/snp-derive-root/**'
+      - 'impl/rust/snp-attest-verify/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
   pull_request:
@@ -19,6 +20,7 @@ on:
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
       - 'impl/rust/snp-derive-root/**'
+      - 'impl/rust/snp-attest-verify/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
 
@@ -62,6 +64,13 @@ jobs:
       # graceful no-device error; the in-guest path is validated on aya.
       - name: snp-derive-root boot helper builds + tests
         working-directory: impl/rust/snp-derive-root
+        run: cargo test
+
+      # TASK-1 DoD #3: relying-party attestation verifier. Separate crate (ECDSA-P384 + RSA-PSS +
+      # X.509, deliberately off the forbid-unsafe enclave path). Tests cover the report sig, the
+      # cert chain against real AMD Genoa ARK/ASK (RSA-PSS) + a synthetic ECDSA chain end to end.
+      - name: snp-attest-verify reference verifier builds + tests
+        working-directory: impl/rust/snp-attest-verify
         run: cargo test
 
   elixir-test:

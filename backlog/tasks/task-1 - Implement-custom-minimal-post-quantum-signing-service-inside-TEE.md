@@ -72,7 +72,7 @@ Because the service will run inside a TEE, many traditional HSM hardware securit
 - [ ] #9 Design and document the integration boundary with the existing multi-layer signing flow (SignerPolicy + OPA + Vault credential brokering)
 - [ ] #10 Specify TEE runtime requirements and attestation model (Nitro Enclaves and/or SEV-SNP)
 - [ ] #11 Implement support for at least ML-DSA (Dilithium) with the parameter sets required by 2d; SLH-DSA (SPHINCS+) support is a stretch goal for MVP
-- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Partial: reference verifier `snp_verify::prevalidate_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden); VCEK→ASK→ARK cert-chain to the AMD root remains the caller's job (see acceptance #3)._
+- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Reference verifier complete across both layers: `snp_verify::prevalidate_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden) **+ `snp-attest-verify`** (TASK-1.2): the report's ECDSA-P384 sig + the VCEK→ASK→ARK cert chain (RSA-PSS) to the pinned AMD root. Remaining: VCEK TCB-extension binding + a real KDS-resolvable end-to-end golden (aya's chip_id is masked) — see acceptance #3._
 - [ ] #13 Define the on-chain RecoveryTicket format, issuance rules (permissionless special tx after ~1h downtime for 2s blocks), TEE attestation binding, and activation semantics for BlockProducer failover
 - [ ] #14 Design client/reader node verification rules that reject blocks from unauthorized producer keys or with invalid state transitions (including forged 'stay' transitions)
 - [ ] #15 Specify how the TEE signing service uses the network (genesis + recent headers + on-chain recovery history) as a cryptographic second factor for freshness before signing
@@ -540,13 +540,34 @@ baked lab fixture.
 - **Remaining follow-up:** the derived root is platform-specific (per-VCEK), so a baked blob only
   unseals on the host it was sealed for; multi-host mainnet sealing (per-host or VMRK) is open. Plus
   (c)/(d) above.
+
+**2026-06-07 — TASK-1.2 attestation verifier (DoD #3 / AC#12; branch `feat/task-1.2-snp-attest-verify`, PR #23):**
+The relying-party verifier that completes attestation — closes policy §2 step 2 (the cert chain to
+the pinned AMD root), which `prevalidate_report` deliberately left out.
+- New crate `impl/rust/snp-attest-verify/` (lib + CLI), NOT forbid-unsafe — needs ECDSA-P384 + RSA +
+  X.509, kept off the enclave path. Path-deps `enclave-protocol` (reuses `prevalidate_report` +
+  `report_data_for_pubkey`); not a Nix package (cargo-built in CI, like `pq-seal-v1`).
+- Verifies: report sig (VCEK, **ECDSA-P384/SHA-384**; AMD stores r/s little-endian in 72-byte fields
+  at 0x2A0 — byte-reverse to BE) + VCEK→ASK→ARK chain (**AMD ARK/ASK are RSA-4096 RSASSA-PSS/SHA-384**)
+  + ARK self-signed & **pinned** by SPKI. `verify_attestation` composes prevalidate + chain + report
+  sig; CLI takes `--report/--vcek/--cert-chain/--measurement[/--pq-pubkey/--pinned-ark-chain]`.
+- 13 tests: real AMD Genoa ARK self-sign + ASK←ARK (RSA-PSS, KDS certs committed as test vectors) +
+  synthetic ECDSA ARK→ASK→VCEK end-to-end (pass/wrong-pin/broken-intermediate) + report-sig
+  round-trip/tamper/wrong-key + golden-report field extraction. clippy + fmt clean.
+- **Feasibility finding:** aya's `chip_id` is masked → its VCEK is **404 on AMD KDS**, so a *real*
+  full-chain golden isn't available from aya (production hardware resolves). The real chain is covered
+  on its upper legs (ARK/ASK) + synthetically end-to-end.
+- **Follow-ups:** VCEK TCB/chip-id X.509-extension binding (policy §2 last bullet); cert validity
+  dates; KDS auto-fetch in the CLI; a real KDS-resolvable end-to-end golden (vendor a public AMD
+  sample). The verifier still lives here as a reference; the on-chain `MeasurementRegistry` policy
+  encoding remains 2d-solidity work.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
 - [ ] #1 mix test (or equivalent) passes for the new signing service
 - [ ] #2 Security review of the service is completed (at minimum: key never leaves TEE in plaintext, proper use of sealing/attestation, no obvious exfiltration paths)
-- [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted. _Partial: reference relying-party verifier `snp_verify::prevalidate_report` (feature `snp-verify`) checks report structure + `report_data` key binding + measurement allowlist + DEBUG-off, tested vs the committed golden report (6 tests). **Still open:** the VCEK→ASK→ARK signature chain to the pinned AMD root (ECDSA-P384 + X.509 + KDS) — intentionally out of the forbid-unsafe enclave crate; the BP/on-chain consumer must add it. See snp-attestation-verifier-policy.md._
+- [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted. _Two-layer reference verifier implemented + tested: (1) `snp_verify::prevalidate_report` (feature `snp-verify`) — report structure + `report_data` key binding + measurement allowlist + DEBUG-off, tested vs the committed golden report; (2) **`impl/rust/snp-attest-verify`** (TASK-1.2, PR #23) — the report's ECDSA-P384/SHA-384 signature + the VCEK→ASK→ARK cert chain (AMD ARK/ASK are RSA-4096 RSASSA-PSS/SHA-384) to the **pinned** AMD root, with `verify_attestation` composing both layers + a CLI. Separate crate, deliberately off the forbid-unsafe enclave path. 13 tests: real AMD Genoa ARK self-sign + ASK←ARK (RSA-PSS, real KDS certs) + a synthetic ECDSA ARK→ASK→VCEK chain end to end + report-sig round-trip/tamper. **Open follow-ups:** VCEK TCB/chip-id X.509-extension binding, cert validity-date checks, KDS auto-fetch, and a real KDS-resolvable end-to-end golden (aya's chip_id is masked → its VCEK is 404 on KDS, so the real chain is exercised only on its upper legs + synthetically). See snp-attestation-verifier-policy.md §4._
 - [ ] #4 Basic failover scenario between at least two instances of the service (on different hosts/enclaves) is designed and documented
 - [ ] #5 Operational runbook exists covering: deployment into TEE, key provisioning/rotation inside TEE, attestation, monitoring, and incident response for TEE compromise or unavailability
 - [ ] #6 Integration with 2d's existing signing path (Chain.Bridge.Signer + OPA + Vault) is implemented and passes relevant tests
