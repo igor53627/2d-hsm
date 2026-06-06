@@ -44,6 +44,8 @@ pub enum VerifyError {
     ArkNotSelfSigned,
     #[error("ARK does not match the pinned AMD root")]
     ArkPinMismatch,
+    #[error("certificate name chain broken ({0})")]
+    NameChain(&'static str),
     #[error(transparent)]
     Prevalidate(#[from] enclave_protocol::ProtocolError),
 }
@@ -111,7 +113,8 @@ use x509_cert::Certificate;
 
 /// RSASSA-PSS (AMD ARK/ASK cert signatures).
 const OID_RSASSA_PSS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
-/// ecdsa-with-SHA384 (used by the synthetic test chain; AMD's real chain is RSA-PSS).
+/// ecdsa-with-SHA384 — accepted only in the synthetic test chain (AMD's real chain is RSA-PSS).
+#[cfg(test)]
 const OID_ECDSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
 
 /// Parse a PEM bundle (e.g. the AMD KDS `cert_chain`: ASK then ARK) into certificates.
@@ -159,29 +162,36 @@ fn verify_cert_signed_by(
         .map_err(|_| VerifyError::CertParse("issuer spki"))?;
     let alg = cert.signature_algorithm.oid;
 
+    // Production accepts ONLY AMD's algorithm: RSA-4096 RSASSA-PSS / SHA-384 / MGF1-SHA-384 / salt 48.
+    // (A cert declaring different PSS params simply fails to verify here — safe.) Anything else is
+    // rejected; ECDSA cert signatures exist only for the synthetic test chain below (AMD is RSA-only).
     if alg == OID_RSASSA_PSS {
         use rsa::pkcs8::DecodePublicKey;
         use rsa::{Pss, RsaPublicKey};
         let pk = RsaPublicKey::from_public_key_der(&issuer_spki)
             .map_err(|_| VerifyError::CertParse("rsa spki"))?;
-        // AMD ARK/ASK use RSASSA-PSS with SHA-384 / MGF1-SHA-384 / salt-len = 48. A cert declaring
-        // different PSS params simply fails to verify here (safe).
         let digest = Sha384::digest(&tbs);
-        pk.verify(Pss::new::<Sha384>(), &digest, sig)
-            .map_err(|_| VerifyError::CertSignature(ctx))
-    } else if alg == OID_ECDSA_SHA384 {
+        return pk
+            .verify(Pss::new::<Sha384>(), &digest, sig)
+            .map_err(|_| VerifyError::CertSignature(ctx));
+    }
+    // Test-only: the synthetic chain (synthetic_chain_tests) is ECDSA-P384, since x509-cert 0.2's
+    // builder cannot produce randomized RSA-PSS signatures. Compiled out of the shipped verifier so
+    // production rejects non-RSA-PSS cert signatures.
+    #[cfg(test)]
+    if alg == OID_ECDSA_SHA384 {
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
         use p384::ecdsa::Signature;
         use spki::DecodePublicKey;
         let vk = p384::ecdsa::VerifyingKey::from_public_key_der(&issuer_spki)
             .map_err(|_| VerifyError::CertParse("ec issuer spki"))?;
-        let sig = Signature::from_der(sig).map_err(|_| VerifyError::BadReportSignatureEncoding)?;
+        let sig = Signature::from_der(sig).map_err(|_| VerifyError::CertParse("ec cert sig"))?;
         let digest = Sha384::digest(&tbs);
-        vk.verify_prehash(&digest, &sig)
-            .map_err(|_| VerifyError::CertSignature(ctx))
-    } else {
-        Err(VerifyError::UnsupportedSigAlg(alg.to_string()))
+        return vk
+            .verify_prehash(&digest, &sig)
+            .map_err(|_| VerifyError::CertSignature(ctx));
     }
+    Err(VerifyError::UnsupportedSigAlg(alg.to_string()))
 }
 
 fn is_self_signed(cert: &Certificate) -> bool {
@@ -211,11 +221,19 @@ pub fn verify_cert_chain(
     if ark_spki != pinned_ark_spki {
         return Err(VerifyError::ArkPinMismatch);
     }
-    // ASK = the chain cert that is not the ARK.
+    // ASK = the chain cert that ISSUED the VCEK, matched by DN (not merely "not the ARK"), so an
+    // extra/duplicate cert in the bundle can't be mis-selected. Then enforce name-chaining up to the
+    // ARK (RFC 5280 §6.1 issuer/subject linkage) before checking signatures — defense in depth on top
+    // of the pin + signature checks.
     let ask = chain
         .iter()
-        .find(|c| c.tbs_certificate.subject != ark.tbs_certificate.subject)
-        .ok_or(VerifyError::CertParse("no ASK in chain"))?;
+        .find(|c| c.tbs_certificate.subject == vcek.tbs_certificate.issuer)
+        .ok_or(VerifyError::NameChain(
+            "no chain cert matches the VCEK issuer",
+        ))?;
+    if ask.tbs_certificate.issuer != ark.tbs_certificate.subject {
+        return Err(VerifyError::NameChain("ASK issuer != ARK subject"));
+    }
     verify_cert_signed_by(ask, ark, "ask<-ark")?;
     verify_cert_signed_by(vcek, ask, "vcek<-ask")?;
     Ok(())
@@ -473,6 +491,25 @@ mod synthetic_chain_tests {
         assert!(matches!(
             verify_cert_chain(&vcek, &[ask, ark], &bogus_spki),
             Err(VerifyError::ArkPinMismatch)
+        ));
+    }
+
+    #[test]
+    fn missing_ask_rejected_by_name_chain() {
+        // A chain with only the ARK (no cert matching the VCEK's issuer DN) is rejected at the
+        // name-chain step, not silently mis-selected.
+        let (ark_sk, ask_sk, vcek_sk) = (key(10), key(40), key(90));
+        let ark = self_signed(&ark_sk, "CN=Test ARK");
+        let ask = signed_by(&ask_sk, "CN=Test ASK", &ark, &ark_sk);
+        let vcek = signed_by(&vcek_sk, "CN=Test VCEK", &ask, &ask_sk);
+        let ark_spki = ark
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .unwrap();
+        assert!(matches!(
+            verify_cert_chain(&vcek, &[ark], &ark_spki),
+            Err(VerifyError::NameChain(_))
         ));
     }
 

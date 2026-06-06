@@ -16,7 +16,12 @@ This runs on the **relying party** (Block Producer host / on-chain `MeasurementR
 2. **Cert chain VCEK → ASK → ARK** to the pinned AMD root:
    - ARK is identified as the self-signed cert and **pinned** — its SubjectPublicKeyInfo must equal
      the out-of-band AMD root (never trust the ARK delivered in the chain on its own).
-   - ASK signed by ARK, VCEK signed by ASK. AMD ARK/ASK use **RSA-4096 RSASSA-PSS / SHA-384**.
+   - **Name-chaining** (RFC 5280 §6.1): the ASK is selected as the cert whose subject == the VCEK's
+     issuer DN, and its issuer must equal the ARK's subject — so an extra/duplicate cert in the bundle
+     can't be mis-selected.
+   - ASK signed by ARK, VCEK signed by ASK. **Production accepts only AMD's algorithm**
+     (RSA-4096 RSASSA-PSS / SHA-384); any other cert signature algorithm is rejected (the ECDSA cert
+     path exists solely for the `#[cfg(test)]` synthetic chain).
 3. **Report signature**: the report is signed by the VCEK with **ECDSA-P384 / SHA-384**. AMD stores
    `r`/`s` **little-endian** in 72-byte fields at offset `0x2A0`; the verifier byte-reverses to the
    big-endian the `p384` crate expects, then verifies SHA-384 over `report[0..0x2A0]`.
@@ -36,15 +41,21 @@ curl 'https://kdsintf.amd.com/vcek/v1/Genoa/<chip_id_hex>?blSPL=..&teeSPL=..&snp
 curl 'https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain' -o ask_ark.pem
 ```
 
-`--pinned-ark-chain` defaults to the committed AMD Genoa ARK/ASK (`testvectors/amd_genoa_cert_chain.pem`).
+`--pq-pubkey` is **required** (it binds the report to the producer key via `report_data`) — without a
+key binding the attestation is replayable, since the launch measurement is OVMF-level and shared
+across guests (policy §3). To verify without it (e.g. measurement-only debugging), pass the explicit
+`--allow-unbound`, which warns. `--pinned-ark-chain` defaults to the committed AMD Genoa ARK/ASK
+(`testvectors/amd_genoa_cert_chain.pem`).
 
 ## Tests
 
 - **Real AMD data** (`testvectors/amd_genoa_cert_chain.pem`, fetched from KDS): the ARK verifies as
   self-signed (RSA-PSS), and the ASK is signed by the ARK — the production RSA-PSS path on real certs.
 - **Synthetic ECDSA-P384 chain** (built in-test with the pure-Rust `x509-cert` builder): a full
-  ARK→ASK→VCEK chain + a report signed by the VCEK exercises the chain-walk, ARK pin, and report
-  binding end to end (pass + wrong-pin + broken-intermediate).
+  ARK→ASK→VCEK chain + a report signed by the VCEK exercises the chain-walk, ARK pin, name-chaining,
+  and report binding end to end (pass + wrong-pin + missing-ASK + broken-intermediate). It is ECDSA
+  because x509-cert 0.2's builder can't emit randomized RSA-PSS; the production RSA-PSS path is covered
+  by the real AMD certs above.
 - **Report signature**: deterministic P-384 round-trip + tamper/wrong-key/short-report rejection.
 - **Golden report** (`testvectors/snp_report_golden_v5.bin`, real, from aya): field extraction.
 
@@ -58,3 +69,7 @@ curl 'https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain' -o ask_ark.pem
   `report_reported_tcb` expose the report side; the cert-side parse + compare is a follow-up.
 - **Certificate validity dates** (notBefore/notAfter) — a deployment-policy wall-clock check, left to
   the consumer.
+- **basicConstraints / keyUsage** on ARK/ASK (cA=true, keyCertSign) and end-entity on the VCEK —
+  currently trust rests on the pin + signatures + name-chaining, not the CA flags.
+- **Anti-rollback** (policy §2 step 6): a minimum-`reported_tcb` floor; not enforced (no min-TCB
+  parameter yet).

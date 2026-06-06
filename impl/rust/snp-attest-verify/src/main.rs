@@ -40,10 +40,16 @@ struct Cli {
     /// AMD Genoa ARK/ASK — override for a different product or to pin your own copy.
     #[arg(long)]
     pinned_ark_chain: Option<PathBuf>,
-    /// Optional ML-DSA-65 producer public key to bind: requires
-    /// report_data == SHA3-512("2d-hsm-snp-report-data-v1" || pq_pubkey).
+    /// ML-DSA-65 producer public key to bind: requires
+    /// report_data == SHA3-512("2d-hsm-snp-report-data-v1" || pq_pubkey). REQUIRED unless
+    /// --allow-unbound — without it the attestation is not tied to a key (see --allow-unbound).
     #[arg(long)]
     pq_pubkey: Option<PathBuf>,
+    /// Verify WITHOUT binding the report to a producer key. DANGEROUS: the launch measurement is
+    /// OVMF-level and shared across guests, so an unbound report is replayable from a different
+    /// enclave on the same firmware. Mutually exclusive with --pq-pubkey.
+    #[arg(long)]
+    allow_unbound: bool,
     /// Allowed 48-byte launch measurement(s) as hex (repeatable). At least one is required.
     #[arg(long = "measurement", value_name = "HEX", required = true)]
     measurements: Vec<String>,
@@ -67,9 +73,26 @@ fn run(cli: &Cli) -> Result<[u8; 48], String> {
         Some(p) => std::fs::read(p).map_err(|e| format!("read --pinned-ark-chain: {e}"))?,
         None => EMBEDDED_AMD_GENOA_CHAIN.to_vec(),
     };
-    let pq_pubkey = match &cli.pq_pubkey {
-        Some(p) => Some(std::fs::read(p).map_err(|e| format!("read --pq-pubkey: {e}"))?),
-        None => None,
+    let pq_pubkey = match (&cli.pq_pubkey, cli.allow_unbound) {
+        (Some(_), true) => {
+            return Err("--pq-pubkey and --allow-unbound are mutually exclusive".into())
+        }
+        (Some(p), false) => Some(std::fs::read(p).map_err(|e| format!("read --pq-pubkey: {e}"))?),
+        (None, true) => {
+            eprintln!(
+                "snp-attest-verify: WARNING: --allow-unbound: the report is NOT bound to a pq_pubkey. \
+                 The launch measurement is OVMF-level and shared across guests, so this attestation \
+                 is replayable from a different enclave on the same firmware."
+            );
+            None
+        }
+        (None, false) => {
+            return Err(
+                "--pq-pubkey is required to bind the report to a producer key (or pass \
+                        --allow-unbound to verify without key binding — see policy §2 step 3)"
+                    .into(),
+            )
+        }
     };
     let mut allow = Vec::with_capacity(cli.measurements.len());
     for m in &cli.measurements {
