@@ -523,6 +523,23 @@ See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress up
   enclave's root file; (c) low-severity review nits: `selftest()` honor `--field-select`/`--root-key`/
   `--svn`, share the pq-seal domain constant with `enclave-protocol`, drop the dead `run()` branch,
   use `hex::encode`; (d) vTPM/Nitro backends.
+
+**2026-06-07 — TASK-1.1 sealed-boot loop (slice #1 complete; branch `feat/task-1.1-snp-sealed-boot`, PR #22):**
+Closes follow-ups (a) + (b): the enclave now **unseals against the SNP firmware-derived root**, not a
+baked lab fixture.
+- `sealRootSource = "snp"` (vs default `"file"`): a gating `twod-hsm-snp-derive-seal-root` oneshot runs
+  `snp-derive-root --out /run/twod-hsm/pq-seal-root.bin` before the enclave and `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`
+  points there. Enclave boot path otherwise unchanged. Key fact: the enclave unseals against
+  `b"enclave-measurement-placeholder"` (no `TWOD_HSM_ENCLAVE_MEASUREMENT_FILE` set), NOT the live SNP
+  measurement — so re-sealing needs only that known string.
+- New outputs `disk-production-lab-snp-rooted` + CEREMONY-ONLY `disk-production-lab-print-ceremony`;
+  `run-nix-snp-sealed-boot.sh` automates the ceremony. Default outputs byte-identical to main.
+- ✅ **aya end-to-end PASS** (2026-06-07, EPYC 9375F): captured derived root in-guest → sealed the
+  reference ML-DSA-65 keypair against it (6053-byte blob) → `.#disk-production-lab-snp-rooted` booted
+  under SEV-SNP with `real_measurement=1 pq_ready=1` — the enclave unsealed using the boot-derived root.
+- **Remaining follow-up:** the derived root is platform-specific (per-VCEK), so a baked blob only
+  unseals on the host it was sealed for; multi-host mainnet sealing (per-host or VMRK) is open. Plus
+  (c)/(d) above.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
