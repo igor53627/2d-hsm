@@ -69,6 +69,10 @@ mod mldsa65;
 mod pq_signer;
 /// SEV-SNP attestation report fetch (configfs-tsm) + launch-measurement extraction (TASK-5 Phase 3).
 pub mod snp_report;
+/// Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). Off by default — not part
+/// of the enclave signing path; enable with `--features snp-verify`.
+#[cfg(feature = "snp-verify")]
+pub mod snp_verify;
 mod wire;
 
 use serde::{Deserialize, Serialize};

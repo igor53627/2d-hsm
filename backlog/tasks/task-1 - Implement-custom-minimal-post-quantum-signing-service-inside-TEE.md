@@ -72,7 +72,7 @@ Because the service will run inside a TEE, many traditional HSM hardware securit
 - [ ] #9 Design and document the integration boundary with the existing multi-layer signing flow (SignerPolicy + OPA + Vault credential brokering)
 - [ ] #10 Specify TEE runtime requirements and attestation model (Nitro Enclaves and/or SEV-SNP)
 - [ ] #11 Implement support for at least ML-DSA (Dilithium) with the parameter sets required by 2d; SLH-DSA (SPHINCS+) support is a stretch goal for MVP
-- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service
+- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Partial: reference verifier `snp_verify::verify_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden); VCEK→ASK→ARK cert-chain to the AMD root remains the caller's job (see acceptance #3)._
 - [ ] #13 Define the on-chain RecoveryTicket format, issuance rules (permissionless special tx after ~1h downtime for 2s blocks), TEE attestation binding, and activation semantics for BlockProducer failover
 - [ ] #14 Design client/reader node verification rules that reject blocks from unauthorized producer keys or with invalid state transitions (including forged 'stay' transitions)
 - [ ] #15 Specify how the TEE signing service uses the network (genesis + recent headers + on-chain recovery history) as a cryptographic second factor for freshness before signing
@@ -493,11 +493,11 @@ See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress up
 <!-- DOD:BEGIN -->
 - [ ] #1 mix test (or equivalent) passes for the new signing service
 - [ ] #2 Security review of the service is completed (at minimum: key never leaves TEE in plaintext, proper use of sealing/attestation, no obvious exfiltration paths)
-- [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted
+- [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted. _Partial: reference relying-party verifier `snp_verify::verify_report` (feature `snp-verify`) checks report structure + `report_data` key binding + measurement allowlist + DEBUG-off, tested vs the committed golden report (6 tests). **Still open:** the VCEK→ASK→ARK signature chain to the pinned AMD root (ECDSA-P384 + X.509 + KDS) — intentionally out of the forbid-unsafe enclave crate; the BP/on-chain consumer must add it. See snp-attestation-verifier-policy.md._
 - [ ] #4 Basic failover scenario between at least two instances of the service (on different hosts/enclaves) is designed and documented
 - [ ] #5 Operational runbook exists covering: deployment into TEE, key provisioning/rotation inside TEE, attestation, monitoring, and incident response for TEE compromise or unavailability
 - [ ] #6 Integration with 2d's existing signing path (Chain.Bridge.Signer + OPA + Vault) is implemented and passes relevant tests
-- [ ] #7 Performance baseline captured on the **SNP host CPU** (AMD EPYC, e.g. aya's 9375F) for the hot-path PQ algorithm (ML-DSA-65 sign+verify latency + throughput vs the ~2s block budget). _Not a GPU/B200 workload — hot-path signing runs on the enclave CPU; the GPU "B200" path is the separate MAYO-iO slow path in theory-378._
+- [x] #7 Performance baseline captured on the **SNP host CPU** (AMD EPYC, e.g. aya's 9375F) for the hot-path PQ algorithm (ML-DSA-65 sign+verify latency + throughput vs the ~2s block budget). **Measured on aya (AMD EPYC 9375F, `examples/bench_mldsa65.rs`, 2026-06-06):** sign **71.8 µs/op** (13.9k ops/s), verify **26.7 µs/op** (37.4k ops/s), sig 3309 B → sign+verify ≈ **98.6 µs/block = 0.005%** of the ~2s budget (huge headroom). _Not a GPU/B200 workload — hot-path signing runs on the enclave CPU; the GPU "B200" path is the separate MAYO-iO slow path in theory-378._
 - [ ] #8 Design + document the full permissionless on-chain RecoveryTicket + hot-standby model (including concrete format, 1h threshold rationale with Solana comparison, TEE binding, network-as-2nd-factor in the enclave, and client rejection rules for malicious producer state transitions)
 - [ ] #9 Add/update reader node + light client verification spec that enforces authorized producer key + valid state transitions (covers 'stay transition' forgery case)
 <!-- DOD:END -->
