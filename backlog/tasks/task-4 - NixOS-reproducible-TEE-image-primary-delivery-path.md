@@ -1,7 +1,7 @@
 ---
 id: TASK-4
 title: NixOS reproducible TEE image as primary 2d-hsm delivery path
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-04'
 updated_date: '2026-06-06 13:46'
@@ -77,7 +77,7 @@ The flake manifest closes the **operational build-attestation** side of authoriz
 - [x] #1 `impl/nix/vm-hsm/flake.nix` exists with outputs: `packages.enclave`, `packages.vm` (qcow2 or vm runner), `devShell`.
 - [x] #2 `flake.lock` committed; CI workflow runs `nix build .#enclave` and `.#vm` on `x86_64-linux`.
 - [x] #3 Documented **measurement manifest** format (JSON): `git_revision`, `flake_lock`, artifact SHA256, `fork_spec_hash_input` — see `scripts/write-measurement-manifest.sh`.
-- [ ] #4 Reproducibility: the measurement manifest (schema v2) publishes the production artifact SHA256 and the build is Nix-deterministic from the locked `flake.lock` (CI builds + uploads the manifest). **Still open — the literal bar is not met:** no CI job rebuilds and **diffs the artifact SHA256 across two builds**, so output reproducibility rests on Nix determinism as a principle, not a mechanical re-build comparison (a darwin `nix eval` only matches the *derivation* hash, which is tautological under locked inputs — not an output-hash match). TEE measurement is now **real** (TASK-5 #4) and deterministic, but note it pins **OVMF + launch-config, not the guest image** (identical across different guests — TASK-5 verifier-policy §3), so it is not an image fingerprint. _Closeable by a `nix build .#enclave --rebuild` (or two-builder diff) on aya._
+- [x] #4 Reproducibility: the measurement manifest (schema v2) publishes the production artifact SHA256 and the build is Nix-deterministic from the locked `flake.lock`. **Verified on aya (2026-06-06)**: `nix build .#enclave` then `nix build .#enclave --rebuild` rebuilt the derivation and the output was **byte-identical** (`checking outputs … REBUILD_OK`, no hash mismatch) — i.e. two builds → identical artifact. Production `enclave-vsock` sha256 = `772d63a132858015b7a515d1b6cdf97868d8236fa8939982614f7cb3e8805556`. TEE measurement is **real** (TASK-5 #4) and deterministic; note it pins **OVMF + launch-config, not the guest image** (identical across different guests — TASK-5 verifier-policy §3), so it is not an image fingerprint — image identity uses this artifact sha256 + `report_data`.
 - [x] #5 NixOS guest module: systemd unit for HSM binary, `TWOD_HSM_VSOCK_*` bind (not `2D_HSM_*`), minimal firewall; **no** SSH, no extraneous services; `boot.loader.grub.enable = false`.
 - [x] #6 `run-vm-hsm.sh` launches NixOS qcow2 on **KVM** (`SEV_MODE=none`); **SNP** explicitly deferred to TASK-5 #5 (script exits 2 for `SEV_MODE=snp`).
 - [x] #7 Smoke on aya: Nix guest vsock smokes pass on **KVM** (staging + prod transport + prod-lab PQ); SNP pass/fail tracked under TASK-5.
