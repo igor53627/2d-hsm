@@ -61,7 +61,7 @@ in
     after = [
       "systemd-modules-load.service"
       "systemd-udev-settle.service"
-    ];
+    ] ++ lib.optionals isProd [ "sys-kernel-config.mount" ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
       ExecStart = "${enclavePackage}/bin/${binName}";
@@ -78,6 +78,14 @@ in
       ProtectControlGroups = true;
       RestrictSUIDSGID = true;
       LockPersonality = true;
+    }
+    // lib.optionalAttrs isProd {
+      # AC#4: the enclave fetches the SNP launch measurement via configfs-tsm at boot, which
+      # creates and writes /sys/kernel/config/tsm/report/*. Whitelist that subtree read-write so
+      # the hardening sandbox (ProtectSystem=strict / ProtectKernelTunables) does not block the
+      # capture and silently force the placeholder fallback. NOTE: needs live validation once the
+      # NixOS guest boots under SNP (TASK-5 AC#5).
+      ReadWritePaths = [ "/sys/kernel/config/tsm" ];
     };
     preStart = ''
       echo "[vm-hsm] starting ${binName} (${mode})" >/dev/console

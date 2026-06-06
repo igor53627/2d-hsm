@@ -118,8 +118,24 @@ pub fn fetch_measurement_and_report(
 ) -> Result<([u8; SNP_MEASUREMENT_LEN], Vec<u8>), ProtocolError> {
     let report_data = report_data_for_pubkey(pq_pubkey);
     let report = fetch_report(&report_data)?;
-    let measurement = measurement_from_report(&report)?;
+    let measurement = verify_and_extract_measurement(&report, &report_data)?;
     Ok((measurement, report))
+}
+
+/// Verify the report echoes the requested `report_data` (the key binding) before trusting its
+/// measurement, then extract the measurement. Rejects a stale or misrouted report whose
+/// `report_data` does not match what we asked for.
+fn verify_and_extract_measurement(
+    report: &[u8],
+    expected_report_data: &[u8; REPORT_DATA_LEN],
+) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
+    let echoed = report_data_from_report(report)?;
+    if &echoed != expected_report_data {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "SNP report_data does not echo the requested key binding",
+        ));
+    }
+    measurement_from_report(report)
 }
 
 // ---- boot-time capture + cache ----
@@ -210,6 +226,19 @@ mod tests {
         assert!(measurement_from_report(&[]).is_err());
         // Exactly long enough succeeds.
         assert!(measurement_from_report(&[0u8; MIN_REPORT_LEN]).is_ok());
+    }
+
+    #[test]
+    fn verify_and_extract_accepts_matching_report_data() {
+        let expected: [u8; REPORT_DATA_LEN] = (0u8..64).collect::<Vec<_>>().try_into().unwrap();
+        let m = verify_and_extract_measurement(GOLDEN, &expected).unwrap();
+        assert_eq!(hex::encode(m), GOLDEN_MEASUREMENT_HEX);
+    }
+
+    #[test]
+    fn verify_and_extract_rejects_mismatched_report_data() {
+        let wrong = [0xFFu8; REPORT_DATA_LEN];
+        assert!(verify_and_extract_measurement(GOLDEN, &wrong).is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-06-05'
-updated_date: '2026-06-06 09:10'
+updated_date: '2026-06-06 09:53'
 labels:
   - production
   - tee
@@ -40,7 +40,7 @@ Today (2026-06-05, branch `feat/task-1-vsock-staging-transport`):
 - Protocol + state machine + ML-DSA staging signer work in Rust.
 - NixOS guest runs **`enclave-vsock-staging`** with `TWOD_HSM_VSOCK_*` — host→guest vsock smoke passes (KVM).
 - **`.#vm-production`:** debug `enclave-production-transport` (`production-vsock` + `TRANSPORT_ONLY_MODE`) + lab attestation VK (transport smoke). **`.#vm-production-lab`:** debug `lab-production-vsock` + file PQ seal (`pq_signing_ready` smoke). Platform trust + PQ root from vTPM/SNP remain open (Phase 3).
-- SNP launch on aya is not the smoke path; production `GET_MEASUREMENT` / manifest still use placeholder measurement labels.
+- SNP launch on aya **works** for the Ubuntu guest (QEMU 10 + AMD OVMF; SEV-SNP active, golden disk boots) but is not yet the default smoke path, and the NixOS production guest does not boot under SNP yet (AC#5). Production `GET_MEASUREMENT` / manifest still use placeholder measurement labels until the enclave-side AC#4 wiring lands and the prod guest runs under SNP.
 
 This task is the **operational production milestone** after TASK-4 Phase B (transport + guest shell).
 
@@ -128,13 +128,15 @@ PQ for every arm would be possible in theory but is deferred: larger wire size (
 | `run-nix-vm-guest-smoke-prod-lab.sh` (`.#vm-production-lab`) | ✅ aya (`73f9c98`) |
 | `run-nix-vm-guest-smoke-prod.sh` (transport only) | ✅ |
 | Prod `nix build .#enclave` | ✅ build; ✅ optional guest via `vm-production` |
-| SNP guest boot on aya | ❌ (KVM smokes only) |
+| SNP guest boot on aya | ✅ Ubuntu guest (QEMU 10 + AMD OVMF; SEV-SNP active, golden boots); NixOS-under-SNP pending (AC#5) |
 
 ### Success criteria
 
 Prod guest smoke green + manifest documents real TEE measurement (or signed waiver) → ready for BP integration testing, not mainnet alone.
 
 Phase 3 / AC#4 progress (branch feat/task-5-snp-report): SNP boot ALREADY works on aya (EPYC 9375F, QEMU 10 + AMD OVMF, golden disk boots with SEV-SNP active) — the old 0xfee00000 LAPIC blocker notes are stale. Attestation interface = configfs-tsm (/sys/kernel/config/tsm/report), pure file I/O, fits #![forbid(unsafe_code)]; report 1184B, version 5, measurement@0x90[48], report_data@0x50[64] (verified vs a real captured report, committed as testvectors/snp_report_golden_v5.bin). Gap: Ubuntu cloud image kernel 6.8.0-117 ships NO sev-guest module (needs linux-modules-extra + modprobe; NixOS gets boot.kernelModules += sev-guest). Implemented: src/snp_report.rs (fetch+parse+report_data binding=SHA3-512(domain||pq_pubkey)), boot_capture_snp_measurement() hook in enclave_vsock.rs, measurement_response() returns real 48B measurement + raw report with graceful placeholder fallback (KVM/dev). Tests: default 62/0, reference-test-key 89/0; prod+staging binaries build. LIVE VALIDATED on aya: dump_snp_measurement example run inside the SNP guest returned measurement=3e39e33a...6b488 == the raw configfs-tsm capture. Remaining: roborev+PR; VCEK cert chain (auxblob) in attestation; manifest split (build-hash vs TEE measurement); AC#5 NixOS-qcow2 SNP launcher for prod-guest live GET_MEASUREMENT.
+
+Attestation contract (AC#4): GET_MEASUREMENT.measurement = 48-byte SNP launch measurement (report offset 0x90); attestation = the raw signed SNP ATTESTATION_REPORT (1184B, VCEK-signed) with report_data echoing SHA3-512(domain||pq_pubkey) for key binding (verified before caching). DEFERRED (Phase-3 follow-up, not in this slice): bundling the VCEK->ASK->ARK cert chain (configfs-tsm auxblob) and publishing the verifier policy (expected measurement allowlist + chain validation steps) so relying parties have a complete contract. roborev Full Matrix (jobs 7106-7111, compact 7112) on the branch: fixed High fail-open (release builds now refuse to serve an operational signer without a real SNP measurement; dev/lab stay graceful), High NixOS configfs-tsm sandbox (ReadWritePaths=/sys/kernel/config/tsm for prod; needs live validation at AC#5), Medium report_data echo now verified before trust. default cargo test 64/0, reference-test-key 91/0, release prod build OK.
 <!-- SECTION:NOTES:END -->
 
 ## Out of scope
@@ -146,7 +148,7 @@ Phase 3 / AC#4 progress (branch feat/task-5-snp-report): SNP boot ALREADY works 
 
 ## Related
 
-- **TASK-4** (parent) — Nix flake + NixOS guest shell; Phase B smokes ✅ KVM staging
+- **TASK-4** (dependency; see front matter) — Nix flake + NixOS guest shell; Phase B smokes ✅ KVM staging
 - **TASK-3** (Done) — Ed25519 `RecentChainProof` verification in enclave
 - **TASK-1** (In Progress) — ML-DSA signing + seal v1 in TEE
 - Branch: `feat/task-1-vsock-staging-transport` — merge before Phase 1

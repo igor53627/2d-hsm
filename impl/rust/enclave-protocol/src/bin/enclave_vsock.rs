@@ -91,7 +91,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // it logs and continues, and GET_MEASUREMENT keeps the placeholder (graceful fallback).
     match enclave_protocol::boot_capture_snp_measurement() {
         Ok(()) => eprintln!("enclave-vsock: SNP launch measurement captured (attested GET_MEASUREMENT)"),
-        Err(e) => eprintln!("enclave-vsock: SNP measurement unavailable, using placeholder: {e}"),
+        Err(e) => {
+            // Fail-closed in release: never serve an operational PQ signer with a placeholder
+            // measurement/attestation — a host could otherwise block SNP/configfs to make an
+            // operational signer look attested with placeholder evidence. Dev/lab (debug) builds
+            // log and continue so KVM/transport smokes keep working.
+            #[cfg(release_build)]
+            if is_sealed_signer_installed() {
+                return Err(format!(
+                    "refusing to serve an operational PQ signer without a real SNP measurement: {e}"
+                )
+                .into());
+            }
+            eprintln!("enclave-vsock: SNP measurement unavailable, using placeholder: {e}");
+        }
     }
 
     let (cid, port) = vsock_listen_addr_from_env()
