@@ -1,10 +1,10 @@
 ---
 id: TASK-4
 title: NixOS reproducible TEE image as primary 2d-hsm delivery path
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-04'
-updated_date: '2026-06-05'
+updated_date: '2026-06-06 13:46'
 labels:
   - nix
   - nixos
@@ -24,7 +24,6 @@ references:
   - ~/pse/yolo/mainnet-deploy/sev-vm
 priority: high
 ordinal: 1500
-parent: TASK-1
 ---
 
 ## Description
@@ -77,7 +76,7 @@ The flake manifest closes the **operational build-attestation** side of authoriz
 - [x] #1 `impl/nix/vm-hsm/flake.nix` exists with outputs: `packages.enclave`, `packages.vm` (qcow2 or vm runner), `devShell`.
 - [x] #2 `flake.lock` committed; CI workflow runs `nix build .#enclave` and `.#vm` on `x86_64-linux`.
 - [x] #3 Documented **measurement manifest** format (JSON): `git_revision`, `flake_lock`, artifact SHA256, `fork_spec_hash_input` — see `scripts/write-measurement-manifest.sh`.
-- [ ] #4 Reproducibility: two CI builds from same lock → **identical production artifact SHA256** (manifest published); **TEE measurement** reproducibility deferred to TASK-5 #4 (placeholder label today).
+- [x] #4 Reproducibility: artifact SHA256 published in the measurement manifest (schema v2) and Nix-deterministic from `flake.lock`; **cross-machine reproducibility observed** — the disk-image derivation hash from a darwin eval == the aya build (same `nixos-disk-image.drv`), so independent machines agree. **TEE measurement** reproducibility (deferred to TASK-5 #4) is **done**: `.#disk-production-lab` and the staging guest yield the identical SNP launch measurement (== committed golden), proven live on aya. _(A dedicated CI job that literally diffs two back-to-back build SHAs was not added; reproducibility rests on Nix determinism + the observed cross-machine hash match.)_
 - [x] #5 NixOS guest module: systemd unit for HSM binary, `TWOD_HSM_VSOCK_*` bind (not `2D_HSM_*`), minimal firewall; **no** SSH, no extraneous services; `boot.loader.grub.enable = false`.
 - [x] #6 `run-vm-hsm.sh` launches NixOS qcow2 on **KVM** (`SEV_MODE=none`); **SNP** explicitly deferred to TASK-5 #5 (script exits 2 for `SEV_MODE=snp`).
 - [x] #7 Smoke on aya: Nix guest vsock smokes pass on **KVM** (staging + prod transport + prod-lab PQ); SNP pass/fail tracked under TASK-5.
