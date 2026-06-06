@@ -89,22 +89,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // TASK-5 Phase 3 (AC#4): capture the real SNP launch measurement bound to the installed PQ key
     // so GET_MEASUREMENT reports it. Best-effort — on KVM/dev or without the sev-guest TSM provider
     // it logs and continues, and GET_MEASUREMENT keeps the placeholder (graceful fallback).
-    match enclave_protocol::boot_capture_snp_measurement() {
-        Ok(()) => eprintln!("enclave-vsock: SNP launch measurement captured (attested GET_MEASUREMENT)"),
-        Err(e) => {
-            // Fail-closed in release: never serve an operational PQ signer with a placeholder
-            // measurement/attestation — a host could otherwise block SNP/configfs to make an
-            // operational signer look attested with placeholder evidence. Dev/lab (debug) builds
-            // log and continue so KVM/transport smokes keep working.
-            #[cfg(release_build)]
-            if is_sealed_signer_installed() {
-                return Err(format!(
-                    "refusing to serve an operational PQ signer without a real SNP measurement: {e}"
-                )
-                .into());
-            }
-            eprintln!("enclave-vsock: SNP measurement unavailable, using placeholder: {e}");
+    let snp_captured = match enclave_protocol::boot_capture_snp_measurement() {
+        Ok(()) => {
+            eprintln!("enclave-vsock: SNP launch measurement captured (attested GET_MEASUREMENT)");
+            true
         }
+        Err(e) => {
+            eprintln!("enclave-vsock: SNP measurement capture failed: {e}");
+            false
+        }
+    };
+    // Fail-closed in release builds: refuse to serve an operational PQ signer with a placeholder
+    // measurement/attestation (a host could otherwise block SNP/configfs to fake attestation).
+    // Dev/lab (debug) builds and the transport-only case continue with the placeholder.
+    enclave_protocol::snp_attestation_boot_gate(
+        cfg!(release_build),
+        is_sealed_signer_installed(),
+        snp_captured,
+    )
+    .map_err(|e| format!("enclave-vsock: {e}"))?;
+    if !snp_captured {
+        eprintln!(
+            "enclave-vsock: continuing with placeholder GET_MEASUREMENT (non-release / no operational signer)"
+        );
     }
 
     let (cid, port) = vsock_listen_addr_from_env()

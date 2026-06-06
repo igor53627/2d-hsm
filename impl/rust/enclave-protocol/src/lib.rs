@@ -369,6 +369,29 @@ pub fn boot_capture_snp_measurement() -> Result<(), ProtocolError> {
     snp_report::boot_fetch_and_cache(&pq_pubkey)
 }
 
+/// Boot-time fail-closed decision (pure / testable). Production (`require_real`, i.e. release
+/// builds) must refuse to start when an operational PQ signer is installed but the real SNP
+/// measurement could not be captured — otherwise a host that blocks SNP/configfs could make an
+/// operational signer appear attested with a placeholder. Dev/lab (debug) builds, and the
+/// transport-only case (no operational signer), are allowed to continue with the placeholder.
+///
+/// The cached report's `report_data` is verified against the installed key at capture time
+/// (`snp_report::fetch_measurement_and_report`); the sealed signer is install-once
+/// (`pq_signer`), so the advertised `pq_pubkey` cannot change after capture and the binding holds
+/// for the enclave's lifetime.
+pub fn snp_attestation_boot_gate(
+    require_real: bool,
+    signer_installed: bool,
+    measurement_captured: bool,
+) -> Result<(), ProtocolError> {
+    if require_real && signer_installed && !measurement_captured {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "operational PQ signer without a real SNP measurement (production refuses to serve)",
+        ));
+    }
+    Ok(())
+}
+
 fn measurement_response() -> GetMeasurementResponse {
     let pq_pubkey = active_signing_public_key_bytes().unwrap_or_default();
     let (measurement, attestation) = resolve_measurement_and_attestation();
@@ -425,6 +448,19 @@ mod measurement_wiring_tests {
         assert_eq!(att2, report);
 
         snp_report::reset_cached_attestation_for_tests();
+    }
+
+    #[test]
+    fn snp_attestation_boot_gate_refusal_matrix() {
+        use crate::snp_attestation_boot_gate as gate;
+        // release + operational signer + NOT captured -> refuse (fail-closed).
+        assert!(gate(true, true, false).is_err());
+        // release + operational + captured -> ok.
+        assert!(gate(true, true, true).is_ok());
+        // release + no operational signer (transport-only) -> ok.
+        assert!(gate(true, false, false).is_ok());
+        // dev/lab (not release) + operational + not captured -> graceful continue.
+        assert!(gate(false, true, false).is_ok());
     }
 }
 

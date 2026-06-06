@@ -63,6 +63,12 @@ in
       "systemd-udev-settle.service"
     ] ++ lib.optionals isProd [ "sys-kernel-config.mount" ];
     wantedBy = [ "multi-user.target" ];
+    # AC#4: ensure configfs (/sys/kernel/config) is mounted and ordered before the enclave so the
+    # SNP measurement capture via configfs-tsm does not fail (which would trip the release
+    # fail-closed gate). Prod only.
+    unitConfig = lib.optionalAttrs isProd {
+      RequiresMountsFor = "/sys/kernel/config";
+    };
     serviceConfig = {
       ExecStart = "${enclavePackage}/bin/${binName}";
       Restart = "always";

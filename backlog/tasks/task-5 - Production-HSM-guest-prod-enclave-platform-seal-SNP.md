@@ -59,13 +59,13 @@ Ed25519 does **not** replace PQ signing. The enclave **verifies** a 64-byte Ed25
 PQ for every arm would be possible in theory but is deferred: larger wire size (3309 B), different provisioning/rotation story, and intentional **key separation** (chain-view signer ≠ long-term PQ producer key).
 <!-- SECTION:DESCRIPTION:END -->
 
-## Phase status (2026-06-05, branch `feat/task-1-vsock-staging-transport`)
+## Phase status (2026-06-06, AC#4 branch `feat/task-5-snp-report`)
 
 | Phase | Scope | Status |
 |-------|--------|--------|
 | **1** | Prod `enclave-vsock` in NixOS guest (`.#vm-production`) | **Done** — transport smoke via `enclave-production-transport` (debug); lab trust VK only |
 | **2** | Lab PQ seal (`.#vm-production-lab`, fail-closed boot) | **Done** — aya `pq_signing_ready` smoke |
-| **3** | SNP launcher + real TEE measurement | **Open** |
+| **3** | SNP launcher + real TEE measurement | **In progress** — AC#4 enclave-side wired + live-validated on aya (real measurement via configfs-tsm); SNP launcher unification (AC#5), manifest split, and VCEK cert-chain/verifier spec remain |
 | **4** | BP vsock + live `RecentChainProof` | **Open** |
 | **5** | Review gate (Full matrix on material changes) | **Done** for PR #5 (roborev 6890–6900) |
 
