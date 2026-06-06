@@ -23,6 +23,23 @@ Common: host `GUEST_CID=42` matches QEMU `guest-cid=42`. NixOS guest binds `TWOD
 | `run-snp-smoke.sh` | Full E2E: SNP QEMU + `guest-start-hsm.sh` + vsock; OK cid=42; ~2013 bytes; `pq_signing_ready=true` |
 | `host-guest-vsock-smoke.sh` | OK on CID 42 after manual `guest-start-hsm.sh` |
 
+## NixOS under SNP — real measurement (TASK-5 AC#5)
+
+| Script | Flake disk | Pass signals |
+|--------|------------|--------------|
+| `run-nix-snp-guest-smoke.sh` | `.#disk-production-lab` | `[PASS] ... real_measurement=1, pq_ready=1`; CID 42; CBOR key 2 = **48 raw bytes** (not `enclave-measurement-placeholder` / `prod-enclave-v1`); key 3 = real SNP report (≥1184 B, not `attestation-placeholder`); key 6 = true |
+| `SEV_MODE=none run-nix-snp-guest-smoke.sh` | `.#disk-production-lab` | KVM fallback boots; gate auto-relaxes to `require_real=0`, matches placeholder label; `pq_ready=1` (lab signer present even off-SNP) |
+| `DISK_ATTR=disk-production run-nix-snp-guest-smoke.sh` | `.#disk-production` | boot-only (transport); auto `require_real=0 require_pq=0` (no operational signer ⇒ placeholder) |
+
+Gates auto-adjust to disk + mode (lab+SNP ⇒ real measurement + pq; transport or
+off-SNP ⇒ placeholder), so no manual `VSOCK_SMOKE_*` env is needed. The
+real-measurement gate (`VSOCK_SMOKE_REQUIRE_REAL_MEASUREMENT=1`,
+`assert_measurement_fields`) asserts a 48-byte launch measurement distinct from the
+dev/staging labels plus a real (≥1184 B) VCEK-signed report — a structural smoke
+check, not a cryptographic verifier (VCEK-chain validation is deferred). It is the
+live counterpart to AC#4 (enclave-side capture) and needs an SNP host (aya EPYC); CI
+only evals the disk-image derivation.
+
 Requires `./warm-smoke-cache.sh` once (golden disk + cargo binary). Guest bind: `TWOD_HSM_VSOCK_BIND_CID=4294967295`; host: `GUEST_CID=42`.
 
 ## Review record (PR #5)

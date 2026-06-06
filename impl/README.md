@@ -200,4 +200,6 @@ cargo build --bin enclave-uds-staging --features staging-host
 
 Host↔guest **AF_VSOCK** smokes are green via Nix (`impl/scripts/aya-sev-snp/SMOKE-PASS-CRITERIA.md`). Unix socket + stdio remain dev paths.
 
+**NixOS guest under SEV-SNP** (TASK-5 AC#5): `scripts/aya-sev-snp/run-nix-snp-guest-smoke.sh` boots the self-booting EFI image `.#disk-production-lab` under SNP and asserts `GET_MEASUREMENT` returns a real 48-byte launch measurement (KVM `SEV_MODE=none` fallback relaxes the gate). The KVM-only `run-nix-vm-guest-smoke*.sh` runners cannot carry the SNP launch objects — see `nix/vm-hsm/README.md`.
+
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` for phased roadmap.

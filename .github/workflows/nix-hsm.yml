@@ -95,6 +95,15 @@ jobs:
           nix build --no-update-lock-file .#vm-production --print-out-paths
           nix build --no-update-lock-file .#vm-production-lab --print-out-paths
 
+      # TASK-5 AC#5: validate the SEV-SNP disk image *evaluates* (instantiates the
+      # make-disk-image derivation) without building it. The full build needs
+      # vmTools.runInLinuxVM (requiredSystemFeatures = ["kvm"]), which GitHub-hosted
+      # runners can't be relied on to provide; the real build + SNP boot run on aya.
+      - name: Eval SEV-SNP NixOS disk image (AC#5)
+        run: |
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab.drvPath
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production.drvPath
+
       - name: Build measurement manifest
         run: |
           nix build --no-update-lock-file .#measurement-manifest --out-link result

@@ -78,7 +78,34 @@ Why `vm-production` still injects a **lab** trust file: `enclave-vsock` fails cl
 | PQ seal | no (`TRANSPORT_ONLY_MODE`) | yes (file-based, lab only) |
 | Safe for mainnet | **no** | **no** |
 
-Real TEE `measurement` in `GET_MEASUREMENT` → TASK-5 Phase 3 (SNP/Nitro).
+## SEV-SNP disk images (TASK-5 Phase 3 / AC#5)
+
+The `vm-*` outputs build the nixpkgs **qemu-vm runner** (a wrapper that embeds its
+own QEMU and injects the kernel directly): KVM only — there is no hook to pass the
+SEV-SNP launch objects. The confidential launch needs a **self-booting** disk, so:
+
+| Flake output | Guest | Boots under SNP? | `GET_MEASUREMENT` |
+|--------------|-------|------------------|-------------------|
+| `disk-production-lab` | `enclave-production-lab` (lab PQ seal) | yes | **real** 48-byte launch measurement (operational signer ⇒ AC#4 capture) |
+| `disk-production` | `enclave-production-transport` (transport-only) | yes | placeholder by design (no operational signer to bind) |
+
+Both are bootable GPT/EFI **qcow2** images (`nix build .#disk-production-lab` →
+`result/nixos.qcow2`) built via `make-disk-image.nix` (`disk-image.nix`). GRUB is
+installed to the removable media path (`EFI/BOOT/BOOTX64.EFI`) so they boot under
+the AMD `-bios OVMF.fd` SNP line with no persistent EFI NVRAM. Launch + smoke:
+
+```bash
+cd impl/scripts/aya-sev-snp
+./run-nix-snp-guest-smoke.sh                 # SNP NixOS prod guest + real measurement
+SEV_MODE=none ./run-nix-snp-guest-smoke.sh   # KVM fallback (placeholder; gate auto-relaxed)
+```
+
+`vm.nix` and `disk-image.nix` share the profile→enclave mapping (`guest-profile.nix`),
+so the SNP image runs the same binary/trust/seal as the KVM smoke for that profile.
+Still **not mainnet**: lab trust + lab PQ seal; platform trust is TASK-5 #2/#10.
+
+Real TEE `measurement` in `GET_MEASUREMENT` → captured under SNP (AC#4); live NixOS
+guest boot under SNP is AC#5 (this launcher), validated on aya.
 
 ## Related
 

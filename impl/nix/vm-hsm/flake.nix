@@ -65,6 +65,23 @@
             ;
           guestProfile = "production-lab";
         };
+        # Self-booting EFI qcow2 images for the SEV-SNP launch (TASK-5 AC#5).
+        # disk-production-lab is the AC#5 target: it ships the lab-sealed PQ signer,
+        # so under SNP the enclave binds + caches a real launch measurement.
+        # disk-production is transport-only (no operational signer) → boot check
+        # only; its GET_MEASUREMENT stays the placeholder by design.
+        diskImageFor = guestProfile: import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            guestProfile
+            ;
+        };
+        diskProduction = diskImageFor "production";
+        diskProductionLab = diskImageFor "production-lab";
       in
       {
         packages = {
@@ -73,6 +90,9 @@
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;
           vm-production-lab = nixosVmProductionLab.config.system.build.vm;
+          # Bootable EFI qcow2 for the SEV-SNP launcher (run-nix-snp-guest-smoke.sh).
+          disk-production = diskProduction;
+          disk-production-lab = diskProductionLab;
           default = enclave;
         };
 
@@ -92,6 +112,7 @@
             echo "  nix build .#vm               # Phase B NixOS guest (staging)"
             echo "  nix build .#vm-production       # TRANSPORT SMOKE ONLY (debug prod bin + lab trust VK)"
             echo "  nix build .#vm-production-lab   # lab prod (+ PQ seal, pq_signing_ready) — NOT mainnet"
+            echo "  nix build .#disk-production-lab # bootable EFI qcow2 for SEV-SNP launch (AC#5; real measurement)"
           '';
         };
 

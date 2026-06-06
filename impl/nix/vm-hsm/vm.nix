@@ -1,4 +1,10 @@
 # NixOS qcow2 / vm runner for 2d-hsm guest (TASK-4 Phase B).
+#
+# This builds the nixpkgs `qemu-vm` *runner* (config.system.build.vm): a wrapper
+# script that embeds its own QEMU, creates $NIX_DISK_IMAGE on first boot and
+# injects the kernel directly. It is KVM-only — there is no hook to add the
+# SEV-SNP launch objects. For the confidential (SNP) launch, see disk-image.nix,
+# which produces a self-booting EFI qcow2 instead (TASK-5 AC#5).
 {
   nixpkgs,
   enclave-staging,
@@ -9,44 +15,19 @@
 }:
 
 let
-  system = "x86_64-linux";
-  labFixtures = import ./lab-prod-fixtures.nix {
-    pkgs = nixpkgs.legacyPackages.${system};
-  };
-  # Both prod profiles use lab attestation VK until platform trust is provisioned (TASK-5 #2).
-  # vm-production = transport smoke only; vm-production-lab = + file PQ seal. NOT mainnet-ready.
-  isProd = guestProfile == "production" || guestProfile == "production-lab";
-  isProdLab = guestProfile == "production-lab";
-  # vm-production: debug production-vsock only (no lab-pq-seal-from-file) + transport-only env.
-  enclavePackage =
-    if guestProfile == "staging" then
-      enclave-staging
-    else if guestProfile == "production" then
-      enclave-production-transport
-    else if isProdLab then
-      enclave-production-lab
-    else
-      enclave;
-  enclaveMode = if isProdLab then "production" else guestProfile;
-  producerAttestationTrustFile =
-    if isProd then labFixtures.producerAttestationTrustFile else null;
-  pqSealProvisioningRootFile =
-    if isProdLab then labFixtures.pqSealProvisioningRootFile else null;
-  pqSealedSignerFile = if isProdLab then labFixtures.pqSealedSignerFile else null;
-  enclaveTransportOnly = guestProfile == "production";
-in
-nixpkgs.lib.nixosSystem {
-  inherit system;
-  specialArgs = {
+  profile = import ./guest-profile.nix {
     inherit
-      enclavePackage
-      enclaveMode
-      producerAttestationTrustFile
-      pqSealProvisioningRootFile
-      pqSealedSignerFile
-      enclaveTransportOnly
+      nixpkgs
+      enclave
+      enclave-staging
+      enclave-production-lab
+      enclave-production-transport
+      guestProfile
       ;
   };
+in
+nixpkgs.lib.nixosSystem {
+  inherit (profile) system specialArgs;
   modules = [
     ./nixos-module.nix
     "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"

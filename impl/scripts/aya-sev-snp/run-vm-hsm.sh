@@ -12,6 +12,14 @@ DISK_IMAGE="${NIX_DISK_IMAGE:-/tmp/vm-hsm.qcow2}"
 GUEST_CID="${GUEST_CID:-42}"
 SEV_MODE="${SEV_MODE:-none}"
 
+# SNP needs a self-booting EFI image, not the qemu-vm runner; hand off to the
+# dedicated launcher *before* building the (KVM-only) .#vm runner so we don't waste
+# a build (TASK-5 AC#5). The launcher reads SEV_MODE / GUEST_CID from the env.
+if [[ "$SEV_MODE" == "snp" ]]; then
+  echo "SEV_MODE=snp: handing off to run-nix-snp-guest-smoke.sh (qemu-vm runner can't carry SNP)" >&2
+  exec "$SCRIPT_DIR/run-nix-snp-guest-smoke.sh"
+fi
+
 if command -v nix >/dev/null; then
   [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] \
     && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
@@ -27,23 +35,9 @@ RUNNER="$(twod_hsm_find_vm_runner "$VM_LINK")"
 export NIX_DISK_IMAGE="$DISK_IMAGE"
 
 # vsock for host↔guest smoke (host-guest-vsock-smoke.sh uses GUEST_CID).
+# SEV_MODE=snp already handed off above; this runner path is KVM only.
 VSOCK_DEV="-device vhost-vsock-pci,guest-cid=$GUEST_CID"
-case "$SEV_MODE" in
-  snp)
-    QEMU_BIN="${QEMU:-/opt/qemu-snp/bin/qemu-system-x86_64}"
-    if [ ! -x "$QEMU_BIN" ]; then
-      echo "SEV_MODE=snp requires QEMU with memfd-private (e.g. /opt/qemu-snp on aya)" >&2
-      exit 1
-    fi
-    # qemu-vm runner embeds its own QEMU; SNP path is manual until we unify launchers.
-    echo "SEV_MODE=snp: use dedicated SNP launcher after qcow2 exists at $DISK_IMAGE" >&2
-    echo "  $QEMU_BIN ... -drive file=$DISK_IMAGE ... $VSOCK_DEV" >&2
-    exit 2
-    ;;
-  none|*)
-    export QEMU_OPTS="${QEMU_OPTS:-} -display none $VSOCK_DEV"
-    ;;
-esac
+export QEMU_OPTS="${QEMU_OPTS:-} -display none $VSOCK_DEV"
 
 echo "[2/2] starting NixOS vm-hsm (disk=$DISK_IMAGE, cid=$GUEST_CID)"
 exec "$RUNNER"

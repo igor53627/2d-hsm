@@ -55,6 +55,61 @@ def _decode_framed_get_measurement(frame: bytes) -> dict[int, object]:
     return out
 
 
+# SEV-SNP ATTESTATION_REPORT launch measurement is 48 bytes (report offset 0x90);
+# the raw VCEK-signed report is 1184 bytes (version 5). See snp_report.rs
+# (MIN_REPORT_LEN / the committed golden report).
+SNP_MEASUREMENT_LEN = 48
+SNP_REPORT_MIN_LEN = 1184
+# Non-attested measurement labels: the *staging/reference* build serves
+# prod-enclave-v1; the production build falls back to enclave-measurement-placeholder
+# off-SNP/dev (lib.rs resolve_measurement_and_attestation). Either means "not a real
+# SNP measurement". The matching attestation fallback is attestation-placeholder.
+PLACEHOLDER_MEASUREMENTS = (b"enclave-measurement-placeholder", b"prod-enclave-v1")
+PLACEHOLDER_ATTESTATION = b"attestation-placeholder"
+
+
+def assert_measurement_fields(
+    fields: dict[int, object],
+    *,
+    marker: bytes | None = None,
+    require_pq_ready: bool = False,
+    require_real_measurement: bool = False,
+) -> None:
+    """Validate a decoded GET_MEASUREMENT CBOR map (raises AssertionError on mismatch).
+
+    Pure (no I/O) so the SNP/marker gates are unit-testable without a live guest.
+    """
+    if require_real_measurement:
+        # AC#5 live SNP gate: GET_MEASUREMENT must carry the real launch measurement,
+        # not the placeholder label the enclave falls back to on KVM/dev hosts.
+        measurement = fields.get(2)
+        if not isinstance(measurement, (bytes, bytearray)):
+            raise AssertionError(("measurement is not bytes", measurement))
+        if len(measurement) != SNP_MEASUREMENT_LEN:
+            raise AssertionError(
+                ("measurement not %d bytes (SNP launch measurement)" % SNP_MEASUREMENT_LEN,
+                 len(measurement), bytes(measurement))
+            )
+        if bytes(measurement) in PLACEHOLDER_MEASUREMENTS:
+            raise AssertionError(("measurement is a placeholder label, not a real SNP measurement", bytes(measurement)))
+        attestation = fields.get(3)
+        if not isinstance(attestation, (bytes, bytearray)):
+            raise AssertionError(("attestation is not bytes", attestation))
+        # Structural shape check only (this is a smoke, not a verifier): a real
+        # report is >= 1184 bytes and not the 23-byte placeholder. Cryptographic
+        # VCEK-chain verification + measurement binding is the deferred verifier work.
+        if bytes(attestation) == PLACEHOLDER_ATTESTATION or len(attestation) < SNP_REPORT_MIN_LEN:
+            raise AssertionError(("attestation is not a real SNP report", len(attestation)))
+    elif marker is not None:
+        measurement = fields.get(2)
+        if not isinstance(measurement, (bytes, bytearray)) or marker not in measurement:
+            raise AssertionError(("measurement marker missing", marker, measurement))
+    if require_pq_ready:
+        ready = fields.get(6)
+        if ready is not True:
+            raise AssertionError(("pq_signing_ready not true", ready, list(fields.keys())))
+
+
 def get_measurement(
     *,
     cid: int,
@@ -62,6 +117,7 @@ def get_measurement(
     connect_timeout: float = 10.0,
     marker: bytes | None = None,
     require_pq_ready: bool = False,
+    require_real_measurement: bool = False,
 ) -> bytes:
     payload = bytes([0xA1, 0x01, 0x01])
     body = bytes([1, 0x01]) + payload
@@ -77,14 +133,12 @@ def get_measurement(
     resp += recv_until(s, 4 + total - 4, connect_timeout)
 
     fields = _decode_framed_get_measurement(resp)
-    if marker is not None:
-        measurement = fields.get(2)
-        if not isinstance(measurement, (bytes, bytearray)) or marker not in measurement:
-            raise AssertionError(("measurement marker missing", marker, measurement))
-    if require_pq_ready:
-        ready = fields.get(6)
-        if ready is not True:
-            raise AssertionError(("pq_signing_ready not true", ready, list(fields.keys())))
+    assert_measurement_fields(
+        fields,
+        marker=marker,
+        require_pq_ready=require_pq_ready,
+        require_real_measurement=require_real_measurement,
+    )
     return resp
 
 
@@ -92,7 +146,10 @@ def main() -> None:
     cid = int(os.environ.get("GUEST_CID", os.environ.get("VSOCK_CID", "1")))
     port = int(os.environ.get("TWOD_HSM_VSOCK_PORT", "5000"))
     marker_s = os.environ.get("VSOCK_SMOKE_MEASUREMENT_MARKER")
-    marker = marker_s.encode() if marker_s else None
+    require_real = os.environ.get("VSOCK_SMOKE_REQUIRE_REAL_MEASUREMENT") == "1"
+    # A real SNP measurement is 48 raw bytes — no text marker applies; the
+    # require_real assertion supersedes any inherited marker default.
+    marker = None if require_real else (marker_s.encode() if marker_s else None)
     pq = os.environ.get("VSOCK_SMOKE_REQUIRE_PQ_READY") == "1"
     timeout = float(os.environ.get("VSOCK_SMOKE_TIMEOUT", "10"))
     resp = get_measurement(
@@ -101,6 +158,7 @@ def main() -> None:
         connect_timeout=timeout,
         marker=marker,
         require_pq_ready=pq,
+        require_real_measurement=require_real,
     )
     label = os.environ.get("VSOCK_SMOKE_LABEL", "vsock-smoke")
     print("%s: OK cid=%d port=%d bytes=%d" % (label, cid, port, len(resp)))
