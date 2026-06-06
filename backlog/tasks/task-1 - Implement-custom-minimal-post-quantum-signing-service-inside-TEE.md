@@ -500,11 +500,15 @@ See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress up
 - Nix: `.#snp-derive-root` pkg; `.#disk-production-lab-selftest` image runs `--selftest` boot oneshot.
   Default outputs unchanged (lab, non-mainnet). CI builds + tests the crate. Runbook §7 documents the
   production ceremony.
-- **Status:** local + eval verified; ✅ replaces the lab test-vector root with a real platform-derived
-  one. ⏳ **aya in-guest validation pending** (boot the selftest image under SNP; confirm 32-byte key,
-  stable across two reboots, MEASUREMENT binding changes it). **Follow-up (not this PR):** fully
-  sealed-boot mainnet artifact (re-seal a blob against the derived root, bake it) — needs the operator
-  ceremony; vTPM/Nitro backends later.
+- **Status:** ✅ local + eval verified; ✅ **aya in-guest validation PASSED** (2026-06-06, AMD EPYC
+  9375F, `sev=Y`). `run-nix-snp-derive-root-selftest.sh` booted `.#disk-production-lab-selftest` under
+  SEV-SNP twice: both boots `selftest: PASS (nonzero=true, binding_changes=true)` and the derived-root
+  commitment was **identical across two independent relaunches** (fresh overlay each boot):
+  `measurement_root_commit=ed7e9900d618ae7f2839453ffd16b433665209f979ece5add435bc282a5e6202` — proving
+  the ioctl returns a usable 32-byte key, the MEASUREMENT binding is effective, and the root is stable
+  across reboots. (Commitment = SHA3-256 of the root, not the secret.) ✅ replaces the lab test-vector
+  root with a real platform-derived one. **Follow-up (not this PR):** fully sealed-boot mainnet artifact
+  (re-seal a blob against the derived root, bake it) — needs the operator ceremony; vTPM/Nitro later.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
