@@ -487,6 +487,24 @@ We are moving from design into actual protocol definition and skeletons.
 **Blocked on / needs sync with 2d:** precompile verify hook shape; whether block-header digests use same ML-DSA key as tickets (default: yes).
 
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress update (2026-06-02).
+
+**2026-06-06 — TASK-1.1 platform provisioning root (slice #1 above; branch `feat/task-1.1-snp-derive-root`, PR #21):**
+- New crate `impl/rust/snp-derive-root/` (binary, NOT forbid-unsafe) owns `SNP_GET_DERIVED_KEY` on the
+  guest-only `/dev/sev-guest` — the one ioctl `enclave-protocol` (`#![forbid(unsafe_code)]`) cannot do.
+  Derives `root = SHA3-256("2d-hsm-pq-seal-v1-root" ‖ snp_derived_key)`, firmware key bound by default
+  to launch MEASUREMENT (`guest_field_select` bit 3) under VCEK. Secret-to-platform, stable per-image,
+  measurement-bound. Enclave **unchanged**: still reads the root only via `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`.
+- CLI: `--out` (0600 boot file) / `--print` (ceremony) / `--selftest` (in-guest validation, secret-free
+  SHA3-256 commitment) / `--field-select` / `--root-key` / `--svn`. 5 off-SNP unit tests (ABI sizes,
+  `_IOWR('S',0x1,..)`=`0xC0205301`, derivation, no-device error). Clippy clean.
+- Nix: `.#snp-derive-root` pkg; `.#disk-production-lab-selftest` image runs `--selftest` boot oneshot.
+  Default outputs unchanged (lab, non-mainnet). CI builds + tests the crate. Runbook §7 documents the
+  production ceremony.
+- **Status:** local + eval verified; ✅ replaces the lab test-vector root with a real platform-derived
+  one. ⏳ **aya in-guest validation pending** (boot the selftest image under SNP; confirm 32-byte key,
+  stable across two reboots, MEASUREMENT binding changes it). **Follow-up (not this PR):** fully
+  sealed-boot mainnet artifact (re-seal a blob against the derived root, bake it) — needs the operator
+  ceremony; vTPM/Nitro backends later.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
