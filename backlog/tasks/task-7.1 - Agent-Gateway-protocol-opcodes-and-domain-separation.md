@@ -1,7 +1,7 @@
 ---
 id: TASK-7.1
 title: Agent Gateway protocol opcodes and domain separation
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
 labels:
