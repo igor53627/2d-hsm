@@ -75,11 +75,13 @@ Differs by recipient allowlist + spend caps + sealed counter debit.
   sealed.
 - **Checked worst-case arithmetic + integer domain (AC#8):** EVM-value fields (`amount`,
   `value`, `gas_price`/`effective_max_fee_rate`) and the cumulative-spend / budget / breaker
-  counters are **`u256`**; `nonce` / `gas_limit` follow the 2D verifier's accepted domain. The
-  debit is the worst-case native cost `worst_case = amount + gas_limit *
-  effective_max_fee_rate` (not just `amount`), computed with **checked** `u256` `mul`/`add`;
-  overflow **or any out-of-range field fails closed**. `effective_max_fee_rate` is the legacy
-  `gas_price` for the pinned encoding.
+  counters are **`u256`**; `nonce` and `gas_limit` are **`u64`** (the EVM / 2D domain — 2D
+  `Chain.Crypto.Envelope` RLP-encodes them via `:binary.encode_unsigned`; witness
+  `ordinary_tx_v1` has `nonce=0`, `gas_limit=21000`). An input exceeding its width is
+  **rejected (fail-closed), never truncated/downcast**. The debit is the worst-case native cost
+  `worst_case = amount + gas_limit * effective_max_fee_rate` (not just `amount`), computed with
+  **checked** `u256` `mul`/`add`; overflow **or any out-of-range field fails closed**.
+  `effective_max_fee_rate` is the legacy `gas_price` for the pinned encoding.
 - **Per-dispense gate + counter debit (exact rule):** accept **iff all** of the following
   hold, else fail closed (per-field caps are enforced **individually**, not only the aggregate):
   - `amount ≤ max_amount`
@@ -89,11 +91,15 @@ Differs by recipient allowlist + spend caps + sealed counter debit.
   - `cumulative_spend + worst_case ≤ cumulative_budget`
   - **if** a lifetime breaker is configured: `lifetime_spend + worst_case ≤ breaker`
 
-  On accept, debit `cumulative_spend += worst_case`, and **only if a breaker is configured**
-  `lifetime_spend += worst_case`. If no breaker is configured the lifetime check and debit are
-  **skipped** — the breaker is optional and its absence is **not** a failure. Both counters
-  are keyed independently of the treasury `key_ref`, so they survive rotation (never
-  zero-reset on key replacement — AC#15).
+  On accept, **always** debit **both** `cumulative_spend += worst_case` **and**
+  `lifetime_spend += worst_case`. `lifetime_spend` is a total-usage counter maintained from
+  treasury **genesis** whether or not a breaker threshold is configured — so an optional breaker
+  installed *later* still caps **total** usage across refills and never under-counts pre-install
+  dispenses. Only the **threshold check** (`lifetime_spend + worst_case ≤ breaker`, the last
+  accept condition above) is conditional — skipped when no breaker is configured; the breaker is
+  optional and its absence is **not** a failure (dispenses still succeed and still advance
+  `lifetime_spend`). Both counters are keyed independently of the treasury `key_ref`, so they
+  survive rotation (never zero-reset on key replacement — AC#15).
 - **Signing-budget semantics (AC#11):** the debit is committed **at signature emission** — a
   worst-case signing budget, not a settlement oracle. A request **rejected before emission**
   (cap/overflow/validation/seal failure) consumes **no** budget; once a signature is emitted
@@ -110,14 +116,17 @@ Budget and breaker changes are **not** part of a dispense; they go through
 scope_target)` contiguous monotonic counter (§10.6) — a captured `refill_budget` / breaker
 command cannot be replayed. **Host-controlled time never resets any limit.** `refill_budget`
 raises the cumulative budget; `raise_lifetime_breaker` raises the breaker threshold and does
-**not** lower recorded spend. Any **spend-value reset** (`reset_lifetime_breaker`) is a
+**not** lower recorded spend; because `lifetime_spend` is maintained from genesis (§2),
+installing the **first** breaker simply applies a threshold to the already-accumulated total —
+there is **no** first-install seeding choice (it is never re-seeded to 0 or from `cumulative_spend`). Any **spend-value reset** (`reset_lifetime_breaker`) is a
 **recovery-tier** operation bound to a **strict recovery counter + explicit target value**
 (§10.6), audited, and never replayable to roll a counter backward. Normal config bumps do not
 reset cumulative spend.
 
 ## §3 Seal-before-emit, serialized commit, throughput & 7.4↔7.7 boundary (AC#9, AC#14, AC#7)
 
-- **Seal-before-emit (AC#9):** the faucet spend debit (both counters) is **durably sealed
+- **Seal-before-emit (AC#9):** the faucet spend debit (both counters — `cumulative_spend` +
+  the always-maintained `lifetime_spend`, per §2) is **durably sealed
   before any signature leaves** the enclave; failure to seal emits **no** signature
   (fail-closed). A dispense debits only the two faucet spend counters against the current
   sealed treasury config — it does **not** advance an administrative capability counter and
@@ -189,9 +198,13 @@ Consumed by TASK-7.6 (the live signed artifacts are produced with the implementa
   role/profile mismatch (before state touch).
 - **Faucet positive + caps:** dispense treasury→known-transfer-key with caps satisfied succeeds;
   worst-case `amount + gas_limit*effective_max_fee_rate` (legacy `gas_price`) checked; both
-  counters advance.
-- **Faucet rejections:** recipient not a known transfer key; per-dispense cap / cumulative
-  budget / lifetime breaker exceeded; checked-arithmetic overflow; mandatory caps/budget absent.
+  counters advance. **No-breaker variant:** with no breaker configured the dispense still
+  succeeds and still advances `lifetime_spend` (no threshold check). **Breaker variant:** with a
+  breaker configured, exceeding it is rejected, and a breaker installed *after* breaker-less
+  dispenses caps the already-accumulated total.
+- **Faucet rejections:** recipient not a known transfer key; **non-empty `data`/memo**;
+  per-dispense cap / cumulative budget / lifetime breaker exceeded; checked-arithmetic overflow;
+  mandatory caps/budget absent; any field outside its integer width.
 - **Seal-before-emit (AC#9):** simulated seal failure emits no signature; on success both
   counters debited in one commit; no config-version bump / admin-counter advance.
 - **Signing-budget (AC#11):** repeated/duplicate-nonce/unbroadcast dispenses each consume
