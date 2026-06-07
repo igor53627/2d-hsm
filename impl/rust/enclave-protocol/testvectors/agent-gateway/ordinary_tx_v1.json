@@ -1,0 +1,26 @@
+{
+  "_comment": "Frozen 2D ordinary (eth EIP-155) transfer golden vector. TASK-7.1 AC#13. Generated from 2D Chain.Crypto.Envelope encoding. TEST KEYS ONLY.",
+  "chain_id": 11565,
+  "fields": {
+    "data": "0x",
+    "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    "gas_limit": 21000,
+    "gas_price": 1000000000,
+    "nonce": 0,
+    "to": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+    "value": 1000000000000000000
+  },
+  "hash_algorithm": "keccak256",
+  "recovered_from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+  "signature": {
+    "low_s": true,
+    "r": "0x406882360d1472d8e0993c8bf73d93ad8d7b94c2c57e39114e1d22a3d44d485d",
+    "recovery_id": 1,
+    "s": "0x6bd309a7a78433d76fc91d4aa752fde21e9fff70079e38cb43ae6804d2760b17",
+    "v_eip155": 23166
+  },
+  "signed_rlp": "0xf86d80843b9aca008252089470997970c51812dc3a010c7d01b50e0d17dc79c8880de0b6b3a764000080825a7ea0406882360d1472d8e0993c8bf73d93ad8d7b94c2c57e39114e1d22a3d44d485da06bd309a7a78433d76fc91d4aa752fde21e9fff70079e38cb43ae6804d2760b17",
+  "signing_hash_keccak256": "0xd1690760dc3ced0dba0c77c4764f509a990886caa3bde11b9e97ed718a192d56",
+  "surface": "eth_eip155_rlp",
+  "unsigned_rlp_preimage": "0xed80843b9aca008252089470997970c51812dc3a010c7d01b50e0d17dc79c8880de0b6b3a764000080822d2d8080"
+}

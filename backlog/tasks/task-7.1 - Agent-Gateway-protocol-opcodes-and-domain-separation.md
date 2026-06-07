@@ -1,7 +1,7 @@
 ---
 id: TASK-7.1
 title: Agent Gateway protocol opcodes and domain separation
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
 labels:
@@ -53,6 +53,21 @@ Allocate versioned Agent Gateway wire commands for secp256k1 key generation, pub
 - [ ] #21 Test/vector requirements cover producer-command rejection for agent keys, agent-command rejection for producer keys, identity-proof-vs-transfer cross-domain oracle rejection, and existing producer frame decode compatibility after MessageType additions.
 - [ ] #22 Roborev matrix/compact evidence is recorded before merge.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Delivered:
+- **Spec:** new §10 "Agent Gateway command namespace (secp256k1)" in `backlog/docs/vsock-api-wire-format-spec-draft.md` — framing (outer `MessageType 0x40` under frame v1, inner agent_version+opcode; band `0x40..0x4F` reserved); inner envelope + role/profile gate; opcode table 1–8 (+ reserved 9 `AGENT_K1_SIGN_TRON_TRANSFER`); per-command payloads; **Ed25519** admin/recovery capability wire format (signed CBOR map + `payload_binding` + domain prefix + sealed trust roots); `(authority, environment_identifier, scope_class, scope_target)` contiguous-counter scheme + env-id encoding + forward-only recovery resync + authority rotation; treasury config sub-ops; EIP-191 `0x19` identity proof + **low-privilege** read policy; structured error band `0x40–0x46` with anti-oracle collapsing; test/vector requirements.
+- **Golden vectors:** `impl/rust/enclave-protocol/testvectors/agent-gateway/` — frozen eth EIP-155 ordinary-tx preimage/hash/sig/address (`chain_id=11565`), reserved TRON-protobuf vector, EIP-191 identity-proof preimage, dual eth/TRON keys, 3-way domain-separation witnesses. Generated authoritatively from 2D's own crypto and self-checked by signature recovery; generator + README checked in for reproducibility.
+- **Fail-closed routing (AC#20):** fixed the latent fail-**open** `peek_msg_type_from_frame` (defaulted unknown types to `GetMeasurement`); now returns `Option`, classifies `0x40`, and error frames echo the raw type byte. Tests added (peek fail-closed, producer backward-compat, agent-frame recognized-but-fail-closed, raw-byte echo); full crate `cargo test` green.
+
+Decisions recorded: capabilities **Ed25519**; identity reads **low-privilege**; canonical pubkey **uncompressed 65-byte SEC1**; **eth-surface MVP, TRON reserved** (unified-account model).
+
+Cross-repo follow-up: 2D (TASK-132.5 family) must carry an AC permanently reserving EIP-2718 transaction-type `0x19` (the enclave cannot enforce a 2D type assignment).
+
+AC #1–#21 are addressed by this work; AC #22 (roborev matrix) is run pre-merge.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->

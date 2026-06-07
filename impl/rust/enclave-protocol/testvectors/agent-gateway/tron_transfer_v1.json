@@ -1,0 +1,19 @@
+{
+  "_comment": "RESERVED TRON-surface vector (eth-MVP + reserve-TRON decision). For AC#15 3-way domain-separation proof and future TASK-7.x. TEST KEYS ONLY.",
+  "fields": {
+    "amount": 1000000000000000000,
+    "expiration": 1900000030000,
+    "owner_address_41": "0x41f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    "ref_block_bytes": "0x0000",
+    "ref_block_hash": "0x0000000000000000",
+    "timestamp": 1900000000000,
+    "to_address_41": "0x4170997970c51812dc3a010c7d01b50e0d17dc79c8"
+  },
+  "hash_algorithm": "sha256",
+  "raw_data_first_byte": "0x0a",
+  "raw_data_preimage": "0x0a0200002208000000000000000040b0dace86a6375a6d080112690a2d747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e5472616e73666572436f6e747261637412380a1541f39fd6e51aad88f6f4ce6ab8827279cfffb9226612154170997970c51812dc3a010c7d01b50e0d17dc79c818808090bbbad6adf00d7080f0cc86a637",
+  "recovered_from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+  "signature_65_rsv": "0x28b63d03d002e25761bf62a4dbf598491df848fc3a30ec70722f212b006979db2cb589df13266d6bb11fbab7e3c3f01dff5c1753dd77f9cb24959b354e6b9db201",
+  "surface": "tron_protobuf",
+  "txid_sha256": "0x280a82311aff53d3a16ad262b78c002ca80990d40070f4baf37b3f7f42a2144c"
+}

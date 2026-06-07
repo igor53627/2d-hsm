@@ -1,0 +1,10 @@
+{
+  "_comment": "3-way domain separation witnesses. eth RLP list first byte >= 0xc0; TRON protobuf first byte is a protobuf field tag; identity proof first byte 0x19. Hash algs also differ (eth/identity keccak256, tron sha256).",
+  "eth_hash_alg": "keccak256",
+  "eth_preimage_first_byte": "0xed",
+  "identity_hash_alg": "keccak256",
+  "identity_preimage_first_byte": "0x19",
+  "note_eip2718": "0x19 is a legal EIP-2718 TransactionType; 2D must permanently reserve/never assign type 0x19 (TASK-132.5 family). Enclave cannot enforce a 2D type assignment.",
+  "tron_hash_alg": "sha256",
+  "tron_preimage_first_byte": "0x0a"
+}
