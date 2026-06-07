@@ -4,7 +4,7 @@ title: Agent Gateway host policy and capability integration contract
 status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-07 18:20'
+updated_date: '2026-06-07 18:27'
 labels:
   - agent-gateway
   - opa
@@ -39,7 +39,9 @@ Define the host-side integration contract for 2D Agent Gateway callers: local va
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Design delivered in backlog/docs/agent-gateway-host-integration-contract.md (host-side contract; design-only; TEE is non-bypassable). Consumes the TEE capability taxonomy from TASK-7.1/7.2/7.4. Adds: the 5 distinct capability tiers as the host models them (T0 runtime, T1 treasury-provisioning/admin, T2 transfer-refill, T3 backup-export, T4 restore/recovery) (AC#1); agent-specific OPA package signer.agent_gateway + Vault secret/data/agent-gateway/{runtime,provision,export,recovery} with cross-tier-denied ACLs, distinct from bridge, and the Vault=authorization-material-not-keys boundary (AC#3); the host-vs-TEE check matrix per command + AC#2 no-privilege-escalation guarantees (AC#4/#2); the local->OPA->Vault->2d-hsm caller flow mirroring Chain.Bridge.Signer; negative-capability test requirements (DoD#2). Adopted: companion doc; operator pre-signs caps -> Vault (indexed by request_id) -> host forwards at key 5; coarse command_class folding (reset_breaker own recovery lane). Honest residuals: expiry/revocation host-side only (TEE has no clock; hard-revoke=counter-burn); transfer dest/amount limits OPA/host-only (no TEE per-agent cap); rollback-sensitive until TASK-7.7. AC #1-#4 addressed; AC #5 (roborev) run pre-merge.
+Design delivered in backlog/docs/agent-gateway-host-integration-contract.md (host-side contract; design-only; TEE non-bypassable). Consumes the TEE capability taxonomy from TASK-7.1/7.2/7.4. Five DISTINCT capabilities per AC#1: (1) runtime signing SIGN_TRANSFER, (2) faucet-treasury signing SIGN_FAUCET_DISPENSE — a distinct host class, not merged with runtime — (3) provisioning/refill, (4) backup-export, (5) restore/recovery; each a distinct OPA selector + Vault path + counter command_class. OPA package signer.agent_gateway; FIVE Vault paths secret/data/agent-gateway/{runtime-transfer,runtime-faucet,provision,export,recovery} with cross-tier-denied ACLs (migrated from the 2-path model); Vault = authorization material only, not keys/backup-decrypt. Host-vs-TEE split: TEE Frame gates (ALL opcodes) vs Capability gates (ONLY privileged {1,6,7,8}; runtime {4,5} + reads {2,3} carry no key-5 cap). Recovery counter SHARED by RESTORE_BACKUP + reset_lifetime_breaker (vsock §10.6). chain_id validated against the sealed value (11565 = example, not hardcoded). Honest residuals: expiry/revocation host-side only (counter-burn ceremony specified); transfer dest/amount limits OPA/host-only (no TEE per-agent cap); rollback-sensitive until TASK-7.7.
+
+Roborev evidence (AC#5): 3x3 vendor matrix (codex+gemini+claude-code x security/design/default) on 671d307 -> 2 HIGH (AC#1 runtime/faucet tier-merge; §4 global-vs-capability gate split) + 5 MED + LOW; resolved in b5fb632 + OPA-input/notes follow-up; consolidated via roborev compact (job 7631, re-verified clean). AC #1-#4 addressed by this design; AC #5 evidenced here.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

@@ -63,8 +63,14 @@ bound the spend.
 a **disjoint** set from `Chain.Bridge.SignerPolicy`. `data.config` carries per-command toggles
 (`enable_keygen_provisioning`, `faucet_signing_enabled`, `backup_export_enabled`,
 `restore_enabled`) and host soft-caps (transfer destination/amount allowlist — §5 residual).
-Input is a flat map `{opcode, command_domain, chain_id, environment_identifier, request_id,
-key_purpose, scope_class, scope_target, command_class}`.
+Input is a map `{opcode, command_domain, chain_id, environment_identifier, request_id,
+key_purpose, scope_class, scope_target, command_class, payload{…}}` — the `payload` carries the
+**command-specific fields OPA needs to decide**. For `SIGN_TRANSFER` / `SIGN_FAUCET_DISPENSE`
+the policy-relevant fields are `{to, amount, nonce, gas_limit, gas_price}` so the OPA
+destination/amount allowlist (the host-side transfer cap residual, §5) can evaluate them; for
+`GENERATE_KEYS` `{key_purpose, count}`; for `CONFIGURE_TREASURY` the `sub_op` + new limit/budget
+values. (The TEE re-validates the same fields it enforces; OPA's transfer dest/amount check is
+the only place those limits exist today.)
 
 **Vault:** five tiered paths `secret/data/agent-gateway/{runtime-transfer, runtime-faucet,
 provision, export, recovery}`, one per AC#1 capability. The two `runtime-*` paths hold only a
