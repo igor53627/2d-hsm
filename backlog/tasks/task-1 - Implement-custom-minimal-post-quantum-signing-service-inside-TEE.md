@@ -61,21 +61,21 @@ Because the service will run inside a TEE, many traditional HSM hardware securit
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Define the minimal set of signing operations required by 2d BlockProducer and bridges
-- [ ] #2 Choose implementation language and crypto stack (proposed: Rust + liboqs)
-- [ ] #3 Design the service to run inside supported TEEs (Nitro Enclaves / SEV-SNP)
-- [ ] #4 Implement support for at least one NIST PQC signature algorithm (ML-DSA recommended first)
+- [x] #1 Define the minimal set of signing operations required by 2d BlockProducer and bridges _(done — vsock spec §8: GET_MEASUREMENT / ARM_FOR_PRODUCTION / SIGN_AUTHORIZATION_TICKET / GET_STATUS; TASK-2)_
+- [x] #2 Choose implementation language and crypto stack (proposed: Rust + liboqs) _(done — chose **Rust + ML-DSA-65** via pqcrypto-mldsa/mldsa-native, not liboqs)_
+- [x] #3 Design the service to run inside supported TEEs (Nitro Enclaves / SEV-SNP) _(done — SEV-SNP NixOS guest, live on aya; TASK-5)_
+- [x] #4 Implement support for at least one NIST PQC signature algorithm (ML-DSA recommended first) _(done — ML-DSA-65 in mldsa65.rs)_
 - [ ] #5 Define integration approach with existing Chain.Bridge.Signer + OPA + Vault flow
 - [ ] #6 Document key management, attestation, and operational model inside TEE
 - [ ] #7 Inventory and document the exact operations currently performed by Chain.Bridge.Signer against NetHSM (including any pre- and post-processing done in Elixir)
-- [ ] #8 Define the minimal set of operations the new service must support for 2d BlockProducer and bridge signing paths
+- [x] #8 Define the minimal set of operations the new service must support for 2d BlockProducer and bridge signing paths _(done — vsock spec; supported_ticket_types [0,1])_
 - [ ] #9 Design and document the integration boundary with the existing multi-layer signing flow (SignerPolicy + OPA + Vault credential brokering)
-- [ ] #10 Specify TEE runtime requirements and attestation model (Nitro Enclaves and/or SEV-SNP)
-- [ ] #11 Implement support for at least ML-DSA (Dilithium) with the parameter sets required by 2d; SLH-DSA (SPHINCS+) support is a stretch goal for MVP
-- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Reference verifier complete across both layers: `snp_verify::prevalidate_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden) **+ `snp-attest-verify`** (TASK-1.2): the report's ECDSA-P384 sig + the VCEK→ASK→ARK cert chain (RSA-PSS) to the pinned AMD root. Remaining: VCEK TCB-extension binding + a real KDS-resolvable end-to-end golden (aya's chip_id is masked) — see acceptance #3._
+- [x] #10 Specify TEE runtime requirements and attestation model (Nitro Enclaves and/or SEV-SNP) _(done — vsock spec §2.3 + snp-attestation-verifier-policy.md + GET_MEASUREMENT SNP report; SEV-SNP)_
+- [x] #11 Implement support for at least ML-DSA (Dilithium) with the parameter sets required by 2d; SLH-DSA (SPHINCS+) support is a stretch goal for MVP _(done — ML-DSA-65, the frozen 2d param set; SLH-DSA stretch not done)_
+- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Reference verifier complete across both layers: `snp_verify::prevalidate_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden) **+ `snp-attest-verify`** (TASK-1.2): the report's ECDSA-P384 sig + the VCEK→ASK→ARK cert chain (RSA-PSS) to the pinned AMD root + VCEK↔chip binding. Remaining: VCEK SPL/TCB anti-rollback + a real KDS-resolvable end-to-end golden (aya is a Turin engineering-sample — chip_id not KDS-resolvable) — see acceptance #3._
 - [ ] #13 Define the on-chain RecoveryTicket format, issuance rules (permissionless special tx after ~1h downtime for 2s blocks), TEE attestation binding, and activation semantics for BlockProducer failover
 - [ ] #14 Design client/reader node verification rules that reject blocks from unauthorized producer keys or with invalid state transitions (including forged 'stay' transitions)
-- [ ] #15 Specify how the TEE signing service uses the network (genesis + recent headers + on-chain recovery history) as a cryptographic second factor for freshness before signing
+- [x] #15 Specify how the TEE signing service uses the network (genesis + recent headers + on-chain recovery history) as a cryptographic second factor for freshness before signing _(done — RecentChainProof Ed25519 network second factor; TASK-3)_
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -565,7 +565,7 @@ the pinned AMD root), which `prevalidate_report` deliberately left out.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 mix test (or equivalent) passes for the new signing service
+- [x] #1 mix test (or equivalent) passes for the new signing service _(done — Elixir shim `mix test` + Rust `cargo test` green in CI nix-hsm.yml)_
 - [ ] #2 Security review of the service is completed (at minimum: key never leaves TEE in plaintext, proper use of sealing/attestation, no obvious exfiltration paths)
 - [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted. _Two-layer reference verifier implemented + tested: (1) `snp_verify::prevalidate_report` (feature `snp-verify`) — report structure + `report_data` key binding + measurement allowlist + DEBUG-off, tested vs the committed golden report; (2) **`impl/rust/snp-attest-verify`** (TASK-1.2, PR #23) — the report's ECDSA-P384/SHA-384 signature + the VCEK→ASK→ARK cert chain (AMD ARK/ASK are RSA-4096 RSASSA-PSS/SHA-384) to the **pinned** AMD root, with `verify_attestation` composing both layers + a CLI. Separate crate, deliberately off the forbid-unsafe enclave path. 13 tests: real AMD Genoa ARK self-sign + ASK←ARK (RSA-PSS, real KDS certs) + a synthetic ECDSA ARK→ASK→VCEK chain end to end + report-sig round-trip/tamper. **Open follow-ups:** VCEK TCB/chip-id X.509-extension binding, cert validity-date checks, KDS auto-fetch, and a real KDS-resolvable end-to-end golden (aya's chip_id is masked → its VCEK is 404 on KDS, so the real chain is exercised only on its upper legs + synthetically). See snp-attestation-verifier-policy.md §4._
 - [ ] #4 Basic failover scenario between at least two instances of the service (on different hosts/enclaves) is designed and documented
