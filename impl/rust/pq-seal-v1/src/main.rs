@@ -233,17 +233,22 @@ fn seal_blob(
     Ok(blob)
 }
 
-/// A host label becomes a `blobs/<label>.sealed` filename — keep it a safe, single path component.
+/// A host label becomes a `blobs/<label>.sealed` filename — keep it a safe, single path component
+/// (charset + bounded length, so it can't escape the dir or overflow a filesystem name limit).
 fn validate_label(label: &str) -> Result<(), CliError> {
-    let ok = !label.is_empty()
-        && label != "."
+    if label.is_empty() || label.len() > 64 {
+        return Err(CliError::Msg(format!(
+            "host label '{label}' must be 1..=64 chars (it becomes a filename)"
+        )));
+    }
+    let ok = label != "."
         && label != ".."
         && label
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     if !ok {
         return Err(CliError::Msg(format!(
-            "host label '{label}' must be non-empty and match [A-Za-z0-9._-] (it becomes a filename)"
+            "host label '{label}' must match [A-Za-z0-9._-] (it becomes a filename)"
         )));
     }
     Ok(())
@@ -295,11 +300,11 @@ fn cmd_manifest_build(args: ManifestBuildArgs) -> Result<(), CliError> {
     let measurement = read_measurement(&args.measurement_file, &args.measurement_hex)?;
     let (sk, pk) = read_validated_keypair(&args.secret_key_file, &args.public_key_file)?;
 
-    // Seal every host's blob IN MEMORY first, so a bad input (missing root file, duplicate label)
-    // fails before any output is written — never leave a partial out_dir that blocks a retry.
+    // Seal every host's blob IN MEMORY first, so a bad input fails before any output is written.
     // `built` holds (label, sealed blob, root commitment); the secret root is dropped after sealing.
     let mut built: Vec<(String, Vec<u8>, [u8; 32])> = Vec::with_capacity(args.hosts.len());
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen_labels = std::collections::BTreeSet::new();
+    let mut seen_roots = std::collections::BTreeSet::new();
     for h in &args.hosts {
         let (label, path) = h
             .split_once('=')
@@ -307,60 +312,77 @@ fn cmd_manifest_build(args: ManifestBuildArgs) -> Result<(), CliError> {
         validate_label(label)?;
         // Case-insensitive: the label is a blob filename, and the ceremony may run on a
         // case-insensitive filesystem (e.g. macOS) where `Aya` and `aya` are the same file.
-        if !seen.insert(label.to_ascii_lowercase()) {
+        if !seen_labels.insert(label.to_ascii_lowercase()) {
             return Err(CliError::Msg(format!(
                 "duplicate host label '{label}' (case-insensitive)"
             )));
         }
         let root = read_root_32(&PathBuf::from(path))?;
+        let commitment = pq_seal_manifest::root_commitment(&root);
+        // Distinct roots per host: two hosts sharing a root would emit duplicate commitments, which
+        // `Manifest::select` rejects as ambiguous — catch it here so the ceremony can't produce a
+        // manifest no host can use.
+        if !seen_roots.insert(commitment) {
+            return Err(CliError::Msg(format!(
+                "host '{label}' has the same provisioning root as an earlier host — each host needs a distinct root"
+            )));
+        }
         let blob = seal_blob(sk.as_ref(), pk.as_ref(), &measurement, &root)?;
-        built.push((
-            label.to_string(),
-            blob,
-            pq_seal_manifest::root_commitment(&root),
-        ));
+        built.push((label.to_string(), blob, commitment));
     }
 
-    // Inputs all sealed — create the output tree fresh (never clobber a prior ceremony) and write.
+    // Create the output tree fresh (never clobber a prior ceremony), then write. On ANY write-phase
+    // failure, remove the freshly created tree so a retry with the same --out-dir isn't blocked.
     if let Some(parent) = args.out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let blobs_dir = args.out_dir.join("blobs");
     fs::create_dir(&args.out_dir)
         .map_err(|e| CliError::Msg(format!("create --out-dir {}: {e}", args.out_dir.display())))?;
-    fs::create_dir(&blobs_dir)?;
-
-    let mut entries = Vec::with_capacity(built.len());
-    for (label, blob, commitment) in &built {
-        let rel = format!("blobs/{label}.sealed");
-        write_secret_file(&args.out_dir.join(&rel), blob)?;
-        entries.push(pq_seal_manifest::Entry {
-            label: label.clone(),
-            root_commitment: hex::encode(commitment),
-            blob: rel,
-        });
+    if let Err(e) = write_manifest_tree(&args.out_dir, &measurement, &built) {
+        let _ = fs::remove_dir_all(&args.out_dir); // best-effort: clean up our own fresh dir
+        return Err(e);
     }
-
-    let manifest = pq_seal_manifest::Manifest {
-        version: pq_seal_manifest::MANIFEST_VERSION,
-        measurement: hex::encode(&measurement),
-        entries,
-    };
-    let json = manifest
-        .to_json_pretty()
-        .map_err(|e| CliError::Msg(format!("serialize manifest: {e}")))?;
-    fs::write(args.out_dir.join(pq_seal_manifest::MANIFEST_FILENAME), json)?;
 
     eprintln!(
         "wrote {} ({} host(s)) + blobs/ to {}",
         pq_seal_manifest::MANIFEST_FILENAME,
-        manifest.entries.len(),
+        built.len(),
         args.out_dir.display()
     );
     eprintln!(
         "meas_digest={}",
         hex::encode(pq_seal_v1_measurement_digest(&measurement))
     );
+    Ok(())
+}
+
+/// Write `blobs/<label>.sealed` + `pq-seal-manifest.json` into `out_dir` (already created fresh).
+/// Separated so the caller can remove a partially written tree on any error (retry-safe).
+fn write_manifest_tree(
+    out_dir: &std::path::Path,
+    measurement: &[u8],
+    built: &[(String, Vec<u8>, [u8; 32])],
+) -> Result<(), CliError> {
+    fs::create_dir(out_dir.join("blobs"))?;
+    let mut entries = Vec::with_capacity(built.len());
+    for (label, blob, commitment) in built {
+        let rel = format!("blobs/{label}.sealed");
+        write_secret_file(&out_dir.join(&rel), blob)?;
+        entries.push(pq_seal_manifest::Entry {
+            label: label.clone(),
+            root_commitment: hex::encode(commitment),
+            blob: rel,
+        });
+    }
+    let manifest = pq_seal_manifest::Manifest {
+        version: pq_seal_manifest::MANIFEST_VERSION,
+        measurement: hex::encode(measurement),
+        entries,
+    };
+    let json = manifest
+        .to_json_pretty()
+        .map_err(|e| CliError::Msg(format!("serialize manifest: {e}")))?;
+    fs::write(out_dir.join(pq_seal_manifest::MANIFEST_FILENAME), json)?;
     Ok(())
 }
 
@@ -489,5 +511,42 @@ mod manifest_build_tests {
         });
         assert!(r.is_err());
         assert!(!out.exists(), "no partial output directory on failure");
+    }
+
+    #[test]
+    fn rejects_duplicate_root_and_overlong_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let signer = MlDsa65Signer::generate_keypair();
+        let (sk, pk, root) = (base.join("sk"), base.join("pk"), base.join("r.root"));
+        write(&sk, signer.secret_key_bytes());
+        write(&pk, signer.public_key_bytes());
+        write(&root, &[3u8; 32]);
+        let mk = |hosts: Vec<String>, out: PathBuf| ManifestBuildArgs {
+            measurement_file: None,
+            measurement_hex: Some("dd".repeat(48)),
+            secret_key_file: sk.clone(),
+            public_key_file: pk.clone(),
+            hosts,
+            out_dir: out,
+        };
+        // Two distinct labels but the SAME root → rejected (would emit ambiguous commitments).
+        let out_dup = base.join("dup");
+        assert!(cmd_manifest_build(mk(
+            vec![
+                format!("a={}", root.display()),
+                format!("b={}", root.display())
+            ],
+            out_dup.clone()
+        ))
+        .is_err());
+        assert!(!out_dup.exists(), "no output on duplicate-root failure");
+        // Overlong label rejected at validation, before any write.
+        let long = "x".repeat(65);
+        assert!(cmd_manifest_build(mk(
+            vec![format!("{long}={}", root.display())],
+            base.join("long")
+        ))
+        .is_err());
     }
 }
