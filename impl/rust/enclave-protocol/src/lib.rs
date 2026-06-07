@@ -1418,6 +1418,10 @@ pub(crate) fn encode_wire_error_frame_for_frame(
     frame: &[u8],
     e: ProtocolError,
 ) -> Result<Vec<u8>, ProtocolError> {
+    // Call-site invariant: only reached after `decode_message` accepted the 6-byte framing
+    // prefix — sub-6-byte frames surface as Io errors the callers propagate before here.
+    // Make the layered invariant self-checking in debug/test builds (no release impact).
+    debug_assert!(frame.len() >= 6, "error-frame echo expects the 6-byte framing prefix");
     match peek_msg_type_from_frame(frame) {
         Some(t) => encode_wire_error_frame(t, e),
         None => {
