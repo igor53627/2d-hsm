@@ -94,13 +94,19 @@ measurement alone:
   `#![forbid(unsafe_code)]` signing path (it needs ECDSA-P384 + RSA + X.509). It covers step 1
   (via `prevalidate_report`), **step 2** (the report's ECDSA-P384 sig + the VCEK→ASK→ARK chain to the
   **pinned** AMD root; AMD ARK/ASK are RSA-4096 RSASSA-PSS/SHA-384), step 3 (key binding), step 4
-  (allowlist), and the structural parts of step 5/6. Tests verify the RSA-PSS chain against the real
-  AMD Genoa ARK/ASK + a synthetic ECDSA chain end to end.
-  - *Note (this lab):* aya's `chip_id` is masked, so its VCEK is **not KDS-resolvable** (404) — the
-    full real chain is exercised only on its upper legs (real ARK/ASK) + synthetically. Production
-    hardware resolves; a known-good public AMD sample would add a real end-to-end golden.
-  - *Verifier follow-ups:* VCEK **TCB/chip-id extension** binding (step 2 last bullet — parse AMD's
-    custom X.509 OIDs and match `reported_tcb`/`chip_id`); certificate **validity dates**; KDS auto-fetch.
+  (allowlist), step 2's **VCEK↔chip binding** (the VCEK `HWID` extension == report `chip_id`), and the
+  structural parts of step 5/6. Tests verify the RSA-PSS chain against the real AMD **Genoa + Turin**
+  ARK/ASK, a synthetic ECDSA chain end to end, and the HWID/chip binding synthetically.
+  - *Note (this lab):* aya is a **Turin** (Zen 5, CPU family 26 = 0x1A) EPYC 9375F. Its `chip_id` is an
+    8-byte engineering/early-sample value (`snphost show identifier` → 8 bytes, not 64), so its VCEK is
+    **404 on AMD KDS even on the correct `/Turin/` endpoint** with the right TCB params — this is a
+    silicon/endorsement property, **not** a config/BIOS toggle (and not `MASK_CHIP_ID`, which would zero
+    all 64 bytes). The full real chain is thus exercised only on its upper legs (real ARK/ASK) +
+    synthetically; a known-good public AMD Turin sample would add a real end-to-end golden.
+  - *Verifier follow-ups:* VCEK **SPL/TCB anti-rollback** (compare the VCEK's SPL extensions to the
+    report's `reported_tcb` — needs the firmware TCB byte layout, e.g. aya's FMC layout
+    `[FMC,BL,TEE,SNP,_,_,_,ucode]`, + a real VCEK to validate the SPL extension encoding); certificate
+    **validity dates**; basicConstraints/keyUsage; min-TCB floor; KDS auto-fetch.
 - **Open:** publish the OVMF reproducibility + allowlist provenance; the image-binding
   mechanism (§3); on-chain `MeasurementRegistry` policy encoding (2d-solidity repo).
 

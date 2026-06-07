@@ -7,9 +7,10 @@
 //!     --report report.bin --vcek vcek.der --cert-chain ask_ark.pem \
 //!     --measurement 3e39e33a... [--pq-pubkey pq.bin] [--pinned-ark-chain amd.pem]
 //!
-//! The VCEK + ASK/ARK chain come from the AMD KDS (auxblob is empty on current providers); fetch:
-//!   curl 'https://kdsintf.amd.com/vcek/v1/Genoa/<chip_id_hex>?blSPL=..&teeSPL=..&snpSPL=..&ucodeSPL=..' -o vcek.der
-//!   curl 'https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain' -o ask_ark.pem
+//! The VCEK + ASK/ARK chain come from the AMD KDS (auxblob is empty on current providers); pick the
+//! product to match the CPU (lscpu family 25 = Genoa / 26 = Turin), then fetch:
+//!   curl 'https://kdsintf.amd.com/vcek/v1/<Genoa|Turin>/<chip_id_hex>?blSPL=..&teeSPL=..&snpSPL=..&ucodeSPL=..' -o vcek.der
+//!   curl 'https://kdsintf.amd.com/vcek/v1/<Genoa|Turin>/cert_chain' -o ask_ark.pem
 
 use clap::Parser;
 use snp_attest_verify::{
@@ -18,8 +19,10 @@ use snp_attest_verify::{
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// The committed AMD Genoa ARK/ASK — the default out-of-band pin (override with --pinned-ark-chain).
+// Committed AMD product roots (the out-of-band pin). Pick the one matching the CPU family
+// (`lscpu`: 25/0x19 = Genoa, 26/0x1A = Turin) via --product, or pass your own with --pinned-ark-chain.
 const EMBEDDED_AMD_GENOA_CHAIN: &[u8] = include_bytes!("../testvectors/amd_genoa_cert_chain.pem");
+const EMBEDDED_AMD_TURIN_CHAIN: &[u8] = include_bytes!("../testvectors/amd_turin_cert_chain.pem");
 
 #[derive(Parser)]
 #[command(
@@ -36,9 +39,13 @@ struct Cli {
     /// VCEK→ASK→ARK chain (PEM; ASK + ARK), from the AMD KDS `cert_chain`.
     #[arg(long)]
     cert_chain: PathBuf,
-    /// Out-of-band pinned AMD root chain (PEM containing the trusted ARK). Defaults to the embedded
-    /// AMD Genoa ARK/ASK — override for a different product or to pin your own copy.
-    #[arg(long)]
+    /// AMD product whose bundled ARK/ASK to pin: `genoa` (CPU family 25) or `turin` (family 26).
+    /// Required unless --pinned-ark-chain is given (no silent default — the pin must match the chip).
+    #[arg(long, value_parser = ["genoa", "turin"])]
+    product: Option<String>,
+    /// Out-of-band pinned AMD root chain (PEM containing the trusted ARK) — use INSTEAD of --product
+    /// (mutually exclusive) to pin your own copy or a product not bundled here.
+    #[arg(long, conflicts_with = "product")]
     pinned_ark_chain: Option<PathBuf>,
     /// ML-DSA-65 producer public key to bind: requires
     /// report_data == SHA3-512("2d-hsm-snp-report-data-v1" || pq_pubkey). REQUIRED unless
@@ -69,9 +76,21 @@ fn run(cli: &Cli) -> Result<[u8; 48], String> {
     let vcek_der = std::fs::read(&cli.vcek).map_err(|e| format!("read --vcek: {e}"))?;
     let chain_pem =
         std::fs::read(&cli.cert_chain).map_err(|e| format!("read --cert-chain: {e}"))?;
-    let pinned_pem = match &cli.pinned_ark_chain {
-        Some(p) => std::fs::read(p).map_err(|e| format!("read --pinned-ark-chain: {e}"))?,
-        None => EMBEDDED_AMD_GENOA_CHAIN.to_vec(),
+    let pinned_pem = match (&cli.pinned_ark_chain, cli.product.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err("specify only one of --pinned-ark-chain / --product".into())
+        }
+        (Some(p), None) => std::fs::read(p).map_err(|e| format!("read --pinned-ark-chain: {e}"))?,
+        (None, Some("genoa")) => EMBEDDED_AMD_GENOA_CHAIN.to_vec(),
+        (None, Some("turin")) => EMBEDDED_AMD_TURIN_CHAIN.to_vec(),
+        (None, Some(other)) => return Err(format!("unknown --product '{other}' (genoa|turin)")),
+        (None, None) => {
+            return Err(
+                "pin the AMD root: --product <genoa|turin> (match the CPU — lscpu family \
+                        25=genoa, 26=turin) or --pinned-ark-chain <pem>"
+                    .into(),
+            )
+        }
     };
     let pq_pubkey = match (&cli.pq_pubkey, cli.allow_unbound) {
         (Some(_), true) => {
