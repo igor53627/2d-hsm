@@ -161,12 +161,16 @@ Three keying assumptions, stated separately:
    measurement against the **operator-approved allowlist**; (iii) in the **offline recovery
    environment** (operator HSM/enclave holding the recovery private key) the backup is
    decapsulated and the payload **re-wrapped** (ML-KEM-Encaps) to the destination TEE's
-   attested ephemeral public key; (iv) the destination TEE decapsulates and imports the
-   plaintext scalars **only inside itself**. Plaintext therefore exists only in the trusted
-   offline recovery environment and inside the attested destination TEE — never in a
-   runtime/production TEE on an untrusted host, and the recovery private key never enters any
-   production TEE. A routine image upgrade adds the new measurement to the allowlist;
-   arbitrary measurements are refused.
+   attested ephemeral public key, in an **import envelope** whose AEAD AAD authenticates the
+   original backup's `chain_id`, `environment_identifier`, and key-ref manifest hash to that
+   ephemeral key; (iv) the destination TEE decapsulates and, **before importing**, verifies
+   that `chain_id` / `environment_identifier` equal its own sealed config (cross-environment
+   restore fails closed) and that the manifest hash matches, then imports the plaintext
+   scalars **only inside itself**. Plaintext therefore exists only in the trusted offline
+   recovery environment and inside the attested destination TEE — never in a runtime/production
+   TEE on an untrusted host, and the recovery private key never enters any production TEE. A
+   routine image upgrade adds the new measurement to the allowlist; arbitrary measurements
+   are refused.
 
 **Counter / spend high-water seeding** (AC#11/#12 — never zero, never stale): on fresh-TEE
 restore the enclave **must not** initialise capability counters or faucet cumulative-spend

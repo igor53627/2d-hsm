@@ -32,4 +32,6 @@ high_risk_paths = [
   "backlog/docs/*vsock*",
   "backlog/docs/*authorization-ticket*",
   "backlog/docs/*hard-fork*",
+  "backlog/docs/*agent-gateway*",
+  "backlog/docs/*provisioning-runbook*",
 ]
