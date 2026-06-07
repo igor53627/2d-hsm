@@ -1,7 +1,7 @@
 ---
 id: TASK-1.2
 title: 'Complete SNP attestation verification: VCEK->ASK->ARK chain + image binding'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-06 15:58'
 labels:

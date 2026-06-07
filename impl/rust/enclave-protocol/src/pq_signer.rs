@@ -249,17 +249,30 @@ mod v1_seal {
         h.finalize().into()
     }
 
-    pub(crate) fn resolve_provisioning_root() -> Result<[u8; 32], ProtocolError> {
+    // Returns the root in a `Zeroizing` so every *transient* caller copy is scrubbed on drop. (The
+    // process-lifetime copy in PLATFORM_PROVISIONING_ROOT is NOT scrubbed during operation — closing
+    // that needs mlock / no-core-dump, which is orthogonal to zeroize.)
+    pub(crate) fn resolve_provisioning_root() -> Result<zeroize::Zeroizing<[u8; 32]>, ProtocolError> {
         let guard = super::PLATFORM_PROVISIONING_ROOT
             .lock()
             .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
-        if let Some(root) = *guard {
-            return Ok(root);
+        // copy_from_slice into a pre-zeroed Zeroizing buffer so the secret is never materialized as a
+        // bare `[u8;32]` Copy temporary on the stack (which has no Drop and would not be scrubbed).
+        if let Some(root) = guard.as_ref() {
+            let mut out = zeroize::Zeroizing::new([0u8; 32]);
+            out.copy_from_slice(root);
+            return Ok(out);
         }
         drop(guard);
         #[cfg(any(test, feature = "reference-seal-v1-root"))]
         {
-            return Ok(*include_bytes!("../testvectors/seal_v1_provisioning_root.bin"));
+            // The `&[u8; 32]` annotation keeps the fixture-length check at COMPILE time (a malformed
+            // fixture fails the build) instead of a runtime panic in copy_from_slice.
+            let reference_root: &[u8; 32] =
+                include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
+            let mut out = zeroize::Zeroizing::new([0u8; 32]);
+            out.copy_from_slice(reference_root);
+            return Ok(out);
         }
         #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
         {
@@ -273,23 +286,24 @@ mod v1_seal {
         SEALED_BLOB_V1_HEADER_LEN + PLAINTEXT_LEN + 16
     }
 
+    // Returns the ChaCha20Poly1305 sealing key in a `Zeroizing` — it directly en/decrypts the
+    // ML-DSA-65 secret key, so it is at least as sensitive as the root and must not linger on the stack.
     fn derive_aead_key(
         root: &[u8; 32],
         meas_digest: &[u8; V1_MEAS_DIGEST_LEN],
-    ) -> Result<[u8; 32], ProtocolError> {
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, ProtocolError> {
         let mut h = Sha3_256::new();
         h.update(AEAD_KEY_DOMAIN);
         h.update(root);
         h.update(meas_digest);
-        Ok(h.finalize().into())
+        Ok(zeroize::Zeroizing::new(h.finalize().into()))
     }
 
     pub fn unseal_mldsa65_keypair_v1(
         sealed_blob: &[u8],
         enclave_measurement: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-        use zeroize::Zeroizing;
-        let root = Zeroizing::new(resolve_provisioning_root()?);
+        let root = resolve_provisioning_root()?;
         unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, &root)
     }
 
@@ -322,7 +336,7 @@ mod v1_seal {
             ));
         }
         let key = derive_aead_key(provisioning_root, &expected_meas)?;
-        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
             .map_err(|_| ProtocolError::PqSigningUnavailable("v1 AEAD key invalid"))?;
         let nonce = Nonce::from_slice(&sealed_blob[41..SEALED_BLOB_V1_HEADER_LEN]);
         let aad = &sealed_blob[..9 + V1_MEAS_DIGEST_LEN];
@@ -373,7 +387,7 @@ mod v1_seal {
         MlDsa65Signer::from_verified_key_bytes(secret_key, public_key)?;
         let meas_digest = measurement_digest_v1(enclave_measurement);
         let key = derive_aead_key(provisioning_root, &meas_digest)?;
-        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
             .map_err(|_| ProtocolError::PqSigningUnavailable("v1 AEAD key invalid"))?;
 
         use zeroize::Zeroizing;
@@ -457,9 +471,11 @@ pub fn is_platform_pq_seal_v1_provisioning_root_set() -> bool {
 }
 
 /// Whether v1 unseal can resolve a provisioning root (platform, reference-seal, or `cfg(test)`).
+/// Presence-only — does not materialize the secret root (mirrors `resolve_provisioning_root`'s logic).
 #[cfg(feature = "ml-dsa-65")]
 pub fn is_pq_seal_v1_provisioning_root_configured() -> bool {
-    v1_seal::resolve_provisioning_root().is_ok()
+    is_platform_pq_seal_v1_provisioning_root_set()
+        || cfg!(any(test, feature = "reference-seal-v1-root"))
 }
 
 #[cfg(all(feature = "ml-dsa-65", test))]

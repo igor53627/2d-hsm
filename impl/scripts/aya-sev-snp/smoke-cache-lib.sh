@@ -47,8 +47,9 @@ twod_hsm_nix_outlink_hit() {
       done
       return 1
       ;;
-    disk-production | disk-production-lab)
-      # make-disk-image emits a bootable qcow2 under the out path (TASK-5 AC#5).
+    disk-production | disk-production-lab | disk-production-lab-selftest)
+      # make-disk-image emits a bootable qcow2 under the out path (TASK-5 AC#5;
+      # disk-production-lab-selftest adds the TASK-1.1 derived-root self-check oneshot).
       local c
       for c in "${link}"/*.qcow2; do
         [[ -e "$c" ]] && return 0
@@ -79,9 +80,12 @@ twod_hsm_nix_build_stamp() {
     printf '%s' "$_TWOD_HSM_NIX_BUILD_STAMP"
     return 0
   fi
-  local repo_root rust_dir script_dir
+  local repo_root rust_dir snp_dir script_dir
   repo_root="$(cd "${flake_dir}/../../.." && pwd)"
   rust_dir="${repo_root}/impl/rust/enclave-protocol"
+  # TASK-1.1: snp-derive-root is a separate crate baked into the disk-production-lab-selftest image,
+  # so it must contribute to the stamp — otherwise editing its sources leaves a stale cached image.
+  snp_dir="${repo_root}/impl/rust/snp-derive-root"
   script_dir="${repo_root}/impl/scripts/aya-sev-snp"
   _TWOD_HSM_NIX_BUILD_STAMP=$(
     {
@@ -94,6 +98,9 @@ twod_hsm_nix_build_stamp() {
       twod_hsm_cat_tree "${rust_dir}/src" -name '*.rs'
       twod_hsm_cat_tree "${rust_dir}/examples" -name '*.rs'
       twod_hsm_cat_tree "${rust_dir}/testvectors" -type f
+      [[ -f "${snp_dir}/Cargo.toml" ]] && cat "${snp_dir}/Cargo.toml"
+      [[ -f "${snp_dir}/Cargo.lock" ]] && cat "${snp_dir}/Cargo.lock"
+      twod_hsm_cat_tree "${snp_dir}/src" -name '*.rs'
       # Script-dir markdown docs are intentionally excluded: they do not affect Nix build outputs.
       twod_hsm_cat_tree "${script_dir}" \( -name '*.sh' -o -name '*.py' \)
     } | sha256sum | awk '{print $1}'
@@ -284,6 +291,45 @@ twod_hsm_link_firmware_cache() {
   if [[ -f "$src" && "$src" != "$(twod_hsm_cache_firmware)/OVMF.fd" ]]; then
     ln -sf "$src" "$(twod_hsm_cache_firmware)/OVMF.fd"
     echo "firmware cache: $(twod_hsm_cache_firmware)/OVMF.fd -> $src" >&2
+  fi
+}
+
+# Resolve the SNP-capable QEMU + AMD OVMF and export QEMU_BIN + SNP_BIOS. Fails if QEMU lacks
+# sev-snp-guest or no OVMF is found. Shared by the SNP launcher scripts (run-nix-snp-*).
+twod_hsm_resolve_snp_qemu() {
+  local qemu
+  if [[ -x /opt/qemu-snp/bin/qemu-system-x86_64 ]]; then
+    qemu="${QEMU_BIN:-/opt/qemu-snp/bin/qemu-system-x86_64}"
+  else
+    qemu="${QEMU_BIN:-qemu-system-x86_64}"
+  fi
+  qemu="$(command -v "$qemu" || true)"
+  if [[ -z "$qemu" ]]; then
+    echo "qemu-system-x86_64 not found (set QEMU_BIN or run ./install-qemu-snp.sh)" >&2
+    return 1
+  fi
+  if ! "$qemu" -object help 2>&1 | grep -q sev-snp-guest; then
+    echo "QEMU lacks sev-snp-guest (run ./install-qemu-snp.sh)" >&2
+    return 1
+  fi
+  QEMU_BIN="$qemu"
+  SNP_BIOS="$(twod_hsm_snp_ovmf_path)" || return 1
+  export QEMU_BIN SNP_BIOS
+}
+
+# Create a writable work disk DST backed by the read-only store image SRC: a thin qcow2 overlay
+# (near-instant) when qemu-img is available, else a full writable copy. Shared by run-nix-snp-*.
+twod_hsm_make_work_overlay() {
+  local src=$1 dst=$2 qemu_img
+  rm -f "$dst"
+  qemu_img="${QEMU_IMG:-}"
+  [[ -n "$qemu_img" && -x "$qemu_img" ]] || qemu_img="$(dirname "${QEMU_BIN:-}")/qemu-img"
+  [[ -x "$qemu_img" ]] || qemu_img="$(command -v qemu-img || true)"
+  if [[ -n "$qemu_img" && -x "$qemu_img" ]]; then
+    "$qemu_img" create -q -f qcow2 -F qcow2 -b "$src" "$dst"
+  else
+    cp -f "$src" "$dst"
+    chmod u+w "$dst"
   fi
 }
 

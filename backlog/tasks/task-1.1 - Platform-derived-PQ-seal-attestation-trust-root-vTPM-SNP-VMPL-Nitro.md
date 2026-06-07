@@ -1,7 +1,7 @@
 ---
 id: TASK-1.1
 title: Platform-derived PQ-seal + attestation-trust root (vTPM/SNP VMPL/Nitro)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-06 15:58'
 labels:

@@ -10,6 +10,9 @@ on:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
+      - 'impl/rust/pq-seal-manifest/**'
+      - 'impl/rust/snp-derive-root/**'
+      - 'impl/rust/snp-attest-verify/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
   pull_request:
@@ -17,6 +20,9 @@ on:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
+      - 'impl/rust/pq-seal-manifest/**'
+      - 'impl/rust/snp-derive-root/**'
+      - 'impl/rust/snp-attest-verify/**'
       - 'impl/elixir-shim/**'
       - '.github/workflows/nix-hsm.yml'
 
@@ -46,12 +52,35 @@ jobs:
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 
+      # Shared multi-host manifest format + per-host blob selection (TASK-1.1). Tiny lib used by
+      # the `pq-seal-v1 manifest` ceremony and (next slice) the boot-time selector.
+      - name: pq-seal-manifest builds + tests
+        working-directory: impl/rust/pq-seal-manifest
+        run: cargo test
+
       # Offline provisioning tool: not a workspace member, so it only gets
       # rebuilt here. Catches enclave-protocol API drift (e.g. seal/verify
-      # signature changes) before it rots the tool.
-      - name: pq-seal-v1 provisioning tool builds
+      # signature changes) before it rots the tool. `cargo test` also covers
+      # the `manifest build` subcommand (seal-per-host + trustless selection).
+      - name: pq-seal-v1 provisioning tool builds + tests
         working-directory: impl/rust/pq-seal-v1
-        run: cargo build
+        run: cargo test
+
+      # TASK-1.1: SNP firmware-derived pq-seal root boot helper. Separate crate
+      # (owns the one ioctl enclave-protocol's forbid-unsafe can't). The ioctl
+      # path is Linux-gated, so the off-SNP tests here cover the repr(C) ABI
+      # sizes, the IOWR number, the domain-separated derivation, and the
+      # graceful no-device error; the in-guest path is validated on aya.
+      - name: snp-derive-root boot helper builds + tests
+        working-directory: impl/rust/snp-derive-root
+        run: cargo test
+
+      # TASK-1 DoD #3: relying-party attestation verifier. Separate crate (ECDSA-P384 + RSA-PSS +
+      # X.509, deliberately off the forbid-unsafe enclave path). Tests cover the report sig, the
+      # cert chain against real AMD Genoa ARK/ASK (RSA-PSS) + a synthetic ECDSA chain end to end.
+      - name: snp-attest-verify reference verifier builds + tests
+        working-directory: impl/rust/snp-attest-verify
+        run: cargo test
 
   elixir-test:
     runs-on: ubuntu-latest
@@ -101,6 +130,10 @@ jobs:
           nix build --no-update-lock-file .#vm-production --print-out-paths
           nix build --no-update-lock-file .#vm-production-lab --print-out-paths
 
+      # TASK-1.1: SNP firmware-derived pq-seal root boot helper (Nix package).
+      - name: Build snp-derive-root boot helper
+        run: nix build --no-update-lock-file .#snp-derive-root --print-out-paths
+
       # TASK-5 AC#5: validate the SEV-SNP disk image *evaluates* (instantiates the
       # make-disk-image derivation) without building it. The full build needs
       # vmTools.runInLinuxVM (requiredSystemFeatures = ["kvm"]), which GitHub-hosted
@@ -109,6 +142,12 @@ jobs:
         run: |
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab.drvPath
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production.drvPath
+          # TASK-1.1: derived-root self-check image (oneshot runs snp-derive-root --selftest in-guest).
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-selftest.drvPath
+          # TASK-1.1 sealed-boot loop: snp-rooted image (enclave unseals against the boot-derived root)
+          # + the ceremony print image. Eval only; the end-to-end boot ceremony runs on aya.
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-snp-rooted.drvPath
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-print-ceremony.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).

@@ -72,7 +72,7 @@ Because the service will run inside a TEE, many traditional HSM hardware securit
 - [ ] #9 Design and document the integration boundary with the existing multi-layer signing flow (SignerPolicy + OPA + Vault credential brokering)
 - [x] #10 Specify TEE runtime requirements and attestation model (Nitro Enclaves and/or SEV-SNP) _(done — vsock spec §2.3 + snp-attestation-verifier-policy.md + GET_MEASUREMENT SNP report; SEV-SNP)_
 - [x] #11 Implement support for at least ML-DSA (Dilithium) with the parameter sets required by 2d; SLH-DSA (SPHINCS+) support is a stretch goal for MVP _(done — ML-DSA-65, the frozen 2d param set; SLH-DSA stretch not done)_
-- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Partial: reference verifier `snp_verify::prevalidate_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden); VCEK→ASK→ARK cert-chain to the AMD root remains the caller's job (see acceptance #3)._
+- [ ] #12 Achieve remote attestation verification on the caller side before trusting the service. _Reference verifier complete across both layers: `snp_verify::prevalidate_report` (structure + report_data key binding + measurement allowlist + DEBUG-off, tested vs golden) **+ `snp-attest-verify`** (TASK-1.2): the report's ECDSA-P384 sig + the VCEK→ASK→ARK cert chain (RSA-PSS) to the pinned AMD root + VCEK↔chip binding. Remaining: VCEK SPL/TCB anti-rollback + a real KDS-resolvable end-to-end golden (aya is a Turin engineering-sample — chip_id not KDS-resolvable) — see acceptance #3._
 - [ ] #13 Define the on-chain RecoveryTicket format, issuance rules (permissionless special tx after ~1h downtime for 2s blocks), TEE attestation binding, and activation semantics for BlockProducer failover
 - [ ] #14 Design client/reader node verification rules that reject blocks from unauthorized producer keys or with invalid state transitions (including forged 'stay' transitions)
 - [x] #15 Specify how the TEE signing service uses the network (genesis + recent headers + on-chain recovery history) as a cryptographic second factor for freshness before signing _(done — RecentChainProof Ed25519 network second factor; TASK-3)_
@@ -487,13 +487,87 @@ We are moving from design into actual protocol definition and skeletons.
 **Blocked on / needs sync with 2d:** precompile verify hook shape; whether block-header digests use same ML-DSA key as tickets (default: yes).
 
 See `backlog/docs/implementation-plan-vsock-api-and-hard-fork.md` § Progress update (2026-06-02).
+
+**2026-06-06 — TASK-1.1 platform provisioning root (slice #1 above; branch `feat/task-1.1-snp-derive-root`, PR #21):**
+- New crate `impl/rust/snp-derive-root/` (binary, NOT forbid-unsafe) owns `SNP_GET_DERIVED_KEY` on the
+  guest-only `/dev/sev-guest` — the one ioctl `enclave-protocol` (`#![forbid(unsafe_code)]`) cannot do.
+  Derives `root = SHA3-256("2d-hsm-pq-seal-v1-root" ‖ snp_derived_key)`, firmware key bound by default
+  to launch MEASUREMENT (`guest_field_select` bit 3) under VCEK. Secret-to-platform, stable per-image,
+  measurement-bound. Enclave **unchanged**: still reads the root only via `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`.
+- CLI: `--out` (0600 boot file) / `--print` (ceremony) / `--selftest` (in-guest validation, secret-free
+  SHA3-256 commitment) / `--field-select` / `--root-key` / `--svn`. 5 off-SNP unit tests (ABI sizes,
+  `_IOWR('S',0x1,..)`=`0xC0205301`, derivation, no-device error). Clippy clean.
+- Nix: `.#snp-derive-root` pkg; `.#disk-production-lab-selftest` image runs `--selftest` boot oneshot.
+  Default outputs unchanged (lab, non-mainnet). CI builds + tests the crate. Runbook §7 documents the
+  production ceremony.
+- **Status:** ✅ local + eval verified; ✅ **aya in-guest validation PASSED** (2026-06-06, AMD EPYC
+  9375F, `sev=Y`). `run-nix-snp-derive-root-selftest.sh` booted `.#disk-production-lab-selftest` under
+  SEV-SNP twice: both boots `selftest: PASS (nonzero=true, binding_changes=true)` and the derived-root
+  commitment was **identical across two independent relaunches** (fresh overlay each boot):
+  `measurement_root_commit=ed7e9900d618ae7f2839453ffd16b433665209f979ece5add435bc282a5e6202` — proving
+  the ioctl returns a usable 32-byte key, the MEASUREMENT binding is effective, and the root is stable
+  across reboots. (Commitment = SHA3-256 of the root, not the secret.) ✅ replaces the lab test-vector
+  root with a real platform-derived one.
+- **Code review (`/code-review max`, commit `7c1906d`):** refuted a critical-sounding "kernel struct is
+  `__packed`" finding (verified `include/uapi/linux/sev-guest.h` v5.19→master: not packed, sizeof 32,
+  `0xC0205301` correct). Fixed: all-zero-key guard (`DeriveError::ZeroKey`) on the `--out`/prod path;
+  zeroize the firmware key + derived root + `--print` hex (added `zeroize` dep, matches pq-seal-v1);
+  `write_root_0600` now creates the parent dir + uses `create_new`/O_EXCL (no symlink-follow, guaranteed
+  0600); `--out` rejects a flag-looking path; **decoupled the selftest oneshot from the enclave**
+  (`wantedBy multi-user.target`, after `systemd-udev-settle`, dropped the spurious configfs dep) so a
+  failed diagnostic can't cancel the signer; `smoke-cache-lib` build-stamp now hashes the crate (no
+  stale re-validation). **Re-validated on aya** with the hardened code + decoupled unit: both boots PASS,
+  commitment byte-identical (`ed7e9900…6202`) ⇒ refactor didn't change the derivation.
+- **Follow-ups (not this PR):** (a) fully sealed-boot mainnet artifact — re-seal a blob against the
+  derived root + bake it (operator ceremony); (b) wire the production `--out` oneshot that writes the
+  enclave's root file; (c) low-severity review nits: `selftest()` honor `--field-select`/`--root-key`/
+  `--svn`, share the pq-seal domain constant with `enclave-protocol`, drop the dead `run()` branch,
+  use `hex::encode`; (d) vTPM/Nitro backends.
+
+**2026-06-07 — TASK-1.1 sealed-boot loop (slice #1 complete; branch `feat/task-1.1-snp-sealed-boot`, PR #22):**
+Closes follow-ups (a) + (b): the enclave now **unseals against the SNP firmware-derived root**, not a
+baked lab fixture.
+- `sealRootSource = "snp"` (vs default `"file"`): a gating `twod-hsm-snp-derive-seal-root` oneshot runs
+  `snp-derive-root --out /run/twod-hsm/pq-seal-root.bin` before the enclave and `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE`
+  points there. Enclave boot path otherwise unchanged. Key fact: the enclave unseals against
+  `b"enclave-measurement-placeholder"` (no `TWOD_HSM_ENCLAVE_MEASUREMENT_FILE` set), NOT the live SNP
+  measurement — so re-sealing needs only that known string.
+- New outputs `disk-production-lab-snp-rooted` + CEREMONY-ONLY `disk-production-lab-print-ceremony`;
+  `run-nix-snp-sealed-boot.sh` automates the ceremony. Default outputs byte-identical to main.
+- ✅ **aya end-to-end PASS** (2026-06-07, EPYC 9375F): captured derived root in-guest → sealed the
+  reference ML-DSA-65 keypair against it (6053-byte blob) → `.#disk-production-lab-snp-rooted` booted
+  under SEV-SNP with `real_measurement=1 pq_ready=1` — the enclave unsealed using the boot-derived root.
+- **Remaining follow-up:** the derived root is platform-specific (per-VCEK), so a baked blob only
+  unseals on the host it was sealed for; multi-host mainnet sealing (per-host or VMRK) is open. Plus
+  (c)/(d) above.
+
+**2026-06-07 — TASK-1.2 attestation verifier (DoD #3 / AC#12; branch `feat/task-1.2-snp-attest-verify`, PR #23):**
+The relying-party verifier that completes attestation — closes policy §2 step 2 (the cert chain to
+the pinned AMD root), which `prevalidate_report` deliberately left out.
+- New crate `impl/rust/snp-attest-verify/` (lib + CLI), NOT forbid-unsafe — needs ECDSA-P384 + RSA +
+  X.509, kept off the enclave path. Path-deps `enclave-protocol` (reuses `prevalidate_report` +
+  `report_data_for_pubkey`); not a Nix package (cargo-built in CI, like `pq-seal-v1`).
+- Verifies: report sig (VCEK, **ECDSA-P384/SHA-384**; AMD stores r/s little-endian in 72-byte fields
+  at 0x2A0 — byte-reverse to BE) + VCEK→ASK→ARK chain (**AMD ARK/ASK are RSA-4096 RSASSA-PSS/SHA-384**)
+  + ARK self-signed & **pinned** by SPKI. `verify_attestation` composes prevalidate + chain + report
+  sig; CLI takes `--report/--vcek/--cert-chain/--measurement[/--pq-pubkey/--pinned-ark-chain]`.
+- 13 tests: real AMD Genoa ARK self-sign + ASK←ARK (RSA-PSS, KDS certs committed as test vectors) +
+  synthetic ECDSA ARK→ASK→VCEK end-to-end (pass/wrong-pin/broken-intermediate) + report-sig
+  round-trip/tamper/wrong-key + golden-report field extraction. clippy + fmt clean.
+- **Feasibility finding:** aya's `chip_id` is masked → its VCEK is **404 on AMD KDS**, so a *real*
+  full-chain golden isn't available from aya (production hardware resolves). The real chain is covered
+  on its upper legs (ARK/ASK) + synthetically end-to-end.
+- **Follow-ups:** VCEK TCB/chip-id X.509-extension binding (policy §2 last bullet); cert validity
+  dates; KDS auto-fetch in the CLI; a real KDS-resolvable end-to-end golden (vendor a public AMD
+  sample). The verifier still lives here as a reference; the on-chain `MeasurementRegistry` policy
+  encoding remains 2d-solidity work.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
 - [x] #1 mix test (or equivalent) passes for the new signing service _(done — Elixir shim `mix test` + Rust `cargo test` green in CI nix-hsm.yml)_
 - [ ] #2 Security review of the service is completed (at minimum: key never leaves TEE in plaintext, proper use of sealing/attestation, no obvious exfiltration paths)
-- [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted. _Partial: reference relying-party verifier `snp_verify::prevalidate_report` (feature `snp-verify`) checks report structure + `report_data` key binding + measurement allowlist + DEBUG-off, tested vs the committed golden report (6 tests). **Still open:** the VCEK→ASK→ARK signature chain to the pinned AMD root (ECDSA-P384 + X.509 + KDS) — intentionally out of the forbid-unsafe enclave crate; the BP/on-chain consumer must add it. See snp-attestation-verifier-policy.md._
+- [ ] #3 Remote attestation verification is implemented and tested on the caller side before any signing request is accepted. _Two-layer reference verifier implemented + tested: (1) `snp_verify::prevalidate_report` (feature `snp-verify`) — report structure + `report_data` key binding + measurement allowlist + DEBUG-off, tested vs the committed golden report; (2) **`impl/rust/snp-attest-verify`** (TASK-1.2, PR #23) — the report's ECDSA-P384/SHA-384 signature + the VCEK→ASK→ARK cert chain (AMD ARK/ASK are RSA-4096 RSASSA-PSS/SHA-384) to the **pinned** AMD root, with `verify_attestation` composing both layers + a CLI. Separate crate, deliberately off the forbid-unsafe enclave path. 13 tests: real AMD Genoa ARK self-sign + ASK←ARK (RSA-PSS, real KDS certs) + a synthetic ECDSA ARK→ASK→VCEK chain end to end + report-sig round-trip/tamper. **Open follow-ups:** VCEK TCB/chip-id X.509-extension binding, cert validity-date checks, KDS auto-fetch, and a real KDS-resolvable end-to-end golden (aya's chip_id is masked → its VCEK is 404 on KDS, so the real chain is exercised only on its upper legs + synthetically). See snp-attestation-verifier-policy.md §4._
 - [ ] #4 Basic failover scenario between at least two instances of the service (on different hosts/enclaves) is designed and documented
 - [ ] #5 Operational runbook exists covering: deployment into TEE, key provisioning/rotation inside TEE, attestation, monitoring, and incident response for TEE compromise or unavailability
 - [ ] #6 Integration with 2d's existing signing path (Chain.Bridge.Signer + OPA + Vault) is implemented and passes relevant tests
