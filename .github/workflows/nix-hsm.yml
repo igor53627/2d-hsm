@@ -10,6 +10,7 @@ on:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
+      - 'impl/rust/pq-seal-manifest/**'
       - 'impl/rust/snp-derive-root/**'
       - 'impl/rust/snp-attest-verify/**'
       - 'impl/elixir-shim/**'
@@ -19,6 +20,7 @@ on:
       - 'impl/nix/vm-hsm/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
+      - 'impl/rust/pq-seal-manifest/**'
       - 'impl/rust/snp-derive-root/**'
       - 'impl/rust/snp-attest-verify/**'
       - 'impl/elixir-shim/**'
@@ -50,12 +52,19 @@ jobs:
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 
+      # Shared multi-host manifest format + per-host blob selection (TASK-1.1). Tiny lib used by
+      # the `pq-seal-v1 manifest` ceremony and (next slice) the boot-time selector.
+      - name: pq-seal-manifest builds + tests
+        working-directory: impl/rust/pq-seal-manifest
+        run: cargo test
+
       # Offline provisioning tool: not a workspace member, so it only gets
       # rebuilt here. Catches enclave-protocol API drift (e.g. seal/verify
-      # signature changes) before it rots the tool.
-      - name: pq-seal-v1 provisioning tool builds
+      # signature changes) before it rots the tool. `cargo test` also covers
+      # the `manifest build` subcommand (seal-per-host + trustless selection).
+      - name: pq-seal-v1 provisioning tool builds + tests
         working-directory: impl/rust/pq-seal-v1
-        run: cargo build
+        run: cargo test
 
       # TASK-1.1: SNP firmware-derived pq-seal root boot helper. Separate crate
       # (owns the one ioctl enclave-protocol's forbid-unsafe can't). The ioctl

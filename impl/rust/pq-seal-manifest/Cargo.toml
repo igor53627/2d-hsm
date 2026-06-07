@@ -1,0 +1,14 @@
+[package]
+name = "pq-seal-manifest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Shared format + per-host blob selection for 2d-hsm multi-host pq-seal v1: a manifest of host-specific sealed producer-key blobs, each selected by a one-way commitment to that host's 32-byte provisioning root. Used by the `pq-seal-v1 manifest` ceremony tool and the boot-time selector."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha3 = "0.10"
+hex = "0.4"
+thiserror = "1"
