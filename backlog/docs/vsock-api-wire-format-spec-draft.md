@@ -611,7 +611,7 @@ CBOR integer-key map (canonical, per §8):
   2: opcode        (uint, see §10.3),
   3: command_domain(tstr, fixed = "2d-hsm/agent-gateway/v1"),
   4: request_id    (bstr, binds one request),
-  5: capability    (map, REQUIRED for privileged opcodes only — §10.5),
+  5: capability    (map; REQUIRED only for privileged opcodes — see §10.3 table + §10.5; carries its Ed25519 signature at key 13),
   6: key_ref|batch_id (bstr, where applicable),
   7: payload       (map, per-command — §10.4)
 }
@@ -641,9 +641,23 @@ Mixed-role fixtures are permitted only in non-deployable tests.
 `0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker, 3 reset_lifetime_breaker`
 (AC#8), each validated by exhaustive allow-list and mapped to a capability tier (§10.7).
 
+**Capability requirement per opcode** (resolves the inner-envelope key-5 condition):
+- **No capability — low-privilege reads:** `PUBLIC_IDENTITY`, `PROVE_IDENTITY`.
+- **No administrative capability — runtime signing:** `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE`.
+  These do **not** carry capability key 5; per the threat model they are reachable by any
+  vsock caller, and their bound is the enclave-built canonical preimage (no caller digest),
+  key-purpose, chain/env binding, and — for faucet — sealed spend caps, **not** an admin
+  capability.
+- **Capability key 5 REQUIRED — privileged:** `GENERATE_KEYS`, `CONFIGURE_TREASURY`
+  (every sub-op), `EXPORT_BACKUP`, `RESTORE_BACKUP`. Missing/invalid key 5 ⇒ fail closed.
+
 ### 10.4 Per-command payloads (AC#1, AC#14)
 
-Selected schemas (all CBOR int-key maps; full schemas in TASK-7.1):
+Schemas (all CBOR int-key maps). `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE`, and
+`PUBLIC_IDENTITY` are fully specified here; the complete request/response maps for
+`GENERATE_KEYS`/`PROVE_IDENTITY` are owned by TASK-7.3, `CONFIGURE_TREASURY` by TASK-7.4,
+and `EXPORT_BACKUP`/`RESTORE_BACKUP` by TASK-7.2 — each consuming this envelope, capability,
+and error contract, with the per-command map carried at envelope key 7:
 
 - **`AGENT_K1_SIGN_TRANSFER`** (runtime; `agent_transfer_k1` only) — *semantic fields,
   never a caller digest*: `{1: chain_id(=11565), 2: from, 3: to(20B), 4: amount,
@@ -680,18 +694,29 @@ privileged opcodes. **Host-side Vault/OPA authorization alone is never sufficien
 2 command_opcode                 8 scope_target (enclave_id|fleet_id, command_class folded in)
 3 treasury_sub_op (if opcode 6)  9 counter (monotonic for the tuple)
 4 key_purpose (1=transfer,2=faucet) 10 request_id
-5 chain_id (= sealed 11565)      11 payload_binding = keccak256(canonical command params)
+5 chain_id (= sealed 11565)      11 payload_binding = keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical command params)
 6 environment_identifier (= sealed)  12 is_recovery (bool → verify vs recovery_authority_pk)
+--- below is NOT part of the signed bytes ---
+13 ed25519_signature (64B)
 ```
 
+**Signature transmission.** The capability map carries the 64-byte Ed25519 signature at key
+`13`. The signed message is `"2d-hsm/agent-cap/v1\0" ‖ canonical-CBOR({1..12})` — keys `1–12`
+only, with key `13` excluded before verification — so "the capability map minus key 13 = the
+signed bytes" is unambiguous and wire-stable.
+
 The design doc's "key refs or batch/count" capability binding is covered transitively by
-`payload_binding` (keccak256 over the canonical command params); there is no separate
-key-ref field in the signed capability.
+`payload_binding` (now `keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical command params)`);
+there is no separate key-ref field in the signed capability.
 
 **Verify order (all before state touch):** role/profile gate → opcode allow-list →
-`cap_format_version` → Ed25519 verify vs the correct sealed authority → `chain_id`/`env`/
-`scope` equal sealed values → contiguous counter (§10.6) → `payload_binding ==
-keccak256(actual params)` → mutate + seal-before-return.
+`cap_format_version` → Ed25519 verify over keys `1–12` (key 13 excluded) vs the correct
+sealed authority → `cap.command_opcode == request.opcode` **and** `cap.treasury_sub_op ==
+request.sub_op` (opcode 6) **and** `cap.request_id == envelope.request_id` →
+`chain_id`/`env`/`scope` equal sealed values → contiguous counter (§10.6) → `payload_binding
+== keccak256(actual params)` → mutate + seal-before-return. The opcode/sub-op/request_id
+equality checks stop a capability issued for one opcode/sub-op/request from authorizing
+another (e.g. a `set_limits` cap cannot authorize `reset_lifetime_breaker`).
 
 Capability tiers per command follow the design doc table (`agent-gateway-secp256k1-signer-design.md` §"Capability tiers").
 
@@ -715,8 +740,10 @@ host-controlled).
   leading/trailing/double hyphen; byte-exact case-sensitive compare against the sealed value;
   malformed → fail closed at decode.
 - **Recovery resync (AC#11):** a recovery-authority capability resyncs a wedged scope
-  **forward-only** (sets counter strictly `>` current highest, or is sequenced by an
-  independent strict recovery counter); audited; never rolls backward.
+  **forward-only**: it sets the target tuple's counter strictly `>` its current highest
+  **and** is itself sequenced by an independent strict recovery counter (one normative
+  mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
+  strict recovery counter. Audited; never rolls backward.
 - **Authority rotation (AC#17):** `authority` is part of the tuple, so a new authority
   starts a fresh stream and retired-authority capabilities cannot replay. Fallback for
   authority compromise = full re-provisioning (residual risk documented).
@@ -750,7 +777,9 @@ a global remote monotonic ledger is specified (AC#12). All writes sealed before 
   enclave always builds each preimage itself and never signs a caller digest. **EIP-2718
   caveat:** `0x19` is a legal `TransactionType`, so disjointness from typed txs depends on
   the pinned policy that **2D permanently reserves/never assigns tx-type `0x19`** —
-  tracked by a 2D-side AC in the TASK-132.5 family (the enclave cannot enforce it).
+  tracked by a 2D-side AC in the TASK-132.5 family (the enclave cannot enforce it). This
+  2D-side reservation is a **blocking dependency** for TASK-7.3/7.4: their non-collision
+  proof must reference a pinned 2D commit/test showing tx-type `0x19` is reserved/rejected.
   Witnesses in `testvectors/agent-gateway/domain_separation.json`.
 - **Read policy (AC#16):** `AGENT_K1_PUBLIC_IDENTITY` and `AGENT_K1_PROVE_IDENTITY` are
   **low-privilege local reads** — no administrative capability — but still validate command

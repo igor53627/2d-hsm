@@ -1,5 +1,7 @@
-# TASK-7.1 golden-vector generator — run from ../2d with:
-#   mix run --no-start /tmp/gen_agent_vectors.exs
+# TASK-7.1 golden-vector generator — run from the sibling ../2d checkout:
+#   cd ../2d && mix run --no-start \
+#     <2d-hsm>/impl/rust/enclave-protocol/testvectors/agent-gateway/gen_agent_vectors.exs
+#   (writes vectors next to this script via __DIR__; same in-repo path as this dir's README)
 # Produces frozen Agent Gateway test vectors from 2D's OWN crypto (authoritative
 # against the live verifier) and self-checks each via signature recovery.
 

@@ -15,7 +15,9 @@ accepts. Each signing vector is **self-checked by signature recovery** at genera
 time (eth via `ExSecp256k1.recover`, TRON via `Chain.Crypto.recover_tron_sender`),
 and every signature is asserted **low-S** (`s <= n/2`).
 
-Regenerate (from the sibling `../2d` checkout, deps already compiled):
+Regenerate (from the sibling `../2d` checkout, deps already compiled). These vectors were
+generated against 2D commit `93183ca` ("Harden agent signer custody grants"); regenerate
+against that revision for byte-identical output:
 
 ```sh
 cd ../2d && mix run --no-start \
