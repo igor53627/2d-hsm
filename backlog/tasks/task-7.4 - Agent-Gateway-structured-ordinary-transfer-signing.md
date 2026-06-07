@@ -1,9 +1,10 @@
 ---
 id: TASK-7.4
 title: Agent Gateway structured ordinary transfer signing
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
+updated_date: '2026-06-07 16:23'
 labels:
   - agent-gateway
   - signing
@@ -13,6 +14,7 @@ dependencies:
   - TASK-7.2
   - TASK-7.3
 references:
+  - backlog/docs/agent-gateway-transfer-faucet-signing.md
   - backlog/docs/agent-gateway-secp256k1-signer-design.md
   - ../2d/lib/chain/block_executor.ex
   - ../2d/lib/chain/crypto/envelope.ex
@@ -45,6 +47,12 @@ Design Agent Gateway signing as structured ordinary 2D transaction signing. The 
 - [ ] #15 If treasury-key rotation is in scope (per the TASK-7.2 carry-over semantics), signing against a rotated/replacement `agent_faucet_treasury_k1` key continues to debit the carried-over cumulative signing-budget and lifetime-breaker counters and never signs against a counter reset to zero merely because the treasury key was replaced; absent an active reviewed rotation protocol, rotation remains fail-closed.
 - [ ] #16 Roborev matrix/compact evidence is recorded before merge.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Design delivered in backlog/docs/agent-gateway-transfer-faucet-signing.md (design-only; secp256k1 signing impl is TASK-7.6). Consumes TASK-7.1 protocol + frozen ordinary_tx_v1 vector, TASK-7.2 faucet caps + seal-before-emit, TASK-7.3 keygen/identity. Adds: SIGN_TRANSFER structured-field -> EIP-155 preimage build + from/chain_id checks + low-S/recovery/v keyed to the 2D verifier + no caller digest + empty data; SIGN_FAUCET_DISPENSE to-must-be-known-transfer-key + worst-case checked-arithmetic caps (legacy gas_price) + dual sealed counters + signing-budget semantics; seal-before-emit + serialized commit + throughput statement + 7.4/7.7 boundary + residual; no-generic-digest + identity-proof non-coercion + key-purpose cross-rejection; conditional rotation carry-over; golden-vector/test requirements. Adopted: legacy gas_price (no EIP-1559 in pinned vector), rotation carry-over semantics only, no reconciliation (worst-case budget), anti-rollback assumptions toward 7.7, dispense-rate model + benchmark deferred to 7.6. AC #1-#15 addressed by this design; AC #16 (roborev matrix) run pre-merge.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
