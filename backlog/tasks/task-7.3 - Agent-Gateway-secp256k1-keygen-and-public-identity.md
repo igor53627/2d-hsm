@@ -53,7 +53,7 @@ Locked decisions: random 32B `key_ref`; do not block 7.3 on 2D PR #144 (cited as
 cross-repo blocking dep for the `0x19` reservation); defer the live signed PROVE_IDENTITY
 sample to 7.6; error codes reference the 7.1 §10.9 band; treasury-singleton via entry-list scan.
 
-AC #1–#7 addressed: the roborev 3×3 matrix was run and its findings resolved in-PR — clarified treasury `key_ref` is random 32B (counter = capability counter, not the ref); serialized keygen (single-writer/CAS) so concurrent treasury keygens can't both append; documented the identity-proof trust model (binds by signed address; `key_purpose` non-authoritative); added the anti-oracle error-code mapping; `key_ref` uniqueness check; production-gated identity-proof signing on the 2D `0x19` reservation; updated the high-level design doc's pubkey-encoding line; and set parent TASK-7 → In Progress.
+AC #1–#7 addressed: the roborev 3×3 matrix was run and its findings resolved in-PR — clarified treasury `key_ref` is random 32B (counter = capability counter, not the ref); serialized keygen (single-writer/CAS) so concurrent treasury keygens can't both append; documented the identity-proof trust model (binds by signed address; `key_purpose` non-authoritative); added the anti-oracle error-code mapping; `key_ref` uniqueness check; production-gated identity-proof signing on the 2D `0x19` reservation; updated the high-level design doc's pubkey-encoding line; and set parent TASK-7 → In Progress. **Roborev evidence:** 3×3 vendor matrix (codex+gemini+claude-code × security/design/default) jobs 7497–7505, consolidated via `roborev compact` (jobs 7510→7515); all design findings closed, residual items are documentation/process only.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
