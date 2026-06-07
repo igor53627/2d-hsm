@@ -31,7 +31,7 @@ cd ../2d && mix run --no-start \
 |------|--------------|
 | `ordinary_tx_v1.{json,preimage.bin,signing_hash.bin,signed.bin}` | eth EIP-155 ordinary transfer, `chain_id=11565`: unsigned RLP preimage, `keccak256` signing hash, low-S secp256k1 signature (`v=chain_id*2+35+rid`), signed RLP, recovered `from`. **This is the AC#13 frozen artifact for `AGENT_K1_SIGN_TRANSFER`.** |
 | `tron_transfer_v1.{json,raw_data.bin,txid.bin}` | **RESERVED** TRON-surface vector: protobuf `TransferContract` `raw_data`, `sha256` txid, 65-byte `r‖s‖v`. For the AC#15 3-way domain-separation proof and a future TRON-signing opcode (eth-MVP + reserve-TRON decision). |
-| `identity_proof_v1.{json,preimage.bin,signing_hash.bin}` | EIP-191-style identity-proof preimage layout (`0x19 ‖ label ‖ chain_id ‖ env_id ‖ key_ref ‖ pubkey ‖ address ‖ verifier_nonce`) and its `keccak256` hash. Layout owned by TASK-7.1 AC#15; final non-collision proof owned by TASK-7.3. |
+| `identity_proof_v1.{json,preimage.bin,signing_hash.bin}` | EIP-191-style identity-proof preimage layout (`0x19 ‖ len(label) ‖ label ‖ chain_id ‖ len(env_id) ‖ env_id ‖ key_ref ‖ pubkey ‖ address ‖ verifier_nonce`; variable-length fields are 1-byte length-prefixed) and its `keccak256` hash. Layout owned by TASK-7.1 AC#15; final non-collision proof owned by TASK-7.3. |
 | `keys.json` | TEST-ONLY keypairs showing one unified secp256k1 account in **both** address encodings (eth `0x…` and TRON `T…`). |
 | `domain_separation.json` | The 3-way disjointness witnesses (below). |
 

@@ -7,7 +7,9 @@ alias Chain.Crypto
 alias Chain.Crypto.Address
 alias Chain.Tron
 
-out = "/Users/user/pse/2d-hsm/impl/rust/enclave-protocol/testvectors/agent-gateway"
+# Write next to this script (the testvectors/agent-gateway/ dir), so any contributor
+# can regenerate regardless of checkout location or cwd.
+out = __DIR__
 File.mkdir_p!(out)
 
 # secp256k1 group order n and n/2 for low-S assertion
@@ -180,8 +182,10 @@ tron_json = %{
 # ---------------------------------------------------------------------------
 # Vector 3: EIP-191-style identity-proof preimage (TASK-7.1 owns layout;
 # TASK-7.3 owns the final non-collision proof). Disjoint from BOTH tx surfaces.
-#   0x19 || label || chain_id(8B BE) || env_id(1B len || bytes) || key_ref(32B)
-#        || pubkey(65B uncompressed) || address(20B) || verifier_nonce(32B)
+#   0x19 || len(label)(1B) || label || chain_id(8B BE) || len(env_id)(1B) || env_id
+#        || key_ref(32B) || pubkey(65B uncompressed) || address(20B) || verifier_nonce(32B)
+# Every variable-length field is 1-byte length-prefixed so a future label/env-id
+# change cannot shift the parse of later fixed-width fields.
 # ---------------------------------------------------------------------------
 label = "2d-hsm/agent-identity-proof/v1"
 env_id = "testnet"
@@ -190,7 +194,7 @@ verifier_nonce = :binary.copy(<<0xAB>>, 32)
 
 id_preimage =
   <<0x19>> <>
-    label <>
+    <<byte_size(label)::unsigned-8>> <> label <>
     <<chain_id::unsigned-big-64>> <>
     <<byte_size(env_id)::unsigned-8>> <> env_id <>
     key_ref <>
@@ -211,7 +215,7 @@ id_json = %{
   "domain_prefix_byte" => "0x19",
   "label" => label,
   "hash_algorithm" => "keccak256",
-  "layout" => "0x19 || label || chain_id(8B BE) || len(env_id)(1B) || env_id || key_ref(32B) || pubkey(65B) || address(20B) || verifier_nonce(32B)",
+  "layout" => "0x19 || len(label)(1B) || label || chain_id(8B BE) || len(env_id)(1B) || env_id || key_ref(32B) || pubkey(65B) || address(20B) || verifier_nonce(32B)",
   "fields" => %{
     "chain_id" => chain_id,
     "environment_identifier" => env_id,

@@ -1421,6 +1421,9 @@ pub(crate) fn encode_wire_error_frame_for_frame(
     match peek_msg_type_from_frame(frame) {
         Some(t) => encode_wire_error_frame(t, e),
         None => {
+            // Echo the original (unrecognized) type byte rather than a producer type.
+            // Frames shorter than 6 bytes surface as Io errors that propagate *before*
+            // this path, so frame[5] is present in practice; unwrap_or(0) is defensive.
             let type_byte = frame.get(5).copied().unwrap_or(0);
             let body = protocol_error_to_wire_body(&e)?;
             encode_message_raw(type_byte, &body)

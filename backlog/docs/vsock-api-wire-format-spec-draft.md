@@ -732,9 +732,11 @@ a global remote monotonic ledger is specified (AC#12). All writes sealed before 
 
 ### 10.8 Identity proof + read policy (AC#15, AC#16)
 
-- **Layout (AC#15):** `0x19 ‖ "2d-hsm/agent-identity-proof/v1" ‖ chain_id(8B BE) ‖
-  len(env_id)(1B) ‖ env_id ‖ key_ref(32B) ‖ pubkey(65B) ‖ address(20B) ‖
-  verifier_nonce(32B)`, hashed with keccak256. The **verifier** owns nonce freshness.
+- **Layout (AC#15):** `0x19 ‖ len(label)(1B) ‖ label ("2d-hsm/agent-identity-proof/v1") ‖
+  chain_id(8B BE) ‖ len(env_id)(1B) ‖ env_id ‖ key_ref(32B) ‖ pubkey(65B) ‖
+  address(20B) ‖ verifier_nonce(32B)`, hashed with keccak256. Every variable-length field
+  (label, env_id) is 1-byte length-prefixed so no future label/env-id change shifts the
+  parse of later fixed-width fields. The **verifier** owns nonce freshness.
   Pinned by `testvectors/agent-gateway/identity_proof_v1.*`.
 - **3-way domain separation (AC#15)** — disjoint by construction:
 
