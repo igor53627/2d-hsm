@@ -18,7 +18,7 @@ scheme, error band), `agent-gateway-keystore-backup-format.md` (sealed authoriti
 |-------|----------|
 | Doc landing | A focused companion doc (this file), parallel to the other `agent-gateway-*.md`; design doc stays enclave-centric. |
 | Capability carrier | Operator ceremony **pre-signs** Ed25519 capabilities (admin/recovery authority, offline) → stored in tiered Vault paths **indexed by `request_id`** → host fetches and forwards at envelope key 5. Host sees cap fields but cannot forge/mutate them (TEE re-verifies the signature). |
-| `command_class` folding (AC#18) | **Coarse** default (`generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`). Recovery operations — `RESTORE_BACKUP` **and** `reset_lifetime_breaker` — **share the single strict recovery counter** (per vsock §10.6), not separate lanes. Finer per-sub-op lanes are an operator-tunable if `configure_treasury` self-wedges. |
+| `command_class` folding (AC#18) | **Coarse** default — **five** folded classes `generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`, `restore_backup` (vsock §10.6), each its own `scope_target` lane so a stalled cap in one can't wedge another. Recovery has **two distinct** properties: `restore_backup` is its own folded `command_class` lane, **and** recovery ops (`RESTORE_BACKUP` + `reset_lifetime_breaker`) are sequenced by the **independent strict recovery counter** (never rolls back). Finer per-sub-op lanes are an operator-tunable if `configure_treasury` self-wedges. |
 | Expiry / revocation | **Host-side only** (Vault short-TTL tokens / drop the pre-signed cap on revoke) **plus counter-burn** for hard revocation. The **TEE does not enforce expiry** (no clock) — residual, see §5. |
 | Transfer dest/amount limits | **Host/OPA only** (`data.config` allowlist) — there is **no** TEE per-agent transfer destination/amount cap yet. Residual, see §5. |
 
@@ -39,9 +39,9 @@ signing.
 |---|-------------------|----------|--------------------|---------|-------|
 | **1 runtime signing** | `SIGN_TRANSFER`(4), `agent_transfer_k1` | **none** (no cap) | none — bounded by sealed key-purpose + canonical EIP-155 + sealed chain_id | transfer key |
 | **2 faucet-treasury signing** | `SIGN_FAUCET_DISPENSE`(5), `agent_faucet_treasury_k1` | **none** (no cap) | none — bounded by sealed key-purpose + per-dispense/cumulative/lifetime caps + seal-before-emit | `to` ∈ active transfer-key set |
-| **3 provisioning/refill** | `GENERATE_KEYS`(1: transfer count≥1 \| faucet count=1 singleton), `CONFIGURE_TREASURY`(6: set_limits/refill_budget/raise_breaker) | `admin_authority_pk` | contiguous per `(authority,env,scope_class,scope_target)`; `command_class`∈{generate_transfer, generate_faucet, configure_treasury} | transfer=**fleet**; treasury+config=**enclave** |
+| **3 provisioning/refill** | `GENERATE_KEYS`(1: transfer count≥1 \| faucet count=1 singleton), `CONFIGURE_TREASURY`(6: set_limits/refill_budget/raise_lifetime_breaker) | `admin_authority_pk` | contiguous per `(authority,env,scope_class,scope_target)`; `command_class`∈{generate_transfer, generate_faucet, configure_treasury} | transfer=**fleet**; treasury+config=**enclave** |
 | **4 backup export** | `EXPORT_BACKUP`(7) | `admin_authority_pk` (export role) | contiguous; `command_class=export_backup` | enclave |
-| **5 restore/recovery** | `RESTORE_BACKUP`(8), `CONFIGURE_TREASURY` reset_lifetime_breaker | `recovery_authority_pk` (`is_recovery=true`) | **single strict recovery counter** — shared by restore + reset_breaker (per vsock §10.6), never rolls back | enclave, fresh-TEE |
+| **5 restore/recovery** | `RESTORE_BACKUP`(8), `CONFIGURE_TREASURY` reset_lifetime_breaker | `recovery_authority_pk` (`is_recovery=true`) | **single strict recovery counter** — shared by restore + reset_lifetime_breaker (per vsock §10.6), never rolls back | enclave, fresh-TEE |
 
 **Distinctness + ordering (AC#1/#2):** runtime signing < faucet-treasury signing (distinct
 key purpose + spend caps), both < provisioning/refill < backup export < restore/recovery
@@ -106,8 +106,10 @@ A tampered Vault response is rejected at the TEE (`0x43`).
    `{opa_reason}`, **no Vault call**.
 3. **Vault capability lookup** (privileged opcodes **{1,6,7,8}** only — runtime signing {4,5} **and** read-only identity {2,3} **skip** this entirely):
    GET the **tier path** (provision/export/recovery), fetch the operator-pre-signed Ed25519
-   capability indexed by `request_id`, scoped to `(chain_id, env_id, scope_class, scope_target,
-   command_class, counter)`. Apply credential-response redaction (deny-substrings, token-prefix,
+   capability indexed by `request_id`, for the counter tuple `(authority,
+   environment_identifier, scope_class, scope_target)` — with `command_class` **folded into**
+   `scope_target` — at the next `counter`; `chain_id` is a separate sealed-equality check carried
+   in the cap, not part of the counter tuple. Apply credential-response redaction (deny-substrings, token-prefix,
    length cap) as in `Chain.Bridge.Signer.Credentials`. Missing/expired ⇒ fail-closed
    `{vault_error_code}` (no oracle). Host attaches the cap at envelope key 5 (cannot forge/alter).
 4. **`2d-hsm` invocation:** open vsock to `AGENT_SIGNER_2D_HSM_ENDPOINT`; build outer frame
@@ -122,7 +124,7 @@ A tampered Vault response is rejected at the TEE (`0x43`).
 ## §4 Host-vs-TEE check matrix — AC#4 + AC#2 no-escalation
 
 **Global host-only gates (advisory, not security-load-bearing):** command-domain string,
-request_id/opcode/env_id format, payload schema, OPA default-deny, Vault path/role tier,
+request_id/opcode/environment_identifier format, payload schema, OPA default-deny, Vault path/role tier,
 host transfer dest/amount allowlist (§5 residual).
 
 **TEE Frame gates (non-bypassable, ALL opcodes, before dispatch):** (1) **role/profile gate** —
@@ -139,7 +141,7 @@ recovery by `is_recovery`). (6) `cap.command_opcode==request.opcode` &&
 `cap.treasury_sub_op==request.sub_op` && `cap.request_id==envelope.request_id`. (7)
 `scope_class`/`scope_target` match the cap and the sealed scope. (8) **contiguous counter** for
 the tuple (incoming==highest+1; reject lower=replay, gap=skip-ahead; the recovery counter is
-separate + strict, **shared** by restore + reset_breaker). (9) `payload_binding == keccak256(
+separate + strict, **shared** by restore + reset_lifetime_breaker). (9) `payload_binding == keccak256(
 opcode || sub_op || request_id || canonical params)`.
 
 **Then (any mutating opcode):** mutate + **seal-before-return**. Errors collapse anti-oracle
@@ -158,8 +160,8 @@ faucet caps, domain separation), per-command below.
 - **GENERATE_KEYS (1, provisioning/refill):** host = provision Vault cap + OPA. TEE = capability
   gates; tier from key_purpose; treasury singleton; enclave (faucet) vs fleet (transfer) scope;
   in-enclave `key_ref`; atomic seal.
-- **CONFIGURE_TREASURY (6, provisioning [set_limits/refill/raise] or recovery [reset_breaker]):**
-  host = admin (recovery for reset_breaker) cap + OPA. TEE = sub_op ∈ {0..3}; reset_breaker needs
+- **CONFIGURE_TREASURY (6, provisioning [set_limits/refill/raise] or recovery [reset_lifetime_breaker]):**
+  host = admin (recovery for reset_lifetime_breaker) cap + OPA. TEE = sub_op ∈ {0..3}; reset_lifetime_breaker needs
   recovery authority + the shared strict recovery counter; config-version bump.
 - **EXPORT_BACKUP (7, backup export):** host = export Vault cap + OPA. TEE = admin authority;
   export counter; opaque `pq-agent-backup-v1` only (cannot decrypt).
@@ -179,14 +181,20 @@ only; disjoint preimage first-bytes); cannot cross key purpose (`0x42`); cannot 
 
 - **Capability expiry/revocation is host-side only.** The TEE has no clock and no revocation
   list — it enforces only counter contiguity + signature. Soft expiry = Vault short-TTL token /
-  drop the pre-signed cap. **Hard-revocation ceremony (counter-burn):** to invalidate an
-  outstanding, not-yet-used cap at counter `N` (== `highest+1`), the operator issues and submits
-  a **benign command at counter `N`** (e.g. a no-op `set_limits` to the same values), advancing
-  `highest` to `N`; the stale cap is then rejected as replay (`counter==highest` → `0x43`). If
-  the stale cap is for a higher gap counter it is already rejected as skip-ahead. There is **no**
-  TEE-side revocation list; a host that bypasses Vault and replays a still-valid next-counter cap
-  before the burn lands is the residual. A TEE-side expiry/epoch field is a possible TASK-7.1
-  §10.5 follow-up.
+  drop the pre-signed cap. **Counter-burn is per-`command_class` lane and only works where a
+  harmless no-op exists.** Because the contiguous counter is per `(authority,
+  environment_identifier, scope_class, scope_target)` with `command_class` folded into
+  `scope_target`, each `command_class` is a **separate** lane — burning one lane does not touch
+  the others. A `configure_treasury` cap can be burned by submitting a no-op `set_limits` at
+  counter `N` (advancing that lane's `highest`, so the stale cap is rejected as replay → `0x43`).
+  But the high-value lanes (`generate_transfer`, `generate_faucet`, `export_backup`,
+  restore/recovery) have **no harmless command at counter `N`** — a keygen "burn" actually mints
+  keys, an export "burn" actually exports. So for those lanes **counter-burn is NOT available**;
+  hard-revocation of an unused leaked cap there is **host-side only** (drop it from Vault), and the
+  cap stays TEE-acceptable until it is consumed or its `counter` is otherwise advanced. There is
+  no TEE-side revocation list. A dedicated TEE revoke / counter-advance opcode (or an expiry/epoch
+  field) that invalidates an unused cap **without** performing its action would be a **TASK-7.1
+  §10.5 follow-up**; until then this is a documented residual.
 - **No TEE per-agent transfer destination/amount cap.** `SIGN_TRANSFER` (runtime signing) is
   bounded only by key-purpose + canonical EIP-155 + sealed chain_id; destination/amount limits
   live in OPA `data.config` (host advisory). This is the documented host-residual (design
@@ -221,7 +229,7 @@ the load-bearing assertion (host stage also denies, but defense-in-depth):
   set_limits cap used for refill_budget → `0x43` (sub_op mismatch).
 - Recovery-only: reset_lifetime_breaker with admin authority, or against the operational counter → `0x43`.
 - Counter: replay (==highest), rollback (<highest), skip-ahead (>highest+1) → `0x43`.
-- Scope/env: wrong scope_target/scope_class, or env_id ≠ sealed (testnet→mainnet) → `0x43`/AAD mismatch.
+- Scope/env: wrong scope_target/scope_class, or environment_identifier ≠ sealed (testnet→mainnet) → `0x43`/AAD mismatch.
 - Payload-binding mismatch with otherwise-valid sig/counter → `0x43`.
 - Role/profile cross-rejection (`0x41`); treasury singleton; faucet seal-before-emit (`0x46`); faucet-not-configured (`0x45`).
 - Host stage: OPA default-deny before any Vault call; missing/expired Vault cap fail-closed; bridge token on an agent Vault path denied at the Vault ACL.
