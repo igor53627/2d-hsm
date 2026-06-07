@@ -15,7 +15,7 @@ Refs: `vsock-api-wire-format-spec-draft.md` §10; `agent-gateway-secp256k1-signe
 
 | Topic | Decision |
 |-------|----------|
-| Gas-fee field | Cap against the **legacy `gas_price`** field — the pinned `ordinary_tx_v1` is EIP-155 (`gas_price=1e9`), no EIP-1559. The cap field is named encoding-agnostically (`effective_max_fee_rate`); AC#8's "if EIP-1559… use `maxFeePerGas`" is a forward-conditional that does not apply until a 1559 surface is pinned. |
+| Gas-fee field | Cap against the **legacy `gas_price`** field — the pinned `ordinary_tx_v1` is EIP-155 (`gas_price=1e9`), no EIP-1559. The sealed **cap** is `max_effective_gas_fee_rate` and the per-tx **operand** is `effective_max_fee_rate` (= the legacy `gas_price`); both names are encoding-agnostic. AC#8's "if EIP-1559… use `maxFeePerGas`" is a forward-conditional that does not apply until a 1559 surface is pinned. |
 | Rotation (AC#15) | Specify only the **carry-over semantics** (a rotated treasury key keeps debiting the carried-over counters; never zero-reset on replacement); rotation itself stays **fail-closed** absent a reviewed protocol. TASK-7.3 owns duplicate-treasury rejection; 7.2/7.4 own counter carry-over. |
 | Reconciliation (AC#11) | **None** in MVP — the cap is a worst-case *signing* budget, not a settlement oracle; failed/duplicate-nonce/unbroadcast signatures permanently consume budget. Documented residual; a credit-back protocol is deferred. |
 | Anti-rollback (AC#14) | 7.4 owns durability (seal-before-emit); 7.7 owns the rollback **mechanism**. State the assumed freshness round-trip toward 7.7; gate production fund custody on 7.7 (or an explicit funding block). |
@@ -45,8 +45,11 @@ and hashes with keccak256; it **never accepts a caller-provided digest**.
 > signing hash `0xd1690760dc3ced0dba0c77c4764f509a990886caa3bde11b9e97ed718a192d56`.
 
 **Signature (keyed to the 2D verifier — AC#4):** secp256k1 over the keccak256 hash;
-**low-S** enforced (`s ≤ n/2`, `secp256k1n_half = 0x7FFF…20A0`; `s > n/2` is malleable and
-rejected, EIP-2); `recovery_id ∈ {0,1}`; `v = chain_id*2 + 35 + recovery_id ∈ {23165, 23166}`
+**low-S** enforced (`s ≤ n/2`, `secp256k1n_half = 0x7FFF…20A0`, EIP-2): the enclave
+**normalizes** its own signature to low-S — if `s > n/2`, set `s = n − s` and **flip
+`recovery_id`** — so an emitted signature is always low-S and the post-sign recovery
+invariant still recovers `from` (a self-generated high-S signature is normalized, not
+rejected); `recovery_id ∈ {0,1}`; `v = chain_id*2 + 35 + recovery_id ∈ {23165, 23166}`
 (the 2D `signed_rlp` guard raises on any other `v` — fail closed). Wire form
 `RLP([nonce, gas_price, gas, to, value, data, v, r, s])` with `r`/`s` minimally re-encoded.
 
@@ -70,20 +73,47 @@ Differs by recipient allowlist + spend caps + sealed counter debit.
   signing-budget** counter, and an **optional quorum-resettable lifetime circuit breaker**.
   Faucet signing **fails closed** until mandatory per-dispense caps + a cumulative budget are
   sealed.
-- **Checked worst-case arithmetic (AC#8):** the debit is the worst-case native cost
-  `worst_case = amount + gas_limit * effective_max_fee_rate` (not just `amount`), computed
-  with **checked** `mul`/`add`; overflow **fails closed**. `effective_max_fee_rate` is the
-  legacy `gas_price` for the pinned encoding.
-- **Per-dispense gate + dual-counter debit:** accept iff `worst_case ≤` per-dispense caps
-  **and** `cumulative_spend + worst_case ≤ budget` **and** `lifetime_spend + worst_case ≤
-  breaker`; then debit **both** counters. Both are keyed independently of the treasury
-  `key_ref`, so they survive rotation (never zero-reset on key replacement — AC#15).
-- **Signing-budget semantics (AC#11):** spend is counted at **signature emission** — a
-  worst-case signing budget, not a settlement oracle. Failed, replacement, duplicate-nonce,
-  and unbroadcast signatures **still consume** budget unless a later reviewed reconciliation
-  protocol exists. Nonce sequencing is a host-side 2D responsibility, not a TEE invariant.
+- **Checked worst-case arithmetic + integer domain (AC#8):** EVM-value fields (`amount`,
+  `value`, `gas_price`/`effective_max_fee_rate`) and the cumulative-spend / budget / breaker
+  counters are **`u256`**; `nonce` / `gas_limit` follow the 2D verifier's accepted domain. The
+  debit is the worst-case native cost `worst_case = amount + gas_limit *
+  effective_max_fee_rate` (not just `amount`), computed with **checked** `u256` `mul`/`add`;
+  overflow **or any out-of-range field fails closed**. `effective_max_fee_rate` is the legacy
+  `gas_price` for the pinned encoding.
+- **Per-dispense gate + counter debit (exact rule):** accept **iff all** of the following
+  hold, else fail closed (per-field caps are enforced **individually**, not only the aggregate):
+  - `amount ≤ max_amount`
+  - `gas_limit ≤ max_gas_limit`
+  - `effective_max_fee_rate ≤ max_effective_gas_fee_rate`
+  - `worst_case = checked(amount + checked(gas_limit * effective_max_fee_rate))` (no overflow)
+  - `cumulative_spend + worst_case ≤ cumulative_budget`
+  - **if** a lifetime breaker is configured: `lifetime_spend + worst_case ≤ breaker`
+
+  On accept, debit `cumulative_spend += worst_case`, and **only if a breaker is configured**
+  `lifetime_spend += worst_case`. If no breaker is configured the lifetime check and debit are
+  **skipped** — the breaker is optional and its absence is **not** a failure. Both counters
+  are keyed independently of the treasury `key_ref`, so they survive rotation (never
+  zero-reset on key replacement — AC#15).
+- **Signing-budget semantics (AC#11):** the debit is committed **at signature emission** — a
+  worst-case signing budget, not a settlement oracle. A request **rejected before emission**
+  (cap/overflow/validation/seal failure) consumes **no** budget; once a signature is emitted
+  it permanently consumes budget even if it later fails on-chain, is a duplicate-nonce /
+  replacement, or is never broadcast — unless a later reviewed reconciliation protocol exists. Nonce sequencing is a host-side 2D responsibility, not a TEE invariant.
   Normal config bumps do not reset spend; increases require the explicit treasury-refill
   capability (`CONFIGURE_TREASURY refill_budget`).
+
+## §2.1 Cap mutation — refill / breaker raise / reset (AC#10)
+
+Budget and breaker changes are **not** part of a dispense; they go through
+`AGENT_K1_CONFIGURE_TREASURY` (vsock §10.7) with a TEE-verified, **replay-protected** admin
+(or recovery/quorum) capability bound to the `(authority, environment_identifier, scope_class,
+scope_target)` contiguous monotonic counter (§10.6) — a captured `refill_budget` / breaker
+command cannot be replayed. **Host-controlled time never resets any limit.** `refill_budget`
+raises the cumulative budget; `raise_lifetime_breaker` raises the breaker threshold and does
+**not** lower recorded spend. Any **spend-value reset** (`reset_lifetime_breaker`) is a
+**recovery-tier** operation bound to a **strict recovery counter + explicit target value**
+(§10.6), audited, and never replayable to roll a counter backward. Normal config bumps do not
+reset cumulative spend.
 
 ## §3 Seal-before-emit, serialized commit, throughput & 7.4↔7.7 boundary (AC#9, AC#14, AC#7)
 
@@ -151,7 +181,9 @@ Consumed by TASK-7.6 (the live signed artifacts are produced with the implementa
 - **Transfer signature:** produced `(r,s,recovery_id)` matches the frozen `r/s`, `low_s=true`,
   `v=23166`; `signed_rlp` matches; recovery yields `from=0xf39f…2266` (2D-verifier-accepted).
 - **Deterministic + low-S (AC#12):** RFC 6979 — signing the pinned hash twice is byte-identical;
-  raw RNG-only `k` is rejected; high-S is rejected/normalized, only `s ≤ n/2` emitted.
+  raw RNG-only `k` is rejected; a high-S result is **normalized** (`s = n − s`, flip
+  `recovery_id`), only `s ≤ n/2` emitted, and the normalized `(r,s,recovery_id,v)` still
+  recovers `from`.
 - **Rejections:** wrong `chain_id`; `from` ≠ derived(key_ref); non-empty `data`; caller digest /
   identity-proof-shaped input; key-purpose cross-use (transfer↔faucet, producer purposes);
   role/profile mismatch (before state touch).
