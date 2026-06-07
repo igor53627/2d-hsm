@@ -43,6 +43,7 @@ pub fn root_commitment(root: &[u8; 32]) -> [u8; 32] {
 
 /// One host's sealed-blob entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     /// Human-readable label (hostname / chip_id). **Advisory only** — operator/diagnostics; it is
     /// NEVER used to select a blob (that would let the untrusted host steer selection).
@@ -55,6 +56,7 @@ pub struct Entry {
 
 /// The manifest: one entry per provisioned host, all sealing the same producer key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
     /// Hex of the launch measurement the blobs were sealed against. **Advisory** — the unseal step
@@ -83,15 +85,14 @@ impl Manifest {
     /// (host not provisioned) or — defensively — if more than one does.
     pub fn select(&self, root: &[u8; 32]) -> Result<&Entry, ManifestError> {
         let want = hex::encode(root_commitment(root));
-        let matches: Vec<&Entry> = self
+        let mut matches = self
             .entries
             .iter()
-            .filter(|e| e.root_commitment.eq_ignore_ascii_case(&want))
-            .collect();
-        match matches.len() {
-            0 => Err(ManifestError::NoMatch),
-            1 => Ok(matches[0]),
-            n => Err(ManifestError::Ambiguous(n)),
+            .filter(|e| e.root_commitment.eq_ignore_ascii_case(&want));
+        let first = matches.next().ok_or(ManifestError::NoMatch)?;
+        match matches.count() {
+            0 => Ok(first),
+            extra => Err(ManifestError::Ambiguous(extra + 1)),
         }
     }
 }

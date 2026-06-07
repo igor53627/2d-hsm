@@ -217,13 +217,14 @@ bound to the measurement — no shared secret to distribute or rotate across hos
 
 **Ceremony (trusted workstation):**
 
-1. **Collect each host's root commitment + root.** Run inside each target host's image (the §7.1 path):
+1. **Capture each host's root** as the **raw 32-byte** file `manifest build` consumes. Run inside each
+   target host's image (the §7.1 path):
    ```
    # on/within host i:
-   snp-derive-root --print          # prints root_i hex (secret — handle offline)
+   snp-derive-root --out hostI.root   # raw 32 bytes, mode 0600 (secret — handle offline)
    ```
-   Save each `root_i` to a 32-byte file (`hostI.root`). (A future slice can collect only commitments and
-   seal against those; today the ceremony needs the roots.)
+   Use `--out` (raw bytes), **not** `--print` (which emits 64-char hex for human inspection). (A future
+   slice can collect only commitments and seal against those; today the ceremony needs the roots.)
 2. **Seal the producer key once per host + build the manifest:**
    ```
    pq-seal-v1 manifest build \

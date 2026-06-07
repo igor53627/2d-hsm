@@ -58,7 +58,7 @@ enum Command {
     MeasDigest(MeasDigestArgs),
     /// Write fresh ML-DSA-65 keypair files (provisioning ceremony helper).
     GenerateKeypair(GenerateKeypairArgs),
-    /// Multi-host manifest operations: seal the producer key once per host root (see runbook §8).
+    /// Multi-host manifest operations: seal the producer key once per host root (see runbook §7.2).
     #[command(subcommand)]
     Manifest(ManifestCmd),
 }
@@ -217,6 +217,22 @@ fn read_validated_keypair(
     Ok((sk, pk))
 }
 
+/// Seal the keypair under one root + check the blob length (shared by `seal` and `manifest build`).
+fn seal_blob(
+    sk: &[u8],
+    pk: &[u8],
+    measurement: &[u8],
+    root: &[u8; 32],
+) -> Result<Vec<u8>, CliError> {
+    let blob = seal_mldsa65_keypair_v1_with_root(sk, pk, measurement, root)?;
+    if blob.len() != pq_seal_v1_expected_blob_len() {
+        return Err(CliError::Msg(
+            "internal error: unexpected sealed blob length".into(),
+        ));
+    }
+    Ok(blob)
+}
+
 /// A host label becomes a `blobs/<label>.sealed` filename — keep it a safe, single path component.
 fn validate_label(label: &str) -> Result<(), CliError> {
     let ok = !label.is_empty()
@@ -237,12 +253,7 @@ fn cmd_seal(args: SealArgs) -> Result<(), CliError> {
     let measurement = read_measurement(&args.measurement_file, &args.measurement_hex)?;
     let root = read_root_32(&args.provisioning_root_file)?;
     let (sk, pk) = read_validated_keypair(&args.secret_key_file, &args.public_key_file)?;
-    let blob = seal_mldsa65_keypair_v1_with_root(sk.as_ref(), pk.as_ref(), &measurement, &root)?;
-    if blob.len() != pq_seal_v1_expected_blob_len() {
-        return Err(CliError::Msg(
-            "internal error: unexpected sealed blob length".into(),
-        ));
-    }
+    let blob = seal_blob(sk.as_ref(), pk.as_ref(), &measurement, &root)?;
     write_secret_file(&args.output, &blob)?;
     eprintln!("wrote {} bytes to {}", blob.len(), args.output.display());
     eprintln!(
@@ -284,41 +295,48 @@ fn cmd_manifest_build(args: ManifestBuildArgs) -> Result<(), CliError> {
     let measurement = read_measurement(&args.measurement_file, &args.measurement_hex)?;
     let (sk, pk) = read_validated_keypair(&args.secret_key_file, &args.public_key_file)?;
 
-    // Parse + validate every host up front, so we fail before writing any output.
-    let mut parsed: Vec<(String, PathBuf)> = Vec::with_capacity(args.hosts.len());
+    // Seal every host's blob IN MEMORY first, so a bad input (missing root file, duplicate label)
+    // fails before any output is written — never leave a partial out_dir that blocks a retry.
+    // `built` holds (label, sealed blob, root commitment); the secret root is dropped after sealing.
+    let mut built: Vec<(String, Vec<u8>, [u8; 32])> = Vec::with_capacity(args.hosts.len());
     let mut seen = std::collections::BTreeSet::new();
     for h in &args.hosts {
         let (label, path) = h
             .split_once('=')
             .ok_or_else(|| CliError::Msg(format!("--host '{h}' must be LABEL=ROOTFILE")))?;
         validate_label(label)?;
-        if !seen.insert(label.to_string()) {
-            return Err(CliError::Msg(format!("duplicate host label '{label}'")));
+        // Case-insensitive: the label is a blob filename, and the ceremony may run on a
+        // case-insensitive filesystem (e.g. macOS) where `Aya` and `aya` are the same file.
+        if !seen.insert(label.to_ascii_lowercase()) {
+            return Err(CliError::Msg(format!(
+                "duplicate host label '{label}' (case-insensitive)"
+            )));
         }
-        parsed.push((label.to_string(), PathBuf::from(path)));
+        let root = read_root_32(&PathBuf::from(path))?;
+        let blob = seal_blob(sk.as_ref(), pk.as_ref(), &measurement, &root)?;
+        built.push((
+            label.to_string(),
+            blob,
+            pq_seal_manifest::root_commitment(&root),
+        ));
     }
 
-    // Create the output tree fresh — never clobber a prior ceremony's blobs.
+    // Inputs all sealed — create the output tree fresh (never clobber a prior ceremony) and write.
+    if let Some(parent) = args.out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
     let blobs_dir = args.out_dir.join("blobs");
     fs::create_dir(&args.out_dir)
         .map_err(|e| CliError::Msg(format!("create --out-dir {}: {e}", args.out_dir.display())))?;
     fs::create_dir(&blobs_dir)?;
 
-    let mut entries = Vec::with_capacity(parsed.len());
-    for (label, root_path) in &parsed {
-        let root = read_root_32(root_path)?;
-        let blob =
-            seal_mldsa65_keypair_v1_with_root(sk.as_ref(), pk.as_ref(), &measurement, &root)?;
-        if blob.len() != pq_seal_v1_expected_blob_len() {
-            return Err(CliError::Msg(
-                "internal error: unexpected sealed blob length".into(),
-            ));
-        }
+    let mut entries = Vec::with_capacity(built.len());
+    for (label, blob, commitment) in &built {
         let rel = format!("blobs/{label}.sealed");
-        write_secret_file(&args.out_dir.join(&rel), &blob)?;
+        write_secret_file(&args.out_dir.join(&rel), blob)?;
         entries.push(pq_seal_manifest::Entry {
             label: label.clone(),
-            root_commitment: hex::encode(pq_seal_manifest::root_commitment(&root)),
+            root_commitment: hex::encode(commitment),
             blob: rel,
         });
     }
@@ -436,5 +454,40 @@ mod manifest_build_tests {
             base.join("o2")
         ))
         .is_err());
+        // Case-insensitive duplicate rejected (labels are filenames; macOS volumes fold case).
+        assert!(cmd_manifest_build(mk(
+            vec![
+                format!("Aya={}", root.display()),
+                format!("aya={}", root.display())
+            ],
+            base.join("o3")
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn partial_failure_writes_no_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let signer = MlDsa65Signer::generate_keypair();
+        let (sk, pk, good) = (base.join("sk"), base.join("pk"), base.join("good.root"));
+        write(&sk, signer.secret_key_bytes());
+        write(&pk, signer.public_key_bytes());
+        write(&good, &[5u8; 32]);
+        let out = base.join("partial");
+        // The second host's root file does not exist → the whole build fails and writes nothing.
+        let r = cmd_manifest_build(ManifestBuildArgs {
+            measurement_file: None,
+            measurement_hex: Some("cc".repeat(48)),
+            secret_key_file: sk,
+            public_key_file: pk,
+            hosts: vec![
+                format!("ok={}", good.display()),
+                format!("missing={}", base.join("nope.root").display()),
+            ],
+            out_dir: out.clone(),
+        });
+        assert!(r.is_err());
+        assert!(!out.exists(), "no partial output directory on failure");
     }
 }
