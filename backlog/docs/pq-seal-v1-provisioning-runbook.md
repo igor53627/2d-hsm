@@ -266,5 +266,5 @@ Re-seal the whole manifest on an **image change** (measurement-bound) or to **ad
 |------|--------|
 | 2026-06-02 | Initial staging runbook (platform root + `pq-seal-v1` CLI) |
 | 2026-06-02 | §5 poisoned-mutex troubleshooting; paths relative to `pq-seal-v1` cwd |
-| 2026-06-07 | §7.2 multi-host sealing — per-host ceremony (`pq-seal-v1 manifest build`, TASK-1.1) |
 | 2026-06-06 | §7 production root via `snp-derive-root` (SEV-SNP firmware); ceremony + selftest (TASK-1.1) |
+| 2026-06-07 | §7.2 multi-host sealing — per-host ceremony (`pq-seal-v1 manifest build`, TASK-1.1) |
