@@ -114,7 +114,7 @@ Capability tiers:
 
 For secp256k1 keys, public identity consists of:
 
-- compressed or uncompressed public key, with one canonical encoding chosen in the protocol spec;
+- uncompressed 65-byte SEC1 public key (`0x04 ‖ X ‖ Y`) — the canonical encoding locked by TASK-7.1; compressed (`0x02`/`0x03`) is rejected;
 - derived 20-byte 2D address using the same derivation as current ordinary accounts;
 - key ref;
 - key purpose;

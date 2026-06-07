@@ -1,7 +1,7 @@
 ---
 id: TASK-7
 title: Agent Gateway secp256k1 signing backend and backup keystore
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
 labels:

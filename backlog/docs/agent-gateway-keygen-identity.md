@@ -44,14 +44,20 @@ envelope key 5). One opcode serves both purposes, distinguished by `purpose`:
 
 - **`agent_transfer_k1` (batch):** `count ≥ 1`; each key gets a fresh **random 32-byte
   `key_ref`** from the TEE CSPRNG; fleet scope allowed; **transfer-refill** admin tier.
-- **`agent_faucet_treasury_k1` (singleton):** `count` must be `1`; **enclave-scoped**
-  contiguous counter; **treasury-provisioning** admin tier — strictly **stronger** than
-  transfer-refill (a transfer-refill capability cannot mint a treasury key; the capability
-  binds command + key purpose + scope, §10.5).
+- **`agent_faucet_treasury_k1` (singleton):** `count` must be `1`; its `key_ref` is a
+  **random 32-byte** value too (identical scheme to transfer keys). The **enclave-scoped
+  contiguous counter** here is the signed **admin capability** replay counter (TASK-7.1
+  §10.6), **not** the `key_ref` — the treasury ref is never counter-derived. **Treasury-
+  provisioning** admin tier — strictly **stronger** than transfer-refill (a transfer-refill
+  capability cannot mint a treasury key; the capability binds command + key purpose + scope,
+  §10.5).
 
-**Opacity (AC#1):** `key_ref` is generated inside the enclave and is never accepted from the
-host; the host cannot choose or overwrite a ref. Entry-list append is a privileged sealed
-mutation.
+**Opacity + uniqueness (AC#1):** `key_ref` is generated inside the enclave and is never
+accepted from the host; the host cannot choose or overwrite a ref. Entry-list append is a
+privileged sealed mutation. Each generated `key_ref` is checked for uniqueness against the
+existing sealed refs **and** the in-batch set before commit; on the astronomically-unlikely
+collision (or a degraded RNG) it is regenerated, and the commit fails closed rather than
+aliasing an existing ref.
 
 **Private scalar:** generated inside the enclave from the TEE CSPRNG (`getrandom`; cf.
 `pq_signer.rs:400-403`), never host-influenced; held in `Zeroizing` (7.2 AC#15).
@@ -61,7 +67,11 @@ new `KeyEntry` (`key_ref`, `purpose`, `algorithm=secp256k1`, `public_identity` =
 65-byte SEC1, `creation_metadata`) are sealed in **one** `pq-agent-keystore-v1` commit before
 any ref is returned. Partial/persist failure ⇒ no usable refs + a reconcilable signal (no
 silent orphans). Capacity (`max_batch_size`, `total_capacity`, 7.2 AC#5) is checked **before**
-seal; fail-closed on overflow or persist failure.
+seal; fail-closed on overflow or persist failure. Keygen is **serialized** — a single-writer
+critical section (or a sealed-state generation the commit must compare-and-swap against): the
+treasury-singleton scan, capability-counter advance, capacity check, and entry append all
+validate against the **latest** sealed generation and a stale commit is rejected, so two
+concurrent treasury keygens cannot both observe "no treasury" and both append.
 
 **Treasury singleton (AC#2):** before generating a treasury key, the enclave scans the sealed
 entry list for an active `agent_faucet_treasury_k1`; if present, a second treasury keygen
@@ -84,6 +94,10 @@ purpose, and chain/environment binding. Response:
   backend:      agent_version(=1) + build/protocol version }
 ```
 
+AC#4's "derived 20-byte 2D address" is the `eth_address` body; `tron_address` is an additional
+Base58Check encoding of the **same** 20-byte body (unified-account model), so the dual return
+is a superset of AC#4.
+
 ## Identity proof (`AGENT_K1_PROVE_IDENTITY`) + non-collision (AC#5)
 
 Low-privilege read; EIP-191 `0x19` non-transaction domain. **Layout (pinned by 7.1 AC#15,
@@ -92,6 +106,16 @@ env_id ‖ key_ref(32B) ‖ pubkey(65B) ‖ address(20B) ‖ verifier_nonce(32B)
 `label="2d-hsm/agent-identity-proof/v1"`, keccak256, signed low-S + recovery id. Signs only
 structured fields (no caller-controlled arbitrary bytes); the **verifier** owns nonce
 freshness; the enclave binds the 32-byte verifier nonce so proofs are live and non-replayable.
+
+**Trust model / `key_purpose`.** The proof binds the key by its **signed `address`** (and
+`key_ref`); a verifier (the 2D app) authenticates a key by matching that signed address
+against the operator-configured address — e.g. `AGENT_FAUCET_TREASURY_ADDRESS` (2D
+TASK-132.5.2). `key_purpose` in the `PUBLIC_IDENTITY` response is **non-authoritative**
+convenience metadata returned over the untrusted host path and **must not** drive a trust
+decision: a valid `agent_transfer_k1` proof cannot be passed off as the treasury because its
+signed address differs from the configured treasury address. (A future layout revision could
+additionally bind `key_purpose` into the signed preimage; deferred because address-binding
+already prevents purpose-spoofing.)
 
 **Non-collision argument (what 7.3 adds)** — the identity-proof preimage is disjoint from all
 three 2D transaction surfaces, with the frozen vectors as witnesses
@@ -110,6 +134,13 @@ three 2D transaction surfaces, with the frozen vectors as witnesses
    TASK-132.5)**; the non-collision vector asserts the pinned 2D encoding has not assigned
    `0x19` (`domain_separation.json` `note_eip2718`).
 
+**Production gate (reconciling §10.8's "blocking dependency").** The *design task* is not
+blocked, but `AGENT_K1_PROVE_IDENTITY` and any identity-proof signing **must stay
+non-production-gated / disabled until** the 2D-side `0x19` reservation is pinned by a **merged**
+2D commit/test (PR #144 / TASK-132.5 family); production fund custody is gated by TASK-7.7
+regardless. So §10.8's "blocking dependency" is honoured as a *production* gate, not a gate on
+this design task.
+
 ## secp256k1 implementation contract (design-only; impl in TASK-7.6/7.4)
 
 - **Crate:** RustCrypto **k256** (+ `ecdsa` with `recovery`) — consistent with the existing
@@ -120,6 +151,20 @@ three 2D transaction surfaces, with the frozen vectors as witnesses
   TASK-7.6, and `SIGN_TRANSFER`/`SIGN_FAUCET_DISPENSE` in TASK-7.4.
 - **Zeroization:** scalars in `Zeroizing`; transient per-signature `k` wiped; residual:
   process-abort skips `Drop` (same residual TASK-6 records for ML-DSA).
+
+## Error-code exposure (anti-oracle) — references TASK-7.1 §10.9 band `0x40–0x46`
+
+Fail-closed conditions map to the TASK-7.1 agent error band, collapsing distinctions that
+would create an oracle:
+- malformed request / bad field / unknown sub-op → `0x40 AGENT_MALFORMED`.
+- wrong role/profile → `0x41 AGENT_WRONG_PROFILE`.
+- key-purpose mismatch **and** key-not-found → **collapsed** to `0x42 AGENT_KEY_PURPOSE_MISMATCH` (never reveal which).
+- any capability failure — missing / invalid / wrong-tier / **duplicate-treasury rejected** — → **collapsed** to `0x43 AGENT_CAPABILITY_REJECTED`; in particular "treasury already exists" is **not** distinguishable from "no/insufficient capability".
+- capacity overflow → `0x44 AGENT_CAP_EXCEEDED` (safe to expose — a resource limit, not an identity/capability oracle).
+- seal failure → `0x46 AGENT_SEAL_FAILED`.
+
+Never expose key existence, which key-purpose was expected, whether a treasury key already
+exists, or capability internals.
 
 ## Golden-vector + test requirements (AC#6, AC#7)
 
