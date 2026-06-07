@@ -110,6 +110,8 @@ Capability tiers:
 
 ## Public identity
 
+> **Keygen + identity spec:** secp256k1 key generation (opaque random `key_ref`, batch vs singleton treasury, atomic seal), the `AGENT_K1_PUBLIC_IDENTITY` dual eth/TRON response, and the `AGENT_K1_PROVE_IDENTITY` non-collision argument are specified in `agent-gateway-keygen-identity.md` (TASK-7.3). This section is the high-level model.
+
 For secp256k1 keys, public identity consists of:
 
 - compressed or uncompressed public key, with one canonical encoding chosen in the protocol spec;
