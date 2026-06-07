@@ -37,17 +37,23 @@ Instead of waiting for vendor support or forking a heavy general-purpose HSM, th
 
 ## Current Status
 
-See `backlog/tasks/` for the full board.
+See `backlog/tasks/` for the full board (`backlog board`).
 
 | Task | Status | Summary |
 |------|--------|---------|
-| **TASK-2** | In progress | Vsock API + wire protocol (`impl/rust/enclave-protocol/`); **next:** Elixir shim + real vsock I/O |
+| **TASK-1** | In progress | Umbrella: minimal PQ signing service inside a TEE |
+| **TASK-1.1** | In progress | Platform-derived PQ-seal + attestation-trust root (SEV-SNP `SNP_GET_DERIVED_KEY` / vTPM / Nitro) — mainnet keystone that replaces the lab fixtures |
+| **TASK-1.2** | Done | SEV-SNP attestation verification: VCEK→ASK→ARK chain + image/chip binding (Turin product root) |
+| **TASK-2** | Done | vsock API + wire protocol (`impl/rust/enclave-protocol/`): AuthorizationTickets + hard-fork flows |
 | **TASK-3** | Done | Cryptographic `RecentChainProof` verification (Producer Chain Attestation v1) |
-| **TASK-1** | In progress | ML-DSA-65 + seal v1 staging **merged** (`60eeefc`); platform root in real TEE + prod CI gate next |
+| **TASK-4** | Done | NixOS reproducible TEE image as the primary 2d-hsm delivery path |
+| **TASK-5** | Done | Production enclave platform seal (SNP) + mainnet trust-provisioning gate |
+| **TASK-6** | Done | ML-DSA secret-key zeroization in `pq_signer` validation |
+| **TASK-7** | To Do (design merged) | Agent Gateway secp256k1 signing backend + encrypted backup keystore — see `backlog/docs/agent-gateway-secp256k1-signer-design.md` |
 
-**Reference implementation today:** ML-DSA-65 AuthorizationTicket signatures (when sealed signer installed), length-prefixed CBOR framing, canonical ticket hashing, enclave arming / hard-fork gating, Producer Chain Attestation v1. Details: `impl/README.md`, `backlog/docs/vsock-api-wire-format-spec-draft.md`.
+**Reference implementation today:** ML-DSA-65 AuthorizationTicket signatures (sealed signer), length-prefixed CBOR vsock wire protocol with enclave arming / hard-fork gating, canonical ticket hashing, Producer Chain Attestation v1, relying-party SEV-SNP attestation (VCEK→ASK→ARK + image/chip binding), sealed-boot against the SNP-derived provisioning root, and a NixOS reproducible enclave image. Details: `impl/README.md`, `backlog/docs/vsock-api-wire-format-spec-draft.md`.
 
-**Next major increment:** **TASK-2** Elixir host shim + real vsock transport. **TASK-1 follow-ups:** platform `set_pq_seal_v1_provisioning_root`, no `reference-seal-v1-root` in prod builds. Staging PQ: `backlog/docs/pq-seal-v1-provisioning-runbook.md`.
+**In flight / next:** **TASK-1.1** platform-derived PQ-seal + trust root validated in a real TEE — the last gate before mainnet, since `productionMode` refuses lab fixtures — then **TASK-1.3** integration with the 2d signing path (Chain.Bridge.Signer / OPA / Vault). The **Agent Gateway secp256k1** backend (ordinary 2D faucet/transfer signing, run as a role separate from PQ block-producer signing) is now designed across **TASK-7.1–7.7** and queued for implementation. Staging PQ provisioning: `backlog/docs/pq-seal-v1-provisioning-runbook.md`.
 
 ## Development
 
