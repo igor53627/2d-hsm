@@ -1,7 +1,7 @@
 ---
 id: TASK-7.2
 title: Agent Gateway persistent keystore and encrypted backup DR design
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
 labels:
