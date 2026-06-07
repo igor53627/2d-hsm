@@ -41,7 +41,7 @@ This task is intentionally split into smaller reviewable subtasks because it tou
 - [ ] #5 TASK-7.5 defines host integration for OPA/Vault capability separation.
 - [ ] #6 TASK-7.6 implements the reviewed design or splits implementation into narrower child tasks before code begins; replacement tasks must cover protocol framing, keystore/backup, keygen/identity, signing/caps, and host integration.
 - [ ] #7 TASK-7.7 defines the production anti-rollback mechanism or explicitly blocks production fund custody without it.
-- [ ] #8 Production Agent Gateway signing runs as a separate signer role/profile from Block Producer signing, with separate endpoint/listener configuration, sealed state, keystore, authority roots, and command-family enablement.
+- [ ] #8 Production Agent Gateway signing runs as a separate signer role/profile from Block Producer signing, with separate endpoint/listener configuration, sealed state, keystore, authority roots, and command-family enablement; where a deployment runs both roles on shared host resources, resource controls (rate limits, quotas, or scheduling priority) prevent high-volume Agent Gateway keygen, backup-export, identity-proof, faucet, or transfer workloads from starving producer signing.
 - [ ] #9 The design and implementation do not reuse AuthorizationTicket commands, producer ML-DSA keys, or producer arming/network-second-factor state for Agent Gateway signing.
 - [ ] #10 High-risk review follows this repo's AGENTS.md roborev matrix rules before merge.
 <!-- AC:END -->

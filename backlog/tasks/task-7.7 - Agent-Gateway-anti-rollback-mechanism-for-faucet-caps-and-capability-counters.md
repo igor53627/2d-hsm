@@ -27,7 +27,7 @@ Define the production anti-rollback mechanism for Agent Gateway sealed replay co
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The design selects one anti-rollback mechanism for production fund custody: external append-only ledger, remote monotonic counter, operator-signed boot authorization with high-water marks, or another reviewed equivalent.
+- [ ] #1 The design selects one anti-rollback mechanism for production fund custody: external append-only ledger, remote monotonic counter, operator-signed boot authorization with high-water marks (which must itself be replay-resistant — bound to a platform/hardware monotonic counter or a remote challenge-response — so a host cannot replay a stale sealed state together with its matching stale authorization), or another reviewed equivalent.
 - [ ] #2 The mechanism covers administrative capability replay counters and faucet cumulative spend counters.
 - [ ] #3 Restore and failover procedures seed counter high-water marks from authenticated material and never reset counters to zero from a stale backup.
 - [ ] #4 Active-active clones of one faucet key remain prohibited unless the mechanism provides a global spend/capability ledger shared by every live clone.

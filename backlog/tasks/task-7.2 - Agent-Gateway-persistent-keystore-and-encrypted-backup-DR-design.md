@@ -46,7 +46,8 @@ Design the persistent multi-key agent keystore and encrypted backup blob semanti
 - [ ] #16 Sealed keystore format versioning, fail-closed unknown-version handling, and reviewed forward-migration rules are specified.
 - [ ] #17 Treasury-key rotation is deferred or specified with counter carry-over semantics; spend counters never reset merely because a replacement treasury key is generated.
 - [ ] #18 Key generation atomically seals both administrative capability counter advancement and generated key metadata before returning usable refs; partial failures produce a recoverable/reconcilable signal rather than silent orphan refs.
-- [ ] #19 Roborev matrix/compact evidence is recorded before merge.
+- [ ] #19 The agent keystore encryption key is derived from the provisioning root with domain-separated key derivation (HKDF or a SHA3-based KDF bound to a unique agent-keystore label, e.g. `2d-hsm-agent-keystore-v1`) so it cannot collide or overlap with producer ML-DSA key material derived from the same root.
+- [ ] #20 Roborev matrix/compact evidence is recorded before merge.
 <!-- AC:END -->
 
 ## Definition of Done
