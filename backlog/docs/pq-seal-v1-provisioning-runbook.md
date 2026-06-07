@@ -260,6 +260,33 @@ Re-seal the whole manifest on an **image change** (measurement-bound) or to **ad
 
 ---
 
+## 9. Agent Gateway keystore + backup provisioning (TASK-7.2)
+
+The Agent Gateway secp256k1 signer uses a **separate** sealed keystore
+(`pq-agent-keystore-v1`) and DR backup blob (`pq-agent-backup-v1`), distinct from the
+producer ML-DSA seal blob — see `agent-gateway-keystore-backup-format.md` for byte layouts,
+KDF domains, and ML-KEM backup wrapping. Provisioning a 2d-hsm **agent-gateway role** adds,
+at the measured ceremony (alongside §7.1/§7.2):
+
+- **Configured chain id** and operator-assigned **`environment_identifier`** (`[a-z0-9-]`,
+  1–64; e.g. `mainnet`/`testnet`/`staging`), sealed; runtime requests are compared against
+  these, never host-chosen.
+- **Admin authority public key** and **recovery/quorum authority root** (Ed25519, 32-byte),
+  installed from ceremony material and sealed; host-side Vault/OPA alone is never sufficient.
+- **Backup-recovery wrapping public key** (ML-KEM): the enclave seals only the **public**
+  key; the matching decapsulation **private** key is generated and held **offline** in
+  operator custody and never enters any TEE. Record its custodian + recovery quorum.
+- **Replay/cap/spend init**: capability counter high-water marks, faucet caps + cumulative
+  spend counters, and the monotonic treasury config version are initialised in sealed state.
+- **Operator-approved measurement allowlist** for fresh-TEE restore, the wedged-scope
+  counter-recovery procedure, and the (manual, first-slice) fresh-TEE restore ceremony.
+
+> Until TASK-7.6 implements the format and TASK-7.7 supplies anti-rollback, treat
+> agent-gateway sealed counters/caps as host-rollback-sensitive — **not** for production fund
+> custody.
+
+---
+
 ## Revision log
 
 | Date | Change |
@@ -268,3 +295,4 @@ Re-seal the whole manifest on an **image change** (measurement-bound) or to **ad
 | 2026-06-02 | §5 poisoned-mutex troubleshooting; paths relative to `pq-seal-v1` cwd |
 | 2026-06-06 | §7 production root via `snp-derive-root` (SEV-SNP firmware); ceremony + selftest (TASK-1.1) |
 | 2026-06-07 | §7.2 multi-host sealing — per-host ceremony (`pq-seal-v1 manifest build`, TASK-1.1) |
+| 2026-06-07 | §9 Agent Gateway keystore + backup provisioning (TASK-7.2 design) |

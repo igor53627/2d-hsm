@@ -1,7 +1,7 @@
 ---
 id: TASK-7.2
 title: Agent Gateway persistent keystore and encrypted backup DR design
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
 labels:
@@ -15,6 +15,7 @@ dependencies:
   - TASK-6
 references:
   - backlog/docs/agent-gateway-secp256k1-signer-design.md
+  - backlog/docs/agent-gateway-keystore-backup-format.md
   - backlog/docs/pq-seal-v1-provisioning-runbook.md
 priority: high
 ordinal: 7020
@@ -49,6 +50,28 @@ Design the persistent multi-key agent keystore and encrypted backup blob semanti
 - [ ] #19 The agent keystore encryption key is derived from the provisioning root with domain-separated key derivation (HKDF or a SHA3-based KDF bound to a unique agent-keystore label, e.g. `2d-hsm-agent-keystore-v1`) so it cannot collide or overlap with producer ML-DSA key material derived from the same root.
 - [ ] #20 Roborev matrix/compact evidence is recorded before merge.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Design delivered in `backlog/docs/agent-gateway-keystore-backup-format.md`: two new sealed
+formats — `pq-agent-keystore-v1` (multi-key sealed keystore) and `pq-agent-backup-v1` (DR
+backup) — reusing the `pq-seal-v1` AEAD / SHA3-KDF / header / AAD / `Zeroizing` primitives
+and the SNP-derived provisioning root, with distinct magics + domain labels (AC#1/#2/#16/#19).
+Covers the full sealed-state inventory (AC#8), multi-key entry list + capacity + atomic keygen
+(AC#1/#5/#18), DR backup wrapping independent of the seal root (AC#3/#6/#13), restore scope +
+never-zero/stale counter seeding (AC#4/#11/#12), the 7.2-vs-7.7 rollback boundary + residual
+risk (AC#10), privilege model (AC#6), secp256k1 zeroization (AC#15), audit retention (AC#14),
+runbook amendments (AC#9 → runbook §9), and golden-vector/test requirements (AC#7).
+
+Locked decisions: reuse pq-seal-v1 primitives (new layouts); single operator recovery key for
+DR wrapping (quorum descriptor reserved); **ML-KEM** (pure PQ) backup envelope — residual: no
+classical hybrid layer, flagged for review; fresh-TEE restore onto an operator-approved
+measurement allowlist; canonical CBOR; authority rotation deferred (epoch field reserved);
+bounded audit ring + backpressure.
+
+AC #1–#19 addressed by this design; AC #20 (roborev matrix) run pre-merge.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
