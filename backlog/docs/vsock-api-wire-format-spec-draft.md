@@ -560,7 +560,279 @@ PQ ticket signing inside the TEE remains TASK-1; this section only covers the ne
 
 ---
 
-## 10. Next Steps
+## 10. Agent Gateway command namespace (secp256k1) — TASK-7.1
+
+A **separate** command namespace for the Agent Gateway secp256k1 signer (ordinary 2D
+faucet/transfer signing). It does **not** reuse producer / AuthorizationTicket commands,
+keys, or state (see `agent-gateway-secp256k1-signer-design.md`). Full design rationale
+and per-AC mapping live in TASK-7.1; this section is the normative wire contract.
+
+**Scope decisions locked in TASK-7.1:**
+- **eth surface MVP, TRON reserved.** 2D is a *unified secp256k1 account*: one key →
+  one 20-byte body (`keccak256(pubkey)[12:32]`), addressable as both eth `0x…` and
+  TRON `T…` (Base58Check of `0x41‖body`), with two tx surfaces (EIP-155 RLP /
+  keccak256, and TRON protobuf / sha256). The MVP signs **only the eth EIP-155 surface**;
+  a TRON-signing opcode and golden-vector slot are **reserved** (§10.3, §10.8), and
+  `AGENT_K1_PUBLIC_IDENTITY` returns **both** address encodings (§10.4).
+- **Administrative/recovery capabilities use Ed25519** (§10.5).
+- **`AGENT_K1_PUBLIC_IDENTITY` / `AGENT_K1_PROVE_IDENTITY` are low-privilege reads** (§10.4, §10.8).
+- **Canonical public-key encoding: uncompressed 65-byte SEC1** (`0x04‖X‖Y`); compressed rejected (AC#14).
+
+### 10.1 Framing model (AC#1, AC#2, AC#20)
+
+One **outer** `message_type = 0x40` (`AgentGateway`) under the existing **frame v1**
+(`protocol_version` stays `1`). The agent command set carries its **own** inner version
+and opcode inside the CBOR payload, so it can evolve without a frame-version bump.
+
+- Outer band **`0x40..0x4F` reserved** for Agent Gateway envelopes; only `0x40` is
+  allocated today. `0x50..0x7F` left for future producer/other families.
+- **Why not a frame-version bump or a wide outer range:** producer frames
+  (`0x01/0x10/0x20/0x30`) stay byte-identical and still decode (success criterion:
+  "existing producer commands remain wire-compatible"), and inner opcodes are CBOR
+  ints that cost no scarce outer bytes.
+
+**Fail-closed at three checkpoints** (none may fall back to a producer type — AC#3/AC#20):
+1. `decode_message`: `0x40 → AgentGateway`; `0x41..0xFF → UnknownMessageType`.
+2. `peek_msg_type_from_frame` (routing/error-frame helper): returns *no* type for
+   unrecognized bytes. This PR fixes a prior fail-**open** default (unknown types fell back
+   to `GetMeasurement`): it now returns `Option<MessageType>` and an unrecognized request's
+   error frame echoes the original type byte, never a producer type.
+3. Inner agent decoder: validate `agent_version == AGENT_PROTOCOL_VERSION (=1)`, then
+   match `opcode` against the exhaustive allow-list below; unknown version, opcode, or
+   treasury sub-op → fail closed (`AGENT_MALFORMED`), no state touch.
+
+### 10.2 Inner Agent Gateway envelope + role/profile gate (AC#4, AC#5)
+
+CBOR integer-key map (canonical, per §8):
+
+```
+{
+  1: agent_version (uint, = 1),
+  2: opcode        (uint, see §10.3),
+  3: command_domain(tstr, fixed = "2d-hsm/agent-gateway/v1"),
+  4: request_id    (bstr, binds one request),
+  5: capability    (map; REQUIRED only for privileged opcodes — see §10.3 table + §10.5; carries its Ed25519 signature at key 13),
+  6: key_ref|batch_id (bstr, where applicable),
+  7: payload       (map, per-command — §10.4)
+}
+```
+
+**Role/profile gate (AC#5).** Before *any* command-specific state is touched:
+a **producer-profile** signer rejects every Agent Gateway opcode; an
+**Agent-Gateway-profile** signer rejects producer + AuthorizationTicket message types.
+Mixed-role fixtures are permitted only in non-deployable tests.
+
+### 10.3 Opcode allocation (AC#1)
+
+| opcode | command | tier | scope (financial?) |
+|--------|---------|------|--------------------|
+| 1 | `AGENT_K1_GENERATE_KEYS` | privileged (provisioning/refill) | transfer pool: fleet allowed · faucet treasury: **enclave** |
+| 2 | `AGENT_K1_PUBLIC_IDENTITY` | low-privilege read | — |
+| 3 | `AGENT_K1_PROVE_IDENTITY` | low-privilege read | — |
+| 4 | `AGENT_K1_SIGN_TRANSFER` | runtime signing | — |
+| 5 | `AGENT_K1_SIGN_FAUCET_DISPENSE` | faucet treasury signing | — |
+| 6 | `AGENT_K1_CONFIGURE_TREASURY` | treasury admin / recovery | **enclave** (AC#12) |
+| 7 | `AGENT_KEYSTORE_EXPORT_BACKUP` | backup-export admin | enclave default |
+| 8 | `AGENT_KEYSTORE_RESTORE_BACKUP` | recovery/quorum | recovery counter |
+| **9** | `AGENT_K1_SIGN_TRON_TRANSFER` | **RESERVED** (eth-MVP + reserve-TRON) — fail-closed until a future task | — |
+| 0, 10.. | reserved; decoder fails closed on any non-allow-listed opcode | | |
+
+`CONFIGURE_TREASURY` sub-operations are an **inner discriminant** (not separate opcodes):
+`0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker, 3 reset_lifetime_breaker`
+(AC#8), each validated by exhaustive allow-list and mapped to a capability tier (§10.7).
+
+**Capability requirement per opcode** (resolves the inner-envelope key-5 condition):
+- **No capability — low-privilege reads:** `PUBLIC_IDENTITY`, `PROVE_IDENTITY`.
+- **No administrative capability — runtime signing:** `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE`.
+  These do **not** carry capability key 5; per the threat model they are reachable by any
+  vsock caller, and their bound is the enclave-built canonical preimage (no caller digest),
+  key-purpose, chain/env binding, and — for faucet — sealed spend caps, **not** an admin
+  capability.
+- **Capability key 5 REQUIRED — privileged:** `GENERATE_KEYS`, `CONFIGURE_TREASURY`
+  (every sub-op), `EXPORT_BACKUP`, `RESTORE_BACKUP`. Missing/invalid key 5 ⇒ fail closed.
+
+### 10.4 Per-command payloads (AC#1, AC#14)
+
+Schemas (all CBOR int-key maps). `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE`, and
+`PUBLIC_IDENTITY` are fully specified here; the complete request/response maps for
+`GENERATE_KEYS`/`PROVE_IDENTITY` are owned by TASK-7.3, `CONFIGURE_TREASURY` by TASK-7.4,
+and `EXPORT_BACKUP`/`RESTORE_BACKUP` by TASK-7.2 — each consuming this envelope, capability,
+and error contract, with the per-command map carried at envelope key 7:
+
+- **`AGENT_K1_SIGN_TRANSFER`** (runtime; `agent_transfer_k1` only) — *semantic fields,
+  never a caller digest*: `{1: chain_id(=11565), 2: from, 3: to(20B), 4: amount,
+  5: nonce, 6: gas_limit, 7: gas_price, 8: data(empty in MVP)}`. The enclave builds the
+  canonical EIP-155 preimage (`RLP([nonce, gas_price, gas, to, value, data, 11565, «», «»])`),
+  hashes with keccak256, and returns a **low-S** signature + recovery id
+  (`v = 11565*2+35+recovery_id ∈ {23165, 23166}`). Pinned by
+  `testvectors/agent-gateway/ordinary_tx_v1.*`.
+- **`AGENT_K1_SIGN_FAUCET_DISPENSE`** (`agent_faucet_treasury_k1` only) — pure native
+  transfer, `data` empty; `to` MUST match a known `agent_transfer_k1` identity in the
+  keystore. TEE caps over worst-case `amount + gas_limit * effective_max_fee_rate`
+  (checked arithmetic, fail-closed on overflow); two sealed counters debited
+  **before** the signature is emitted.
+- **`AGENT_K1_PUBLIC_IDENTITY`** response — `{1: pubkey (uncompressed 65B SEC1 0x04, AC#14),
+  2: eth_address (20B), 3: tron_address (Base58Check of 0x41‖body), 4: key_ref,
+  5: key_purpose, 6: backend_version}`. Returning **both** address encodings reflects the
+  unified-account model (TRON-reserve decision).
+
+### 10.5 Administrative / recovery capability (AC#6, AC#7, AC#11)
+
+A TEE-verified, signed, parameter-binding token carried at inner-envelope key `5` for
+privileged opcodes. **Host-side Vault/OPA authorization alone is never sufficient** (AC#6).
+
+- **Algorithm:** Ed25519, 64-byte signature, **32-byte raw** public key (same family
+  and sealed-trust-root pattern as `ProducerAttestationTrust`).
+- **Trust roots (sealed at measured provisioning, never host-supplied):**
+  `admin_authority_pk` and `recovery_authority_pk` (MVP quorum = one higher-tier
+  recovery key). Bound to sealed state; never derived from `pq_pubkey`.
+- **Signed structure** (canonical CBOR int-key map = the signed bytes), prefixed with the
+  domain `"2d-hsm/agent-cap/v1\0"` before verification:
+
+```
+1 cap_format_version (=1)        7 scope_class (0=enclave,1=fleet; financial MUST be enclave)
+2 command_opcode                 8 scope_target (enclave_id|fleet_id, command_class folded in)
+3 treasury_sub_op (if opcode 6)  9 counter (monotonic for the tuple)
+4 key_purpose (1=transfer,2=faucet) 10 request_id
+5 chain_id (= sealed 11565)      11 payload_binding = keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical command params)
+6 environment_identifier (= sealed)  12 is_recovery (bool → verify vs recovery_authority_pk)
+--- below is NOT part of the signed bytes ---
+13 ed25519_signature (64B)
+```
+
+**Signature transmission.** The capability map carries the 64-byte Ed25519 signature at key
+`13`. The signed message is `"2d-hsm/agent-cap/v1\0" ‖ canonical-CBOR({1..12})` — keys `1–12`
+only, with key `13` excluded before verification — so "the capability map minus key 13 = the
+signed bytes" is unambiguous and wire-stable.
+
+The design doc's "key refs or batch/count" capability binding is covered transitively by
+`payload_binding` (now `keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical command params)`);
+there is no separate key-ref field in the signed capability.
+
+**Verify order (all before state touch):** role/profile gate → opcode allow-list →
+`cap_format_version` → Ed25519 verify over keys `1–12` (key 13 excluded) vs the correct
+sealed authority → `cap.command_opcode == request.opcode` **and** `cap.treasury_sub_op ==
+request.sub_op` (opcode 6) **and** `cap.request_id == envelope.request_id` →
+`chain_id`/`env`/`scope` equal sealed values → contiguous counter (§10.6) → `payload_binding
+== keccak256(actual params)` → mutate + seal-before-return. The opcode/sub-op/request_id
+equality checks stop a capability issued for one opcode/sub-op/request from authorizing
+another (e.g. a `set_limits` cap cannot authorize `reset_lifetime_breaker`).
+
+Capability tiers per command follow the design doc table (`agent-gateway-secp256k1-signer-design.md` §"Capability tiers").
+
+### 10.6 Counter scheme + `environment_identifier` (AC#9, AC#10, AC#11, AC#12, AC#18)
+
+Replay protection is **strict contiguity**, not timestamps or nonce sets (enclave time is
+host-controlled).
+
+- **Tuple:** `(authority, environment_identifier, scope_class, scope_target)`; sealed state
+  holds the highest accepted counter per tuple.
+- **Contiguity:** accept iff `incoming == highest + 1`; reject lower (replay) and gaps
+  (skip-ahead); advance + seal before returning success.
+- **Command-class split (AC#18 default):** fold `command_class` into `scope_target`
+  (`generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`,
+  `restore_backup`) so a stalled/withheld capability for one class cannot wedge the others.
+- **Default `scope_class`:** transfer-pool keygen — fleet allowed; faucet keygen and
+  **all** treasury config — enclave required (AC#12, no budget multiplication across clones);
+  export — enclave default; restore — recovery tier with an independent strict recovery
+  counter.
+- **`environment_identifier` (AC#10):** UTF-8, `1..=64` bytes, `[a-z0-9-]`, no
+  leading/trailing/double hyphen; byte-exact case-sensitive compare against the sealed value;
+  malformed → fail closed at decode.
+- **Recovery resync (AC#11):** a recovery-authority capability resyncs a wedged scope
+  **forward-only**: it sets the target tuple's counter strictly `>` its current highest
+  **and** is itself sequenced by an independent strict recovery counter (one normative
+  mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
+  strict recovery counter. Audited; never rolls backward.
+- **Authority rotation (AC#17):** `authority` is part of the tuple, so a new authority
+  starts a fresh stream and retired-authority capabilities cannot replay. Fallback for
+  authority compromise = full re-provisioning (residual risk documented).
+
+### 10.7 Treasury configuration (AC#8, AC#12)
+
+`AGENT_K1_CONFIGURE_TREASURY` sub-ops map to tiers: `set_limits`/`refill_budget`/
+`raise_lifetime_breaker` = treasury-admin; `reset_lifetime_breaker` = recovery/quorum
+(bound to a strict recovery counter and target value). Config version is monotonic and
+sealed; a normal config bump does **not** reset cumulative spend. Two sealed faucet
+counters (refillable cumulative budget + optional lifetime breaker). Enclave-scoped unless
+a global remote monotonic ledger is specified (AC#12). All writes sealed before success.
+
+### 10.8 Identity proof + read policy (AC#15, AC#16)
+
+- **Layout (AC#15):** `0x19 ‖ len(label)(1B) ‖ label ("2d-hsm/agent-identity-proof/v1") ‖
+  chain_id(8B BE) ‖ len(env_id)(1B) ‖ env_id ‖ key_ref(32B) ‖ pubkey(65B) ‖
+  address(20B) ‖ verifier_nonce(32B)`, hashed with keccak256. Every variable-length field
+  (label, env_id) is 1-byte length-prefixed so no future label/env-id change shifts the
+  parse of later fixed-width fields. The **verifier** owns nonce freshness.
+  Pinned by `testvectors/agent-gateway/identity_proof_v1.*`.
+- **3-way domain separation (AC#15)** — disjoint by construction:
+
+  | domain | first preimage byte | hash |
+  |--------|---------------------|------|
+  | eth EIP-155 tx | `≥0xc0` (RLP list; this vector `0xed`) | keccak256 |
+  | TRON tx (reserved) | `0x0a` (protobuf field-1 tag) | sha256 |
+  | identity proof | `0x19` (EIP-191) | keccak256 |
+
+  Leading bytes are mutually distinct **and** the TRON surface uses a different hash. The
+  enclave always builds each preimage itself and never signs a caller digest. **EIP-2718
+  caveat:** `0x19` is a legal `TransactionType`, so disjointness from typed txs depends on
+  the pinned policy that **2D permanently reserves/never assigns tx-type `0x19`** —
+  tracked by a 2D-side AC in the TASK-132.5 family (the enclave cannot enforce it). This
+  2D-side reservation is a **blocking dependency** for TASK-7.3/7.4: their non-collision
+  proof must reference a pinned 2D commit/test showing tx-type `0x19` is reserved/rejected.
+  Witnesses in `testvectors/agent-gateway/domain_separation.json`.
+- **Read policy (AC#16):** `AGENT_K1_PUBLIC_IDENTITY` and `AGENT_K1_PROVE_IDENTITY` are
+  **low-privilege local reads** — no administrative capability — but still validate command
+  domain, key purpose, and chain/environment binding; `PROVE_IDENTITY` binds the fresh
+  verifier-provided nonce.
+
+### 10.9 Structured error codes + disclosure policy (AC#19)
+
+Agent error band over the common `{1: code, 2: reason}` map; `reason` carries no secret in
+deployable builds. Coarse classes the host needs are exposed; oracle-creating distinctions
+are collapsed:
+
+| code | meaning | disclosure |
+|------|---------|-----------|
+| `0x40 AGENT_MALFORMED` | bad CBOR / unknown version / opcode / sub-op / field / env-id format | syntax only |
+| `0x41 AGENT_WRONG_PROFILE` | command disabled in this role/profile | needed for routing |
+| `0x42 AGENT_KEY_PURPOSE_MISMATCH` | **collapses** key-not-found AND wrong-purpose | anti-oracle |
+| `0x43 AGENT_CAPABILITY_REJECTED` | **collapses** bad sig / wrong authority / chain-env-scope / non-contiguous counter / payload-binding / retired authority | anti-oracle |
+| `0x44 AGENT_CAP_EXCEEDED` | per-dispense/gas/budget/breaker exceeded or checked-overflow | distinct from malformed |
+| `0x45 AGENT_NOT_CONFIGURED` | faucet signing before mandatory caps sealed | safe |
+| `0x46 AGENT_SEAL_FAILED` | atomic sealed-commit failed; no signature/refs emitted | safe |
+
+Agent codes `0x40–0x46` are deliberately disjoint from the producer/common error codes
+(`1`, `2`), so both namespaces share one `{1: code, 2: reason}` map without collision.
+
+Never expose key-existence, per-field capability failure, exact provisioning/sealing state,
+or key-derivation detail.
+
+### 10.10 Golden vectors + test/vector requirements (AC#13, AC#21, AC#22)
+
+Frozen, self-checked, in-repo artifacts in
+`impl/rust/enclave-protocol/testvectors/agent-gateway/` (provenance + regeneration in its
+`README.md`): `ordinary_tx_v1.*` (AC#13 eth preimage/hash/sig/address, `chain_id=11565`),
+`tron_transfer_v1.*` (reserved surface, for the §10.8 disjointness proof),
+`identity_proof_v1.*`, `keys.json` (dual eth/TRON encodings), `domain_separation.json`.
+
+Required tests (consumed by TASK-7.3/7.4/7.6, AC#21):
+- Producer frames `0x01/0x10/0x20/0x30` still decode unchanged after adding `0x40`.
+- `peek_msg_type_from_frame` returns no-type for `0x41`/`0xFF` (never `GetMeasurement`); `0x40 → AgentGateway`.
+- Unknown `agent_version`/opcode/treasury-sub-op → `AGENT_MALFORMED`, no state touch.
+- Role/profile cross-rejection matrix (producer↔agent), both before state touch.
+- Key-purpose cross-rejection (transfer↔faucet; producer purposes rejected by agent commands).
+- Identity-proof vs transfer cross-domain: the two preimages produce different hashes and
+  `SIGN_TRANSFER` refuses an identity-proof-shaped input.
+- Capability binding: mismatched `payload_binding`/authority/chain/env/scope or non-contiguous
+  counter → `AGENT_CAPABILITY_REJECTED`; valid cap accepted, its replay rejected.
+- Golden-vector self-consistency: rebuild eth preimage from JSON fields → keccak256 → equals
+  `ordinary_tx_v1.signing_hash.bin`; pinned `r/s/v` recovers the expected `from` (low-S enforced).
+- Roborev matrix recorded before merge (AC#22).
+
+---
+
+## 11. Next Steps
 
 - Run **roborev Reduced matrix** on this document (v0.2) + `authorization-tickets-precompile-spec-draft.md`, then `roborev compact`.
 - Wire decode: reject 64-byte PQ signatures when `pq_signing_ready` is true / production profile (3309 B only).

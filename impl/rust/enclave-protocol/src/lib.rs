@@ -201,6 +201,10 @@ pub enum MessageType {
     SignAuthorizationTicket = 0x10,
     ArmForProduction = 0x20,
     GetStatus = 0x30,
+    /// Agent Gateway secp256k1 namespace (TASK-7.1). Outer envelope under frame v1;
+    /// the inner CBOR payload carries its own agent_version + opcode. Reserved
+    /// outer band 0x40..0x4F. Command handling lands in TASK-7.6.
+    AgentGateway = 0x40,
 }
 
 /// Простой диспетчер команд (скелет).
@@ -239,6 +243,13 @@ pub struct FramedMessage {
 /// Format (big-endian):
 /// [u32 total_len] [u8 version] [u8 msg_type] [CBOR payload]
 pub fn encode_message(msg_type: MessageType, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    encode_message_raw(msg_type as u8, payload)
+}
+
+/// Like [`encode_message`] but with a raw message-type byte. Used to echo an
+/// *unrecognized* request type in an error frame without falling back to a known
+/// (producer) variant — fail-closed routing per TASK-7.1 AC#20.
+fn encode_message_raw(type_byte: u8, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let total_len = 2 + payload.len(); // version + type + payload
     if total_len > MAX_MESSAGE_SIZE as usize {
         return Err(ProtocolError::MessageTooLarge(total_len as u32));
@@ -247,7 +258,7 @@ pub fn encode_message(msg_type: MessageType, payload: &[u8]) -> Result<Vec<u8>, 
     let mut buf = Vec::with_capacity(4 + total_len);
     buf.extend_from_slice(&(total_len as u32).to_be_bytes());
     buf.push(PROTOCOL_VERSION);
-    buf.push(msg_type as u8);
+    buf.push(type_byte);
     buf.extend_from_slice(payload);
     Ok(buf)
 }
@@ -285,6 +296,7 @@ pub fn decode_message(data: &[u8]) -> Result<FramedMessage, ProtocolError> {
         0x10 => MessageType::SignAuthorizationTicket,
         0x20 => MessageType::ArmForProduction,
         0x30 => MessageType::GetStatus,
+        0x40 => MessageType::AgentGateway,
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
 
@@ -1326,6 +1338,10 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
             decode_arm_for_production_request(payload)?,
         )),
         MessageType::GetStatus => Ok(Command::GetStatus(decode_get_status_request(payload)?)),
+        // Reserved by TASK-7.1; agent command decoding/handling lands in TASK-7.6. Fail closed.
+        MessageType::AgentGateway => Err(ProtocolError::WireProtocol(
+            "agent gateway commands not yet implemented (reserved by TASK-7.1; see TASK-7.6)",
+        )),
     }
 }
 
@@ -1350,13 +1366,17 @@ fn encode_wire_response(msg_type: MessageType, response: &Response) -> Result<Ve
 }
 
 /// Best-effort message type from a frame prefix (for error responses when decode fails).
-pub fn peek_msg_type_from_frame(frame: &[u8]) -> MessageType {
+///
+/// Returns `None` for an unrecognized type byte — callers must NOT fall back to a
+/// producer message type (that was a fail-**open** routing bug; TASK-7.1 AC#20).
+pub fn peek_msg_type_from_frame(frame: &[u8]) -> Option<MessageType> {
     match frame.get(5) {
-        Some(0x01) => MessageType::GetMeasurement,
-        Some(0x10) => MessageType::SignAuthorizationTicket,
-        Some(0x20) => MessageType::ArmForProduction,
-        Some(0x30) => MessageType::GetStatus,
-        _ => MessageType::GetMeasurement,
+        Some(0x01) => Some(MessageType::GetMeasurement),
+        Some(0x10) => Some(MessageType::SignAuthorizationTicket),
+        Some(0x20) => Some(MessageType::ArmForProduction),
+        Some(0x30) => Some(MessageType::GetStatus),
+        Some(0x40) => Some(MessageType::AgentGateway),
+        _ => None,
     }
 }
 
@@ -1391,6 +1411,30 @@ pub(crate) fn encode_wire_error_frame(
     encode_message(msg_type, &body)
 }
 
+/// Encode an error frame echoing the *request's* message type. A recognized type
+/// is echoed as itself; an unrecognized type byte is echoed raw rather than
+/// defaulting to a producer type (fail-closed routing, TASK-7.1 AC#20).
+pub(crate) fn encode_wire_error_frame_for_frame(
+    frame: &[u8],
+    e: ProtocolError,
+) -> Result<Vec<u8>, ProtocolError> {
+    // Call-site invariant: only reached after `decode_message` accepted the 6-byte framing
+    // prefix — sub-6-byte frames surface as Io errors the callers propagate before here.
+    // Make the layered invariant self-checking in debug/test builds (no release impact).
+    debug_assert!(frame.len() >= 6, "error-frame echo expects the 6-byte framing prefix");
+    match peek_msg_type_from_frame(frame) {
+        Some(t) => encode_wire_error_frame(t, e),
+        None => {
+            // Echo the original (unrecognized) type byte rather than a producer type.
+            // Frames shorter than 6 bytes surface as Io errors that propagate *before*
+            // this path, so frame[5] is present in practice; unwrap_or(0) is defensive.
+            let type_byte = frame.get(5).copied().unwrap_or(0);
+            let body = protocol_error_to_wire_body(&e)?;
+            encode_message_raw(type_byte, &body)
+        }
+    }
+}
+
 /// Process one framed host request with session state (all commands, integer-key wire).
 ///
 /// Decode/dispatch failures return a wire error frame on the **same** `msg_type` (connection stays up).
@@ -1411,11 +1455,10 @@ pub fn process_framed_with_shared_state(
     state: &mut EnclaveState,
     attestation_trust: ProducerAttestationTrust,
 ) -> Result<Vec<u8>, ProtocolError> {
-    let msg_type = peek_msg_type_from_frame(frame);
     match try_process_framed_with_shared_state(frame, state, attestation_trust) {
         Ok(resp) => Ok(resp),
         Err(e @ ProtocolError::Io(_)) => Err(e),
-        Err(e) => encode_wire_error_frame(msg_type, e),
+        Err(e) => encode_wire_error_frame_for_frame(frame, e),
     }
 }
 
@@ -1433,11 +1476,10 @@ fn try_process_framed_with_shared_state(
 
 /// Stateless one-shot bridge: **GET_MEASUREMENT only** (no `test-support` required).
 pub fn process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    let msg_type = peek_msg_type_from_frame(frame);
     match try_process_framed_bytes(frame) {
         Ok(resp) => Ok(resp),
         Err(e @ ProtocolError::Io(_)) => Err(e),
-        Err(e) => encode_wire_error_frame(msg_type, e),
+        Err(e) => encode_wire_error_frame_for_frame(frame, e),
     }
 }
 
@@ -1805,8 +1847,12 @@ mod tests {
         let mut bad_frame = encode_message(MessageType::GetMeasurement, &payload).unwrap();
         bad_frame[5] = 0xFF;
         let resp = process_framed_with_session(&bad_frame, &mut session).unwrap();
-        let decoded = decode_message(&resp).unwrap();
-        assert!(is_wire_error_payload(&decoded.payload));
+        // Fail-closed routing (TASK-7.1 AC#20): the error frame echoes the original
+        // unknown type byte and does NOT default to a producer type (0x01). The body
+        // (after the 6-byte header) is still a wire error payload.
+        assert_eq!(resp[5], 0xFF);
+        assert_ne!(resp[5], MessageType::GetMeasurement as u8);
+        assert!(is_wire_error_payload(&resp[6..]));
     }
 
     #[test]
@@ -1995,7 +2041,7 @@ mod tests {
             let (code, reason) = decode_wire_error(&decoded.payload).unwrap();
             assert_eq!(code, 1);
             assert!(reason.contains("only one HARD_FORK_ACTIVATION"));
-            assert_eq!(peek_msg_type_from_frame(&resp), MessageType::SignAuthorizationTicket);
+            assert_eq!(peek_msg_type_from_frame(&resp), Some(MessageType::SignAuthorizationTicket));
         }
     }
 
@@ -2126,7 +2172,7 @@ mod tests {
             let (code, reason) = decode_wire_error(&decoded.payload).unwrap();
             assert_eq!(code, 1);
             assert!(reason.contains("only one HARD_FORK_ACTIVATION"));
-            assert_eq!(peek_msg_type_from_frame(&resp), MessageType::SignAuthorizationTicket);
+            assert_eq!(peek_msg_type_from_frame(&resp), Some(MessageType::SignAuthorizationTicket));
         }
     }
 
@@ -3587,5 +3633,63 @@ mod tests {
         hex::decode(hash_hex.trim_start_matches("0x"))
             .ok()
             .and_then(|b| if b.len() == 32 { Some(b.try_into().unwrap()) } else { None })
+    }
+}
+
+#[cfg(test)]
+mod agent_gateway_framing_tests {
+    use super::*;
+
+    // AC#21: existing producer frames still decode after adding 0x40 AgentGateway.
+    #[test]
+    fn producer_frames_still_decode_after_agentgateway_added() {
+        for t in [
+            MessageType::GetMeasurement,
+            MessageType::SignAuthorizationTicket,
+            MessageType::ArmForProduction,
+            MessageType::GetStatus,
+        ] {
+            let frame = encode_message(t, &[]).unwrap();
+            assert_eq!(decode_message(&frame).unwrap().msg_type, t);
+        }
+    }
+
+    // AC#20: peek classifies 0x40 and fails closed (None) on unknown bytes —
+    // it must NOT fall back to a producer type (the old fail-open bug).
+    #[test]
+    fn peek_classifies_agent_gateway_and_fails_closed_on_unknown() {
+        let mk = |type_byte: u8| [0u8, 0, 0, 2, PROTOCOL_VERSION, type_byte];
+        assert_eq!(peek_msg_type_from_frame(&mk(0x01)), Some(MessageType::GetMeasurement));
+        assert_eq!(peek_msg_type_from_frame(&mk(0x40)), Some(MessageType::AgentGateway));
+        // Old behaviour returned Some(GetMeasurement) for these — must be None now.
+        assert_eq!(peek_msg_type_from_frame(&mk(0x41)), None);
+        assert_eq!(peek_msg_type_from_frame(&mk(0xFF)), None);
+        assert_eq!(peek_msg_type_from_frame(&[]), None);
+    }
+
+    // A 0x40 frame is recognized at the framing layer but command handling fails
+    // closed until TASK-7.6 (reserved namespace).
+    #[test]
+    fn agent_gateway_frame_decodes_but_command_fails_closed() {
+        let frame = encode_message(MessageType::AgentGateway, &[0xA0]).unwrap(); // 0xA0 = empty CBOR map
+        let decoded = decode_message(&frame).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::AgentGateway);
+        assert!(matches!(
+            decode_wire_command(decoded.msg_type, &decoded.payload),
+            Err(ProtocolError::WireProtocol(_))
+        ));
+    }
+
+    // AC#20: an unknown-type or reserved-agent request yields an error frame that
+    // echoes its OWN type byte, never a producer type (no fail-open misrouting).
+    #[test]
+    fn error_frames_echo_their_own_type_byte_not_a_producer_type() {
+        let unknown = encode_message_raw(0x77, &[0xA0]).unwrap();
+        let resp = process_framed_bytes(&unknown).unwrap();
+        assert_eq!(resp[5], 0x77, "unknown type must be echoed, not defaulted to 0x01");
+
+        let agent = encode_message(MessageType::AgentGateway, &[0xA0]).unwrap();
+        let resp = process_framed_bytes(&agent).unwrap();
+        assert_eq!(resp[5], 0x40, "agent gateway error must echo 0x40, not 0x01");
     }
 }

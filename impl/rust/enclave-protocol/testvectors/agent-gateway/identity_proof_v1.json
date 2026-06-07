@@ -1,0 +1,23 @@
+{
+  "_comment": "EIP-191-style Agent Gateway identity-proof preimage. TASK-7.1 AC#15 (layout); TASK-7.3 owns final non-collision proof. TEST KEYS ONLY.",
+  "domain_prefix_byte": "0x19",
+  "fields": {
+    "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    "chain_id": 11565,
+    "environment_identifier": "testnet",
+    "key_ref": "0x90ed43f083774b2d3e25b64d44116020fc05c4dc171b3e8adfbdb5691259893a",
+    "pubkey_uncompressed": "0x048318535b54105d4a7aae60c08fc45f9687181b4fdfc625bd1a753fa7397fed753547f11ca8696646f2f3acb08e31016afac23e630c5d11f59f61fef57b0d2aa5",
+    "verifier_nonce": "0xabababababababababababababababababababababababababababababababab"
+  },
+  "hash_algorithm": "keccak256",
+  "label": "2d-hsm/agent-identity-proof/v1",
+  "layout": "0x19 || len(label)(1B) || label || chain_id(8B BE) || len(env_id)(1B) || env_id || key_ref(32B) || pubkey(65B) || address(20B) || verifier_nonce(32B)",
+  "preimage": "0x191e32642d68736d2f6167656e742d6964656e746974792d70726f6f662f76310000000000002d2d07746573746e657490ed43f083774b2d3e25b64d44116020fc05c4dc171b3e8adfbdb5691259893a048318535b54105d4a7aae60c08fc45f9687181b4fdfc625bd1a753fa7397fed753547f11ca8696646f2f3acb08e31016afac23e630c5d11f59f61fef57b0d2aa5f39fd6e51aad88f6f4ce6ab8827279cfffb92266abababababababababababababababababababababababababababababababab",
+  "signature": {
+    "low_s": true,
+    "r": "0xd3ddd2c90fb3d896591430850813a7e33b2b3066f590df656e3ea3063c40cab4",
+    "recovery_id": 0,
+    "s": "0x0629b346027cdc81715b8b2b9dfaff38aed5147455436fdcefc95dfb9e138e1c"
+  },
+  "signing_hash_keccak256": "0xaa0107b0d6b5eadb4c5bb879077630df980a8585711a6373275fad9f44af1569"
+}
