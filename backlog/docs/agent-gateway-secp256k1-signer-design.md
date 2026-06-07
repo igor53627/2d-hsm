@@ -176,6 +176,8 @@ ECDSA signing uses RFC 6979 deterministic nonce derivation or a vetted constant-
 
 ## Host-side policy boundary
 
+> **Host integration contract:** the concrete 2D host-side contract — five capability tiers as the host models them, agent-specific OPA/Vault namespacing, the local→OPA→Vault→`2d-hsm` caller flow, the host-vs-TEE check matrix, and negative-capability cases — is in `agent-gateway-host-integration-contract.md` (TASK-7.5). This section is the high-level boundary statement.
+
 The host-side flow may mirror the existing NetHSM bridge shape:
 
 ```text
