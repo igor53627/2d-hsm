@@ -266,6 +266,10 @@ the format is implemented):
   with the source seal root; it decrypts only with R1's offline ML-KEM private key.
 - **KEM-DEM round-trip:** `Encaps`→KDF→AEAD then `Decaps`→KDF→AEAD recovers the payload
   byte-exactly; because `kem_ct` is in the AAD, mutating it fails decryption.
+- **Restore ingress envelope:** ingress KEM-DEM round-trip to the destination ephemeral key
+  recovers the payload; mutating any `AAD'` field (dest attestation/measurement, `chain_id`,
+  `environment_identifier`, manifest hash, original-backup digest, `ingress_kem_ct`) fails
+  decapsulation/import. (Ceremony path; full vectors land with TASK-7.6.)
 - **Cross-environment restore fails:** a backup carrying `environment_identifier=testnet`
   (and/or a different `chain_id`) is rejected by a `mainnet` enclave (AAD mismatch).
 - **Recovery-auth vs wrapping-key separation** (AC#13): a restore authorized by the Ed25519
