@@ -46,6 +46,8 @@ pub enum VerifyError {
     ArkPinMismatch,
     #[error("certificate name chain broken ({0})")]
     NameChain(&'static str),
+    #[error("VCEK/report binding failed ({0})")]
+    TcbBinding(&'static str),
     #[error(transparent)]
     Prevalidate(#[from] enclave_protocol::ProtocolError),
 }
@@ -253,6 +255,50 @@ pub fn pinned_ark_spki(pinned_chain_pem: &[u8]) -> Result<Vec<u8>, VerifyError> 
 }
 
 // ---------------------------------------------------------------------------------------------
+// VCEK ↔ report chip binding (policy §2 step 2, last bullet).
+// ---------------------------------------------------------------------------------------------
+
+/// AMD VCEK `HWID` extension OID — the 64-byte chip identifier the VCEK was issued for.
+const AMD_VCEK_HWID_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.3704.1.4");
+
+/// Extract the 64-byte HWID from a VCEK HWID extension's `extn_value`, tolerant of the two encodings
+/// seen in practice: the raw 64 bytes, or a DER OCTET STRING wrapping them (AMD's DER has known
+/// quirks; cf. go-sev-guest). Validated synthetically — a real-VCEK cross-check is a follow-up (no
+/// KDS-resolvable chip on the lab box; see policy §4).
+fn parse_amd_hwid(extn_value: &[u8]) -> Result<[u8; 64], VerifyError> {
+    let raw: &[u8] = if extn_value.len() == 64 {
+        extn_value
+    } else {
+        // Fall back to a DER OCTET STRING wrapper.
+        return x509_cert::der::asn1::OctetString::from_der(extn_value)
+            .ok()
+            .and_then(|os| <[u8; 64]>::try_from(os.as_bytes()).ok())
+            .ok_or(VerifyError::TcbBinding(
+                "VCEK HWID is neither 64 raw bytes nor an OCTET STRING of 64 bytes",
+            ));
+    };
+    <[u8; 64]>::try_from(raw).map_err(|_| VerifyError::TcbBinding("VCEK HWID is not 64 bytes"))
+}
+
+/// Bind the VCEK to the report's chip: the VCEK's HWID extension must equal the report's `chip_id`.
+/// Without this, a genuine VCEK from a *different* chip could be paired with a report (mix-and-match).
+pub fn verify_vcek_chip_binding(vcek: &Certificate, report: &[u8]) -> Result<(), VerifyError> {
+    let ext = vcek
+        .tbs_certificate
+        .extensions
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|e| e.extn_id == AMD_VCEK_HWID_OID)
+        .ok_or(VerifyError::TcbBinding("VCEK has no AMD HWID extension"))?;
+    let hwid = parse_amd_hwid(ext.extn_value.as_bytes())?;
+    if hwid != report_chip_id(report)? {
+        return Err(VerifyError::TcbBinding("VCEK HWID != report chip_id"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // Full attestation verification (policy §2): structural prevalidate + report sig + cert chain.
 // ---------------------------------------------------------------------------------------------
 
@@ -282,6 +328,8 @@ pub fn verify_attestation(
     verify_cert_chain(vcek, chain, pinned_ark_spki)?;
     let vcek_key = cert_p384_key(vcek)?;
     verify_report_signature(report, &vcek_key)?;
+    // 4. bind the VCEK to this chip (its HWID extension == the report's chip_id).
+    verify_vcek_chip_binding(vcek, report)?;
     Ok(pre.measurement)
 }
 
@@ -319,6 +367,29 @@ mod chain_tests {
     use super::*;
 
     const AMD_GENOA_CHAIN: &[u8] = include_bytes!("../testvectors/amd_genoa_cert_chain.pem");
+    // aya is a Turin (Zen 5, CPU family 26) EPYC 9375F — its product root is Turin, not Genoa.
+    const AMD_TURIN_CHAIN: &[u8] = include_bytes!("../testvectors/amd_turin_cert_chain.pem");
+
+    #[test]
+    fn amd_turin_chain_verifies_to_pinned_root() {
+        // Real AMD Turin ARK/ASK (from KDS) — second product root, exercises the RSA-PSS path.
+        let chain = parse_cert_chain_pem(AMD_TURIN_CHAIN).unwrap();
+        assert_eq!(chain.len(), 2);
+        let ark = chain
+            .iter()
+            .find(|c| is_self_signed(c))
+            .expect("Turin ARK self-signed (RSA-PSS)");
+        let ask = chain
+            .iter()
+            .find(|c| c.tbs_certificate.subject != ark.tbs_certificate.subject)
+            .unwrap();
+        verify_cert_signed_by(ask, ark, "ask<-ark").expect("Turin ASK signed by ARK");
+        // Distinct root from Genoa.
+        assert_ne!(
+            pinned_ark_spki(AMD_TURIN_CHAIN).unwrap(),
+            pinned_ark_spki(AMD_GENOA_CHAIN).unwrap()
+        );
+    }
 
     #[test]
     fn amd_chain_parses_two_certs() {
@@ -529,6 +600,96 @@ mod synthetic_chain_tests {
         assert!(matches!(
             verify_cert_chain(&vcek, &[ask, ark], &ark_spki),
             Err(VerifyError::CertSignature(_))
+        ));
+    }
+
+    // A custom AMD HWID extension for building synthetic VCEKs (value = DER OCTET STRING of the id).
+    struct HwidExt(x509_cert::der::asn1::OctetString);
+    impl const_oid::AssociatedOid for HwidExt {
+        const OID: ObjectIdentifier = AMD_VCEK_HWID_OID;
+    }
+    impl x509_cert::der::Encode for HwidExt {
+        fn encoded_len(&self) -> x509_cert::der::Result<x509_cert::der::Length> {
+            self.0.encoded_len()
+        }
+        fn encode(&self, writer: &mut impl x509_cert::der::Writer) -> x509_cert::der::Result<()> {
+            self.0.encode(writer)
+        }
+    }
+    impl x509_cert::ext::AsExtension for HwidExt {
+        fn critical(&self, _subject: &Name, _extensions: &[x509_cert::ext::Extension]) -> bool {
+            false
+        }
+    }
+    fn vcek_with_hwid(
+        subject_sk: &SigningKey,
+        issuer: &Certificate,
+        issuer_sk: &SigningKey,
+        hwid: &[u8; 64],
+    ) -> Certificate {
+        let mut builder = CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: issuer.tbs_certificate.subject.clone(),
+                path_len_constraint: None,
+            },
+            SerialNumber::from(3u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str("CN=Test VCEK").unwrap(),
+            spki_of(subject_sk),
+            issuer_sk,
+        )
+        .unwrap();
+        builder
+            .add_extension(&HwidExt(
+                x509_cert::der::asn1::OctetString::new(hwid.to_vec()).unwrap(),
+            ))
+            .unwrap();
+        builder.build::<DerSignature>().unwrap()
+    }
+
+    #[test]
+    fn hwid_parse_both_encodings() {
+        let want = [0xABu8; 64];
+        // Encoding A: raw 64 bytes.
+        assert_eq!(parse_amd_hwid(&want).unwrap(), want);
+        // Encoding B: DER OCTET STRING wrapper.
+        let der = x509_cert::der::asn1::OctetString::new(want.to_vec())
+            .unwrap()
+            .to_der()
+            .unwrap();
+        assert_eq!(parse_amd_hwid(&der).unwrap(), want);
+        // Wrong length rejected.
+        assert!(parse_amd_hwid(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn vcek_chip_binding_pass_and_mismatch() {
+        let (ark_sk, ask_sk, vcek_sk) = (key(10), key(40), key(90));
+        let ark = self_signed(&ark_sk, "CN=Test ARK");
+        let ask = signed_by(&ask_sk, "CN=Test ASK", &ark, &ark_sk);
+        let report = report_signed_by(&vcek_sk);
+        let chip = report_chip_id(&report).unwrap();
+        // VCEK whose HWID matches the report's chip_id → binding passes.
+        verify_vcek_chip_binding(&vcek_with_hwid(&vcek_sk, &ask, &ask_sk, &chip), &report)
+            .expect("matching HWID must bind");
+        // VCEK whose HWID differs → rejected.
+        let mut other = chip;
+        other[0] ^= 0xff;
+        assert!(matches!(
+            verify_vcek_chip_binding(&vcek_with_hwid(&vcek_sk, &ask, &ask_sk, &other), &report),
+            Err(VerifyError::TcbBinding(_))
+        ));
+    }
+
+    #[test]
+    fn vcek_without_hwid_rejected() {
+        let (ark_sk, ask_sk, vcek_sk) = (key(10), key(40), key(90));
+        let ark = self_signed(&ark_sk, "CN=Test ARK");
+        let ask = signed_by(&ask_sk, "CN=Test ASK", &ark, &ark_sk);
+        let vcek = signed_by(&vcek_sk, "CN=Test VCEK", &ask, &ask_sk); // no HWID extension
+        assert!(matches!(
+            verify_vcek_chip_binding(&vcek, &report_signed_by(&vcek_sk)),
+            Err(VerifyError::TcbBinding(_))
         ));
     }
 }

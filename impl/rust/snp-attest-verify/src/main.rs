@@ -7,9 +7,10 @@
 //!     --report report.bin --vcek vcek.der --cert-chain ask_ark.pem \
 //!     --measurement 3e39e33a... [--pq-pubkey pq.bin] [--pinned-ark-chain amd.pem]
 //!
-//! The VCEK + ASK/ARK chain come from the AMD KDS (auxblob is empty on current providers); fetch:
-//!   curl 'https://kdsintf.amd.com/vcek/v1/Genoa/<chip_id_hex>?blSPL=..&teeSPL=..&snpSPL=..&ucodeSPL=..' -o vcek.der
-//!   curl 'https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain' -o ask_ark.pem
+//! The VCEK + ASK/ARK chain come from the AMD KDS (auxblob is empty on current providers); pick the
+//! product to match the CPU (lscpu family 25 = Genoa / 26 = Turin), then fetch:
+//!   curl 'https://kdsintf.amd.com/vcek/v1/<Genoa|Turin>/<chip_id_hex>?blSPL=..&teeSPL=..&snpSPL=..&ucodeSPL=..' -o vcek.der
+//!   curl 'https://kdsintf.amd.com/vcek/v1/<Genoa|Turin>/cert_chain' -o ask_ark.pem
 
 use clap::Parser;
 use snp_attest_verify::{
