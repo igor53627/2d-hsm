@@ -1,7 +1,7 @@
 ---
 id: TASK-7.3
 title: Agent Gateway secp256k1 keygen and public identity
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
 labels:
