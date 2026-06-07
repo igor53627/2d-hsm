@@ -28,14 +28,18 @@ This runs on the **relying party** (Block Producer host / on-chain `MeasurementR
 4. **VCEK ↔ chip binding**: the VCEK's AMD `HWID` extension (`1.3.6.1.4.1.3704.1.4`) must equal the
    report's `chip_id` — so a genuine VCEK from a *different* chip can't be paired with the report
    (mix-and-match). The parser tolerates both observed HWID encodings (raw 64 bytes / OCTET STRING).
+   **Skipped when `chip_id` is all-zero** (`MASK_CHIP_ID`): the chip isn't exposed, so there's nothing
+   to bind to — trust then rests on the chain + measurement (enforcing it would falsely reject).
 
 ## Usage
 
 ```
 snp-attest-verify \
   --report report.bin --vcek vcek.der --cert-chain ask_ark.pem \
-  --measurement 3e39e33ab71f37ec... [--pq-pubkey pq.bin] [--pinned-ark-chain amd.pem]
+  --product turin --pq-pubkey pq.bin --measurement 3e39e33ab71f37ec...
 ```
+`--product <genoa|turin>` pins the bundled AMD root for that CPU family (or pass your own
+`--pinned-ark-chain <pem>`) — **one is required**, there's no silent default.
 
 `auxblob` is empty on current providers (see policy §4), so fetch the VCEK + chain from the **AMD KDS**.
 **Pick the KDS product to match the CPU**: `lscpu` CPU family **25** (0x19) = `Genoa` (Zen 4), family
@@ -50,8 +54,7 @@ curl "https://kdsintf.amd.com/vcek/v1/$P/cert_chain" -o ask_ark.pem
 `--pq-pubkey` is **required** (it binds the report to the producer key via `report_data`) — without a
 key binding the attestation is replayable, since the launch measurement is OVMF-level and shared
 across guests (policy §3). To verify without it (e.g. measurement-only debugging), pass the explicit
-`--allow-unbound`, which warns. `--pinned-ark-chain` defaults to the committed AMD Genoa ARK/ASK
-(`testvectors/amd_genoa_cert_chain.pem`).
+`--allow-unbound`, which warns.
 
 ## Tests
 

@@ -46,8 +46,8 @@ pub enum VerifyError {
     ArkPinMismatch,
     #[error("certificate name chain broken ({0})")]
     NameChain(&'static str),
-    #[error("VCEK/report binding failed ({0})")]
-    TcbBinding(&'static str),
+    #[error("VCEK/report chip binding failed ({0})")]
+    ChipBinding(&'static str),
     #[error(transparent)]
     Prevalidate(#[from] enclave_protocol::ProtocolError),
 }
@@ -266,34 +266,49 @@ const AMD_VCEK_HWID_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.
 /// quirks; cf. go-sev-guest). Validated synthetically — a real-VCEK cross-check is a follow-up (no
 /// KDS-resolvable chip on the lab box; see policy §4).
 fn parse_amd_hwid(extn_value: &[u8]) -> Result<[u8; 64], VerifyError> {
-    let raw: &[u8] = if extn_value.len() == 64 {
-        extn_value
-    } else {
-        // Fall back to a DER OCTET STRING wrapper.
-        return x509_cert::der::asn1::OctetString::from_der(extn_value)
-            .ok()
-            .and_then(|os| <[u8; 64]>::try_from(os.as_bytes()).ok())
-            .ok_or(VerifyError::TcbBinding(
-                "VCEK HWID is neither 64 raw bytes nor an OCTET STRING of 64 bytes",
-            ));
-    };
-    <[u8; 64]>::try_from(raw).map_err(|_| VerifyError::TcbBinding("VCEK HWID is not 64 bytes"))
+    // Real AMD KDS VCEKs put the 64 bytes raw; try_from enforces the exact length.
+    if let Ok(raw) = <[u8; 64]>::try_from(extn_value) {
+        return Ok(raw);
+    }
+    // Fall back to a DER OCTET STRING wrapper (the other encoding seen in practice).
+    x509_cert::der::asn1::OctetString::from_der(extn_value)
+        .ok()
+        .and_then(|os| <[u8; 64]>::try_from(os.as_bytes()).ok())
+        .ok_or(VerifyError::ChipBinding(
+            "VCEK HWID is neither 64 raw bytes nor an OCTET STRING of 64 bytes",
+        ))
 }
 
 /// Bind the VCEK to the report's chip: the VCEK's HWID extension must equal the report's `chip_id`.
 /// Without this, a genuine VCEK from a *different* chip could be paired with a report (mix-and-match).
+///
+/// Skipped when the report's `chip_id` is all-zero (`MASK_CHIP_ID`): the platform deliberately does
+/// not expose the chip, so there is nothing to bind to — trust then rests on the cert chain to the
+/// pinned AMD root + the measurement allowlist. (KDS VCEKs always carry the real HWID, so enforcing
+/// equality against a masked, zeroed report `chip_id` would falsely reject a genuine attestation.)
 pub fn verify_vcek_chip_binding(vcek: &Certificate, report: &[u8]) -> Result<(), VerifyError> {
-    let ext = vcek
+    let chip_id = report_chip_id(report)?;
+    if chip_id == [0u8; 64] {
+        return Ok(());
+    }
+    let mut hwid_exts = vcek
         .tbs_certificate
         .extensions
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .find(|e| e.extn_id == AMD_VCEK_HWID_OID)
-        .ok_or(VerifyError::TcbBinding("VCEK has no AMD HWID extension"))?;
-    let hwid = parse_amd_hwid(ext.extn_value.as_bytes())?;
-    if hwid != report_chip_id(report)? {
-        return Err(VerifyError::TcbBinding("VCEK HWID != report chip_id"));
+        .filter(|e| e.extn_id == AMD_VCEK_HWID_OID);
+    let ext = hwid_exts
+        .next()
+        .ok_or(VerifyError::ChipBinding("VCEK has no AMD HWID extension"))?;
+    if hwid_exts.next().is_some() {
+        // A well-formed cert has at most one of each extension (RFC 5280 §4.2).
+        return Err(VerifyError::ChipBinding(
+            "VCEK has multiple HWID extensions",
+        ));
+    }
+    if parse_amd_hwid(ext.extn_value.as_bytes())? != chip_id {
+        return Err(VerifyError::ChipBinding("VCEK HWID != report chip_id"));
     }
     Ok(())
 }
@@ -677,8 +692,75 @@ mod synthetic_chain_tests {
         other[0] ^= 0xff;
         assert!(matches!(
             verify_vcek_chip_binding(&vcek_with_hwid(&vcek_sk, &ask, &ask_sk, &other), &report),
-            Err(VerifyError::TcbBinding(_))
+            Err(VerifyError::ChipBinding(_))
         ));
+    }
+
+    // A VCEK HWID extension whose value is the 64 RAW bytes (no inner OCTET STRING) — the encoding
+    // real AMD KDS VCEKs use; exercises parse_amd_hwid's raw-64 branch via a real cert.
+    struct HwidRawExt([u8; 64]);
+    impl const_oid::AssociatedOid for HwidRawExt {
+        const OID: ObjectIdentifier = AMD_VCEK_HWID_OID;
+    }
+    impl x509_cert::der::Encode for HwidRawExt {
+        fn encoded_len(&self) -> x509_cert::der::Result<x509_cert::der::Length> {
+            x509_cert::der::Length::try_from(self.0.len())
+        }
+        fn encode(&self, writer: &mut impl x509_cert::der::Writer) -> x509_cert::der::Result<()> {
+            writer.write(&self.0)
+        }
+    }
+    impl x509_cert::ext::AsExtension for HwidRawExt {
+        fn critical(&self, _subject: &Name, _extensions: &[x509_cert::ext::Extension]) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn vcek_chip_binding_raw_hwid_encoding() {
+        // The raw-64 HWID encoding (what AMD KDS VCEKs use) — exercised end to end via a real cert.
+        let (ark_sk, ask_sk, vcek_sk) = (key(10), key(40), key(90));
+        let ark = self_signed(&ark_sk, "CN=Test ARK");
+        let ask = signed_by(&ask_sk, "CN=Test ASK", &ark, &ark_sk);
+        let report = report_signed_by(&vcek_sk);
+        let chip = report_chip_id(&report).unwrap();
+        let mut builder = CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: ask.tbs_certificate.subject.clone(),
+                path_len_constraint: None,
+            },
+            SerialNumber::from(4u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str("CN=Test VCEK").unwrap(),
+            spki_of(&vcek_sk),
+            &ask_sk,
+        )
+        .unwrap();
+        builder.add_extension(&HwidRawExt(chip)).unwrap();
+        let vcek = builder.build::<DerSignature>().unwrap();
+        // Confirm it really is the raw-64 form (not OCTET-STRING-wrapped → would be 66 bytes).
+        let ext = vcek
+            .tbs_certificate
+            .extensions
+            .as_deref()
+            .unwrap()
+            .iter()
+            .find(|e| e.extn_id == AMD_VCEK_HWID_OID)
+            .unwrap();
+        assert_eq!(ext.extn_value.as_bytes().len(), 64, "raw-64 HWID encoding");
+        verify_vcek_chip_binding(&vcek, &report).expect("raw-HWID binding must pass");
+    }
+
+    #[test]
+    fn masked_chip_id_skips_binding() {
+        // MASK_CHIP_ID: report chip_id all-zero → binding is N/A and must not reject (even with no ext).
+        let (ark_sk, ask_sk, vcek_sk) = (key(10), key(40), key(90));
+        let ark = self_signed(&ark_sk, "CN=Test ARK");
+        let ask = signed_by(&ask_sk, "CN=Test ASK", &ark, &ark_sk);
+        let mut report = report_signed_by(&vcek_sk);
+        report[CHIP_ID_OFFSET..CHIP_ID_OFFSET + CHIP_ID_LEN].fill(0); // masked chip_id
+        let vcek = signed_by(&vcek_sk, "CN=Test VCEK", &ask, &ask_sk); // no HWID extension
+        verify_vcek_chip_binding(&vcek, &report).expect("masked chip_id must skip the binding");
     }
 
     #[test]
@@ -689,7 +771,7 @@ mod synthetic_chain_tests {
         let vcek = signed_by(&vcek_sk, "CN=Test VCEK", &ask, &ask_sk); // no HWID extension
         assert!(matches!(
             verify_vcek_chip_binding(&vcek, &report_signed_by(&vcek_sk)),
-            Err(VerifyError::TcbBinding(_))
+            Err(VerifyError::ChipBinding(_))
         ));
     }
 }
