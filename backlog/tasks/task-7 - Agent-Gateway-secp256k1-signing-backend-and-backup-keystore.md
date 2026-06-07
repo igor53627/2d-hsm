@@ -4,6 +4,7 @@ title: Agent Gateway secp256k1 signing backend and backup keystore
 status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
+updated_date: '2026-06-07 16:43'
 labels:
   - agent-gateway
   - secp256k1
@@ -15,7 +16,9 @@ dependencies:
   - TASK-6
 references:
   - backlog/docs/agent-gateway-secp256k1-signer-design.md
-  - ../2d/backlog/tasks/task-132.5 - Provision-dedicated-2d-hsm-signer-namespace-for-agent-faucet-and-transfer-signing.md
+  - >-
+    ../2d/backlog/tasks/task-132.5 -
+    Provision-dedicated-2d-hsm-signer-namespace-for-agent-faucet-and-transfer-signing.md
   - ../2d/docs/specs/2026-06-07-agent-gateway-signer-2d-hsm-key-pool-design.md
   - impl/rust/enclave-protocol
   - backlog/docs/vsock-api-wire-format-spec-draft.md
@@ -37,7 +40,7 @@ This task is intentionally split into smaller reviewable subtasks because it tou
 - [ ] #1 TASK-7.1 defines versioned Agent Gateway protocol/opcodes and command-domain separation.
 - [ ] #2 TASK-7.2 defines persistent multi-key agent keystore storage and encrypted backup/DR semantics.
 - [ ] #3 TASK-7.3 designs secp256k1 agent key generation and public identity derivation, including faucet treasury key generation.
-- [ ] #4 TASK-7.4 designs structured ordinary 2D transfer and faucet dispense signing without generic digest signing.
+- [x] #4 TASK-7.4 designs structured ordinary 2D transfer and faucet dispense signing without generic digest signing.
 - [ ] #5 TASK-7.5 defines host integration for OPA/Vault capability separation.
 - [ ] #6 TASK-7.6 implements the reviewed design or splits implementation into narrower child tasks before code begins; replacement tasks must cover protocol framing, keystore/backup, keygen/identity, signing/caps, and host integration.
 - [ ] #7 TASK-7.7 defines the production anti-rollback mechanism or explicitly blocks production fund custody without it.
@@ -45,6 +48,8 @@ This task is intentionally split into smaller reviewable subtasks because it tou
 - [ ] #9 The design and implementation do not reuse AuthorizationTicket commands, producer ML-DSA keys, or producer arming/network-second-factor state for Agent Gateway signing.
 - [ ] #10 High-risk review follows this repo's AGENTS.md roborev matrix rules before merge.
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 

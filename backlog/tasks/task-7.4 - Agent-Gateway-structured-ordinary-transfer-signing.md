@@ -1,10 +1,10 @@
 ---
 id: TASK-7.4
 title: Agent Gateway structured ordinary transfer signing
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-07 16:29'
+updated_date: '2026-06-07 16:43'
 labels:
   - agent-gateway
   - signing
@@ -54,11 +54,19 @@ Design Agent Gateway signing as structured ordinary 2D transaction signing. The 
 Design delivered in backlog/docs/agent-gateway-transfer-faucet-signing.md (design-only; secp256k1 signing impl is TASK-7.6). Consumes TASK-7.1 protocol + frozen ordinary_tx_v1 vector, TASK-7.2 faucet caps + seal-before-emit, TASK-7.3 keygen/identity. Adds: SIGN_TRANSFER structured-field -> EIP-155 preimage build + from/chain_id checks + low-S/recovery/v keyed to the 2D verifier + no caller digest + empty data; SIGN_FAUCET_DISPENSE to-must-be-known-transfer-key + worst-case checked-arithmetic caps (legacy gas_price) + dual sealed counters + signing-budget semantics; seal-before-emit + serialized commit + throughput statement + 7.4/7.7 boundary + residual; no-generic-digest + identity-proof non-coercion + key-purpose cross-rejection; conditional rotation carry-over; golden-vector/test requirements. Adopted: legacy gas_price (no EIP-1559 in pinned vector), rotation carry-over semantics only, no reconciliation (worst-case budget), anti-rollback assumptions toward 7.7, dispense-rate model + benchmark deferred to 7.6. AC #1-#15 addressed by this design; AC #16 (roborev matrix) run pre-merge.
 
 Roborev evidence: 3×3 vendor matrix (codex+gemini+claude-code × security/design/default) run on 68ed1c0; findings resolved in-PR — explicit per-field faucet cap predicate + conditional breaker (HIGH), low-S normalization (flip recovery_id) not reject, u256 integer domain, AC#10 cap-mutation replay-protection section, effective_max_fee_rate naming, budget-only-on-emit wording; consolidated via roborev compact.
+
+/code-review skill (xhigh, 21 cand → 5 confirmed) run on PR #31 before merge: caught regressions from the roborev-fix — §2/§3/§6 breaker-counter contradiction, missing first-install lifetime_spend seed, §6 faucet data/memo rejection gap, AC#8 integer-domain underspec. All 5 fixed (lifetime_spend always maintained from genesis; only the breaker threshold check is conditional) + 7.2 cross-doc clarified; re-verified clean. Merged PR #31 (squash 388d15c).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Design delivered in backlog/docs/agent-gateway-transfer-faucet-signing.md (PR #31, squash 388d15c). Specifies AGENT_K1_SIGN_TRANSFER + SIGN_FAUCET_DISPENSE: structured-field → canonical EIP-155 preimage keyed to the 2D verifier (low-S normalization, recovery_id, v∈{23165,23166}), no generic digest signing + identity-proof non-coercion + key-purpose cross-rejection, faucet recipient allowlist + checked u256 worst-case caps + always-maintained lifetime_spend with optional breaker threshold, seal-before-emit + serialized commit, the 7.4↔7.7 rollback boundary, and golden-vector/test requirements. Design-only; secp256k1 signing impl is TASK-7.6. Verified by roborev 3×3 + compact (clean) and the /code-review skill (5 confirmed findings resolved + re-verified).
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Golden-vector requirements cover successful signing and rejection cases after the 2D transaction encoding is pinned.
-- [ ] #2 Test requirements prove generic digest signing and identity-proof oracle coercion fail for agent key purposes.
-- [ ] #3 Final summary added before marking Done.
+- [x] #1 Golden-vector requirements cover successful signing and rejection cases after the 2D transaction encoding is pinned.
+- [x] #2 Test requirements prove generic digest signing and identity-proof oracle coercion fail for agent key purposes.
+- [x] #3 Final summary added before marking Done.
 <!-- DOD:END -->
