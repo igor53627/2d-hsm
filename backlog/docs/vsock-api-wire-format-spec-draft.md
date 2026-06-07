@@ -87,7 +87,7 @@ Do **not** conflate them:
 - Producer Chain Attestation does **not** replace ML-DSA block or ticket signatures.
 - The Ed25519 verifying key (`ProducerAttestationTrust`) is **not** derived from `pq_pubkey` (see §9.3).
 
-User and bridge transactions on 2d remain **secp256k1** until a separate wallet PQ migration (2d TASK-24). This service does not sign Ethereum-style user txs.
+User and bridge transactions on 2d remain **secp256k1** until a separate wallet PQ migration (2d TASK-24). The producer/recovery vsock surface described in this draft does not sign Ethereum-style user txs; the Agent Gateway extension is a separate command namespace with its own key purposes, policies, and versioned test vectors.
 
 ### 2.4 AF_VSOCK transport (bind address)
 
