@@ -4,7 +4,7 @@ title: Agent Gateway secp256k1 signing backend and backup keystore
 status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-07 16:43'
+updated_date: '2026-06-07 18:01'
 labels:
   - agent-gateway
   - secp256k1
@@ -37,9 +37,9 @@ This task is intentionally split into smaller reviewable subtasks because it tou
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 TASK-7.1 defines versioned Agent Gateway protocol/opcodes and command-domain separation.
-- [ ] #2 TASK-7.2 defines persistent multi-key agent keystore storage and encrypted backup/DR semantics.
-- [ ] #3 TASK-7.3 designs secp256k1 agent key generation and public identity derivation, including faucet treasury key generation.
+- [x] #1 TASK-7.1 defines versioned Agent Gateway protocol/opcodes and command-domain separation.
+- [x] #2 TASK-7.2 defines persistent multi-key agent keystore storage and encrypted backup/DR semantics.
+- [x] #3 TASK-7.3 designs secp256k1 agent key generation and public identity derivation, including faucet treasury key generation.
 - [x] #4 TASK-7.4 designs structured ordinary 2D transfer and faucet dispense signing without generic digest signing.
 - [ ] #5 TASK-7.5 defines host integration for OPA/Vault capability separation.
 - [ ] #6 TASK-7.6 implements the reviewed design or splits implementation into narrower child tasks before code begins; replacement tasks must cover protocol framing, keystore/backup, keygen/identity, signing/caps, and host integration.
@@ -48,6 +48,8 @@ This task is intentionally split into smaller reviewable subtasks because it tou
 - [ ] #9 The design and implementation do not reuse AuthorizationTicket commands, producer ML-DSA keys, or producer arming/network-second-factor state for Agent Gateway signing.
 - [ ] #10 High-risk review follows this repo's AGENTS.md roborev matrix rules before merge.
 <!-- AC:END -->
+
+
 
 
 
