@@ -87,6 +87,32 @@ Print `meas_digest` (hex, one line) for a measurement file or hex string. Use to
 pq-seal-v1 meas-digest --measurement-file ./enclave.measurement
 ```
 
+### `manifest build`
+
+**Multi-host ceremony** (TASK-1.1): seal the **same** producer key once per host provisioning root,
+emitting `pq-seal-manifest.json` + `blobs/<label>.sealed` for an HA fleet (the root is per-chip, so
+each host needs its own blob). See runbook **§7.2**.
+
+**Required:** exactly one of `--measurement-file`/`--measurement-hex`; `--secret-key-file`;
+`--public-key-file`; one or more `--host LABEL=ROOTFILE`; `--out-dir`.
+
+```bash
+pq-seal-v1 manifest build \
+  --measurement-hex <48-byte image measurement> \
+  --secret-key-file /secure/producer.sk.bin \
+  --public-key-file /secure/producer.pk.bin \
+  --host aya=/secure/aya.root --host bravo=/secure/bravo.root \
+  --out-dir ./fleet-manifest
+```
+
+- Each `ROOTFILE` is the **raw 32-byte** root from `snp-derive-root --out` (not `--print`, which is hex).
+- `LABEL` is the blob filename stem: `[A-Za-z0-9._-]`, 1..=64 chars, unique (case-insensitive).
+- Each host needs a **distinct** root; a repeated root is rejected.
+- `--out-dir` is created fresh (its parent must exist); a failed build writes nothing (retry-safe).
+- The manifest records a one-way `root_commitment = SHA3-256(domain ‖ root)` per host (never the root)
+  for trustless boot-time selection; blobs are AEAD-bound to `(root, measurement)`, so they need not be
+  kept secret. Shared format/selection lib: `pq-seal-manifest`.
+
 ## Staging vs production root
 
 | Environment | Provisioning root |

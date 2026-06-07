@@ -28,6 +28,10 @@ pub enum ManifestError {
     NoMatch,
     #[error("{0} manifest entries match this host's root (expected exactly 1)")]
     Ambiguous(usize),
+    #[error(
+        "manifest has duplicate root_commitment {0} (no host could ever select unambiguously)"
+    )]
+    DuplicateCommitment(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -71,6 +75,16 @@ impl Manifest {
         let m: Manifest = serde_json::from_slice(bytes)?;
         if m.version != MANIFEST_VERSION {
             return Err(ManifestError::Version(m.version));
+        }
+        // Reject at load a manifest `select` could never use unambiguously (e.g. hand-edited/merged),
+        // so the failure surfaces here, not as a boot-time `Ambiguous` on the affected host.
+        let mut seen = std::collections::BTreeSet::new();
+        for e in &m.entries {
+            if !seen.insert(e.root_commitment.to_ascii_lowercase()) {
+                return Err(ManifestError::DuplicateCommitment(
+                    e.root_commitment.clone(),
+                ));
+            }
         }
         Ok(m)
     }
@@ -155,6 +169,18 @@ mod tests {
         assert!(matches!(
             m.select(&root(1)),
             Err(ManifestError::Ambiguous(2))
+        ));
+    }
+
+    #[test]
+    fn from_json_rejects_duplicate_commitments() {
+        // A hand-edited/merged manifest with two equal commitments is rejected at load, not at boot.
+        let json = manifest_of(&[("a", root(1)), ("b", root(1))])
+            .to_json_pretty()
+            .unwrap();
+        assert!(matches!(
+            Manifest::from_json(json.as_bytes()),
+            Err(ManifestError::DuplicateCommitment(_))
         ));
     }
 

@@ -82,8 +82,8 @@ struct ManifestBuildArgs {
     #[arg(long)]
     public_key_file: PathBuf,
 
-    /// A host as `LABEL=ROOTFILE` (32-byte provisioning root from `snp-derive-root --out`/`--print`).
-    /// Repeat once per host. LABEL is the blob filename stem; must be `[A-Za-z0-9._-]+`.
+    /// A host as `LABEL=ROOTFILE` (the raw 32-byte provisioning root from `snp-derive-root --out`).
+    /// Repeat once per host. LABEL is the blob filename stem; `[A-Za-z0-9._-]`, 1..=64 chars.
     #[arg(long = "host", value_name = "LABEL=ROOTFILE", required = true)]
     hosts: Vec<String>,
 
@@ -298,6 +298,14 @@ fn cmd_generate_keypair(args: GenerateKeypairArgs) -> Result<(), CliError> {
 
 fn cmd_manifest_build(args: ManifestBuildArgs) -> Result<(), CliError> {
     let measurement = read_measurement(&args.measurement_file, &args.measurement_hex)?;
+    if measurement.len() != 48 {
+        // The SEV-SNP launch measurement is 48 bytes; a wrong length seals a fleet that can't unseal.
+        eprintln!(
+            "warning: measurement is {} bytes (SEV-SNP launch measurement is 48) — \
+             every blob will fail to unseal if this is not the real image measurement",
+            measurement.len()
+        );
+    }
     let (sk, pk) = read_validated_keypair(&args.secret_key_file, &args.public_key_file)?;
 
     // Seal every host's blob IN MEMORY first, so a bad input fails before any output is written.
@@ -331,13 +339,15 @@ fn cmd_manifest_build(args: ManifestBuildArgs) -> Result<(), CliError> {
         built.push((label.to_string(), blob, commitment));
     }
 
-    // Create the output tree fresh (never clobber a prior ceremony), then write. On ANY write-phase
-    // failure, remove the freshly created tree so a retry with the same --out-dir isn't blocked.
-    if let Some(parent) = args.out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    fs::create_dir(&args.out_dir)
-        .map_err(|e| CliError::Msg(format!("create --out-dir {}: {e}", args.out_dir.display())))?;
+    // Create the output dir fresh (never clobber a prior ceremony; its parent must already exist),
+    // then write. On ANY write-phase failure, remove the freshly created tree so a retry with the
+    // same --out-dir isn't blocked.
+    fs::create_dir(&args.out_dir).map_err(|e| {
+        CliError::Msg(format!(
+            "create --out-dir {} (does its parent exist?): {e}",
+            args.out_dir.display()
+        ))
+    })?;
     if let Err(e) = write_manifest_tree(&args.out_dir, &measurement, &built) {
         let _ = fs::remove_dir_all(&args.out_dir); // best-effort: clean up our own fresh dir
         return Err(e);

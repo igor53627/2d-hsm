@@ -187,7 +187,8 @@ whole ceremony on a SEV-SNP host — boots `.#disk-production-lab-print-ceremony
 root, seals the reference keypair against it offline, builds `.#disk-production-lab-snp-rooted` with
 that blob, and asserts the enclave reaches `pq_signing_ready` + a real measurement. NOTE the derived
 root is **platform-specific** (per VCEK / per chip), so a baked blob only unseals on the host it was
-sealed for; multi-host mainnet needs per-host sealing (or VMRK) — tracked as a follow-up.
+sealed for; for a multi-host fleet, seal the key once per host and ship the blobs in a manifest — see
+**§7.2**.
 
 **Measurement binding ⇒ re-seal on image change:** because the root is bound to MEASUREMENT, any
 change to the enclave image (firmware, kernel, binary) changes the root and invalidates an existing
