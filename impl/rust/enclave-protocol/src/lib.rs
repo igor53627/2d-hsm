@@ -1840,8 +1840,12 @@ mod tests {
         let mut bad_frame = encode_message(MessageType::GetMeasurement, &payload).unwrap();
         bad_frame[5] = 0xFF;
         let resp = process_framed_with_session(&bad_frame, &mut session).unwrap();
-        let decoded = decode_message(&resp).unwrap();
-        assert!(is_wire_error_payload(&decoded.payload));
+        // Fail-closed routing (TASK-7.1 AC#20): the error frame echoes the original
+        // unknown type byte and does NOT default to a producer type (0x01). The body
+        // (after the 6-byte header) is still a wire error payload.
+        assert_eq!(resp[5], 0xFF);
+        assert_ne!(resp[5], MessageType::GetMeasurement as u8);
+        assert!(is_wire_error_payload(&resp[6..]));
     }
 
     #[test]

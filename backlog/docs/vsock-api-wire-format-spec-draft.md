@@ -594,9 +594,9 @@ and opcode inside the CBOR payload, so it can evolve without a frame-version bum
 **Fail-closed at three checkpoints** (none may fall back to a producer type — AC#3/AC#20):
 1. `decode_message`: `0x40 → AgentGateway`; `0x41..0xFF → UnknownMessageType`.
 2. `peek_msg_type_from_frame` (routing/error-frame helper): returns *no* type for
-   unrecognized bytes. **NOTE:** the reference crate currently defaults unknown types to
-   `GetMeasurement` (fail-**open**) — TASK-7.1 fixes this to return `Option<MessageType>`
-   so callers emit a neutral error frame, never `GetMeasurement`.
+   unrecognized bytes. This PR fixes a prior fail-**open** default (unknown types fell back
+   to `GetMeasurement`): it now returns `Option<MessageType>` and an unrecognized request's
+   error frame echoes the original type byte, never a producer type.
 3. Inner agent decoder: validate `agent_version == AGENT_PROTOCOL_VERSION (=1)`, then
    match `opcode` against the exhaustive allow-list below; unknown version, opcode, or
    treasury sub-op → fail closed (`AGENT_MALFORMED`), no state touch.
@@ -609,7 +609,7 @@ CBOR integer-key map (canonical, per §8):
 {
   1: agent_version (uint, = 1),
   2: opcode        (uint, see §10.3),
-  3: command_domain(uint, fixed Agent Gateway domain tag),
+  3: command_domain(tstr, fixed = "2d-hsm/agent-gateway/v1"),
   4: request_id    (bstr, binds one request),
   5: capability    (map, REQUIRED for privileged opcodes only — §10.5),
   6: key_ref|batch_id (bstr, where applicable),
@@ -684,6 +684,10 @@ privileged opcodes. **Host-side Vault/OPA authorization alone is never sufficien
 6 environment_identifier (= sealed)  12 is_recovery (bool → verify vs recovery_authority_pk)
 ```
 
+The design doc's "key refs or batch/count" capability binding is covered transitively by
+`payload_binding` (keccak256 over the canonical command params); there is no separate
+key-ref field in the signed capability.
+
 **Verify order (all before state touch):** role/profile gate → opcode allow-list →
 `cap_format_version` → Ed25519 verify vs the correct sealed authority → `chain_id`/`env`/
 `scope` equal sealed values → contiguous counter (§10.6) → `payload_binding ==
@@ -736,7 +740,7 @@ a global remote monotonic ledger is specified (AC#12). All writes sealed before 
 
   | domain | first preimage byte | hash |
   |--------|---------------------|------|
-  | eth EIP-155 tx | `0xed` (RLP list, always `≥0xc0`) | keccak256 |
+  | eth EIP-155 tx | `≥0xc0` (RLP list; this vector `0xed`) | keccak256 |
   | TRON tx (reserved) | `0x0a` (protobuf field-1 tag) | sha256 |
   | identity proof | `0x19` (EIP-191) | keccak256 |
 
@@ -766,6 +770,9 @@ are collapsed:
 | `0x44 AGENT_CAP_EXCEEDED` | per-dispense/gas/budget/breaker exceeded or checked-overflow | distinct from malformed |
 | `0x45 AGENT_NOT_CONFIGURED` | faucet signing before mandatory caps sealed | safe |
 | `0x46 AGENT_SEAL_FAILED` | atomic sealed-commit failed; no signature/refs emitted | safe |
+
+Agent codes `0x40–0x46` are deliberately disjoint from the producer/common error codes
+(`1`, `2`), so both namespaces share one `{1: code, 2: reason}` map without collision.
 
 Never expose key-existence, per-field capability failure, exact provisioning/sealing state,
 or key-derivation detail.
