@@ -778,9 +778,11 @@ a global remote monotonic ledger is specified (AC#12). All writes sealed before 
   caveat:** `0x19` is a legal `TransactionType`, so disjointness from typed txs depends on
   the pinned policy that **2D permanently reserves/never assigns tx-type `0x19`** —
   tracked by a 2D-side AC in the TASK-132.5 family (the enclave cannot enforce it). This
-  2D-side reservation is a **blocking dependency** for TASK-7.3/7.4: their non-collision
-  proof must reference a pinned 2D commit/test showing tx-type `0x19` is reserved/rejected.
-  Witnesses in `testvectors/agent-gateway/domain_separation.json`.
+  2D-side reservation is a **production gate**, not a gate on the TASK-7.3/7.4 *design*:
+  `AGENT_K1_PROVE_IDENTITY` and any identity-proof signing must stay non-production / disabled
+  until a **merged** 2D commit/test pins that tx-type `0x19` is reserved/rejected; the
+  non-collision proof references that pinned artifact, and production fund custody (TASK-7.7)
+  is gated regardless. Witnesses in `testvectors/agent-gateway/domain_separation.json`.
 - **Read policy (AC#16):** `AGENT_K1_PUBLIC_IDENTITY` and `AGENT_K1_PROVE_IDENTITY` are
   **low-privilege local reads** — no administrative capability — but still validate command
   domain, key purpose, and chain/environment binding; `PROVE_IDENTITY` binds the fresh
