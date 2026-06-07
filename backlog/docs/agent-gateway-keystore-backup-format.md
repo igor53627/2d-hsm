@@ -82,7 +82,8 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    scope_class, scope_target) -> highest_accepted_counter`. Acceptance (TASK-7.1):
    `incoming == highest+1`; reject lower (replay) and gaps.
 4. **Faucet state** (AC#8/#17): per-dispense max amount, max gas limit, max effective gas
-   fee rate, `cumulative_native_spend` (refillable) + optional lifetime circuit-breaker.
+   fee rate, `cumulative_native_spend` (refillable) + a lifetime-spend counter always
+   maintained from genesis with an **optional** circuit-breaker threshold (see TASK-7.4 §2).
    Spend counters keyed **independently of the treasury `key_ref`** so they survive
    treasury-key rotation (AC#17 — never reset on key replacement).
 5. **Audit** (AC#8/#14): bounded ring buffer of privileged-op records (op, authority,

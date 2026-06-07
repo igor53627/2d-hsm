@@ -66,6 +66,8 @@ The MVP supports one active `agent_faucet_treasury_k1` key per sealed agent keys
 
 ## Structured transfer signing
 
+> **Signing contract spec:** the concrete `AGENT_K1_SIGN_TRANSFER` / `AGENT_K1_SIGN_FAUCET_DISPENSE` signing contract (EIP-155 preimage build, low-S/recovery/`v` keyed to the 2D verifier, faucet caps + checked worst-case arithmetic, seal-before-emit, no-digest/domain separation, test vectors) is in `agent-gateway-transfer-faucet-signing.md` (TASK-7.4). This section is the high-level model.
+
 `AGENT_K1_SIGN_TRANSFER` accepts semantic fields, not an arbitrary digest:
 
 - `chain_id`: must equal the configured 2D chain id.
