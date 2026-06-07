@@ -187,7 +187,8 @@ whole ceremony on a SEV-SNP host — boots `.#disk-production-lab-print-ceremony
 root, seals the reference keypair against it offline, builds `.#disk-production-lab-snp-rooted` with
 that blob, and asserts the enclave reaches `pq_signing_ready` + a real measurement. NOTE the derived
 root is **platform-specific** (per VCEK / per chip), so a baked blob only unseals on the host it was
-sealed for; multi-host mainnet needs per-host sealing (or VMRK) — tracked as a follow-up.
+sealed for; for a multi-host fleet, seal the key once per host and ship the blobs in a manifest — see
+**§7.2**.
 
 **Measurement binding ⇒ re-seal on image change:** because the root is bound to MEASUREMENT, any
 change to the enclave image (firmware, kernel, binary) changes the root and invalidates an existing
@@ -204,6 +205,46 @@ the console.
 > runbook / a provisioning step. vTPM and Nitro backends are future work (SNP first).
 
 Full operator runbook (hot standby, attestation verification, monitoring, incident response) remains **TASK-1** acceptance criterion #5 — this document is the **PQ seal v1 slice** only.
+
+### 7.2 Multi-host sealing — per-host ceremony (`pq-seal-v1 manifest build`, TASK-1.1)
+
+The §7.1 root is **per chip** (SNP derives it from a platform secret + the MEASUREMENT). With one image
+on N hosts, each host derives a *different* root, so a blob sealed for host X will not unseal on host Y.
+For an HA BlockProducer fleet sharing **one** producer key, seal that key once **per host** and ship all
+the blobs in a manifest; each host selects its own.
+
+Why per-host (not a shared root / VMRK): keeps the §7.1 guarantee that the root is secret to the chip and
+bound to the measurement — no shared secret to distribute or rotate across hosts.
+
+**Ceremony (trusted workstation):**
+
+1. **Capture each host's root** as the **raw 32-byte** file `manifest build` consumes. Run inside each
+   target host's image (the §7.1 path):
+   ```
+   # on/within host i:
+   snp-derive-root --out hostI.root   # raw 32 bytes, mode 0600 (secret — handle offline)
+   ```
+   Use `--out` (raw bytes), **not** `--print` (which emits 64-char hex for human inspection). (A future
+   slice can collect only commitments and seal against those; today the ceremony needs the roots.)
+2. **Seal the producer key once per host + build the manifest:**
+   ```
+   pq-seal-v1 manifest build \
+     --measurement-hex <48-byte-image-measurement> \
+     --secret-key-file producer.sk.bin --public-key-file producer.pk.bin \
+     --host aya=aya.root --host bravo=bravo.root \
+     --out-dir ./fleet-manifest
+   # → fleet-manifest/pq-seal-manifest.json + fleet-manifest/blobs/<label>.sealed
+   ```
+   Each blob is AEAD-bound to `(root_i, measurement)`; the manifest records a **commitment**
+   `SHA3-256(domain ‖ root_i)` per host (never the root), plus an advisory label.
+3. **Distribute** `pq-seal-manifest.json` + `blobs/`. They need **not** be secret or trusted: a blob is
+   useless on the wrong chip, and a tampered/missing entry fails to unseal (fail-closed). They can live on
+   a host-provided volume, so changing the fleet is a manifest update — **no image rebuild**.
+4. **Boot selection (next slice):** the boot helper derives `root_i`, computes its commitment, picks the
+   matching entry, and places that blob where the enclave already reads it
+   (`TWOD_HSM_PQ_SEALED_SIGNER_FILE`). The enclave is unchanged; the AEAD re-authenticates on unseal.
+
+Re-seal the whole manifest on an **image change** (measurement-bound) or to **add/remove a host**.
 
 ---
 
@@ -226,3 +267,4 @@ Full operator runbook (hot standby, attestation verification, monitoring, incide
 | 2026-06-02 | Initial staging runbook (platform root + `pq-seal-v1` CLI) |
 | 2026-06-02 | §5 poisoned-mutex troubleshooting; paths relative to `pq-seal-v1` cwd |
 | 2026-06-06 | §7 production root via `snp-derive-root` (SEV-SNP firmware); ceremony + selftest (TASK-1.1) |
+| 2026-06-07 | §7.2 multi-host sealing — per-host ceremony (`pq-seal-v1 manifest build`, TASK-1.1) |
