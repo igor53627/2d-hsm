@@ -43,9 +43,9 @@ struct Cli {
     /// Required unless --pinned-ark-chain is given (no silent default — the pin must match the chip).
     #[arg(long, value_parser = ["genoa", "turin"])]
     product: Option<String>,
-    /// Out-of-band pinned AMD root chain (PEM containing the trusted ARK) — overrides --product
-    /// (e.g. to pin your own copy or a product not bundled here).
-    #[arg(long)]
+    /// Out-of-band pinned AMD root chain (PEM containing the trusted ARK) — use INSTEAD of --product
+    /// (mutually exclusive) to pin your own copy or a product not bundled here.
+    #[arg(long, conflicts_with = "product")]
     pinned_ark_chain: Option<PathBuf>,
     /// ML-DSA-65 producer public key to bind: requires
     /// report_data == SHA3-512("2d-hsm-snp-report-data-v1" || pq_pubkey). REQUIRED unless
