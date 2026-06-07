@@ -266,8 +266,12 @@ mod v1_seal {
         drop(guard);
         #[cfg(any(test, feature = "reference-seal-v1-root"))]
         {
+            // The `&[u8; 32]` annotation keeps the fixture-length check at COMPILE time (a malformed
+            // fixture fails the build) instead of a runtime panic in copy_from_slice.
+            let reference_root: &[u8; 32] =
+                include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
             let mut out = zeroize::Zeroizing::new([0u8; 32]);
-            out.copy_from_slice(include_bytes!("../testvectors/seal_v1_provisioning_root.bin"));
+            out.copy_from_slice(reference_root);
             return Ok(out);
         }
         #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
