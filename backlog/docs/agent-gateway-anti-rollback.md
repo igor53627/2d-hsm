@@ -8,7 +8,8 @@ replaying spent capability counters and resetting faucet `cumulative_spend`. Thi
 mechanism that proves the sealed blob is the **latest**, and the production-funding **block** that
 fails closed until that mechanism is deployed.
 
-Design/contract only (implementation is TASK-7.6). 7.7 **adds** the freshness-binding mechanism +
+Design/contract document; the **anti-rollback anchor implementation is TASK-7.7's own** (slices in §8;
+TASK-7.6 owns the Agent Gateway secp256k1 signer backend it binds onto). 7.7 **adds** the freshness-binding mechanism +
 the AC#5 gate + restore high-water seeding source + the active-active rule, **plus a bounded
 `pq-agent-keystore-v1` format extension** — a `freshness_epoch` field and a pinned `anchor_root`
 identity/CA in the keystore plaintext config — which is a `format_version` bump with a reviewed,
@@ -393,9 +394,26 @@ the dispatch path** (`decode_envelope` now decodes the envelope and its nested c
 through it), closing the residual for the privileged-command path. For the anchor path,
 `verify_anchor_response_bytes(bytes, nonce, config)` is the strict-decode entrypoint the boot-wiring
 slice calls (dead-code-gated until then). `agent_cbor` also unifies the int-keyed map accessors that
-were duplicated across `agent_capability`/`agent_dispatch`/`agent_anchor`. **Note:** the reader is for
-untrusted host wire maps only — the sealed `pq-agent-keystore-v1` body is serde-CBOR and must NOT be
-routed through it.
+were duplicated across `agent_capability`/`agent_dispatch`/`agent_anchor`.
+
+**Safety carve-out:** the reader is for untrusted host wire maps only — the sealed `pq-agent-keystore-v1`
+body is serde-CBOR (a struct map, not a canonical int-keyed map) and must **NOT** be routed through it.
+
+**Host-encoder obligation (for the boot-relay / SDK slice).** Because the enclave now *enforces*
+canonical form, the legitimate host/SDK that produces these wire bytes MUST emit RFC 8949 §4.2.1
+canonical CBOR: integer map keys **ascending by encoded-key bytes**, shortest-form arguments,
+definite-length only. Note a plain Rust encoder (e.g. `ciborium::into_writer`) emits shortest-form +
+definite-length but does **not** auto-sort map keys — it preserves insertion/struct order — so the
+client must build maps in ascending-key order (for shortest-form unsigned int keys, ascending numeric
+== ascending encoded-byte order, so emitting keys in numeric order suffices). A non-canonical encoding
+of otherwise-valid signed values is rejected as `Malformed`. This tightening is **pre-launch** — the
+agent-gateway path is feature-gated and unwired, so no deployed client needs migration.
+
+**Decoder vs schema.** `strict_decode_map` is a *general* canonical reader (it accepts CBOR arrays and
+maps up to the caps); per-message admissibility — the exact allowed key set and field types — is
+enforced afterward by `check_strict_keys` + the typed accessors in each module. Invariant: keep the
+decoder's `MAX_STR_LEN` ≥ the largest per-field byte cap (today 64 B) so no schema-valid field is
+rejected at decode.
 
 **Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
 the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, wiring

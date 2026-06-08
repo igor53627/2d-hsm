@@ -76,6 +76,10 @@ pub(crate) fn check_strict_keys(map: &[(Value, Value)], allowed: impl Fn(u64) ->
 // Caps for the strict decoder. Host input is already bounded by MAX_MESSAGE_SIZE (1 MiB); these keep
 // a hostile-but-small frame from forcing deep recursion or large pre-allocations, and are far above
 // any legitimate agent-gateway message (largest schema is the 13-key capability map; values are tiny).
+// FORWARD-COMPAT: these are silent hard limits — a conformant, correctly-signed message that exceeds
+// any of them is rejected as `Malformed`. If a future agent-gateway schema legitimately needs a larger
+// map/array, deeper nesting, or a bigger string/bytes field (e.g. a marks vector or an attestation
+// blob), raise the relevant constant in lockstep with that schema change.
 const MAX_CBOR_DEPTH: usize = 4; // legit envelope nests to depth 2 (cap@5 / payload@7 submaps)
 const MAX_MAP_ENTRIES: u64 = 64;
 const MAX_ARRAY_ENTRIES: u64 = 64;
