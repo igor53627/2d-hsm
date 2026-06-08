@@ -31,13 +31,13 @@ We follow the **Multi-Agent Code-Review Playbook** (see the full playbook at the
 **Independent perspectives before an irreversible step.**
 
 For every high-risk change:
-- Run at least the **Reduced Matrix** (3 reviews: codex security, gemini security, claude-code design) — see "Reduced vs Full Matrix" below and `.roborev.toml`
+- Run at least the **Reduced Matrix** (4 reviews: codex security, gemini security, claude-code design, grok security) — see "Reduced vs Full Matrix" below and `.roborev.toml`
 - Use `roborev compact` (or equivalent consolidation) before considering the change "reviewed"
 - Run the **Full Matrix** when the decision rules below require it
 - Major or architecture-changing work also gets a human gate
 
 ### Current Matrix (as of 2026-06)
-- Agents: codex, gemini, claude-code (vendor diversity across lineages)
+- Agents: codex, gemini, claude-code, grok (vendor diversity across lineages). Grok has no native roborev agent — it runs via the `opencode` agent (`--agent opencode --model xai/grok-4.3`, auth = `XAI_API_KEY` in the daemon env).
 - Lenses: `security` + `design` (roborev CLI); **concurrency-sensitive** work adds `design` with `--reasoning maximum` (see `~/pse/roborev/pse-review-2x3.sh`)
 - Config lives in `.roborev.toml` at repo root; shared scripts in `~/pse/roborev/`
 
@@ -45,10 +45,11 @@ For every high-risk change:
 
 For high-risk work we distinguish two levels of review:
 
-**Reduced Matrix** (default practical 3-review set)
+**Reduced Matrix** (default practical 4-review set)
 - security + codex
 - security + gemini
 - design + claude-code
+- security + grok (via the `opencode` agent, `xai/grok-4.3`)
 
 This is the normal operating mode for incremental work inside an already-reviewed direction.
 
@@ -77,9 +78,12 @@ See the "Reduced vs Full Matrix" section above for when to use which level.
 
 **Typical Reduced Matrix (most common):**
 ```bash
+~/pse/roborev/pse-review-reduced.sh --dirty   # 4 cells: codex+gemini security, claude-code design, grok security
+# …or run the cells by hand:
 roborev review --dirty --type security --agent codex --model gpt-5.5
 roborev review --dirty --type security --agent gemini --model gemini-3.1-pro-preview
 roborev review --dirty --type design --agent claude-code --model opus
+roborev review --dirty --type security --agent opencode --model xai/grok-4.3   # grok lens
 ```
 
 **Full Matrix (when required by the rules above):**
