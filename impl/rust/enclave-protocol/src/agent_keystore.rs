@@ -1,13 +1,21 @@
 //! Sealed keystore envelope for the Agent Gateway signer (TASK-7.6.2 / TASK-7.2 format).
 //!
 //! This module is the **`pq-agent-keystore-v1` seal/unseal envelope**: the AEAD wrapping layer
-//! that binds the keystore body to the per-enclave seal root + measurement, exactly mirroring the
-//! producer `pq-seal-v1` primitives in `pq_signer.rs` (ChaCha20Poly1305 + `SHA3-256(domain ‖ root
-//! ‖ meas_digest)` KDF, `magic ‖ version ‖ meas_digest ‖ nonce` header with `AAD = header − nonce`,
-//! fail-closed-on-unknown-version-before-decrypt, `Zeroizing` plaintext). It deliberately uses a
-//! **distinct magic and KDF/measurement domains** so a producer blob can never be parsed as a
-//! keystore and the keystore AEAD key can never collide with the producer key derived from the
-//! same SNP root (format-/key-level role isolation — see
+//! that binds the keystore body to the per-enclave seal root + measurement, reusing the producer
+//! `pq-seal-v1` *conventions* in `pq_signer.rs` (`SHA3-256(domain ‖ root ‖ meas_digest)` KDF,
+//! `magic ‖ version ‖ meas_digest ‖ nonce` header with `AAD = header − nonce`,
+//! fail-closed-on-unknown-version-before-decrypt, `Zeroizing` plaintext).
+//!
+//! **AEAD choice — XChaCha20Poly1305 (192-bit nonce), unlike the producer's ChaCha20Poly1305.**
+//! The producer blob is sealed *once* at provisioning (one nonce per key), so a 96-bit random
+//! nonce is safe there. The keystore is instead **re-sealed on every privileged mutation** under a
+//! *fixed* per-enclave key, so a 96-bit random nonce would accrue a birthday-bound collision risk;
+//! XChaCha20Poly1305's extended nonce removes it. `format_version = 1` denotes this XChaCha
+//! envelope from inception — the module has never shipped, so no 96-bit-nonce `v1` blob exists.
+//!
+//! It deliberately uses **distinct magic and KDF/measurement domains** so a producer blob can never
+//! be parsed as a keystore and the keystore AEAD key can never collide with the producer key
+//! derived from the same SNP root (format-/key-level role isolation — see
 //! `backlog/docs/agent-gateway-keystore-backup-format.md`).
 //!
 //! The plaintext here is opaque bytes: the deterministic-CBOR keystore body (config/identity, key
@@ -25,7 +33,10 @@ use zeroize::Zeroizing;
 /// `b"2DAGTKS\0"` — distinct from the producer `b"2DHSMV1\0"` so the two blob families can never
 /// be cross-parsed (format-level role separation, AC#2).
 pub const KEYSTORE_MAGIC: &[u8; 8] = b"2DAGTKS\0";
-/// Current sealed-keystore format version (`u16`, big-endian on the wire).
+/// Current sealed-keystore format version (`u16`, big-endian on the wire). `1` denotes the
+/// XChaCha20Poly1305 envelope + deterministic-CBOR body defined here; an incompatible on-disk
+/// layout/encoding change (e.g. byte-string field encoding, a different AEAD) bumps this and gains
+/// a fail-closed old-version rejection or explicit migration.
 pub const KEYSTORE_FORMAT_VERSION: u16 = 1;
 
 const MEAS_DIGEST_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-meas";
