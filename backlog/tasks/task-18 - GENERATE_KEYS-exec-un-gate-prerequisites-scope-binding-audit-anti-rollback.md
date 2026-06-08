@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-08 19:05'
+updated_date: '2026-06-08 19:08'
 labels:
   - agent-gateway
   - security
@@ -27,4 +28,5 @@ GENERATE_KEYS live execution is implemented behind the off-by-default, release-b
 - [ ] #1 scope_target ↔ sealed-local-enclave-identity binding: bind cap.scope_target to a sealed enclave/fleet id (installed/derived at boot) and byte-compare before mutation, so an 'enclave-scoped' (scope_class=0) cap minted for enclave A cannot be replayed on a clone B (whose counter row for that tuple is empty) to mint a second treasury key — the AC#12 budget-multiplication guard. Enforce command-class scope_target (generate_transfer/generate_faucet) too.
 - [ ] #2 AC#14 privileged-op audit record: append an AuditRecord (op, authority, counter, config_version) to candidate.audit in the same sealed commit as GENERATE_KEYS (and every privileged mutation), and enforce last_exported_seq backpressure (fail closed rather than overwrite un-exported entries).
 - [ ] #3 Anti-rollback durable commit (TASK-7.7): the in-memory swap currently precedes host persistence, so a host can drop the returned sealed blob, reboot from the prior blob, and replay the one-shot capability to re-mint keys. Wire the freshness_epoch advance against the pinned anchor (or an equivalent durable monotonic anchor / persist-ack commit) so a consumed counter cannot be rolled back. Only then un-gate (remove the release ban / flip the feature on).
+- [ ] #4 Pin the GENERATE_KEYS wire contract: document the exact §10.4 request {1:purpose,2:count} + response {1:[keys],2:sealed_blob} canonical CBOR, and the payload_binding preimage (opcode‖request_id‖canonical-CBOR(params)) bytes, in the vsock spec, and add a cross-component golden vector shared by the enclave and the off-enclave capability signer (so they cannot drift on key order / int encoding). Prereq for a real host signer to interop.
 <!-- AC:END -->
