@@ -210,11 +210,25 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
         None => None,
         Some(v) => Some(as_bytes32(v).ok_or(AgentError::Malformed)?),
     };
-    // Extract only the 32-byte verifier nonce (payload key 7 → sub-map key 1) — never clone the
-    // whole payload. Absent/malformed payload ⇒ None (PROVE_IDENTITY requires it; reads ignore it).
+    // Payload (key 7). Strict like the outer envelope (no parser ambiguity / audit-evasion): if
+    // present it must be a map whose only key is 1 (the 32-byte verifier nonce), no duplicates/
+    // unknowns. Extract just the nonce — never clone the (caller-controlled) payload subtree.
     let verifier_nonce = match map_get(&map, 7) {
-        Some(Value::Map(inner)) => map_get(inner, 1).and_then(as_bytes32),
-        _ => None,
+        None => None,
+        Some(Value::Map(inner)) => {
+            let mut seen = false;
+            for (k, _) in inner {
+                if as_u64(k) != Some(1) || seen {
+                    return Err(AgentError::Malformed); // unknown or duplicate inner key
+                }
+                seen = true;
+            }
+            match map_get(inner, 1) {
+                Some(v) => Some(as_bytes32(v).ok_or(AgentError::Malformed)?),
+                None => None, // empty payload map ({}) — PROVE then fails closed on the missing nonce
+            }
+        }
+        Some(_) => return Err(AgentError::Malformed), // key 7 present but not a map
     };
     Ok(AgentEnvelope {
         agent_version,
@@ -710,6 +724,30 @@ mod tests {
         let not_map = enc(Value::Integer(1.into()));
         assert_eq!(
             dispatch_agent(Profile::AgentGateway, &not_map, &body).err(),
+            Some(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn payload_with_extra_inner_key_rejected() {
+        // Inner payload map must be strict (only key 1) — an extra inner key ⇒ Malformed, before
+        // routing (so it holds regardless of the PROVE preview feature).
+        let (body, key_ref) = body_with_key();
+        let payload = envelope(
+            3,
+            vec![
+                (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                (
+                    Value::Integer(7.into()),
+                    Value::Map(vec![
+                        (Value::Integer(1.into()), Value::Bytes(vec![0xab; 32])),
+                        (Value::Integer(2.into()), Value::Integer(9.into())), // unknown inner key
+                    ]),
+                ),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
             Some(AgentError::Malformed)
         );
     }
