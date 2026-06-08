@@ -1,10 +1,10 @@
 ---
 id: TASK-7.7
 title: Agent Gateway anti-rollback mechanism for faucet caps and capability counters
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-08 07:10'
+updated_date: '2026-06-08 07:53'
 labels:
   - agent-gateway
   - tee
@@ -45,9 +45,15 @@ Design delivered in backlog/docs/agent-gateway-anti-rollback.md (design-only; im
 Roborev evidence (AC#6): 3x3 vendor matrix (codex+gemini+claude-code x security/design/default) on 524c8d8 -> 3 HIGH + 3 MED; consolidated via roborev compact (job 7704). Resolved: anchor mutual-authentication (signed nonce-bound anchor responses vs pinned/sealed anchor root — was one-directional); lease=N is NOT bounded naively -> requires anchor-visible lease IDs + consumed sub-cursor, admin/recovery/config always lease=1, production default lease=1; Nix gate enum drops standalone operator-signed-boot (replay-vulnerable); Rust fund-block adds AGENT_K1_CONFIGURE_TREASURY sub-ops; opt-out is measured/sealed (not host-settable) with defined relaxed layers.
 <!-- SECTION:NOTES:END -->
 
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Design delivered in backlog/docs/agent-gateway-anti-rollback.md (PR #33, squash e5d3213). Production anti-rollback for sealed replay counters + faucet spend caps. Platform: SEV-SNP has NO per-enclave hardware monotonic counter -> external anchor required. Selected Option A = remote monotonic counter + epoch-lease: freshness_epoch in the pq-agent-keystore-v1 encrypted body (format extension, version bump per 7.2 AC#16); mutual-authenticated anchor handshake (agent-domain SNP report_data + Ed25519-signed anchor response vs pinned anchor_root); reject blob with epoch < anchor-current AND > anchor-current (fail closed); per-dispense bump+seal-before-emit; default lease=1, safe lease=N only via per-spend anchor-ack (count-bounded, never time); crash-reconcile keyed by request_id. Covers cap counters + faucet cumulative/lifetime spend + strict recovery counter (AC#2); boot/restore seed from authenticated marks never-zero (AC#3); active-active operator-procedural under A, enforced only by Option B global ledger (AC#4); AC#5 funding gate = 2-layer fail-closed (Nix assertion with explicit opt-out term + derived enabled, Rust block on rollback-sensitive commands with SIGN_TRANSFER excluded/EXPORT+RESTORE included) + hard-block-default + measured/sealed audited opt-out. Verified by roborev 3x3 + compact + the /code-review skill (40->15) + all 9 PR bot comments resolved/replied (CodeRabbit confirmed). Implementation is TASK-7.6.
+<!-- SECTION:FINAL_SUMMARY:END -->
+
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Anti-rollback design or production-funding block is documented.
-- [ ] #2 Failure and rollback scenarios are covered by tests, vectors, or reviewed runbook validation where code does not yet exist.
-- [ ] #3 Final summary added before marking Done.
+- [x] #1 Anti-rollback design or production-funding block is documented.
+- [x] #2 Failure and rollback scenarios are covered by tests, vectors, or reviewed runbook validation where code does not yet exist.
+- [x] #3 Final summary added before marking Done.
 <!-- DOD:END -->
