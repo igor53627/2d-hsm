@@ -12,7 +12,7 @@
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use sha2::Digest as _;
 use sha3::{Digest as _, Keccak256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Errors from the secp256k1 primitives. Deliberately coarse (no oracle detail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,21 +52,33 @@ impl Keypair {
     /// the 32 random bytes form a valid non-zero scalar `< n`. The transient stack bytes are
     /// zeroized; the secret lives only inside the zeroize-on-drop `SigningKey`.
     pub fn generate() -> Result<Self, Secp256k1Error> {
-        let mut bytes = [0u8; 32];
-        let signing_key = loop {
-            getrandom::getrandom(&mut bytes).map_err(|_| Secp256k1Error::Csprng)?;
-            match SigningKey::from_slice(&bytes) {
-                Ok(sk) => break sk,
-                Err(_) => {
-                    // invalid scalar (zero or >= n) — scrub and retry
-                    bytes.zeroize();
-                    continue;
+        // Single canonical keygen path; the returned secret bytes are dropped (zeroized) here.
+        Self::generate_with_secret().map(|(keypair, _secret)| keypair)
+    }
+
+    /// Generate a fresh keypair **and** return its 32-byte secret scalar (in `Zeroizing`) so the
+    /// in-crate keystore-sealing path can persist it. This is the one canonical secp256k1 keygen
+    /// loop — rejection-sampling a valid non-zero scalar `< n` from `getrandom`, scrubbing every
+    /// rejected draw. `pub(crate)`: the secret export exists only for the keystore-sealing caller
+    /// (`agent_keygen`); there is no public accessor that hands out a private scalar.
+    pub(crate) fn generate_with_secret() -> Result<(Self, Zeroizing<[u8; 32]>), Secp256k1Error> {
+        // Bounded rejection sampling: a uniform 32-byte draw is an invalid scalar (zero or >= n)
+        // with probability < 2^-128, so the loop body essentially never repeats. The bound makes a
+        // degraded/stuck CSPRNG fail closed (`Csprng`) instead of hanging key generation.
+        const MAX_RETRIES: usize = 64;
+        let mut secret = Zeroizing::new([0u8; 32]);
+        for _ in 0..MAX_RETRIES {
+            getrandom::getrandom(&mut secret[..]).map_err(|_| Secp256k1Error::Csprng)?;
+            match SigningKey::from_slice(&secret[..]) {
+                Ok(signing_key) => {
+                    let verifying_key = *signing_key.verifying_key();
+                    return Ok((Self { signing_key, verifying_key }, secret));
                 }
+                // invalid scalar (zero or >= n) — scrub the rejected draw and retry
+                Err(_) => secret.zeroize(),
             }
-        };
-        bytes.zeroize();
-        let verifying_key = *signing_key.verifying_key();
-        Ok(Self { signing_key, verifying_key })
+        }
+        Err(Secp256k1Error::Csprng)
     }
 
     /// Construct from a 32-byte secret scalar (e.g. a test vector). Rejects invalid scalars.

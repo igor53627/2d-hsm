@@ -39,6 +39,12 @@ default = []
 # Agent Gateway secp256k1 signer backend (TASK-7.6). Reuses the already-optional zeroize/getrandom
 # (otherwise only pulled by ml-dsa-65) for the CSPRNG keygen; does not embed any key by itself.
 agent-gateway = ["dep:k256", "dep:bs58", "dep:sha2", "dep:zeroize", "dep:getrandom", "dep:chacha20poly1305"]
+# Enables AGENT_K1_PROVE_IDENTITY signing. **Production-gated OFF** until the 2D side pins the
+# EIP-2718 transaction-type 0x19 reservation in a MERGED commit (2D PR #144 / TASK-132.5) — until
+# then identity-proof signing is non-collision-unproven against typed txs (vsock spec §10.8). With
+# `agent-gateway` but WITHOUT this, PROVE_IDENTITY fails closed (AGENT_NOT_CONFIGURED). Never enable
+# in a production build before that reservation merges; production fund custody is TASK-7.7-gated too.
+agent-prove-identity-preview = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []
