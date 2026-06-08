@@ -8,13 +8,17 @@ replaying spent capability counters and resetting faucet `cumulative_spend`. Thi
 mechanism that proves the sealed blob is the **latest**, and the production-funding **block** that
 fails closed until that mechanism is deployed.
 
-Design/contract only (implementation is TASK-7.6). 7.7 **adds** only the freshness-binding
-mechanism + the AC#5 gate + restore high-water seeding source + the active-active rule. It
-**consumes** (and does not change): the keystore format + in-enclave validation + restore-seeding
-contract (TASK-7.2 AC#8/#11/#12/#17/#18), seal-before-emit durability + the atomic serialized
-single-writer commit (TASK-7.4 §3), the counter tuple + contiguity + strict recovery counter
-(TASK-7.1/7.5, vsock §10.6), `pq-seal-v1` AEAD/measurement binding (`enclave-protocol/src/pq_signer.rs`),
-SNP attestation (`snp-attest-verify`), the SNP-derived provisioning root (provisioning-runbook §7.1).
+Design/contract only (implementation is TASK-7.6). 7.7 **adds** the freshness-binding mechanism +
+the AC#5 gate + restore high-water seeding source + the active-active rule, **plus a bounded
+`pq-agent-keystore-v1` format extension** — a `freshness_epoch` field and a pinned `anchor_root`
+identity/CA in the keystore plaintext config — which is a `format_version` bump with a reviewed,
+vector-backed forward-migration **per TASK-7.2 AC#16** (not a silent change). It **consumes**
+(unchanged): in-enclave validation + the restore-seeding contract (TASK-7.2 AC#8/#11/#12/#17/#18),
+seal-before-emit durability + the atomic serialized single-writer commit (TASK-7.4 §3), the counter
+tuple + contiguity + strict recovery counter (TASK-7.1/7.5, vsock §10.6), the
+`pq-seal-v1`/`pq-agent-keystore-v1` AEAD/measurement-binding primitives
+(`enclave-protocol/src/pq_signer.rs`), SNP attestation (`snp-attest-verify`), the SNP-derived
+provisioning root (provisioning-runbook §7.1).
 
 ## Decisions (selected, TASK-7.7)
 
@@ -67,32 +71,54 @@ ever advances state for a genuine current enclave instance.
 An operator-run, durable, monotonic counter/epoch service, one logical counter per treasury
 instance, under separation of duties from the host.
 
-**Freshness binding (mutual authentication).** The sealed keystore stores a `freshness_epoch`
-obtained from the anchor; the `pq-seal-v1` AAD additionally covers `freshness_epoch`. **Both**
-directions are authenticated: the enclave proves it is a genuine current instance with a fresh SNP
-attestation (measurement + VCEK + a report nonce), and the **anchor's response is itself signed** by
-the anchor identity key whose public half / CA is **pinned in the sealed keystore config**, covering
-`(treasury_id, epoch/marks, the enclave's fresh channel-binding nonce)`. On every (re)start the
-enclave issues a fresh nonce, verifies the signed response against the pinned anchor root, and
-**refuses any sealed blob whose `freshness_epoch` < the authenticated anchor-current** (stale → fail
-closed). A host controlling vsock therefore cannot replay a stale low-epoch response or route the
-enclave to a spoofed anchor — an unauthenticated, stale, or nonce-mismatched response fails closed.
+**Freshness binding (mutual authentication).** `freshness_epoch` lives in the
+**`pq-agent-keystore-v1` encrypted plaintext body** (alongside the counter/spend state); the
+keystore AEAD authenticates the whole body, so the epoch is integrity-bound. The AAD itself stays
+the fixed `magic ‖ format_version ‖ meas_digest` identity tuple — **do not put a per-restart value
+in the AAD, and do not touch the `pq-seal-v1` producer-blob AAD/layout**. **Both** directions are
+authenticated: the enclave proves it is a genuine current instance with a fresh SNP attestation
+(agent `report_data` layout below), and the **anchor's response is itself signed** by the
+`anchor_root` Ed25519 identity whose public half / CA is **pinned in the keystore plaintext config**
+(the format extension above), covering `(treasury_id, epoch/marks, the enclave's fresh
+channel-binding nonce)` as **canonical CBOR**. On every (re)start the enclave issues a fresh nonce,
+verifies the signed response against the pinned `anchor_root`, and **refuses any sealed blob whose
+`freshness_epoch` < the authenticated anchor-current** (stale → fail closed). A host controlling
+vsock therefore cannot replay a stale low-epoch response or route the enclave to a spoofed anchor.
+**`anchor_root` lifecycle:** installed at provisioning into the sealed config; verified at every
+boot; rotation is a reviewed reprovisioning (re-seal under the new root).
+
+**Agent attestation `report_data`.** The producer ML-DSA blob already spends SNP `report_data` on
+`SHA3-512("2d-hsm-snp-report-data-v1" ‖ pq_pubkey)` (`snp_report.rs`). The Agent Gateway is a
+**separate profile/measurement**, so its enclave uses its **own** domain-separated
+`report_data = SHA3-512("2d-hsm-agent-anchor-handshake-v1" ‖ treasury_id ‖ freshness_nonce)` for the
+anchor handshake — binding the per-(re)start nonce + secp256k1 treasury identity, **not** the
+producer pq_pubkey. The anchor verifies that fresh attestation (agent measurement on the allowlist +
+VCEK) before advancing or reporting.
 
 **Per-dispense (seal-before-emit, AC#2).** Within the TASK-7.4 serialized single-writer commit,
 each fund-moving operation (faucet dispense; and each administrative counter advance) **bumps the
-remote counter to `epoch+1` and seals the new epoch into the blob in the same commit BEFORE the
-signature/refs are emitted**. Default **`lease=1`**: one synchronous remote bump per signature →
+remote counter to `epoch+1` and seals the new epoch into the keystore body in the same commit BEFORE
+the signature/refs are emitted**. Default **`lease=1`**: one synchronous remote bump per signature →
 **zero replay window** (a rolled-back blob is strictly behind the anchor and rejected). **All
 administrative, recovery, and treasury-config counter advances are ALWAYS synchronous (`lease=1`)** —
-never amortized. A **naive `lease=N`** where the blob-wide `freshness_epoch` stays equal to
-anchor-current for the whole window is **NOT bounded**: a host can repeatedly snapshot and replay the
-same start-of-lease blob, and the anchor cannot distinguish it from valid in-window state, so the loss
-is unbounded. A **safe `lease=N`** (low-value faucets only, explicit per-treasury) therefore requires
-**anchor-visible lease IDs + a consumed sub-cursor**: each local spend reports/acks its sub-counter to
-the anchor (or the anchor pre-commits `N` debits and the enclave seals the consumed sub-cursor into
-the AAD), and the anchor **rejects a reused lease cursor** — which removes most of `lease=N`'s
-round-trip savings. **Production default and recommendation is `lease=1`;** `lease=N` is permitted
-only with that consumed-cursor scheme and only where the residual is an explicitly accepted bounded loss.
+never amortized. A **naive `lease=N`** (the blob-wide `freshness_epoch` staying equal to
+anchor-current for the whole window) is **NOT bounded**: a host can repeatedly snapshot and replay
+the same start-of-lease blob and the anchor cannot distinguish it from valid in-window state. A
+**safe `lease=N`** (low-value faucets only, explicit per-treasury) therefore requires the anchor to
+**track consumption**: each local spend **reports/acks its consumed sub-counter to the anchor before
+emit**, the anchor records the per-`lease_id` high-water and **rejects any sub-counter ≤ the recorded
+high-water** (reused cursor), so a replayed start-of-lease blob is caught. The alternative "anchor
+pre-commits `N` and the enclave only seals the cursor locally" is **rejected** — the cursor would
+live in host-rollbackable sealed state the anchor never sees, making replay unbounded. This per-spend
+ack removes most of `lease=N`'s round-trip savings. **Production default and recommendation is `lease=1`.**
+
+**Crash/partition reconciliation.** The remote bump is **idempotent**, keyed by the dispense
+`request_id`: if the anchor recorded `epoch+1` but the local seal-then-emit did not complete (a
+dropped seal/ack), on restart the enclave re-reads the anchor; when the anchor is exactly one ahead
+for a `request_id` whose signature was **never emitted**, it **reconciles forward** (re-seals to the
+anchor epoch, discards the un-emitted op) rather than self-wedging. A gap > 1, or an
+emitted-but-unsealed signature, fails closed for operator intervention — preserving no-over-dispense
+without a permanent self-wedge on a single dropped ack.
 
 **Coverage (AC#2).** The same epoch gate protects **both** the capability counter high-water table
 and the faucet spend counters (both live in the one sealed keystore whose epoch the anchor pins);
@@ -112,9 +138,12 @@ high-value treasuries.
 
 ## §4 Active-active prohibition + the append-only-ledger upgrade (AC#4)
 
-A per-instance remote counter (Option A) does **not** permit clones: two live enclaves of one
-faucet key would each pin their own epoch and could double-spend. **Active-active clones of one
-faucet key remain prohibited** unless the deployment uses **Option B — a global external
+A per-instance remote counter (Option A) does **not** permit clones: two live enclaves of one faucet
+key would each pin their own per-instance epoch and could double-spend, and **Option A gives the
+enclave no way to detect that a sibling clone exists** (measurement/sealing are per-instance). So
+under Option A the single-instance rule is an **operator-procedural prohibition** (provision exactly
+one anchor counter per faucet key + single-instance deployment), **not** an enclave-enforced guard.
+Hard, enclave-/anchor-enforced active-active is provided **only** by **Option B — a global external
 append-only ledger** shared by every live clone: each clone appends a signed (attestation-bound)
 dispense/counter-advance entry and emits its signature only after the append is durably
 acknowledged; the ledger enforces a **global** cumulative cap with per-entry sequence +
@@ -142,10 +171,18 @@ exactly like the mainnet trust/seal gate.
 **Layer 2 — Rust dispatch gate.** (a) compile-time: in the `release_build` cfg family,
 `compile_error!` on any lab/stub anti-rollback feature in release. (b) runtime fail-closed: inside
 the AgentGateway (0x40) handler, if the boot-resolved anti-rollback binding is absent/unconfigured,
-**reject fund-custody commands** (`AGENT_K1_GENERATE_KEYS`, `AGENT_K1_SIGN_FAUCET_DISPENSE`, `AGENT_K1_SIGN_TRANSFER`, and `AGENT_K1_CONFIGURE_TREASURY`'s fund-custody sub-ops — `set_limits` / `refill_budget` / `raise_lifetime_breaker` / `reset_lifetime_breaker`) with an
-AgentGateway error — *"anti-rollback mechanism not configured; faucet/transfer signing blocked
-(TASK-7.7)"*; read-only/status/attestation stay allowed. An enclave that cannot prove freshness
-will not emit a fund-moving signature.
+**reject the rollback-sensitive commands** — those that advance/debit sealed counters or spend:
+`AGENT_K1_GENERATE_KEYS`, `AGENT_K1_SIGN_FAUCET_DISPENSE`, `AGENT_K1_CONFIGURE_TREASURY` fund-custody
+sub-ops (`set_limits` / `refill_budget` / `raise_lifetime_breaker` / `reset_lifetime_breaker`),
+`AGENT_KEYSTORE_EXPORT_BACKUP` (advances the export capability counter), and
+`AGENT_KEYSTORE_RESTORE_BACKUP` (advances the strict recovery counter) — with an AgentGateway error
+*"anti-rollback mechanism not configured (TASK-7.7)"*; read-only/status/attestation stay allowed.
+**`AGENT_K1_SIGN_TRANSFER` is deliberately NOT in this runtime list** — it carries no rollback-
+sensitive sealed state (no spend/cap/counter; bounded only by key-purpose + canonical EIP-155 +
+sealed chain_id per 7.4/7.5), so gating it on anti-rollback would protect nothing it touches. AC#5's
+transfer-wallet fund-custody block is instead enforced at **Layer 1**: a funding profile that
+provisions transfer wallets does not build without a mechanism, so transfer custody is blocked at
+deployment.
 
 **Opt-out (measured/sealed, audited, not silent).** The opt-out is **not** a runtime/host-settable
 input — it is provisioned into the **measured/sealed** configuration (a build-time guest-profile flag
@@ -154,6 +191,10 @@ at runtime; changing it requires explicit **reprovisioning**. It relaxes **only*
 assertion and Layer-2's runtime fund-command block (**not** the compile-time lab/stub guard), permits a
 funding profile **only** by recording the **verbatim TASK-7.2 AC#10** residual-risk acknowledgment
 (operator-signed, audited), and may itself carry a reduced spend ceiling. Default is the hard block.
+The acknowledgment is the **verbatim AC#10 text**, operator-signed by the admin/recovery authority
+and recorded in the sealed keystore config + the audit ring; the enclave verifies that signature and
+that the recorded text matches before honoring the opt-out, so it can never be a host-supplied
+runtime string.
 
 **Runbook gate** (provisioning-runbook new §): operator must select + provision the mechanism, vet
 the measurement allowlist, and record the anchor endpoint/credentials **before** flipping
@@ -175,6 +216,9 @@ attestation) before it may emit fund-moving signatures.
   refuses to start the fund path (fail closed) — the core anti-rollback assertion.
 - **Per-dispense `lease=1`:** a fund signature is emitted only after the remote bump + seal commit;
   simulated anchor failure ⇒ no signature (0x4x). A rolled-back blob after a dispense is rejected.
+- **Crash reconciliation:** a dropped seal/ack leaving anchor=`epoch+1` and blob=`epoch` with no
+  emitted signature ⇒ restart reconciles forward (no self-wedge); a gap > 1, or an emitted-unsealed
+  signature, fails closed for operator intervention.
 - **`lease=N` consumed-cursor:** a naive lease is **unbounded** — test that repeated snapshot/replay
   of a start-of-lease blob within the window is caught only by anchor-visible lease IDs + a consumed
   sub-cursor that rejects a reused cursor; admin/recovery/config advances are always synchronous.
@@ -182,8 +226,9 @@ attestation) before it may emit fund-moving signatures.
   `lifetime_spend` are both detected.
 - **Restore never-zero:** restore from a stale backup with a behind epoch is rejected; seeding is
   from authenticated marks (AC#3).
-- **Active-active:** two clones without the Option B ledger is rejected/prohibited; with the ledger,
-  the global cap holds under concurrent appends (AC#4).
+- **Active-active:** under Option A the single-instance rule is operator-procedural (the enclave
+  cannot detect a clone) — provisioning/runbook must enforce one instance per faucet key; under
+  **Option B** the global ledger **enforces** the cumulative cap under concurrent appends (AC#4).
 - **AC#5 gate:** a `productionMode` funding profile with `agentAntiRollbackMode == "none"` fails the
   Nix build; the runtime dispatch blocks fund commands when unconfigured; the opt-out requires the
   recorded residual-risk acknowledgment.
@@ -194,4 +239,8 @@ also roll the anchor back defeats it (hence separation of duties + an anti-rollb
 preferably quorum, anchor). A safe `lease=N` accepts a bounded replay loss only via the anchor-visible
 consumed-cursor scheme (a naive lease is unbounded, §3). Until the
 mechanism is deployed, the AC#5 hard block makes production fund custody impossible (absent the
-audited opt-out).
+audited opt-out). **Liveness DoS (accepted availability residual):** because production is `lease=1`
+(no offline window) and the untrusted host sits on the enclave↔anchor path, the host can **censor**
+that channel to wedge all fund custody. This is **fail-closed** — no fund loss, no rollback, and the
+host gains nothing — but it is a deliberate availability denial the host can trigger at will; HA +
+monitored anchor connectivity is the operational mitigation.
