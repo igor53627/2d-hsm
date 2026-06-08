@@ -257,6 +257,21 @@ pub(crate) fn verify_anchor_response(
     })
 }
 
+/// Strict-canonical-CBOR decode `bytes` (rejecting non-shortest integers, indefinite lengths,
+/// duplicate / out-of-order keys, and trailing bytes), then verify as [`verify_anchor_response`].
+/// This is the entrypoint the boot-wiring slice should call on host-supplied response bytes: it
+/// closes the "binds values, not wire bytes" precondition documented on [`verify_anchor_response`]
+/// by pinning the canonical wire encoding **before** the signature is checked over the re-encoded
+/// preimage. (Until boot wiring lands, this is dead-code-gated like the rest of the module.)
+pub(crate) fn verify_anchor_response_bytes(
+    bytes: &[u8],
+    expected_nonce: &[u8; DIGEST_LEN],
+    config: &KeystoreConfig,
+) -> Result<AnchorState, AnchorError> {
+    let map = crate::agent_cbor::strict_decode_map(bytes).map_err(|_| AnchorError::Malformed)?;
+    verify_anchor_response(&map, expected_nonce, config)
+}
+
 /// Reconcile the local sealed state against a verified [`AnchorState`] (design doc §3). The local
 /// `marks_digest` is computed by the caller from its sealed counters/spend.
 ///
@@ -693,6 +708,35 @@ mod tests {
         assert_eq!(
             verify_anchor_response(&map, &nonce, &cfg),
             Err(AnchorError::SignatureInvalid)
+        );
+    }
+
+    fn encode_map(m: &[(Value, Value)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(m.to_vec()), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn verify_bytes_accepts_canonical_rejects_noncanonical() {
+        let cfg = test_config();
+        let nonce = [0x33u8; 32];
+        let resp = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, 7, 2, [0xab; 32], nonce);
+        let bytes = encode_map(&resp);
+        // Canonical wire bytes verify end-to-end through the strict-decode entrypoint.
+        let st = verify_anchor_response_bytes(&bytes, &nonce, &cfg).unwrap();
+        assert_eq!(st.epoch, 7);
+        // Security-critical: re-encode the `version` value (byte index 2) in non-shortest long form.
+        // The decoded VALUES are identical and the canonical preimage would `verify_strict`, but the
+        // strict decoder rejects the non-canonical wire bytes BEFORE the signature is ever checked.
+        let mut bad = bytes.clone();
+        assert_eq!(bad[0], 0xa8); // map with 8 entries (keys 1..=7 + 13)
+        assert_eq!(bad[1], 0x01); // key 1
+        assert_eq!(bad[2], 0x01); // version value, shortest form
+        bad.splice(2..3, [0x18u8, 0x01u8]); // 1 encoded as 0x18 0x01 (non-shortest)
+        assert_eq!(
+            verify_anchor_response_bytes(&bad, &nonce, &cfg),
+            Err(AnchorError::Malformed)
         );
     }
 

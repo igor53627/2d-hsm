@@ -156,18 +156,15 @@ use crate::agent_cbor::{as_bytes, as_bytes32, as_u64, check_strict_keys, map_get
 
 /// Decode the inner Agent Gateway envelope. Any shape error → `Malformed` (0x40, syntax only).
 fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
-    let mut cursor = std::io::Cursor::new(payload);
-    let value: Value =
-        ciborium::de::from_reader(&mut cursor).map_err(|_| AgentError::Malformed)?;
-    if cursor.position() != payload.len() as u64 {
-        return Err(AgentError::Malformed); // trailing bytes
-    }
-    let Value::Map(map) = value else {
-        return Err(AgentError::Malformed);
-    };
-    // Strict envelope: every key must be a known integer 1..=7, and none may repeat. Unknown or
-    // duplicate keys ⇒ Malformed (no silent first-match resolution; the wire format stays
-    // unambiguous for future capability/payload binding).
+    // Strict CANONICAL decode (rejects non-shortest integers, indefinite lengths, duplicate /
+    // out-of-order keys, and trailing bytes) so the envelope AND its nested cap (key 5) / payload
+    // (key 7) submaps bind the exact wire bytes — not a lenient ciborium re-encoding. This is what
+    // makes the downstream capability Ed25519 check (which signs over a re-encoded canonical preimage)
+    // sound against a host that submits a non-canonical encoding of otherwise-valid signed values.
+    let map = crate::agent_cbor::strict_decode_map(payload).map_err(|_| AgentError::Malformed)?;
+    // Strict envelope schema: every key must be a known integer 1..=7, and none may repeat. Unknown
+    // or duplicate keys ⇒ Malformed (the canonical decode already rejected dup/out-of-order keys; this
+    // is the schema allow-list on top).
     if !check_strict_keys(&map, |n| (1..=7).contains(&n)) {
         return Err(AgentError::Malformed);
     }
@@ -858,6 +855,28 @@ mod tests {
         assert_eq!(
             dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
             Some(AgentError::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn noncanonical_nested_capability_is_malformed_before_verify() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        let mut cap = crate::agent_capability::test_signed_capability(
+            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+        );
+        // Reverse the cap entries so the nested submap's keys are DESCENDING (non-canonical) while the
+        // signed VALUES are unchanged. In ascending order this exact cap reaches NotConfigured (see
+        // deferred_privileged_op_valid_cap_reaches_not_configured); the non-canonical wire bytes must
+        // be rejected as Malformed by the strict decoder BEFORE verify_capability runs — proving the
+        // nested cap submap (envelope key 5) is canonical-checked, not just the top-level envelope.
+        cap.reverse();
+        let payload = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            Some(AgentError::Malformed)
         );
     }
 
