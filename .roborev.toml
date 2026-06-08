@@ -16,14 +16,25 @@ exclude_patterns = [
   "**/*.bin",
 ]
 
+# NOTE: the LOCAL Reduced Matrix is 4 cells — codex/security, gemini/security,
+# claude-code/design, and grok/security (via `--agent opencode --model
+# xai/grok-4.3`); see AGENTS.md. The `[ci]` block below is intentionally only the
+# 3 native vendors: `roborev ci review` cannot pin a per-agent --model, and the
+# grok cell needs `--model xai/grok-4.3` (+ XAI_API_KEY), so grok runs in the
+# local matrix (~/pse/roborev/pse-review-reduced.sh), not CI. This 3-agent CI set
+# is a deliberate scope, not a stale config.
+
 [ci]
 # PR CI: three vendors × two lenses (6 cells). Per-agent models are not
 # configurable on `roborev ci review` — pin gemini/claude locally via scripts.
 agents = ["codex", "gemini", "claude-code"]
 review_types = ["security", "design"]
 
-# Soft-degrade: if one agent is unavailable, synthesis runs on responders;
-# re-run manually if a missing cell matters for the change.
+# Soft-degrade applies ONLY to these 3 CI vendors: if one is unavailable, CI
+# synthesis runs on responders; re-run manually if a missing cell matters.
+# This does NOT license dropping the local grok cell — per AGENTS.md, a grok cell
+# that did not reach `done` is a gap, never "compacted clean" (compact silently
+# ignores `skipped`/failed jobs).
 
 # High-risk paths — force Full matrix (AGENTS.md) when touched.
 high_risk_paths = [
