@@ -55,6 +55,9 @@ jobs:
       - name: Agent Gateway incl. PROVE_IDENTITY preview (TASK-7.6.3)
         run: cargo test --features agent-prove-identity-preview
 
+      - name: Agent Gateway incl. GENERATE_KEYS exec preview (TASK-7.6.x)
+        run: cargo test --features agent-keygen-exec-preview
+
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 

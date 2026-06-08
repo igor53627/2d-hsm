@@ -11,8 +11,9 @@
 //! `ml-dsa-65 ⊥ agent-gateway` compile-time ban is about not shipping both *signing backends* in one
 //! binary, not about the platform root (which is a single platform-level secret either way).
 //!
-//! This module is **always compiled** so the producer (`ml-dsa-65`) and the agent (`agent-gateway`)
-//! profiles share exactly one root global, setter, and resolver.
+//! This module is compiled for the **seal-capable profiles** (`any(ml-dsa-65, agent-gateway)`) so the
+//! producer and the agent share exactly one root global, setter, and resolver. (It is not built for
+//! the bare no-feature profile, which has no sealed state and does not pull in the `zeroize` dep.)
 
 use crate::ProtocolError;
 use std::sync::Mutex;

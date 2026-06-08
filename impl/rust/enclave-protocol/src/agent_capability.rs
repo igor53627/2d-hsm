@@ -492,6 +492,7 @@ pub(crate) fn test_signed_capability(
     environment_identifier: &str,
     scope_class: u8,
     scope_target: &[u8],
+    key_purpose: u8,
     payload_binding: [u8; 32],
 ) -> Vec<(Value, Value)> {
     use ed25519_dalek::Signer;
@@ -500,7 +501,7 @@ pub(crate) fn test_signed_capability(
         cap_format_version: 1,
         command_opcode: opcode,
         treasury_sub_op,
-        key_purpose: 1,
+        key_purpose,
         chain_id,
         environment_identifier: environment_identifier.to_string(),
         scope_class,

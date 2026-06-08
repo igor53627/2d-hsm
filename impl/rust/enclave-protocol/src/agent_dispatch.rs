@@ -7,10 +7,14 @@
 //! - **Low-privilege reads** `PUBLIC_IDENTITY(2)` / `PROVE_IDENTITY(3)` (no capability) are handled
 //!   here end-to-end against the unsealed keystore.
 //! - **Privileged** opcodes `{GENERATE_KEYS(1), CONFIGURE_TREASURY(6), EXPORT_BACKUP(7),
-//!   RESTORE_BACKUP(8)}` route through [`verify_capability`] — a **fail-closed seam**. The full
-//!   Ed25519 capability verification + contiguous-counter advance + atomic seal land in a later
-//!   slice (TASK-7.6.x / 7.2 / 7.4); until then the seam **rejects** (`AGENT_CAPABILITY_REJECTED`),
-//!   so privileged opcodes are safely inert rather than open.
+//!   RESTORE_BACKUP(8)}` are verified by [`verify_capability`] (Ed25519 + authority tier + opcode/
+//!   request binding + contiguous-counter CHECK, via [`crate::agent_capability`]). **GENERATE_KEYS
+//!   executes** (key mint + counter advance + candidate re-seal/swap) ONLY under the off-by-default,
+//!   release-banned `agent-keygen-exec-preview` feature — live, host-rollback-replayable key minting
+//!   must wait for anti-rollback (TASK-7.7) + `scope_target`↔sealed-enclave-id binding + the AC#14
+//!   audit record. Without that feature (and for CONFIGURE_TREASURY/EXPORT/RESTORE) a verified
+//!   privileged request **fails closed** with `AGENT_NOT_CONFIGURED`. Capability *failures* collapse
+//!   to `AGENT_CAPABILITY_REJECTED` (0x43).
 //! - **Runtime signing** `{SIGN_TRANSFER(4), SIGN_FAUCET_DISPENSE(5)}` is TASK-7.6.4; not in this
 //!   slice → `AGENT_NOT_CONFIGURED`.
 //!
@@ -300,10 +304,18 @@ pub fn dispatch_agent(
         // failures collapse to 0x43 / 0x40. Returns the verified data the handler binds + advances.
         let verified = verify_capability(&env, keystore)?;
         return match opcode {
+            // GENERATE_KEYS executes ONLY under the off-by-default `agent-keygen-exec-preview`
+            // feature (release-banned): live key minting must wait for anti-rollback (TASK-7.7) +
+            // scope_target-binding + the AC#14 audit record. Production verifies the cap then fails
+            // closed (no mutation).
+            #[cfg(feature = "agent-keygen-exec-preview")]
             AgentOpcode::GenerateKeys => handle_generate_keys(&env, keystore, &verified),
-            // CONFIGURE_TREASURY / EXPORT_BACKUP / RESTORE_BACKUP verify here but their execution
-            // (mutation + per-op payload-binding / sub-op binding) lands in later slices.
-            _ => Err(AgentError::NotConfigured),
+            // CONFIGURE_TREASURY / EXPORT_BACKUP / RESTORE_BACKUP (and GENERATE_KEYS without the
+            // preview feature) verify here but their execution lands in later slices ⇒ fail closed.
+            _ => {
+                let _ = &verified;
+                Err(AgentError::NotConfigured)
+            }
         };
     }
     if env.capability.is_some() {
@@ -393,9 +405,26 @@ fn handle_prove_identity(
     Ok(AgentResponse::ProveIdentity(proof))
 }
 
+/// Canonical CBOR of the GENERATE_KEYS command params `{1: purpose, 2: count}` (RFC 8949 shortest
+/// form) — the exact bytes hashed into `payload_binding`. Shared by the handler and the tests so the
+/// two cannot drift on the wire layout.
+fn generate_keys_canonical_params(purpose_code: u64, count: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::agent_capability::put_uint(&mut out, 5, 2); // 2-entry map header
+    crate::agent_capability::put_uint(&mut out, 0, 1);
+    crate::agent_capability::put_uint(&mut out, 0, purpose_code);
+    crate::agent_capability::put_uint(&mut out, 0, 2);
+    crate::agent_capability::put_uint(&mut out, 0, count);
+    out
+}
+
 /// GENERATE_KEYS(1): after a verified admin capability, bind the request params to the cap, generate
 /// `count` keys of `purpose` on a CANDIDATE clone, and advance the capability counter. Returns the
 /// candidate for the frame layer to seal → persist → swap (no live mutation here).
+///
+/// Compiled always (so its imports/helpers stay "used") but only CALLED under the
+/// `agent-keygen-exec-preview` feature — without it, dispatch routes GENERATE_KEYS to NotConfigured.
+#[cfg_attr(not(feature = "agent-keygen-exec-preview"), allow(dead_code))]
 fn handle_generate_keys(
     env: &AgentEnvelope,
     keystore: &KeystoreBody,
@@ -423,14 +452,12 @@ fn handle_generate_keys(
     // payload_binding (§10.5, last gate before mutation): recompute
     // keccak256(opcode ‖ request_id ‖ canonical-CBOR({1:purpose, 2:count})) and compare to the cap's
     // signed value, so the host cannot have altered purpose/count under a valid cap. → 0x43.
-    let mut canonical = Vec::new();
-    crate::agent_capability::put_uint(&mut canonical, 5, 2); // 2-entry map header
-    crate::agent_capability::put_uint(&mut canonical, 0, 1);
-    crate::agent_capability::put_uint(&mut canonical, 0, purpose_code);
-    crate::agent_capability::put_uint(&mut canonical, 0, 2);
-    crate::agent_capability::put_uint(&mut canonical, 0, count);
-    let computed =
-        crate::agent_capability::payload_binding(env.opcode, None, &env.request_id, &canonical);
+    let computed = crate::agent_capability::payload_binding(
+        env.opcode,
+        None,
+        &env.request_id,
+        &generate_keys_canonical_params(purpose_code, count),
+    );
     if computed != verified.payload_binding {
         return Err(AgentError::CapabilityRejected);
     }
@@ -511,6 +538,11 @@ static INSTALLED_KEYSTORE: Mutex<Option<InstalledAgentKeystore>> = Mutex::new(No
 /// existing `key_ref` handles. The measurement is retained so privileged mutations can re-seal.
 #[must_use]
 pub fn install_agent_keystore(body: KeystoreBody, enclave_measurement: &[u8]) -> bool {
+    // An empty measurement would make every privileged re-seal fail (`EmptyMeasurement`) — reject the
+    // install up front rather than brick keygen after boot.
+    if enclave_measurement.is_empty() {
+        return false;
+    }
     match INSTALLED_KEYSTORE.lock() {
         Ok(mut guard) if guard.is_none() => {
             *guard = Some(InstalledAgentKeystore { body, measurement: enclave_measurement.to_vec() });
@@ -542,19 +574,22 @@ pub fn reset_agent_keystore_for_tests() {
 /// the response for the host to persist, and **swaps** it into the live slot — only after a
 /// successful seal (seal failure ⇒ `0x46`, live state untouched).
 pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
-    let mut guard = match INSTALLED_KEYSTORE.lock() {
-        Ok(g) => g,
-        Err(_) => return encode_agent_error(AgentError::SealFailed), // poisoned lock — fail closed
-    };
-    let measurement = match guard.as_ref() {
-        Some(installed) => installed.measurement.clone(),
+    // Recover from a poisoned lock rather than bricking the agent permanently: the slot's only
+    // mutation is the final swap below, performed AFTER every fallible step succeeds, so a panic in an
+    // earlier step leaves the body intact and the next frame can safely continue. (Removes a
+    // "one panic anywhere under dispatch → permanent 0x46 lockout" DoS.)
+    let mut guard = INSTALLED_KEYSTORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Borrow the installed body for dispatch and clone its measurement in one arm (no second
+    // fallible unwrap). The borrow ends when dispatch returns its OWNED outcome, freeing `guard`.
+    let (outcome, measurement) = match guard.as_ref() {
+        Some(installed) => {
+            let measurement = installed.measurement.clone();
+            let outcome = dispatch_agent(Profile::AgentGateway, payload, &installed.body);
+            (outcome, measurement)
+        }
         None => return encode_agent_error(AgentError::WrongProfile),
-    };
-    // The immutable borrow ends with the block (dispatch returns an OWNED outcome), freeing `guard`
-    // for the swap below.
-    let outcome = {
-        let body = &guard.as_ref().expect("checked Some above").body;
-        dispatch_agent(Profile::AgentGateway, payload, body)
     };
     match outcome {
         Ok(AgentResponse::GenerateKeys { keys, candidate }) => {
@@ -615,16 +650,10 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
             (Value::Integer(5.into()), Value::Bytes(proof.pubkey_uncompressed.to_vec())),
         ]),
         // GENERATE_KEYS MUST be encoded by the frame layer WITH its sealed blob
-        // (`encode_generate_keys_response`); reaching the generic encoder would emit a persist-less
-        // (blob-less) success. Catch the misuse in debug/test; in release fail closed to an error body
-        // rather than fabricate a success the host can't persist.
-        AgentResponse::GenerateKeys { .. } => {
-            debug_assert!(
-                false,
-                "GenerateKeys must be encoded by the frame layer with its sealed blob"
-            );
-            encode_agent_error(AgentError::SealFailed)
-        }
+        // (`encode_generate_keys_response`). Reaching the generic encoder means a mis-routed mutation;
+        // fail closed to an error body rather than fabricate a persist-less success the host can't
+        // store. (No panic/`debug_assert` here — this runs under the INSTALLED_KEYSTORE lock.)
+        AgentResponse::GenerateKeys { .. } => encode_agent_error(AgentError::SealFailed),
     }
 }
 
@@ -852,7 +881,7 @@ mod tests {
         // EXPORT_BACKUP(7) is admin-tier but its handler is still deferred: a valid cap verifies,
         // then the request collapses to NotConfigured (0x45) — proves verify→handler routing.
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", [0xab; 32],
+            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
         );
         let payload = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -872,15 +901,15 @@ mod tests {
         count: u64,
         scope_target: &[u8],
     ) -> (Vec<(Value, Value)>, Vec<(Value, Value)>) {
-        let mut canon = Vec::new();
-        crate::agent_capability::put_uint(&mut canon, 5, 2);
-        crate::agent_capability::put_uint(&mut canon, 0, 1);
-        crate::agent_capability::put_uint(&mut canon, 0, purpose_code);
-        crate::agent_capability::put_uint(&mut canon, 0, 2);
-        crate::agent_capability::put_uint(&mut canon, 0, count);
-        let pb = crate::agent_capability::payload_binding(1, None, request_id, &canon);
+        let pb = crate::agent_capability::payload_binding(
+            1,
+            None,
+            request_id,
+            &generate_keys_canonical_params(purpose_code, count),
+        );
         let cap = crate::agent_capability::test_signed_capability(
-            admin, 1, request_id, counter, false, 11565, "testnet", 0, scope_target, pb,
+            admin, 1, request_id, counter, false, 11565, "testnet", 0, scope_target,
+            purpose_code as u8, pb,
         );
         let payload = vec![
             (Value::Integer(1.into()), Value::Integer(purpose_code.into())),
@@ -889,6 +918,7 @@ mod tests {
         (cap, payload)
     }
 
+    #[cfg(feature = "agent-keygen-exec-preview")]
     #[test]
     fn generate_keys_executes_and_advances_counter() {
         use ed25519_dalek::SigningKey;
@@ -920,6 +950,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "agent-keygen-exec-preview")]
     #[test]
     fn generate_keys_payload_binding_mismatch_rejected() {
         use ed25519_dalek::SigningKey;
@@ -945,6 +976,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "agent-keygen-exec-preview")]
     #[test]
     fn generate_keys_purpose_mismatch_is_key_purpose_mismatch() {
         use ed25519_dalek::SigningKey;
@@ -953,15 +985,14 @@ mod tests {
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // The cap (test helper) signs key_purpose=1 (transfer); request purpose=2 (faucet) ⇒ 0x42.
         // Build a cap+payload for purpose 2 but the cap's signed key_purpose is 1 → mismatch.
-        let mut canon = Vec::new();
-        crate::agent_capability::put_uint(&mut canon, 5, 2);
-        crate::agent_capability::put_uint(&mut canon, 0, 1);
-        crate::agent_capability::put_uint(&mut canon, 0, 2); // purpose 2 in the params
-        crate::agent_capability::put_uint(&mut canon, 0, 2);
-        crate::agent_capability::put_uint(&mut canon, 0, 1);
-        let pb = crate::agent_capability::payload_binding(1, None, &[0x11; 16], &canon);
+        let pb = crate::agent_capability::payload_binding(
+            1,
+            None,
+            &[0x11; 16],
+            &generate_keys_canonical_params(2, 1),
+        );
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_faucet", pb,
+            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_faucet", 1, pb,
         );
         let pay = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())), // purpose 2 (faucet)
@@ -980,6 +1011,89 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_treasury_enclave_scoped_succeeds() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // Faucet treasury (purpose 2), enclave scope (0), singleton count 1.
+        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 2, 1, b"generate_faucet");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+            AgentResponse::GenerateKeys { keys, candidate } => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].key_purpose, KeyPurpose::AgentFaucetTreasuryK1);
+                assert_eq!(candidate.entries.len(), 1);
+            }
+            _ => panic!("expected GenerateKeys"),
+        }
+    }
+
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_fleet_scoped_treasury_rejected() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // Treasury keygen MUST be enclave-scoped (AC#12); a fleet-scoped (scope_class=1) cap is
+        // rejected (0x43) so a treasury budget can't be multiplied across clones.
+        let pb = crate::agent_capability::payload_binding(
+            1,
+            None,
+            &[0x11; 16],
+            &generate_keys_canonical_params(2, 1),
+        );
+        let cap = crate::agent_capability::test_signed_capability(
+            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 1, b"generate_faucet", 2, pb,
+        );
+        let pay = vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Integer(1.into())),
+        ];
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn generate_keys_request_id_mismatch_rejected() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // Cap bound to request_id [0x22;16]; the envelope's request_id is [0x11;16] ⇒ 0x43 (a cap
+        // for one request cannot authorize another).
+        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x22; 16], 1, 1, 1, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::CapabilityRejected)
+        );
+    }
+
     #[test]
     fn privileged_badly_signed_capability_rejected() {
         use ed25519_dalek::SigningKey;
@@ -989,7 +1103,7 @@ mod tests {
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // A well-formed cap signed by the wrong key ⇒ Ed25519 fails ⇒ CapabilityRejected (0x43).
         let cap = crate::agent_capability::test_signed_capability(
-            &wrong, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer", [0xab; 32],
+            &wrong, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer", 1, [0xab; 32],
         );
         let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -1124,21 +1238,28 @@ mod tests {
     /// to avoid cross-test interference; it covers the no-keystore (producer) and installed paths.
     #[test]
     fn frame_handler_via_installed_keystore_slot() {
+        use ed25519_dalek::SigningKey;
         reset_agent_keystore_for_tests();
-        let (body, key_ref) = body_with_key();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // One transfer key so PUBLIC_IDENTITY has something to return.
+        let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 };
+        let key_ref =
+            generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation).unwrap()[0].key_ref;
 
         // No keystore installed ⇒ producer/uninstalled ⇒ WrongProfile (0x41) error body.
         let pubid_env =
             envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
-        let err_body = handle_agent_gateway_frame(&pubid_env);
-        assert_eq!(decode_agent_error_code(&err_body), Some(0x41));
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&pubid_env)), Some(0x41));
 
-        // Install the keystore ⇒ PUBLIC_IDENTITY returns a success body (key 1 = 65-byte pubkey).
+        // Install ⇒ PUBLIC_IDENTITY returns a success body (key 1 = 65-byte pubkey).
         assert!(install_agent_keystore(body, b"meas"), "install-once succeeds on an empty slot");
         let ok_body = handle_agent_gateway_frame(&pubid_env);
         assert_eq!(decode_agent_error_code(&ok_body), None, "success body, not an error map");
-        let v: Value = ciborium::de::from_reader(&ok_body[..]).unwrap();
-        let Value::Map(m) = v else { panic!("response is a map") };
+        let Value::Map(m) = ciborium::de::from_reader(&ok_body[..]).unwrap() else {
+            panic!("response is a map")
+        };
         assert_eq!(as_bytes(map_get(&m, 1).unwrap()).unwrap().len(), 65, "pubkey 65B");
         assert_eq!(as_bytes(map_get(&m, 4).unwrap()).unwrap(), key_ref, "key_ref echoed");
 
@@ -1146,6 +1267,90 @@ mod tests {
         let bad = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(vec![0xfe; 32]))]);
         assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&bad)), Some(0x42));
 
+        // GENERATE_KEYS through the FRAME — live execution is preview-gated, so this whole section
+        // only compiles/runs under `agent-keygen-exec-preview`. Success body carries the key list
+        // (key 1) AND the new sealed keystore blob (key 2) for the host to persist.
+        #[cfg(feature = "agent-keygen-exec-preview")]
+        {
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
+        let gen_env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        let gen_body = handle_agent_gateway_frame(&gen_env);
+        assert_eq!(decode_agent_error_code(&gen_body), None, "GENERATE_KEYS success");
+        let Value::Map(gm) = ciborium::de::from_reader(&gen_body[..]).unwrap() else { panic!() };
+        match map_get(&gm, 1).unwrap() {
+            Value::Array(a) => assert_eq!(a.len(), 2, "2 keys generated"),
+            _ => panic!("key 1 is the key list"),
+        }
+        assert!(
+            !as_bytes(map_get(&gm, 2).unwrap()).unwrap().is_empty(),
+            "key 2 is the non-empty sealed keystore blob"
+        );
+
+        // Replay the SAME cap (counter 1) ⇒ now 0x43: the swap advanced the live counter to 1, so the
+        // contiguity check expects 2. End-to-end replay rejection + proof the swap happened.
+        let (cap_r, pay_r) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
+        let replay_env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap_r)),
+                (Value::Integer(7.into()), Value::Map(pay_r)),
+            ],
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&replay_env)),
+            Some(0x43),
+            "replay of the consumed counter is rejected after the swap"
+        );
+
+        // The next contiguous counter (2) succeeds against the swapped live slot.
+        let (cap2, pay2) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 2, 1, 1, b"generate_transfer");
+        let next_env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap2)),
+                (Value::Integer(7.into()), Value::Map(pay2)),
+            ],
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&next_env)),
+            None,
+            "counter 2 accepted against the advanced live slot"
+        );
+        } // end #[cfg(agent-keygen-exec-preview)] GENERATE_KEYS frame section
+
         reset_agent_keystore_for_tests();
+    }
+
+    /// Production (preview OFF): a fully-valid GENERATE_KEYS request verifies the capability then
+    /// FAILS CLOSED with NotConfigured (0x45) — no key minting until the safety controls land.
+    #[cfg(not(feature = "agent-keygen-exec-preview"))]
+    #[test]
+    fn generate_keys_gated_off_reaches_not_configured() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::NotConfigured)
+        );
     }
 }

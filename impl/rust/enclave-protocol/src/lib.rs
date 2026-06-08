@@ -66,6 +66,15 @@ compile_error!(
      release builds until the 2D EIP-2718 type-0x19 reservation merges (vsock spec §10.8)"
 );
 
+// Live AGENT_K1_GENERATE_KEYS execution mints keys + advances counters via a host-persisted re-seal
+// that an untrusted host can roll back and replay; hard-ban it from release builds until TASK-7.7
+// anti-rollback + scope_target-binding + the AC#14 audit record land.
+#[cfg(all(release_build, feature = "agent-keygen-exec-preview"))]
+compile_error!(
+    "`agent-keygen-exec-preview` (live AGENT_K1_GENERATE_KEYS mutation) must not be enabled in \
+     release builds until anti-rollback (TASK-7.7), scope_target-binding, and audit land"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
