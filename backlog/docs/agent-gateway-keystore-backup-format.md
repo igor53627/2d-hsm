@@ -29,16 +29,22 @@ primitives: `impl/rust/enclave-protocol/src/pq_signer.rs` (`pq-seal-v1`).
 | DR wrapping | Asymmetric escrow to a **single** operator-held recovery **public** key (MVP); `recovery_key_id`/quorum-descriptor field reserved so M-of-N drops in later without changing version semantics. |
 | KEM primitive | **ML-KEM-1024** (pure PQ, Cat-5; e.g. RustCrypto `ml-kem`) for the backup KEM-DEM envelope. *Residual:* no classical hybrid layer (see Residuals); `recovery_key_id` reserved for a later `X25519+ML-KEM` hybrid. |
 | Fresh-TEE restore | Restore only onto an **operator-approved measurement allowlist**, verified at the recovery ceremony. |
-| Serialization | Canonical **CBOR** (deterministic; consistent with the TASK-7.1 capability map; `deny-unknown-fields`). |
+| Serialization | **Deterministic CBOR** (`deny-unknown-fields`): serde struct-field order, all collections are `Vec` (no maps), so a given body always encodes identically — but **not** RFC 8949 *canonical* CBOR, and byte fields encode as integer-arrays, not byte strings. Any change (byte-string encoding, strict canonical ordering) is a `format_version` bump + golden-vector update, never a silent edit. |
 | Authority rotation | **Deferred** to full re-provisioning in MVP; sealed `authority_epoch` field reserved so a later rotation task needs no format bump (the design doc §Keystore and backup model). |
 | Audit | Bounded in-enclave **ring buffer + `last_exported_seq` backpressure** (fail privileged ops closed rather than discard un-exported entries). |
 
 ## Reuse decision and primitive inventory
 
-Reuse from `pq-seal-v1` (`pq_signer.rs:230-359`): ChaCha20Poly1305 AEAD; `SHA3-256(domain ‖
+Reuse from `pq-seal-v1` (`pq_signer.rs:230-359`): the AEAD *conventions* — `SHA3-256(domain ‖
 provisioning_root ‖ meas_digest)` key derivation; `magic ‖ version ‖ meas_digest ‖ nonce`
 header with **AAD = header-minus-nonce**; `Zeroizing` buffers (TASK-6); boot-time
 install-before-use sequencing; the SEV-SNP-derived provisioning root (TASK-5).
+
+**AEAD choice — XChaCha20Poly1305 (24-byte nonce), NOT the producer's ChaCha20Poly1305.** The
+producer blob is sealed *once* at provisioning (one nonce per key), so a 96-bit random nonce is
+safe. The keystore is **re-sealed on every privileged mutation** under a *fixed* per-enclave key,
+so a 96-bit random nonce would accrue a birthday-bound collision risk (NIST caps random-96-bit
+nonces at ~2^32 messages/key); the 192-bit XChaCha nonce removes it regardless of re-seal count.
 
 Do **not** reuse the `pq-seal-v1` blob *layout*: it is structurally single-key and
 fixed-size (`PLAINTEXT_LEN = ML_DSA65_SK + ML_DSA65_PK`, `pq_signer.rs:243`) with no entry
@@ -56,21 +62,26 @@ Wrapped to the per-enclave seal root + measurement; unseals only on the same chi
 - `format_version` = `u16` (=1). **Fail-closed on unknown version BEFORE any decrypt**
   (mirror `pq_signer.rs:327-330`): no silent downgrade, no best-effort parse.
 - `meas_digest` = `SHA3-256(b"2d-hsm-agent-keystore-v1-meas" ‖ enclave_measurement)` (32 B).
-- `nonce` = 12 random bytes.
-- `AAD = magic ‖ format_version ‖ meas_digest`. Body = ChaCha20Poly1305 ciphertext + 16-byte tag.
+- `nonce` = 24 random bytes (XChaCha20Poly1305 extended nonce).
+- `AAD = magic ‖ format_version ‖ meas_digest`. Body = XChaCha20Poly1305 ciphertext + 16-byte tag.
 
 **KDF:** keystore AEAD key = `SHA3-256(b"2d-hsm-agent-keystore-v1-key" ‖ provisioning_root ‖
 meas_digest)`. Same shape as `pq_signer.rs:291-299`, **distinct label** (AC#19) so it cannot
 collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same SNP root.
 
-**Plaintext** (canonical CBOR, `deny-unknown-fields`):
+**Plaintext** (deterministic CBOR, `deny-unknown-fields`):
 1. **Config / identity** (AC#8): `twod_chain_id`; `environment_identifier` (UTF-8, `1..=64`,
    `[a-z0-9-]`, no leading/trailing/double hyphen — TASK-7.1 §10.6); `admin_authority_pk`
    (Ed25519 32 B); `recovery_authority_pk` / threshold root (Ed25519 32 B / quorum
    descriptor); `backup_recovery_wrapping_pubkey` (the operator recovery **public** key for
-   DR — public, sealed here so the enclave can wrap to it; private side never in TEE);
-   `monotonic_treasury_config_version` (u64); `authority_epoch` (u64, reserved for future
-   rotation).
+   DR — ML-KEM-1024 encapsulation key, 1568 B; public, sealed here so the enclave can wrap to
+   it; private side never in TEE); `monotonic_treasury_config_version` (u64); `authority_epoch`
+   (u64, reserved for future rotation); `anchor_root` (Ed25519 32 B — the pinned TASK-7.7
+   anti-rollback anchor identity the enclave verifies freshness responses against; 7.2 stores it,
+   7.7 owns the mechanism).
+1b. **Anti-rollback freshness** (TASK-7.7): `freshness_epoch` (u64) lives in the body alongside
+   the counter/spend state, so the keystore AEAD integrity-binds it; 7.2 seals/stores it, 7.7
+   advances it against `anchor_root` and rejects any unsealed blob whose epoch is stale.
 2. **Entry list** (AC#1): length-prefixed `KeyEntry { key_ref, purpose
    (agent_faucet_treasury_k1 | agent_transfer_k1), algorithm (secp256k1), public_identity
    (uncompressed 65-byte SEC1, TASK-7.1), creation_metadata (config-version + counter
