@@ -72,6 +72,8 @@ pub enum KeystoreError {
     AeadKey,
     /// Ciphertext authentication/decryption failed (wrong root/meas, or tampered blob/tag).
     Decrypt,
+    /// AEAD encryption failed on the seal path.
+    Encrypt,
     /// CSPRNG unavailable when generating a seal nonce.
     Csprng,
     /// Canonical-CBOR (de)serialization of the keystore body failed (incl. deny-unknown-fields).
@@ -81,8 +83,14 @@ pub enum KeystoreError {
     InvalidEnvironmentId,
     /// Key-entry count over `MAX_TOTAL_KEY_ENTRIES` (AC#5 capacity guard).
     CapacityExceeded,
-    /// A fixed-length byte field (public identity 65 B, secret scalar 32 B) had the wrong length.
+    /// A fixed-length byte field (public identity 65 B, secret scalar 32 B) had the wrong length
+    /// or a malformed SEC1 prefix.
     InvalidFieldLength,
+    /// Two key entries share the same `key_ref` (the opaque handle must be unique).
+    DuplicateKeyRef,
+    /// The sealed blob would exceed the vsock `MAX_MESSAGE_SIZE` budget (entries/counters/audit too
+    /// large to transmit to the host — Nitro has no persistent enclave storage).
+    BlobTooLarge,
 }
 
 /// `SHA3-256(domain ‖ enclave_measurement)` — the measurement digest bound into the header + AAD.
@@ -107,7 +115,12 @@ fn derive_aead_key(
     h.update(AEAD_KEY_DOMAIN);
     h.update(provisioning_root);
     h.update(meas_digest);
-    Zeroizing::new(h.finalize().into())
+    // Copy into a pre-zeroed Zeroizing buffer rather than `Zeroizing::new(finalize().into())`:
+    // the latter materializes a bare `[u8; 32]` (a `Copy` type, no `Drop`) on the stack that is
+    // never scrubbed (repo zeroize rule; cf. `pq_signer.rs` resolve_provisioning_root).
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(h.finalize().as_slice());
+    key
 }
 
 /// Seal an opaque keystore body with a caller-supplied nonce (deterministic — for golden vectors).
@@ -138,7 +151,7 @@ pub fn seal_keystore_with_nonce(
         let aad = &out[..AAD_LEN];
         cipher
             .encrypt(XNonce::from_slice(nonce), Payload { msg: body, aad })
-            .map_err(|_| KeystoreError::Decrypt)?
+            .map_err(|_| KeystoreError::Encrypt)?
     };
     out.extend_from_slice(&ct);
     Ok(out)
@@ -417,12 +430,20 @@ impl KeystoreBody {
         {
             return Err(KeystoreError::CapacityExceeded);
         }
+        let mut seen_refs = std::collections::HashSet::with_capacity(self.entries.len());
         for e in &self.entries {
-            if e.public_identity.len() != SECP256K1_UNCOMPRESSED_LEN {
+            // Uncompressed SEC1: exactly 65 bytes AND the 0x04 prefix (full on-curve validation is
+            // done by `secp256k1.rs` at use time; this is the storage-layer structural check).
+            if e.public_identity.len() != SECP256K1_UNCOMPRESSED_LEN || e.public_identity[0] != 0x04
+            {
                 return Err(KeystoreError::InvalidFieldLength);
             }
             if e.secret_scalar.len() != SECRET_SCALAR_LEN {
                 return Err(KeystoreError::InvalidFieldLength);
+            }
+            // key_ref is an opaque handle returned to the host — it must be unique across entries.
+            if !seen_refs.insert(e.key_ref) {
+                return Err(KeystoreError::DuplicateKeyRef);
             }
         }
         for c in &self.counters {
@@ -475,6 +496,13 @@ pub fn seal_body(
     // Pass 1: count the exact encoded length (the CountingWriter discards bytes — no secret retained).
     let mut counter = CountingWriter(0);
     ciborium::ser::into_writer(body, &mut counter).map_err(|_| KeystoreError::Cbor)?;
+    // The sealed blob is persisted by the (untrusted) host and re-installed over vsock on boot —
+    // Nitro enclaves have no persistent storage. Reject any body whose sealed size would exceed the
+    // vsock MAX_MESSAGE_SIZE budget, so a too-large keystore fails closed at seal time rather than
+    // becoming an un-loadable blob (permanent lockout) at install time.
+    if HEADER_LEN + counter.0 + TAG_LEN > crate::MAX_MESSAGE_SIZE as usize {
+        return Err(KeystoreError::BlobTooLarge);
+    }
     // Pass 2: serialize into an exact-capacity Zeroizing buffer (no reallocation → no leaked copy).
     let mut cbor = Zeroizing::new(Vec::with_capacity(counter.0));
     ciborium::ser::into_writer(body, &mut *cbor).map_err(|_| KeystoreError::Cbor)?;
@@ -821,6 +849,36 @@ mod tests {
         let mut body = sample_body();
         body.audit.capacity = MAX_AUDIT_CAPACITY + 1;
         assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+    }
+
+    #[test]
+    fn duplicate_key_ref_rejected() {
+        let mut body = sample_body();
+        let r = body.entries[0].key_ref;
+        body.entries[1].key_ref = r; // collide the two entries' opaque handles
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::DuplicateKeyRef));
+    }
+
+    #[test]
+    fn public_identity_prefix_enforced() {
+        let mut body = sample_body();
+        body.entries[0].public_identity[0] = 0x02; // valid length, wrong SEC1 prefix
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+    }
+
+    #[test]
+    fn oversized_blob_rejected() {
+        // MAX_TOTAL_KEY_ENTRIES entries (each with a unique key_ref) is within the count cap but
+        // serializes past MAX_MESSAGE_SIZE, so seal_body must reject it as BlobTooLarge.
+        let mut body = sample_body();
+        body.entries = (0..MAX_TOTAL_KEY_ENTRIES)
+            .map(|i| {
+                let mut e = sample_entry(KeyPurpose::AgentTransferK1, 0x01, 0x02, 0x00);
+                e.key_ref[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                e
+            })
+            .collect();
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::BlobTooLarge));
     }
 
     #[test]
