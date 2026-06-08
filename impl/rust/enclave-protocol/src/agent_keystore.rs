@@ -17,7 +17,7 @@
 //! Built only under the `agent-gateway` feature, alongside the secp256k1 backend.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest as _, Sha3_256};
 use zeroize::Zeroizing;
@@ -32,9 +32,14 @@ const MEAS_DIGEST_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-meas";
 const AEAD_KEY_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-key";
 
 const MEAS_DIGEST_LEN: usize = 32;
-const NONCE_LEN: usize = 12;
+/// 24-byte (192-bit) XChaCha20Poly1305 nonce. Unlike the producer's one-shot `pq-seal-v1` blob,
+/// the keystore is **re-sealed on every privileged mutation** under a *fixed* per-enclave key
+/// (derived from the stable root+measurement). A 96-bit random nonce has a birthday-bound
+/// collision risk over many re-seals (NIST caps random-96-bit nonces at ~2^32 messages/key); the
+/// extended 192-bit nonce makes random-nonce collision infeasible regardless of re-seal count.
+const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-/// `magic(8) + format_version(2) + meas_digest(32) + nonce(12)`.
+/// `magic(8) + format_version(2) + meas_digest(32) + nonce(24)`.
 const HEADER_LEN: usize = 8 + 2 + MEAS_DIGEST_LEN + NONCE_LEN;
 /// `magic(8) + format_version(2) + meas_digest(32)` — the header minus the nonce.
 const AAD_LEN: usize = 8 + 2 + MEAS_DIGEST_LEN;
@@ -110,7 +115,7 @@ pub fn seal_keystore_with_nonce(
     let meas_digest = measurement_digest(enclave_measurement);
     let key = derive_aead_key(provisioning_root, &meas_digest);
     let cipher =
-        ChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
+        XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
 
     let mut out = Vec::with_capacity(HEADER_LEN + body.len() + TAG_LEN);
     out.extend_from_slice(KEYSTORE_MAGIC);
@@ -121,14 +126,14 @@ pub fn seal_keystore_with_nonce(
     let ct = {
         let aad = &out[..AAD_LEN];
         cipher
-            .encrypt(Nonce::from_slice(nonce), Payload { msg: body, aad })
+            .encrypt(XNonce::from_slice(nonce), Payload { msg: body, aad })
             .map_err(|_| KeystoreError::Decrypt)?
     };
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-/// Seal an opaque keystore body, drawing the 12-byte nonce from the platform CSPRNG.
+/// Seal an opaque keystore body, drawing the 24-byte XChaCha nonce from the platform CSPRNG.
 pub fn seal_keystore(
     body: &[u8],
     provisioning_root: &[u8; 32],
@@ -169,8 +174,8 @@ pub fn unseal_keystore(
     }
     let key = derive_aead_key(provisioning_root, &expected_meas);
     let cipher =
-        ChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
-    let nonce = Nonce::from_slice(&blob[AAD_LEN..HEADER_LEN]);
+        XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
+    let nonce = XNonce::from_slice(&blob[AAD_LEN..HEADER_LEN]);
     let aad = &blob[..AAD_LEN];
     let plain = cipher
         .decrypt(nonce, Payload { msg: &blob[HEADER_LEN..], aad })
@@ -419,16 +424,43 @@ impl KeystoreBody {
     }
 }
 
-/// Validate + deterministically CBOR-encode the body, then seal it (CSPRNG nonce). The transient CBOR
-/// buffer holds plaintext secrets and is zeroized on drop; the returned sealed blob is encrypted.
+/// A `std::io::Write` sink that counts bytes without retaining them — used to size the secret
+/// CBOR buffer in one pass so the real serialization never reallocates (see [`seal_body`]).
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Validate + deterministically CBOR-encode the body, then seal it (CSPRNG nonce). The transient
+/// CBOR buffer holds plaintext secrets and is zeroized on drop.
+///
+/// The buffer is **pre-sized** (a first counting pass that retains no bytes, then a single exact-
+/// capacity `Zeroizing` allocation): a growing `Zeroizing<Vec>` would reallocate mid-serialization,
+/// and `realloc` frees the old allocation **without** zeroizing it — leaking already-written secret
+/// bytes to the allocator. With exact capacity, serialization never reallocates, so the only copy
+/// of the plaintext lives in the one `Zeroizing` buffer that is scrubbed on drop.
 pub fn seal_body(
     body: &KeystoreBody,
     provisioning_root: &[u8; 32],
     enclave_measurement: &[u8],
 ) -> Result<Vec<u8>, KeystoreError> {
     body.validate()?;
-    let mut cbor = Zeroizing::new(Vec::new());
+    // Pass 1: count the exact encoded length (the CountingWriter discards bytes — no secret retained).
+    let mut counter = CountingWriter(0);
+    ciborium::ser::into_writer(body, &mut counter).map_err(|_| KeystoreError::Cbor)?;
+    // Pass 2: serialize into an exact-capacity Zeroizing buffer (no reallocation → no leaked copy).
+    let mut cbor = Zeroizing::new(Vec::with_capacity(counter.0));
     ciborium::ser::into_writer(body, &mut *cbor).map_err(|_| KeystoreError::Cbor)?;
+    // Both passes must encode the same length; if not, pass 2 exceeded the reserved capacity and
+    // reallocated (leaking a copy), or encoding is non-deterministic — either way a bug.
+    debug_assert_eq!(cbor.len(), counter.0, "seal_body CBOR length mismatch between passes");
     seal_keystore(&cbor, provisioning_root, enclave_measurement)
 }
 
@@ -797,7 +829,7 @@ mod tests {
         };
         assert_eq!(
             (blob.len(), hex::encode(digest)),
-            (1090usize, "c2cf7e635b07c0e9044fff8e53c15e09e8fdeabab1ceb6bbbc26705c74aed405".to_string()),
+            (1102usize, "18700ccb7c446e93bc4798997e440fc74f72383f86d90e8ed749305fc408afdc".to_string()),
             "keystore golden blob changed — if intentional, bump format_version + update this vector"
         );
 
