@@ -4,7 +4,7 @@ title: Agent Gateway anti-rollback mechanism for faucet caps and capability coun
 status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-08 07:00'
+updated_date: '2026-06-08 07:10'
 labels:
   - agent-gateway
   - tee
@@ -41,6 +41,8 @@ Define the production anti-rollback mechanism for Agent Gateway sealed replay co
 
 <!-- SECTION:NOTES:BEGIN -->
 Design delivered in backlog/docs/agent-gateway-anti-rollback.md (design-only; impl TASK-7.6). Platform finding: SEV-SNP has NO per-enclave hardware monotonic counter (reported_tcb platform-wide; guest_svn not enforced-monotonic; no vTPM NV counter; snp-derive-root is a key) -> freshness anchor MUST be external. Selected mechanism: Option A = remote monotonic counter + epoch-lease (freshness_epoch in pq-seal-v1 AAD; on start reject blob with epoch < anchor-current; per-dispense bump+seal-before-emit). Default lease=1 synchronous (zero replay window); lease=N is an explicit per-treasury policy for low-value faucets (bounded loss). Covers BOTH capability counters AND faucet cumulative/lifetime spend + strict recovery counter (AC#2). Boot/restore seed from authenticated anchor marks, never zero/stale (AC#3). Active-active prohibited unless Option B (global append-only ledger), documented as the HA upgrade (AC#4). AC#5 production-funding gate: 2-layer fail-closed (Nix build assertion mirroring productionMode + Rust dispatch block on fund commands) + hard-block-default + a single audited opt-out recording the verbatim TASK-7.2 AC#10 residual ack + runbook. Anchor under separation-of-duties + itself anti-rollback-durable (quorum preferred high-value); fail-closed on anchor partition. AC #1-#5 addressed by this design; AC #6 (roborev) run pre-merge.
+
+Roborev evidence (AC#6): 3x3 vendor matrix (codex+gemini+claude-code x security/design/default) on 524c8d8 -> 3 HIGH + 3 MED; consolidated via roborev compact (job 7704). Resolved: anchor mutual-authentication (signed nonce-bound anchor responses vs pinned/sealed anchor root — was one-directional); lease=N is NOT bounded naively -> requires anchor-visible lease IDs + consumed sub-cursor, admin/recovery/config always lease=1, production default lease=1; Nix gate enum drops standalone operator-signed-boot (replay-vulnerable); Rust fund-block adds AGENT_K1_CONFIGURE_TREASURY sub-ops; opt-out is measured/sealed (not host-settable) with defined relaxed layers.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
