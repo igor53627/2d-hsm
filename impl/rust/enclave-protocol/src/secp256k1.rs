@@ -89,11 +89,9 @@ impl Keypair {
     /// Infallible: the verifying key's uncompressed encoding is always `0x04 || X || Y`, so this
     /// derives directly from `X || Y` rather than forcing callers to handle an impossible error.
     pub fn eth_address(&self) -> [u8; 20] {
-        let pk = self.public_key_uncompressed();
-        let hash = keccak256(&pk[1..]);
-        let mut out = [0u8; 20];
-        out.copy_from_slice(&hash[12..]);
-        out
+        // On-curve by construction (the bytes come from this keypair's verifying key), so the
+        // unchecked derivation is sound — no point validation is needed on this path.
+        address_from_uncompressed_xy(&self.public_key_uncompressed())
     }
 
     /// TRON address: Base58Check(`0x41 || body20`) over the same 20-byte body (unified account).
@@ -141,6 +139,18 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// `keccak256(X || Y)[12..32]` from a `0x04 || X || Y` buffer, WITHOUT point validation.
+///
+/// Private: every caller must have already established the point is a well-formed on-curve
+/// secp256k1 point — either by construction (`Keypair::eth_address`, whose bytes come from a
+/// `VerifyingKey`) or via the `from_sec1_bytes` check in `eth_address_from_uncompressed`.
+fn address_from_uncompressed_xy(pubkey65: &[u8; 65]) -> [u8; 20] {
+    let hash = keccak256(&pubkey65[1..]);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&hash[12..]);
+    out
+}
+
 /// eth address from an uncompressed SEC1 pubkey (`0x04 || X || Y`): `keccak256(X || Y)[12..32]`.
 ///
 /// Fully validates the point for untrusted input: the `0x04` prefix **and** that `(X, Y)` is a
@@ -151,12 +161,11 @@ pub fn eth_address_from_uncompressed(pubkey65: &[u8; 65]) -> Result<[u8; 20], Se
     if pubkey65[0] != 0x04 {
         return Err(Secp256k1Error::InvalidPublicKey);
     }
-    // Reject off-curve / identity / malformed coordinates: parsing enforces the curve equation.
+    // Reject off-curve / out-of-field / malformed coordinates: parsing enforces the curve equation
+    // and the field-element range [0, p). (The point at infinity has no `0x04 || X || Y` encoding —
+    // SEC1 represents it as the single byte `0x00` — so it cannot reach this 65-byte path.)
     VerifyingKey::from_sec1_bytes(pubkey65).map_err(|_| Secp256k1Error::InvalidPublicKey)?;
-    let hash = keccak256(&pubkey65[1..]);
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&hash[12..]);
-    Ok(out)
+    Ok(address_from_uncompressed_xy(pubkey65))
 }
 
 /// TRON Base58Check address from the 20-byte body: Base58(`0x41 || body || dsha256(0x41||body)[..4]`).
