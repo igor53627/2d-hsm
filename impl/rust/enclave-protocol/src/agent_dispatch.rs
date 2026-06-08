@@ -122,15 +122,16 @@ pub enum AgentResponse {
     ProveIdentity(IdentityProof),
 }
 
-/// The decoded Agent Gateway envelope (§10.2). Capability (key 5) is captured only as *presence*
-/// here; its verification is the [`verify_capability`] seam.
+/// The decoded Agent Gateway envelope (§10.2). The capability (key 5) is captured as the raw CBOR
+/// map for [`verify_capability`]; presence is derived from `capability.is_some()`.
 struct AgentEnvelope {
     agent_version: u8,
     opcode: u8,
     command_domain: String,
-    #[allow(dead_code)] // bound into capability/audit by later slices; carried through now
     request_id: Vec<u8>,
-    has_capability: bool,
+    /// The administrative/recovery capability map (inner-envelope key 5) for privileged opcodes,
+    /// `None` for reads/runtime. Verified by [`verify_capability`] (§10.5).
+    capability: Option<Vec<(Value, Value)>>,
     key_ref: Option<[u8; 32]>,
     /// The PROVE_IDENTITY verifier nonce (payload key 7 → sub-map key 1), extracted directly so we
     /// never deep-clone the caller-controlled (up to ~1 MiB) payload subtree for opcodes that
@@ -205,7 +206,13 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
         Some(b) if b.len() <= MAX_REQUEST_ID_LEN => b.to_vec(),
         _ => return Err(AgentError::Malformed),
     };
-    let has_capability = map_get(&map, 5).is_some();
+    // Capability (envelope key 5): if present it MUST be a CBOR map (the §10.5 cap structure); its
+    // full Ed25519 + binding + counter verification is the verify_capability seam.
+    let capability = match map_get(&map, 5) {
+        None => None,
+        Some(Value::Map(m)) => Some(m.clone()),
+        Some(_) => return Err(AgentError::Malformed),
+    };
     // key_ref (envelope key 6) is required to be 32 bytes when present.
     let key_ref = match map_get(&map, 6) {
         None => None,
@@ -236,19 +243,31 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
         opcode,
         command_domain,
         request_id,
-        has_capability,
+        capability,
         key_ref,
         verifier_nonce,
     })
 }
 
-/// Fail-closed capability seam for privileged opcodes. The full Ed25519 verification over capability
-/// keys 1–12 against the sealed `admin_authority_pk`/`recovery_authority_pk`, the contiguous-counter
-/// advance, and the payload-binding check land in a later slice (TASK-7.6.x; counter/seal are 7.2
-/// territory). Until then this **rejects** every privileged request, collapsing to
-/// `AGENT_CAPABILITY_REJECTED` (0x43) — privileged opcodes are inert, never open.
-fn verify_capability(_envelope: &AgentEnvelope, _keystore: &KeystoreBody) -> Result<(), AgentError> {
-    Err(AgentError::CapabilityRejected)
+/// Capability seam for privileged opcodes — delegates to [`crate::agent_capability`] (§10.5/§10.6):
+/// Ed25519 verify over canonical-CBOR(keys 1–12) vs the sealed `admin_authority_pk`/
+/// `recovery_authority_pk`, opcode/`request_id` binding, chain/env match, and the contiguous-counter
+/// CHECK. **Verify-only:** the `key_purpose` (0x42) and `payload_binding` checks plus the counter
+/// ADVANCE + atomic re-seal land with the per-opcode handler / mutation slice (so a passing cap then
+/// hits `AGENT_NOT_CONFIGURED` until execution is wired). Every failure collapses to
+/// `AGENT_CAPABILITY_REJECTED` (0x43); structural/version errors surface as `AGENT_MALFORMED`.
+fn verify_capability(envelope: &AgentEnvelope, keystore: &KeystoreBody) -> Result<(), AgentError> {
+    let cap = envelope
+        .capability
+        .as_deref()
+        .ok_or(AgentError::CapabilityRejected)?;
+    crate::agent_capability::verify_capability(
+        cap,
+        envelope.opcode,
+        &envelope.request_id,
+        &keystore.config,
+        &keystore.counters,
+    )
 }
 
 /// Dispatch one Agent Gateway request (`payload` = the inner envelope CBOR, frame body of a `0x40`
@@ -275,15 +294,17 @@ pub fn dispatch_agent(
     // Privilege routing: privileged opcodes MUST carry a capability and go through the seam;
     // read/runtime opcodes MUST NOT carry one.
     if opcode.is_privileged() {
-        if !env.has_capability {
+        if env.capability.is_none() {
             return Err(AgentError::CapabilityRejected); // missing cap collapses to 0x43
         }
-        verify_capability(&env, keystore)?; // fail-closed until the real verifier lands
-        // Once verify_capability returns Ok (later slice), GENERATE_KEYS/CONFIGURE_TREASURY/...
-        // execute here. For now the seam never returns Ok, so this is unreachable.
+        verify_capability(&env, keystore)?; // §10.5 verify-only; failures → 0x43 / 0x40
+        // The capability is authentic and authorized for this request. Execution of
+        // GENERATE_KEYS/CONFIGURE_TREASURY/EXPORT/RESTORE (with the key_purpose + payload_binding
+        // checks and the counter advance + atomic re-seal) lands with the mutation slice; until then
+        // a verified privileged request is "not configured".
         return Err(AgentError::NotConfigured);
     }
-    if env.has_capability {
+    if env.capability.is_some() {
         // A read/runtime opcode carrying a capability is malformed (cap only on privileged ops).
         return Err(AgentError::Malformed);
     }
@@ -637,10 +658,48 @@ mod tests {
     }
 
     #[test]
-    fn privileged_generate_keys_fails_closed_with_capability() {
+    fn privileged_bogus_capability_is_malformed() {
         let (body, _) = body_with_key();
-        // GENERATE_KEYS(1) WITH a capability present still rejects (verifier is a fail-closed stub).
+        // GENERATE_KEYS(1) with a structurally-invalid (empty) capability map → MALFORMED (0x40):
+        // the verifier now parses the cap and rejects missing required keys.
         let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(vec![]))]);
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            Some(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn privileged_valid_capability_reaches_not_configured() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // envelope() sets request_id = [0x11; 16]; the cap must bind the same, chain 11565, env testnet.
+        let cap = crate::agent_capability::test_signed_capability(
+            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer",
+        );
+        let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(cap))]);
+        // Capability verifies (Ed25519 + opcode/request_id/chain/env + first counter == 1); execution
+        // is not yet wired, so the verified privileged request collapses to NotConfigured (0x45).
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn privileged_badly_signed_capability_rejected() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let wrong = SigningKey::from_bytes(&[8u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // A well-formed cap signed by the wrong key ⇒ Ed25519 fails ⇒ CapabilityRejected (0x43).
+        let cap = crate::agent_capability::test_signed_capability(
+            &wrong, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer",
+        );
+        let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
             dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
             Some(AgentError::CapabilityRejected)

@@ -110,6 +110,10 @@ pub mod agent_keygen;
 // privilege routing + read opcodes; privileged opcodes via a fail-closed capability seam.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_dispatch;
+// Agent Gateway capability verification (TASK-7.6.x). Ed25519 over canonical-CBOR(1..12) +
+// contiguous-counter CHECK for privileged opcodes (verify-only; advance/payload-binding deferred).
+#[cfg(feature = "agent-gateway")]
+pub mod agent_capability;
 mod wire;
 
 use serde::{Deserialize, Serialize};
