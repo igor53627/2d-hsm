@@ -81,6 +81,9 @@ pub mod secp256k1;
 // mirroring the producer `pq-seal-v1` primitives with distinct magic + KDF/measurement domains.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_keystore;
+// Agent Gateway identity proof (TASK-7.6.3). EIP-191 0x19 PROVE_IDENTITY preimage + signer.
+#[cfg(feature = "agent-gateway")]
+pub mod agent_identity;
 mod wire;
 
 use serde::{Deserialize, Serialize};
