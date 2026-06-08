@@ -344,7 +344,11 @@ mod tests {
         // Valid 0x04 prefix + 32-byte X + 32-byte Y length, but the coordinates are NOT on the
         // curve. For a given valid x there are exactly two valid y (y and p-y); perturbing Y to
         // any other value is off-curve, so the full-point validation must reject it.
-        let kp = Keypair::generate().unwrap();
+        //
+        // Fixed (non-random) secret so a failure is reproducible: flipping the low byte of Y can
+        // only land back on-curve if Y' == p-y, which is impossible here (the conjugate differs in
+        // its high bytes), so the perturbation is deterministically off-curve for this key.
+        let kp = Keypair::from_secret_bytes(&[0x42u8; 32]).unwrap();
         let mut bad = kp.public_key_uncompressed();
         assert_eq!(bad[0], 0x04);
         bad[64] ^= 0xff; // y no longer satisfies y^2 = x^3 + 7
