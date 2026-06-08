@@ -322,6 +322,10 @@ pub struct KeystoreConfig {
     pub monotonic_treasury_config_version: u64,
     /// Reserved for a future authority-rotation task (no format bump needed).
     pub authority_epoch: u64,
+    /// Pinned anti-rollback **anchor** identity — the Ed25519 public key the enclave verifies the
+    /// anchor's freshness responses against (TASK-7.7). 7.2 only **stores** it; 7.7 owns the
+    /// mechanism. Installed at provisioning; changing it is a reviewed `format_version` bump.
+    pub anchor_root: [u8; 32],
 }
 
 /// The full keystore plaintext: everything sealed inside one `pq-agent-keystore-v1` commit.
@@ -333,6 +337,11 @@ pub struct KeystoreBody {
     pub counters: Vec<CounterEntry>,
     pub faucet: FaucetState,
     pub audit: AuditRing,
+    /// Anti-rollback freshness epoch (TASK-7.7). Lives in the encrypted body alongside the
+    /// counter/spend state, so the keystore AEAD integrity-binds it. 7.2 **stores** it (sealed,
+    /// authenticated); 7.7 advances it against the pinned [`KeystoreConfig::anchor_root`] and
+    /// rejects any unsealed blob whose epoch is behind the authenticated anchor-current.
+    pub freshness_epoch: u64,
 }
 
 /// `environment_identifier` rules (TASK-7.1 §10.6): UTF-8, length `1..=64`, `[a-z0-9-]`, no
@@ -548,6 +557,7 @@ mod tests {
                 backup_recovery_wrapping_pubkey: vec![0xb0; 1568],
                 monotonic_treasury_config_version: 3,
                 authority_epoch: 0,
+                anchor_root: [0xa3; 32],
             },
             entries: vec![
                 sample_entry(KeyPurpose::AgentFaucetTreasuryK1, 0x77, 0x33, 0x01),
@@ -569,6 +579,7 @@ mod tests {
                 circuit_breaker_threshold: None,
             },
             audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
+            freshness_epoch: 1,
         }
     }
 
