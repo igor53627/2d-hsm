@@ -20,11 +20,9 @@
 //! Built only under the `agent-gateway` feature.
 
 use crate::agent_identity::{
-    public_identity_from_entry, sign_identity_proof, IdentityProof, PublicIdentity,
-    AGENT_GATEWAY_VERSION,
+    public_identity_from_entry, IdentityProof, PublicIdentity, AGENT_GATEWAY_VERSION,
 };
 use crate::agent_keystore::{KeyPurpose, KeystoreBody};
-use crate::secp256k1::Keypair;
 use ciborium::value::Value;
 use std::sync::Mutex;
 
@@ -130,7 +128,11 @@ struct AgentEnvelope {
     request_id: Vec<u8>,
     has_capability: bool,
     key_ref: Option<[u8; 32]>,
-    payload: Option<Value>,
+    /// The PROVE_IDENTITY verifier nonce (payload key 7 → sub-map key 1), extracted directly so we
+    /// never deep-clone the caller-controlled (up to ~1 MiB) payload subtree for opcodes that
+    /// ignore it. Only read on the PROVE path (gated by `agent-prove-identity-preview`).
+    #[cfg_attr(not(feature = "agent-prove-identity-preview"), allow(dead_code))]
+    verifier_nonce: Option<[u8; 32]>,
 }
 
 /// Look up an integer-keyed entry in a CBOR map.
@@ -188,7 +190,12 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
         None => None,
         Some(v) => Some(as_bytes32(v).ok_or(AgentError::Malformed)?),
     };
-    let payload = map_get(&map, 7).cloned();
+    // Extract only the 32-byte verifier nonce (payload key 7 → sub-map key 1) — never clone the
+    // whole payload. Absent/malformed payload ⇒ None (PROVE_IDENTITY requires it; reads ignore it).
+    let verifier_nonce = match map_get(&map, 7) {
+        Some(Value::Map(inner)) => map_get(inner, 1).and_then(as_bytes32),
+        _ => None,
+    };
     Ok(AgentEnvelope {
         agent_version,
         opcode,
@@ -196,7 +203,7 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
         request_id,
         has_capability,
         key_ref,
-        payload,
+        verifier_nonce,
     })
 }
 
@@ -248,7 +255,20 @@ pub fn dispatch_agent(
 
     match opcode {
         AgentOpcode::PublicIdentity => handle_public_identity(&env, keystore),
-        AgentOpcode::ProveIdentity => handle_prove_identity(&env, keystore),
+        AgentOpcode::ProveIdentity => {
+            // PRODUCTION GATE (vsock spec §10.8): identity-proof signing stays disabled until the
+            // 2D EIP-2718 type-0x19 reservation merges (2D PR #144). Enabled only via the
+            // `agent-prove-identity-preview` feature; otherwise fail closed.
+            #[cfg(feature = "agent-prove-identity-preview")]
+            {
+                handle_prove_identity(&env, keystore)
+            }
+            #[cfg(not(feature = "agent-prove-identity-preview"))]
+            {
+                let _ = &env;
+                Err(AgentError::NotConfigured)
+            }
+        }
         // Runtime signing (4/5) lands in TASK-7.6.4.
         AgentOpcode::SignTransfer | AgentOpcode::SignFaucetDispense => {
             Err(AgentError::NotConfigured)
@@ -272,17 +292,18 @@ fn handle_public_identity(
 }
 
 /// PROVE_IDENTITY(3): sign the EIP-191 identity proof for `key_ref` over the verifier-supplied
-/// nonce, binding the sealed chain_id/environment_identifier.
+/// nonce, binding the sealed chain_id/environment_identifier. Gated by the production preview
+/// feature (see the dispatch gate).
+#[cfg(feature = "agent-prove-identity-preview")]
 fn handle_prove_identity(
     env: &AgentEnvelope,
     keystore: &KeystoreBody,
 ) -> Result<AgentResponse, AgentError> {
+    use crate::agent_identity::sign_identity_proof;
+    use crate::secp256k1::Keypair;
     let key_ref = env.key_ref.ok_or(AgentError::Malformed)?;
-    // payload (envelope key 7) = { 1: verifier_nonce(32B) }.
-    let verifier_nonce = match &env.payload {
-        Some(Value::Map(m)) => map_get(m, 1).and_then(as_bytes32).ok_or(AgentError::Malformed)?,
-        _ => return Err(AgentError::Malformed),
-    };
+    // payload (envelope key 7) = { 1: verifier_nonce(32B) }, extracted in decode_envelope.
+    let verifier_nonce = env.verifier_nonce.ok_or(AgentError::Malformed)?;
     let entry =
         crate::agent_identity::find_entry(keystore, &key_ref).ok_or(AgentError::KeyPurposeMismatch)?;
     let secret: [u8; 32] = entry
@@ -374,6 +395,9 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
             (Value::Integer(3.into()), Value::Text(id.tron_address.clone())),
             (Value::Integer(4.into()), Value::Bytes(id.key_ref.to_vec())),
             (Value::Integer(5.into()), Value::Integer(key_purpose_code(id.key_purpose).into())),
+            // §10.4 key 6 = backend_version. Currently the agent protocol version (=1); the
+            // build/protocol-version component (keygen-identity doc) is a follow-up — no host keys
+            // off a build component yet, and no vector pins it.
             (Value::Integer(6.into()), Value::Integer((id.agent_version as u64).into())),
         ]),
         // PROVE_IDENTITY response: low-S recoverable signature + the bound address/pubkey.
@@ -409,13 +433,9 @@ fn encode_agent_error(e: AgentError) -> Vec<u8> {
 pub fn decode_agent_error_code(body: &[u8]) -> Option<u8> {
     let v: Value = ciborium::de::from_reader(body).ok()?;
     let Value::Map(m) = v else { return None };
-    let code = map_get(&m, 1).and_then(as_u64)?;
-    // a success PUBLIC_IDENTITY/PROVE map also has key 1 (bytes), so only treat int key1 as an error
-    if matches!(map_get(&m, 1), Some(Value::Integer(_))) {
-        u8::try_from(code).ok()
-    } else {
-        None
-    }
+    // Error bodies carry an INTEGER code at key 1; success bodies carry BYTES at key 1 (a pubkey),
+    // for which `as_u64` returns None — so a success body naturally yields None here.
+    u8::try_from(map_get(&m, 1).and_then(as_u64)?).ok()
 }
 
 #[cfg(test)]
@@ -515,6 +535,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "agent-prove-identity-preview")]
     #[test]
     fn prove_identity_signs_and_recovers() {
         let (body, key_ref) = body_with_key();
@@ -545,6 +566,27 @@ mod tests {
             }
             _ => panic!("expected ProveIdentity"),
         }
+    }
+
+    /// Without the production-preview feature, PROVE_IDENTITY is gated off (vsock §10.8) → 0x45.
+    #[cfg(not(feature = "agent-prove-identity-preview"))]
+    #[test]
+    fn prove_identity_gated_off_when_preview_disabled() {
+        let (body, key_ref) = body_with_key();
+        let payload = envelope(
+            3,
+            vec![
+                (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                (
+                    Value::Integer(7.into()),
+                    Value::Map(vec![(Value::Integer(1.into()), Value::Bytes(vec![0xab; 32]))]),
+                ),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            Some(AgentError::NotConfigured)
+        );
     }
 
     #[test]

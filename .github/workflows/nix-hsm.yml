@@ -49,6 +49,12 @@ jobs:
       - name: Reference SNP verifier (snp-verify, TASK-1 AC#3/#12)
         run: cargo test --features snp-verify
 
+      - name: Agent Gateway secp256k1 (agent-gateway, TASK-7.6) — PROVE_IDENTITY gated off
+        run: cargo test --features agent-gateway
+
+      - name: Agent Gateway incl. PROVE_IDENTITY preview (TASK-7.6.3)
+        run: cargo test --features agent-prove-identity-preview
+
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 
