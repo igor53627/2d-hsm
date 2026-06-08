@@ -1,10 +1,10 @@
 ---
 id: TASK-7.5
 title: Agent Gateway host policy and capability integration contract
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-07 18:27'
+updated_date: '2026-06-08 06:47'
 labels:
   - agent-gateway
   - opa
@@ -44,9 +44,15 @@ Design delivered in backlog/docs/agent-gateway-host-integration-contract.md (hos
 Roborev evidence (AC#5): 3x3 vendor matrix (codex+gemini+claude-code x security/design/default) on 671d307 -> 2 HIGH (AC#1 runtime/faucet tier-merge; §4 global-vs-capability gate split) + 5 MED + LOW; resolved in b5fb632 + OPA-input/notes follow-up; consolidated via roborev compact (job 7631, re-verified clean). AC #1-#4 addressed by this design; AC #5 evidenced here.
 <!-- SECTION:NOTES:END -->
 
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Design delivered in backlog/docs/agent-gateway-host-integration-contract.md (PR #32, squash 2f0c976). Host-side OPA/Vault + capability integration contract consuming the TASK-7.1/7.2/7.4 TEE taxonomy: five distinct capabilities per AC#1 (runtime signing, faucet-treasury signing, provisioning/refill, backup-export, restore/recovery); agent-specific OPA package signer.agent_gateway + five tiered Vault paths with cross-tier-denied ACLs (Vault = authorization material, not keys); host-vs-TEE matrix (Frame gates all-opcodes vs Capability gates privileged-only) + AC#2 no-privilege-escalation; local->OPA->Vault->2d-hsm flow mirroring Chain.Bridge.Signer; negative-capability tests. Honest residuals: expiry/revocation host-side (counter-burn per-lane; high-value lanes host-drop-only); transfer dest/amount OPA/host-only; rollback-sensitive until TASK-7.7. Verified by roborev 3x3 + compact + the /code-review skill (2 HIGH + 6 findings resolved, incl. a false counter-burn revocation guarantee).
+<!-- SECTION:FINAL_SUMMARY:END -->
+
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Integration contract is documented for 2D app implementers.
-- [ ] #2 Negative capability cases are covered by tests or vectors where code exists.
-- [ ] #3 Final summary added before marking Done.
+- [x] #1 Integration contract is documented for 2D app implementers.
+- [x] #2 Negative capability cases are covered by tests or vectors where code exists.
+- [x] #3 Final summary added before marking Done.
 <!-- DOD:END -->
