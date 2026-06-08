@@ -87,6 +87,10 @@ pub mod agent_identity;
 // Agent Gateway key generation (TASK-7.6.3). GENERATE_KEYS keystore-mutation core.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_keygen;
+// Agent Gateway 0x40 dispatch router (TASK-7.6.3). Envelope decode + profile/opcode gates +
+// privilege routing + read opcodes; privileged opcodes via a fail-closed capability seam.
+#[cfg(feature = "agent-gateway")]
+pub mod agent_dispatch;
 mod wire;
 
 use serde::{Deserialize, Serialize};
