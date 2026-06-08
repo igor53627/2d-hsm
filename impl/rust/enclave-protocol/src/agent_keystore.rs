@@ -408,8 +408,11 @@ pub struct KeystoreBody {
     pub audit: AuditRing,
     /// Anti-rollback freshness epoch (TASK-7.7). Lives in the encrypted body alongside the
     /// counter/spend state, so the keystore AEAD integrity-binds it. 7.2 **stores** it (sealed,
-    /// authenticated); 7.7 advances it against the pinned [`KeystoreConfig::anchor_root`] and
-    /// rejects any unsealed blob whose epoch is behind the authenticated anchor-current.
+    /// authenticated); 7.7 advances it against the pinned [`KeystoreConfig::anchor_root`] and never
+    /// trusts a behind-epoch blob's own marks — it adopts the anchor's authenticated counter/spend
+    /// marks when they fully resolve the gap (bounded crash-reconcile), and fails closed for a blob
+    /// ahead of the anchor, a structural key/config gap the anchor never held, or an
+    /// unavailable/unresolvable anchor.
     pub freshness_epoch: u64,
 }
 

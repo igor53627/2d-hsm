@@ -81,9 +81,13 @@ authenticated: the enclave proves it is a genuine current instance with a fresh 
 `anchor_root` Ed25519 identity whose public half / CA is **pinned in the keystore plaintext config**
 (the format extension above), covering `(treasury_id, epoch/marks, the enclave's fresh
 channel-binding nonce)` as **canonical CBOR**. On every (re)start the enclave issues a fresh nonce,
-verifies the signed response against the pinned `anchor_root`, and **refuses any sealed blob whose
-`freshness_epoch` < the authenticated anchor-current** (stale → fail closed). An epoch **ahead** of
-the anchor (`freshness_epoch > anchor-current`, beyond the single-step crash-reconcile of §3)
+verifies the signed response against the pinned `anchor_root`, and **never trusts a sealed blob whose
+`freshness_epoch` < the authenticated anchor-current as-is**: the stale blob's own marks are
+discarded and the anchor's authoritative counter/spend high-water binds (the core anti-rollback
+assertion). The enclave then **adopts** those marks when they fully resolve the gap (the bounded
+counter/spend crash-reconcile of §3) and **fails closed** when the gap spans a structural key/config
+mutation the anchor never held or when the anchor is unavailable. An epoch **ahead** of
+the anchor (`freshness_epoch > anchor-current`, beyond that bounded reconcile)
 indicates the **anchor itself was rolled back** or is inconsistent and **also fails closed** — the
 enclave never silently accepts a blob ahead of the anchor. A host controlling vsock therefore cannot
 replay a stale low-epoch response or route the enclave to a spoofed anchor.
@@ -102,7 +106,8 @@ VCEK) before advancing or reporting.
 each fund-moving operation (faucet dispense; and each administrative counter advance) **bumps the
 remote counter to `epoch+1` and seals the new epoch into the keystore body in the same commit BEFORE
 the signature/refs are emitted**. Default **`lease=1`**: one synchronous remote bump per signature →
-**zero replay window** (a rolled-back blob is strictly behind the anchor and rejected). **All
+**zero replay window** (a rolled-back blob is strictly behind the anchor, so the anchor's higher mark
+binds and the rollback gains nothing — adopt-forward). **All
 administrative, recovery, and treasury-config counter advances are ALWAYS synchronous (`lease=1`)** —
 never amortized. A **naive `lease=N`** (the blob-wide `freshness_epoch` staying equal to
 anchor-current for the whole window) is **NOT bounded**: a host can repeatedly snapshot and replay
@@ -118,13 +123,16 @@ ack removes most of `lease=N`'s round-trip savings. **Production default and rec
 **Crash/partition reconciliation.** The remote bump is **atomic with recording the authoritative
 post-operation marks** at the anchor — the new `epoch` **and** the resulting counter/spend
 high-water — keyed by `request_id`. On restart the enclave re-reads the anchor's authoritative marks;
-if they are **ahead of** the local sealed blob it **adopts them** (re-seals to the anchor's epoch +
-marks). So a dropped seal/ack cannot lose a spend debit, and a host that received a signature **cannot
-hide the debit** by rolling the blob back — the debit lives at the anchor. The enclave never
-reconciles by *guessing* whether a signature was emitted; it **adopts the anchor's recorded state**.
-A divergence the anchor cannot resolve — the anchor **behind** the blob (`freshness_epoch >
-anchor-current`, §3) — fails closed for operator intervention. This preserves no-over-dispense
-without a permanent self-wedge on a single dropped ack.
+if they are **ahead of** the local sealed blob **by a counter/spend advance the recorded marks fully
+describe**, it **adopts them** (re-seals to the anchor's epoch + marks). So a dropped seal/ack cannot
+lose a spend debit, and a host that received a signature **cannot hide the debit** by rolling the
+blob back — the debit lives at the anchor. The enclave never reconciles by *guessing* whether a
+signature was emitted; it **adopts the anchor's recorded state**. A divergence the anchor cannot
+resolve — the anchor **behind** the blob (`freshness_epoch > anchor-current`, §3), **or a forward gap
+spanning a structural key/config mutation whose material the anchor never held** (it records only
+epoch + counter/spend marks, so a dropped `GENERATE_KEYS`/`CONFIGURE_TREASURY` seal is not
+reconstructable) — fails closed for operator intervention (restore from backup). This preserves
+no-over-dispense without a permanent self-wedge on a single dropped ack.
 
 **Coverage (AC#2).** The same epoch gate protects **both** the capability counter high-water table
 and the faucet spend counters (both live in the one sealed keystore whose epoch the anchor pins);
@@ -132,8 +140,10 @@ the strict recovery counter is likewise pinned.
 
 **Boot/restore seeding (AC#3).** Counter high-water marks and faucet spend are seeded at boot/restore
 from the anchor's **authenticated current marks** (or from authenticated recovery material whose
-target is bound to the strict recovery counter) — **never zero, never from a stale backup**; if the
-restored blob's epoch is behind the anchor it is rejected. Option C (operator-signed boot
+target is bound to the strict recovery counter) — **never zero, never from a stale backup**: the
+backup's own stale marks are never trusted; counters are seeded from the anchor's authenticated
+current marks (adopt-forward), and the operation fails closed only if those authenticated marks are
+unavailable or the divergence is unresolvable. Option C (operator-signed boot
 authorization) may supply the seed values **only** when bound to the anchor's challenge-response,
 never as a standalone replayable static authorization.
 
@@ -216,29 +226,36 @@ is used.
 Restore and failover seed counter high-water marks + faucet spend from **authenticated material**
 (the anchor's current marks, or recovery material bound to the strict recovery counter), and
 **never** reset to zero from a stale backup (consumes the TASK-7.2 AC#11/#12 contract). A restored
-blob whose `freshness_epoch` is behind the anchor is rejected. Fresh-TEE restore additionally runs
+blob's own stale `freshness_epoch`/marks are never trusted as authoritative — counters are seeded
+from the anchor's authenticated current marks (adopt-forward); restore fails closed only when those
+marks are unavailable or the divergence is unresolvable. Fresh-TEE restore additionally runs
 the TASK-7.2 attested-ingress ceremony; the new instance registers with the anchor (fresh SNP
 attestation) before it may emit fund-moving signatures.
 
 ## §7 Test / failure-scenario requirements (DoD#2) + residuals
 
 - **Stale-blob rejection:** an enclave presented a sealed blob with `freshness_epoch` < anchor-current
-  refuses to start the fund path (fail closed) — the core anti-rollback assertion.
+  **never trusts the stale blob's own marks** — the anchor's authoritative counter/spend high-water
+  binds (defeating the rollback/replay), the core anti-rollback assertion. It then adopts those marks
+  (crash-reconcile, below) or fails closed (anchor unavailable, or a structural-mutation gap).
 - **Per-dispense `lease=1`:** a fund signature is emitted only after the remote bump + seal commit;
-  simulated anchor failure ⇒ no signature (0x4x). A rolled-back blob after a dispense is rejected.
+  simulated anchor failure ⇒ no signature (0x4x). A rolled-back blob after a dispense does not enable
+  replay — the anchor's higher spend mark binds (adopt-forward), so the double-spend is refused.
 - **Crash reconciliation (adopt-forward, never infer emission):** a dropped seal/ack leaving the
-  anchor **ahead** of the blob (anchor=`epoch+k`, blob=`epoch`, any `k ≥ 1`) ⇒ restart **adopts the
-  anchor's authoritative epoch + counter/spend marks** and re-seals forward (no self-wedge), *without*
-  inferring whether a signature was emitted — the debit already lives at the anchor (§3). Fail-closed
-  is reserved for the anchor **behind** the blob (`freshness_epoch > anchor-current`) or a divergence
-  the anchor cannot authoritatively resolve, which require operator intervention.
+  anchor **ahead** of the blob by a **counter/spend advance the recorded marks fully describe**
+  (anchor=`epoch+k`, blob=`epoch`) ⇒ restart **adopts the anchor's authoritative epoch + counter/spend
+  marks** and re-seals forward (no self-wedge), *without* inferring whether a signature was emitted —
+  the debit already lives at the anchor (§3). **Fail-closed** (operator intervention) is reserved for
+  a forward gap spanning a **structural key/config mutation** whose material the anchor never held
+  (dropped `GENERATE_KEYS`/`CONFIGURE_TREASURY` seal ⇒ restore from backup), the anchor **behind** the
+  blob (`freshness_epoch > anchor-current`), an unavailable anchor, or an unresolvable divergence.
 - **`lease=N` consumed-cursor:** a naive lease is **unbounded** — test that repeated snapshot/replay
   of a start-of-lease blob within the window is caught only by anchor-visible lease IDs + a consumed
   sub-cursor that rejects a reused cursor; admin/recovery/config advances are always synchronous.
 - **Counter + spend coverage:** rollback of the capability counter table AND of `cumulative_spend`/
   `lifetime_spend` are both detected.
-- **Restore never-zero:** restore from a stale backup with a behind epoch is rejected; seeding is
-  from authenticated marks (AC#3).
+- **Restore never-zero:** restore from a stale backup never seeds counters from the backup's own
+  (would-be-zero/stale) marks; they are seeded from the anchor's authenticated marks instead (AC#3).
 - **Active-active:** under Option A the single-instance rule is operator-procedural (the enclave
   cannot detect a clone) — provisioning/runbook must enforce one instance per faucet key; under
   **Option B** the global ledger **enforces** the cumulative cap under concurrent appends (AC#4).
