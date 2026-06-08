@@ -40,6 +40,7 @@ For every high-risk change:
 - Agents: codex, gemini, claude-code, grok (vendor diversity across lineages). Grok has no native roborev agent — it runs via the `opencode` agent (`--agent opencode --model xai/grok-4.3`, auth = `XAI_API_KEY` in the daemon env).
 - Lenses: `security` + `design` (roborev CLI); **concurrency-sensitive** work adds `design` with `--reasoning maximum` (see `~/pse/roborev/pse-review-2x3.sh`)
 - Config lives in `.roborev.toml` at repo root; shared scripts in `~/pse/roborev/`
+- **grok-cell precondition:** the opencode/grok cell only authenticates if the roborev **daemon** has `XAI_API_KEY` in its env (true if the daemon was started from a login shell; if not, `roborev daemon restart` from one). A missing/empty key makes the grok cell **fail, not silently skip** — verify with `roborev review --dirty --agent opencode --model xai/grok-4.3 --type security --wait` before relying on it, and never treat an absent grok review as "compacted clean". If xAI is genuinely unavailable, note the gap explicitly rather than degrading silently to 3 cells.
 
 ### Reduced vs Full Matrix — Decision Rules
 
@@ -54,7 +55,7 @@ For high-risk work we distinguish two levels of review:
 This is the normal operating mode for incremental work inside an already-reviewed direction.
 
 **Full Matrix** (more complete coverage)
-- The three reviews above, plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max), or equivalent manual cells with explicit `--model` per agent
+- The four reviews above (the full Reduced Matrix, grok included — Full ⊇ Reduced), plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max), or equivalent manual cells with explicit `--model` per agent
 
 **When Full Matrix is required (mandatory):**
 - First introduction of significant state / state machine logic (e.g., `EnclaveState`, arming state, freshness tracking).
