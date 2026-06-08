@@ -30,8 +30,11 @@ pub const IDENTITY_PROOF_LABEL: &str = "2d-hsm/agent-identity-proof/v1";
 /// Errors from identity-proof construction. Coarse (no oracle detail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityProofError {
-    /// `label` or `environment_identifier` exceeds the 1-byte length prefix (255 bytes).
+    /// `label` exceeds the 1-byte length prefix (255 bytes).
     FieldTooLong,
+    /// `environment_identifier` violates the TASK-7.1 §10.6 rules (1..=64, `[a-z0-9-]`, no
+    /// leading/trailing/double hyphen).
+    InvalidEnvironmentId,
     /// Signing failed.
     Sign,
 }
@@ -57,8 +60,13 @@ pub fn identity_proof_preimage(
 ) -> Result<Vec<u8>, IdentityProofError> {
     let label = IDENTITY_PROOF_LABEL.as_bytes();
     let env = environment_identifier.as_bytes();
-    if label.len() > 255 || env.len() > 255 {
+    if label.len() > 255 {
         return Err(IdentityProofError::FieldTooLong);
+    }
+    // Enforce the TASK-7.1 §10.6 env-id rules here too (defense in depth): the dispatch path passes
+    // the sealed, already-validated config value, but this is a `pub` helper.
+    if !crate::agent_keystore::is_valid_environment_identifier(environment_identifier) {
+        return Err(IdentityProofError::InvalidEnvironmentId);
     }
     let mut out =
         Vec::with_capacity(1 + 1 + label.len() + 8 + 1 + env.len() + 32 + 65 + 20 + 32);
@@ -254,6 +262,21 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert!(c.len() < a.len(), "shorter env-id ⇒ shorter preimage");
+    }
+
+    #[test]
+    fn invalid_env_id_rejected() {
+        let (key_ref, pubkey, address, nonce) = ([0x01u8; 32], [0x04u8; 65], [0x02u8; 20], [0x03u8; 32]);
+        let too_long = "a".repeat(65);
+        for bad in ["", "Main", "x_y", "-x", "x-", "a--b", "под", too_long.as_str()] {
+            assert_eq!(
+                identity_proof_preimage(1, bad, &key_ref, &pubkey, &address, &nonce),
+                Err(IdentityProofError::InvalidEnvironmentId),
+                "{bad:?} must be rejected"
+            );
+        }
+        // valid env-id still builds.
+        assert!(identity_proof_preimage(1, "mainnet", &key_ref, &pubkey, &address, &nonce).is_ok());
     }
 
     // --- PUBLIC_IDENTITY ---

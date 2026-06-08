@@ -62,20 +62,23 @@ impl Keypair {
     /// rejected draw. `pub(crate)`: the secret export exists only for the keystore-sealing caller
     /// (`agent_keygen`); there is no public accessor that hands out a private scalar.
     pub(crate) fn generate_with_secret() -> Result<(Self, Zeroizing<[u8; 32]>), Secp256k1Error> {
+        // Bounded rejection sampling: a uniform 32-byte draw is an invalid scalar (zero or >= n)
+        // with probability < 2^-128, so the loop body essentially never repeats. The bound makes a
+        // degraded/stuck CSPRNG fail closed (`Csprng`) instead of hanging key generation.
+        const MAX_RETRIES: usize = 64;
         let mut secret = Zeroizing::new([0u8; 32]);
-        let signing_key = loop {
+        for _ in 0..MAX_RETRIES {
             getrandom::getrandom(&mut secret[..]).map_err(|_| Secp256k1Error::Csprng)?;
             match SigningKey::from_slice(&secret[..]) {
-                Ok(sk) => break sk,
-                Err(_) => {
-                    // invalid scalar (zero or >= n) — scrub the rejected draw and retry
-                    secret.zeroize();
-                    continue;
+                Ok(signing_key) => {
+                    let verifying_key = *signing_key.verifying_key();
+                    return Ok((Self { signing_key, verifying_key }, secret));
                 }
+                // invalid scalar (zero or >= n) — scrub the rejected draw and retry
+                Err(_) => secret.zeroize(),
             }
-        };
-        let verifying_key = *signing_key.verifying_key();
-        Ok((Self { signing_key, verifying_key }, secret))
+        }
+        Err(Secp256k1Error::Csprng)
     }
 
     /// Construct from a 32-byte secret scalar (e.g. a test vector). Rejects invalid scalars.

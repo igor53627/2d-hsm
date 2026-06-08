@@ -223,7 +223,12 @@ pub fn unseal_keystore(
 // and is therefore a deliberate `format_version` bump + golden-vector update, never a silent edit.
 // ===========================================================================================
 
-/// Max key entries sealed in one keystore (AC#5 total-capacity guard, enforced before seal).
+/// Coarse upper backstop on key-entry count (AC#5). NOTE: this is **not** the binding capacity —
+/// the authoritative limit is the [`MAX_KEYSTORE_BLOB_SIZE`] seal check, which (with v1's CBOR
+/// integer-array byte encoding) rejects a full 4096-entry keystore well before this count is hit.
+/// So the *effective* capacity is size-derived and smaller; this constant only fail-closes a
+/// pathologically long entry list before serialization. A byte-string body encoding (a future
+/// `format_version`) would raise the effective capacity toward this count.
 pub const MAX_TOTAL_KEY_ENTRIES: usize = 4096;
 /// Max entries minted in a single `AGENT_K1_GENERATE_KEYS` batch (AC#5). NOTE: per-batch
 /// enforcement lands with the keygen mutation path (TASK-7.6.3); this slice only seals/validates
@@ -237,9 +242,11 @@ pub const MAX_AUDIT_CAPACITY: u32 = 65_536;
 
 /// Headroom reserved below `MAX_MESSAGE_SIZE` for the framing that wraps a sealed keystore when it
 /// is transmitted back into the enclave: the 2-byte frame header (version+type, `lib.rs:261`), the
-/// wire length prefix, and the Agent Gateway install/restore CBOR envelope around the blob (defined
-/// in TASK-7.6.3). Generously sized — the install/restore encoder MUST also honor
-/// [`MAX_KEYSTORE_BLOB_SIZE`] so a sealed blob is always re-installable.
+/// wire length prefix, and the install/restore CBOR envelope around the blob. **Provisional** — the
+/// install/restore wire envelope is not yet defined (the current runtime install is an in-enclave
+/// `INSTALLED_KEYSTORE` slot; the host-side install/restore framing is a later slice). 1 KiB is a
+/// generous over-reserve until that slice owns and pins the exact envelope; the install/restore
+/// encoder MUST then honor [`MAX_KEYSTORE_BLOB_SIZE`] so a sealed blob is always re-installable.
 const KEYSTORE_FRAMING_RESERVE: usize = 1024;
 /// Max sealed keystore blob size. A larger blob could seal but be impossible to send back into the
 /// enclave over vsock (frame + envelope would exceed `MAX_MESSAGE_SIZE`) → permanent lockout, since
@@ -407,27 +414,35 @@ pub struct KeystoreBody {
 }
 
 /// `environment_identifier` rules (TASK-7.1 §10.6): UTF-8, length `1..=64`, `[a-z0-9-]`, no
-/// leading/trailing hyphen, no doubled hyphen.
-fn validate_environment_identifier(s: &str) -> Result<(), KeystoreError> {
+/// leading/trailing hyphen, no doubled hyphen. Shared so other Agent Gateway slices (e.g. the
+/// identity-proof preimage builder) enforce the same rule rather than re-deriving it.
+pub(crate) fn is_valid_environment_identifier(s: &str) -> bool {
     let b = s.as_bytes();
     if b.is_empty() || b.len() > 64 {
-        return Err(KeystoreError::InvalidEnvironmentId);
+        return false;
     }
     if b[0] == b'-' || b[b.len() - 1] == b'-' {
-        return Err(KeystoreError::InvalidEnvironmentId);
+        return false;
     }
     let mut prev_hyphen = false;
     for &c in b {
-        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-';
-        if !ok {
-            return Err(KeystoreError::InvalidEnvironmentId);
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-') {
+            return false;
         }
         if c == b'-' && prev_hyphen {
-            return Err(KeystoreError::InvalidEnvironmentId);
+            return false;
         }
         prev_hyphen = c == b'-';
     }
-    Ok(())
+    true
+}
+
+fn validate_environment_identifier(s: &str) -> Result<(), KeystoreError> {
+    if is_valid_environment_identifier(s) {
+        Ok(())
+    } else {
+        Err(KeystoreError::InvalidEnvironmentId)
+    }
 }
 
 impl KeystoreBody {

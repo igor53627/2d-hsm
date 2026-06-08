@@ -48,8 +48,17 @@ pub struct GeneratedKey {
 /// scalars are astronomically unlikely; exceeding the bound signals a degraded RNG → fail closed.
 const RNG_RETRIES: usize = 8;
 
-/// Generate `count` keys of `purpose`, appending them to `body` (in-memory). All-or-nothing: on any
-/// failure `body` is left untouched (entries are staged and only committed once all `count` succeed).
+/// Generate `count` keys of `purpose`, appending them to `body` (in-memory). All-or-nothing **within
+/// this call**: on any failure `body` is left untouched (entries are staged and committed only once
+/// all `count` succeed).
+///
+/// **CALLER CONTRACT — pass a CANDIDATE, not live state.** `body` must be a *working copy* of the
+/// live keystore (`let mut candidate = live.clone()`); the caller then `seal_body(&candidate)`,
+/// returns the sealed blob to the host for persistence, and swaps the candidate into live state
+/// **only after persistence succeeds**. Passing the live body directly would, on a later
+/// seal/persist failure, leave unpersisted keys (e.g. a phantom treasury that then blocks retries)
+/// live in memory. The seal → persist → swap commit is owned by the dispatch-execution slice
+/// (deferred; GENERATE_KEYS currently fail-closes at the capability seam).
 ///
 /// - **Treasury** (`agent_faucet_treasury_k1`): singleton — `count` must be 1 and none may already
 ///   exist (else [`GenerateKeysError::TreasuryExists`]).
@@ -241,10 +250,36 @@ mod tests {
             generate_keys(&mut body, KeyPurpose::AgentTransferK1, MAX_BATCH_SIZE + 1, creation()),
             Err(GenerateKeysError::CapacityExceeded)
         );
-        // over total capacity (simulate a near-full store cheaply by pre-filling refs is expensive;
-        // instead request more than total in one batch is capped by MAX_BATCH_SIZE, so assert the
-        // total-capacity branch via a count that with existing entries exceeds the total).
         assert!(body.entries.is_empty(), "no mutation on capacity failure");
+    }
+
+    #[test]
+    fn total_capacity_enforced() {
+        use crate::agent_keystore::{BackupExportMetadata, KeyAlgorithm, KeyEntry};
+        // Pre-fill to the total cap with cheap placeholders (generate_keys' total check is len()-based
+        // and runs before any keygen), then a 1-key request must fail closed with no mutation.
+        let mut body = empty_body();
+        body.entries = (0..MAX_TOTAL_KEY_ENTRIES)
+            .map(|i| {
+                let mut key_ref = [0u8; 32];
+                key_ref[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                KeyEntry {
+                    key_ref,
+                    purpose: KeyPurpose::AgentTransferK1,
+                    algorithm: KeyAlgorithm::Secp256k1,
+                    public_identity: vec![0x04; 65],
+                    secret_scalar: Zeroizing::new(vec![0u8; 32]),
+                    creation_metadata: creation(),
+                    backup_export_metadata: BackupExportMetadata::default(),
+                }
+            })
+            .collect();
+        assert_eq!(body.entries.len(), MAX_TOTAL_KEY_ENTRIES);
+        assert_eq!(
+            generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation()),
+            Err(GenerateKeysError::CapacityExceeded)
+        );
+        assert_eq!(body.entries.len(), MAX_TOTAL_KEY_ENTRIES, "no mutation on total-capacity failure");
     }
 
     #[test]
