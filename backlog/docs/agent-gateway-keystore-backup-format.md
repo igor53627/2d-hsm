@@ -35,10 +35,16 @@ primitives: `impl/rust/enclave-protocol/src/pq_signer.rs` (`pq-seal-v1`).
 
 ## Reuse decision and primitive inventory
 
-Reuse from `pq-seal-v1` (`pq_signer.rs:230-359`): ChaCha20Poly1305 AEAD; `SHA3-256(domain ‖
+Reuse from `pq-seal-v1` (`pq_signer.rs:230-359`): the AEAD *conventions* — `SHA3-256(domain ‖
 provisioning_root ‖ meas_digest)` key derivation; `magic ‖ version ‖ meas_digest ‖ nonce`
 header with **AAD = header-minus-nonce**; `Zeroizing` buffers (TASK-6); boot-time
 install-before-use sequencing; the SEV-SNP-derived provisioning root (TASK-5).
+
+**AEAD choice — XChaCha20Poly1305 (24-byte nonce), NOT the producer's ChaCha20Poly1305.** The
+producer blob is sealed *once* at provisioning (one nonce per key), so a 96-bit random nonce is
+safe. The keystore is **re-sealed on every privileged mutation** under a *fixed* per-enclave key,
+so a 96-bit random nonce would accrue a birthday-bound collision risk (NIST caps random-96-bit
+nonces at ~2^32 messages/key); the 192-bit XChaCha nonce removes it regardless of re-seal count.
 
 Do **not** reuse the `pq-seal-v1` blob *layout*: it is structurally single-key and
 fixed-size (`PLAINTEXT_LEN = ML_DSA65_SK + ML_DSA65_PK`, `pq_signer.rs:243`) with no entry
@@ -56,8 +62,8 @@ Wrapped to the per-enclave seal root + measurement; unseals only on the same chi
 - `format_version` = `u16` (=1). **Fail-closed on unknown version BEFORE any decrypt**
   (mirror `pq_signer.rs:327-330`): no silent downgrade, no best-effort parse.
 - `meas_digest` = `SHA3-256(b"2d-hsm-agent-keystore-v1-meas" ‖ enclave_measurement)` (32 B).
-- `nonce` = 12 random bytes.
-- `AAD = magic ‖ format_version ‖ meas_digest`. Body = ChaCha20Poly1305 ciphertext + 16-byte tag.
+- `nonce` = 24 random bytes (XChaCha20Poly1305 extended nonce).
+- `AAD = magic ‖ format_version ‖ meas_digest`. Body = XChaCha20Poly1305 ciphertext + 16-byte tag.
 
 **KDF:** keystore AEAD key = `SHA3-256(b"2d-hsm-agent-keystore-v1-key" ‖ provisioning_root ‖
 meas_digest)`. Same shape as `pq_signer.rs:291-299`, **distinct label** (AC#19) so it cannot
