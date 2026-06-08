@@ -10,7 +10,6 @@
 //! ML-DSA signing path (role isolation).
 
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::Digest as _;
 use sha3::{Digest as _, Keccak256};
 use zeroize::Zeroize;
@@ -99,6 +98,9 @@ impl Keypair {
     /// entry point that takes an arbitrary digest — that is the no-generic-digest invariant. The
     /// public, structured EIP-155 / EIP-191 signers (TASK-7.6.3/7.6.4) build the keccak256 preimage
     /// internally and call this primitive; external crates cannot reach it.
+    // Staged: the only non-test in-crate callers (the structured signers) land in TASK-7.6.3/7.6.4,
+    // so a plain lib build has no caller yet — allow the dead-code lint until they do.
+    #[allow(dead_code)]
     pub(crate) fn sign_prehashed(
         &self,
         hash32: &[u8; 32],
