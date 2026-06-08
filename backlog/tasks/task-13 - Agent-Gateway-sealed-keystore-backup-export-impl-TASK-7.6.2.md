@@ -17,7 +17,9 @@ ordinal: 17000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-TASK-7.2 implementation. pq-agent-keystore-v1 sealed multi-key CBOR store (magic 2DAGTKS, ChaCha20Poly1305 + SHA3-256 KDF under domain 2d-hsm-agent-keystore-v1-key, freshness_epoch + anchor_root fields per 7.7; mirror pq_signer.rs seal/unseal, multi-key). KeyEntry, capability counter high-water table, faucet state (cumulative_spend + lifetime breaker), audit ring + last_exported_seq. EXPORT_BACKUP opaque ML-KEM-1024 blob + self-check; fail-closed unknown-version before decrypt. RESTORE ingress format reserved fail-closed (AC#6). Golden round-trip tests. Depends on 7.6.1.
+TASK-7.2 implementation. pq-agent-keystore-v1 sealed multi-key CBOR store (magic 2DAGTKS, XChaCha20Poly1305 [24-byte nonce — the keystore re-seals on every mutation under a fixed key, so it needs the extended nonce, unlike the producer's one-shot ChaCha20Poly1305] + SHA3-256 KDF under domain 2d-hsm-agent-keystore-v1-key, freshness_epoch + anchor_root fields per 7.7; reuse pq_signer.rs seal conventions, multi-key). KeyEntry, capability counter high-water table, faucet state (cumulative_spend + lifetime breaker), audit ring + last_exported_seq. EXPORT_BACKUP opaque ML-KEM-1024 blob + self-check; fail-closed unknown-version before decrypt. RESTORE ingress format reserved fail-closed (AC#6). Golden round-trip tests. Depends on 7.6.1.
+
+Sliced for the Full-Matrix gate: **13a — sealed keystore core** (envelope + CBOR body + validation + golden vector; PR #37) delivers the at-rest store TASK-7.6.3 needs; **13b — DR backup** (pq-agent-backup-v1 ML-KEM-1024 KEM-DEM export + self-check) and the RESTORE fail-closed stub follow as a separate slice.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Implementation Notes
