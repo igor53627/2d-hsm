@@ -31,29 +31,31 @@ We follow the **Multi-Agent Code-Review Playbook** (see the full playbook at the
 **Independent perspectives before an irreversible step.**
 
 For every high-risk change:
-- Run at least the **Reduced Matrix** (3 reviews: codex security, gemini security, claude-code design) — see "Reduced vs Full Matrix" below and `.roborev.toml`
+- Run at least the **Reduced Matrix** (4 reviews: codex security, gemini security, claude-code design, grok security) — see "Reduced vs Full Matrix" below and `.roborev.toml`
 - Use `roborev compact` (or equivalent consolidation) before considering the change "reviewed"
 - Run the **Full Matrix** when the decision rules below require it
 - Major or architecture-changing work also gets a human gate
 
 ### Current Matrix (as of 2026-06)
-- Agents: codex, gemini, claude-code (vendor diversity across lineages)
+- Agents: codex, gemini, claude-code, grok (vendor diversity across lineages). Grok has no native roborev agent — it runs via the `opencode` agent (`--agent opencode --model xai/grok-4.3`, auth = `XAI_API_KEY` in the daemon env).
 - Lenses: `security` + `design` (roborev CLI); **concurrency-sensitive** work adds `design` with `--reasoning maximum` (see `~/pse/roborev/pse-review-2x3.sh`)
 - Config lives in `.roborev.toml` at repo root; shared scripts in `~/pse/roborev/`
+- **grok-cell precondition (verify, don't assume):** the opencode/grok cell only authenticates if the roborev **daemon** has `XAI_API_KEY` in its env (true if the daemon was started from a login shell; if not, `roborev daemon restart` from one). A missing/empty key does **not** fail loudly: roborev maps the opencode agent's non-zero exit to status **`skipped`** (not `failed`), and **`roborev compact` ignores `skipped` jobs** — so an absent grok review is silently treated as clean unless you check. Therefore: confirm the grok cell actually reached **`done`** (run `roborev review --dirty --agent opencode --model xai/grok-4.3 --type security --wait` and check it returns a review, or inspect the job status), treat any non-`done` grok cell as a **gap, never as compacted-clean**, and if xAI is genuinely unavailable, note the missing cell explicitly rather than degrading silently to 3 cells.
 
 ### Reduced vs Full Matrix — Decision Rules
 
 For high-risk work we distinguish two levels of review:
 
-**Reduced Matrix** (default practical 3-review set)
+**Reduced Matrix** (default practical 4-review set)
 - security + codex
 - security + gemini
 - design + claude-code
+- security + grok (via the `opencode` agent, `xai/grok-4.3`)
 
 This is the normal operating mode for incremental work inside an already-reviewed direction.
 
 **Full Matrix** (more complete coverage)
-- The three reviews above, plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max), or equivalent manual cells with explicit `--model` per agent
+- The four reviews above (the full Reduced Matrix, grok included — Full ⊇ Reduced), plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max), or equivalent manual cells with explicit `--model` per agent
 
 **When Full Matrix is required (mandatory):**
 - First introduction of significant state / state machine logic (e.g., `EnclaveState`, arming state, freshness tracking).
@@ -77,14 +79,17 @@ See the "Reduced vs Full Matrix" section above for when to use which level.
 
 **Typical Reduced Matrix (most common):**
 ```bash
+~/pse/roborev/pse-review-reduced.sh --dirty   # 4 cells: codex+gemini security, claude-code design, grok security
+# …or run the cells by hand:
 roborev review --dirty --type security --agent codex --model gpt-5.5
 roborev review --dirty --type security --agent gemini --model gemini-3.1-pro-preview
 roborev review --dirty --type design --agent claude-code --model opus
+roborev review --dirty --type security --agent opencode --model xai/grok-4.3   # grok lens
 ```
 
 **Full Matrix (when required by the rules above):**
 ```bash
-# Reduced three (above), then from repo root:
+# Reduced Matrix (all four cells above, grok included), then from repo root:
 ~/pse/roborev/pse-review-2x3.sh --dirty   # 2×3 concurrency floor
 ~/pse/roborev/pse-review-3x3.sh --dirty   # optional 3×3 vendor sign-off
 ```
