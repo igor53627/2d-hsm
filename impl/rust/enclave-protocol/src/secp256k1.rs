@@ -143,12 +143,16 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 
 /// eth address from an uncompressed SEC1 pubkey (`0x04 || X || Y`): `keccak256(X || Y)[12..32]`.
 ///
-/// Validates the `0x04` prefix for untrusted input — a compressed/malformed prefix would otherwise
-/// silently hash the wrong 64 bytes and yield a bogus address.
+/// Fully validates the point for untrusted input: the `0x04` prefix **and** that `(X, Y)` is a
+/// well-formed on-curve secp256k1 point (via `VerifyingKey::from_sec1_bytes`). A bare prefix check
+/// would accept off-curve / garbage coordinates and emit a `keccak256` "address" for bytes that
+/// correspond to no public key — masking a malformed-input bug in a caller that trusts the `Result`.
 pub fn eth_address_from_uncompressed(pubkey65: &[u8; 65]) -> Result<[u8; 20], Secp256k1Error> {
     if pubkey65[0] != 0x04 {
         return Err(Secp256k1Error::InvalidPublicKey);
     }
+    // Reject off-curve / identity / malformed coordinates: parsing enforces the curve equation.
+    VerifyingKey::from_sec1_bytes(pubkey65).map_err(|_| Secp256k1Error::InvalidPublicKey)?;
     let hash = keccak256(&pubkey65[1..]);
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash[12..]);
@@ -323,6 +327,28 @@ mod tests {
         assert_eq!(
             eth_address_from_uncompressed(&bad),
             Err(Secp256k1Error::InvalidPublicKey)
+        );
+    }
+
+    #[test]
+    fn eth_address_rejects_off_curve_point() {
+        // Valid 0x04 prefix + 32-byte X + 32-byte Y length, but the coordinates are NOT on the
+        // curve. For a given valid x there are exactly two valid y (y and p-y); perturbing Y to
+        // any other value is off-curve, so the full-point validation must reject it.
+        let kp = Keypair::generate().unwrap();
+        let mut bad = kp.public_key_uncompressed();
+        assert_eq!(bad[0], 0x04);
+        bad[64] ^= 0xff; // y no longer satisfies y^2 = x^3 + 7
+        assert_eq!(
+            eth_address_from_uncompressed(&bad),
+            Err(Secp256k1Error::InvalidPublicKey),
+            "off-curve point with a valid 0x04 prefix must be rejected, not hashed to an address"
+        );
+        // Sanity: the unperturbed point still derives the canonical eth address.
+        assert_eq!(
+            eth_address_from_uncompressed(&kp.public_key_uncompressed()).unwrap(),
+            kp.eth_address(),
+            "valid uncompressed point derives the same address as the infallible accessor"
         );
     }
 }
