@@ -152,30 +152,7 @@ struct AgentEnvelope {
     payload: Option<Vec<(Value, Value)>>,
 }
 
-/// Look up an integer-keyed entry in a CBOR map.
-fn map_get(map: &[(Value, Value)], key: u64) -> Option<&Value> {
-    map.iter()
-        .find(|(k, _)| matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(key)))
-        .map(|(_, v)| v)
-}
-
-fn as_u64(v: &Value) -> Option<u64> {
-    match v {
-        Value::Integer(i) => u64::try_from(*i).ok(),
-        _ => None,
-    }
-}
-
-fn as_bytes(v: &Value) -> Option<&[u8]> {
-    match v {
-        Value::Bytes(b) => Some(b),
-        _ => None,
-    }
-}
-
-fn as_bytes32(v: &Value) -> Option<[u8; 32]> {
-    as_bytes(v).and_then(|b| b.try_into().ok())
-}
+use crate::agent_cbor::{as_bytes, as_bytes32, as_u64, check_strict_keys, map_get};
 
 /// Decode the inner Agent Gateway envelope. Any shape error → `Malformed` (0x40, syntax only).
 fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
@@ -191,14 +168,8 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
     // Strict envelope: every key must be a known integer 1..=7, and none may repeat. Unknown or
     // duplicate keys ⇒ Malformed (no silent first-match resolution; the wire format stays
     // unambiguous for future capability/payload binding).
-    let mut seen = 0u8; // bitmask of keys 1..=7
-    for (k, _) in &map {
-        let key = as_u64(k).filter(|n| (1..=7).contains(n)).ok_or(AgentError::Malformed)?;
-        let bit = 1u8 << (key - 1);
-        if seen & bit != 0 {
-            return Err(AgentError::Malformed); // duplicate key
-        }
-        seen |= bit;
+    if !check_strict_keys(&map, |n| (1..=7).contains(&n)) {
+        return Err(AgentError::Malformed);
     }
     let agent_version = map_get(&map, 1)
         .and_then(as_u64)

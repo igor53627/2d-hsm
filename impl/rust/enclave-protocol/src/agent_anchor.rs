@@ -102,25 +102,7 @@ pub(crate) enum FailReason {
     Inconsistent,
 }
 
-fn map_get(map: &[(Value, Value)], key: u64) -> Option<&Value> {
-    map.iter()
-        .find(|(k, _)| matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(key)))
-        .map(|(_, v)| v)
-}
-
-fn as_u64(v: &Value) -> Option<u64> {
-    match v {
-        Value::Integer(i) => u64::try_from(*i).ok(),
-        _ => None,
-    }
-}
-
-fn as_digest(v: &Value) -> Option<[u8; DIGEST_LEN]> {
-    match v {
-        Value::Bytes(b) => b.as_slice().try_into().ok(),
-        _ => None,
-    }
-}
+use crate::agent_cbor::{as_bytes32, as_bytes_n, as_u64, check_strict_keys, map_get};
 
 /// Parsed, type-checked anchor response (keys `1..=7` always signed, `8/9` signed only when
 /// chain-bound, key `13` = signature). `chain_height`/`chain_block_hash` are both-or-neither (a
@@ -142,19 +124,11 @@ struct AnchorResponse {
 /// Strict structural decode of the response map (keys ⊆ {1..=9, 13}, no dup, required present, the
 /// chain-binding pair both-or-neither). Any shape error ⇒ [`AnchorError::Malformed`].
 fn parse_response(map: &[(Value, Value)]) -> Result<AnchorResponse, AnchorError> {
-    let mut seen: u16 = 0;
-    for (k, _) in map {
-        let key = as_u64(k)
-            .filter(|n| (1..=9).contains(n) || *n == 13)
-            .ok_or(AnchorError::Malformed)?;
-        let bit = 1u16 << (key - 1);
-        if seen & bit != 0 {
-            return Err(AnchorError::Malformed); // duplicate key
-        }
-        seen |= bit;
+    if !check_strict_keys(map, |n| (1..=9).contains(&n) || n == 13) {
+        return Err(AnchorError::Malformed);
     }
     let req_u64 = |k: u64| map_get(map, k).and_then(as_u64).ok_or(AnchorError::Malformed);
-    let req_digest = |k: u64| map_get(map, k).and_then(as_digest).ok_or(AnchorError::Malformed);
+    let req_digest = |k: u64| map_get(map, k).and_then(as_bytes32).ok_or(AnchorError::Malformed);
 
     let version = req_u64(1)?;
     let chain_id = req_u64(2)?;
@@ -173,19 +147,14 @@ fn parse_response(map: &[(Value, Value)]) -> Result<AnchorResponse, AnchorError>
         None => None,
     };
     let chain_block_hash = match map_get(map, 9) {
-        Some(v) => Some(as_digest(v).ok_or(AnchorError::Malformed)?),
+        Some(v) => Some(as_bytes32(v).ok_or(AnchorError::Malformed)?),
         None => None,
     };
     if chain_height.is_some() != chain_block_hash.is_some() {
         return Err(AnchorError::Malformed);
     }
-    let signature: [u8; 64] = match map_get(map, 13).and_then(|v| match v {
-        Value::Bytes(b) => Some(b),
-        _ => None,
-    }) {
-        Some(b) => b.as_slice().try_into().map_err(|_| AnchorError::Malformed)?,
-        None => return Err(AnchorError::Malformed),
-    };
+    let signature: [u8; 64] =
+        map_get(map, 13).and_then(as_bytes_n::<64>).ok_or(AnchorError::Malformed)?;
 
     Ok(AnchorResponse {
         version,

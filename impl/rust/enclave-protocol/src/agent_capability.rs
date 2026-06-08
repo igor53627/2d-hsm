@@ -107,45 +107,19 @@ pub(crate) struct VerifiedCapability {
     pub key_purpose: u8,
 }
 
-fn cap_get(map: &[(Value, Value)], key: u64) -> Option<&Value> {
-    map.iter()
-        .find(|(k, _)| matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(key)))
-        .map(|(_, v)| v)
-}
-
-fn as_u64(v: &Value) -> Option<u64> {
-    match v {
-        Value::Integer(i) => u64::try_from(*i).ok(),
-        _ => None,
-    }
-}
-
-fn as_bytes(v: &Value) -> Option<&[u8]> {
-    match v {
-        Value::Bytes(b) => Some(b),
-        _ => None,
-    }
-}
+use crate::agent_cbor::{as_bytes, as_u64, check_strict_keys, map_get};
 
 /// Strict structural decode of the capability map → typed [`Capability`]. Any shape/type/range
 /// violation ⇒ [`AgentError::Malformed`] (`0x40`, syntax only).
 fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
     // Strict keys: every key is an integer in 1..=13, none repeats.
-    let mut seen: u16 = 0;
-    for (k, _) in map {
-        let key = as_u64(k)
-            .filter(|n| (1..=13).contains(n))
-            .ok_or(AgentError::Malformed)?;
-        let bit = 1u16 << (key - 1);
-        if seen & bit != 0 {
-            return Err(AgentError::Malformed); // duplicate key
-        }
-        seen |= bit;
+    if !check_strict_keys(map, |n| (1..=13).contains(&n)) {
+        return Err(AgentError::Malformed);
     }
 
-    let req_u64 = |key: u64| cap_get(map, key).and_then(as_u64).ok_or(AgentError::Malformed);
+    let req_u64 = |key: u64| map_get(map, key).and_then(as_u64).ok_or(AgentError::Malformed);
     let req_u8 = |key: u64| {
-        cap_get(map, key)
+        map_get(map, key)
             .and_then(as_u64)
             .and_then(|v| u8::try_from(v).ok())
             .ok_or(AgentError::Malformed)
@@ -160,7 +134,7 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
         return Err(AgentError::Malformed);
     }
     // key 3 present iff opcode is CONFIGURE_TREASURY.
-    let treasury_sub_op = match cap_get(map, 3) {
+    let treasury_sub_op = match map_get(map, 3) {
         Some(v) => {
             if command_opcode != OPCODE_CONFIGURE_TREASURY {
                 return Err(AgentError::Malformed); // sub-op on a non-treasury cap
@@ -188,7 +162,7 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
     // §10.6: environment_identifier is UTF-8, 1..=64, [a-z0-9-], no leading/trailing/double hyphen.
     // Reuse the keystore validator so a malformed env fails closed AT DECODE (0x40), consistent with
     // the sealed config's own validation (the later byte-exact compare then only sees a valid value).
-    let environment_identifier = match cap_get(map, 6) {
+    let environment_identifier = match map_get(map, 6) {
         Some(Value::Text(s)) if crate::agent_keystore::is_valid_environment_identifier(s) => s.clone(),
         _ => return Err(AgentError::Malformed),
     };
@@ -198,24 +172,24 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
     if scope_class > 1 {
         return Err(AgentError::Malformed);
     }
-    let scope_target = match cap_get(map, 8).and_then(as_bytes) {
+    let scope_target = match map_get(map, 8).and_then(as_bytes) {
         Some(b) if b.len() <= MAX_SCOPE_TARGET_LEN => b.to_vec(),
         _ => return Err(AgentError::Malformed),
     };
     let counter = req_u64(9)?;
-    let request_id = match cap_get(map, 10).and_then(as_bytes) {
+    let request_id = match map_get(map, 10).and_then(as_bytes) {
         Some(b) if b.len() <= MAX_CAP_REQUEST_ID_LEN => b.to_vec(),
         _ => return Err(AgentError::Malformed),
     };
-    let payload_binding: [u8; 32] = match cap_get(map, 11).and_then(as_bytes) {
+    let payload_binding: [u8; 32] = match map_get(map, 11).and_then(as_bytes) {
         Some(b) => b.try_into().map_err(|_| AgentError::Malformed)?,
         None => return Err(AgentError::Malformed),
     };
-    let is_recovery = match cap_get(map, 12) {
+    let is_recovery = match map_get(map, 12) {
         Some(Value::Bool(b)) => *b,
         _ => return Err(AgentError::Malformed),
     };
-    let signature: [u8; 64] = match cap_get(map, 13).and_then(as_bytes) {
+    let signature: [u8; 64] = match map_get(map, 13).and_then(as_bytes) {
         Some(b) => b.try_into().map_err(|_| AgentError::Malformed)?,
         None => return Err(AgentError::Malformed),
     };
