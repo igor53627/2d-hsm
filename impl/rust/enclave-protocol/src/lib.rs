@@ -66,6 +66,15 @@ compile_error!(
      release builds until the 2D EIP-2718 type-0x19 reservation merges (vsock spec §10.8)"
 );
 
+// Live AGENT_K1_GENERATE_KEYS execution mints keys + advances counters via a host-persisted re-seal
+// that an untrusted host can roll back and replay; hard-ban it from release builds until TASK-7.7
+// anti-rollback + scope_target-binding + the AC#14 audit record land.
+#[cfg(all(release_build, feature = "agent-keygen-exec-preview"))]
+compile_error!(
+    "`agent-keygen-exec-preview` (live AGENT_K1_GENERATE_KEYS mutation) must not be enabled in \
+     release builds until anti-rollback (TASK-7.7), scope_target-binding, and audit land"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
@@ -86,6 +95,11 @@ mod host_test_fixtures;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
 mod pq_signer;
+// Shared platform provisioning root (producer pq-seal-v1 + agent pq-agent-keystore-v1). Compiled only
+// for the seal-capable profiles — it uses the optional `zeroize` dep that only those features pull in,
+// so the bare no-feature build must not include it.
+#[cfg(any(feature = "ml-dsa-65", feature = "agent-gateway"))]
+mod seal_root;
 /// SEV-SNP attestation report fetch (configfs-tsm) + launch-measurement extraction (TASK-5 Phase 3).
 pub mod snp_report;
 /// Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). Off by default — not part
@@ -163,11 +177,16 @@ pub use pq_signer::{
 #[cfg(feature = "ml-dsa-65")]
 pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
 pub use uds_listen::{bind_unix_listener, default_dev_socket_dir};
+// Shared provisioning-root API — available to both the producer and the agent profile so each can
+// set/check the platform root at boot (the secret + KDFs stay role-separated; see `seal_root`).
+#[cfg(any(feature = "ml-dsa-65", feature = "agent-gateway"))]
+pub use seal_root::{
+    is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
+    set_pq_seal_v1_provisioning_root,
+};
 #[cfg(feature = "ml-dsa-65")]
 pub use pq_signer::{
-    is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
-    pq_seal_v1_expected_blob_len,
-    pq_seal_v1_measurement_digest, set_pq_seal_v1_provisioning_root, SEALED_BLOB_V1_MAGIC,
+    pq_seal_v1_expected_blob_len, pq_seal_v1_measurement_digest, SEALED_BLOB_V1_MAGIC,
     SEALED_BLOB_V1_HEADER_LEN, SEALED_BLOB_V1_VERSION,
 };
 #[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]

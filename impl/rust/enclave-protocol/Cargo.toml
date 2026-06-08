@@ -45,6 +45,12 @@ agent-gateway = ["dep:k256", "dep:bs58", "dep:sha2", "dep:zeroize", "dep:getrand
 # `agent-gateway` but WITHOUT this, PROVE_IDENTITY fails closed (AGENT_NOT_CONFIGURED). Never enable
 # in a production build before that reservation merges; production fund custody is TASK-7.7-gated too.
 agent-prove-identity-preview = ["agent-gateway"]
+# Enables LIVE AGENT_K1_GENERATE_KEYS execution (key minting + counter advance + re-seal/swap).
+# **Production-gated OFF**: a live, host-rollback-replayable key-minting mutation is unsafe until the
+# TASK-7.7 anti-rollback binding, scope_target↔sealed-enclave-id binding, and the AC#14 audit record
+# land. Without this feature GENERATE_KEYS verifies the capability then fails closed
+# (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs). Never enable in production.
+agent-keygen-exec-preview = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []

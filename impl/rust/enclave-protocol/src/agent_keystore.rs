@@ -81,8 +81,12 @@ pub enum KeystoreError {
     /// `environment_identifier` failed the TASK-7.1 §10.6 rules (1..=64, `[a-z0-9-]`, no
     /// leading/trailing/double hyphen).
     InvalidEnvironmentId,
-    /// Key-entry count over `MAX_TOTAL_KEY_ENTRIES` (AC#5 capacity guard).
+    /// Key-entry count over `MAX_TOTAL_KEY_ENTRIES`, or counter table over `MAX_COUNTER_ENTRIES`
+    /// (AC#5 capacity guard).
     CapacityExceeded,
+    /// A counter advance tried to set a high-water mark `<=` the existing one (anti-rollback
+    /// defense-in-depth: a high-water counter must only move forward).
+    CounterRegression,
     /// A fixed-length byte field (public identity 65 B, secret scalar 32 B) had the wrong length
     /// or a malformed SEC1 prefix.
     InvalidFieldLength,
@@ -449,6 +453,46 @@ fn validate_environment_identifier(s: &str) -> Result<(), KeystoreError> {
 }
 
 impl KeystoreBody {
+    /// Advance the contiguous capability counter for the tuple `(authority, environment_identifier,
+    /// scope_class, scope_target)` to `incoming` (the verified `highest + 1`): update the existing
+    /// row, or insert a new one (first counter) if none exists. The caller mutates a CANDIDATE body
+    /// then seals it. New rows are bounded by [`MAX_COUNTER_ENTRIES`] (fail-closed on overflow).
+    pub(crate) fn advance_counter(
+        &mut self,
+        authority: &[u8; 32],
+        scope_class: u8,
+        scope_target: &[u8],
+        incoming: u64,
+    ) -> Result<(), KeystoreError> {
+        let env = self.config.environment_identifier.clone();
+        if let Some(c) = self.counters.iter_mut().find(|c| {
+            &c.authority == authority
+                && c.environment_identifier == env
+                && c.scope_class == scope_class
+                && c.scope_target == scope_target
+        }) {
+            // Forward-only: the caller verified `incoming == highest + 1`, but guard here too so a
+            // future caller that skipped that check cannot silently roll the high-water backward.
+            if incoming <= c.highest_accepted_counter {
+                return Err(KeystoreError::CounterRegression);
+            }
+            c.highest_accepted_counter = incoming;
+            return Ok(());
+        }
+        if self.counters.len() >= MAX_COUNTER_ENTRIES {
+            return Err(KeystoreError::CapacityExceeded);
+        }
+        self.counters.push(CounterEntry {
+            authority: *authority,
+            environment_identifier: env,
+            scope_class,
+            scope_target: scope_target.to_vec(),
+            highest_accepted_counter: incoming,
+        });
+        Ok(())
+    }
+
+
     /// Structural validation enforced on both seal (before commit) and unseal (after decrypt):
     /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
     pub fn validate(&self) -> Result<(), KeystoreError> {
@@ -736,6 +780,33 @@ mod tests {
         let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
         let out = unseal_body(&blob, &ROOT, MEAS_A).unwrap();
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn advance_counter_inserts_updates_and_is_forward_only() {
+        let mut body = sample_body();
+        body.counters.clear();
+        let auth = [0x11u8; 32];
+        // First advance on an absent tuple inserts the row.
+        body.advance_counter(&auth, 0, b"generate_transfer", 1).unwrap();
+        assert_eq!(body.counters.len(), 1);
+        assert_eq!(body.counters[0].highest_accepted_counter, 1);
+        // A forward advance updates in place.
+        body.advance_counter(&auth, 0, b"generate_transfer", 2).unwrap();
+        assert_eq!(body.counters.len(), 1);
+        assert_eq!(body.counters[0].highest_accepted_counter, 2);
+        // A replay (==) or rollback (<) is refused — high-water is forward-only.
+        assert_eq!(
+            body.advance_counter(&auth, 0, b"generate_transfer", 2),
+            Err(KeystoreError::CounterRegression)
+        );
+        assert_eq!(
+            body.advance_counter(&auth, 0, b"generate_transfer", 1),
+            Err(KeystoreError::CounterRegression)
+        );
+        // A different scope_target is a different tuple ⇒ a fresh row.
+        body.advance_counter(&auth, 0, b"generate_faucet", 1).unwrap();
+        assert_eq!(body.counters.len(), 2);
     }
 
     #[test]

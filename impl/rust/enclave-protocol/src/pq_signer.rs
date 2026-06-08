@@ -22,35 +22,11 @@ pub const SEALED_BLOB_V1_VERSION: u8 = 1;
 #[cfg(feature = "ml-dsa-65")]
 pub const SEALED_BLOB_V1_MAGIC: &[u8; 8] = b"2DHSMV1\0";
 
-/// Runtime provisioning root from platform integration (vTPM / SNP VMPL / Nitro hook).
-/// Set once at enclave boot before `install_sealed_pq_signer` when not using `reference-seal-v1-root`.
-#[cfg(feature = "ml-dsa-65")]
-static PLATFORM_PROVISIONING_ROOT: Mutex<Option<[u8; 32]>> = Mutex::new(None);
-
-/// Install the v1 provisioning root once at enclave boot (production path).
-///
-/// The root must match the secret used by the offline provisioning tool that produced the
-/// sealed blob. Do not accept this value from the untrusted host over vsock.
-#[cfg(feature = "ml-dsa-65")]
-pub fn set_pq_seal_v1_provisioning_root(root: [u8; 32]) -> Result<(), ProtocolError> {
-    let mut guard = PLATFORM_PROVISIONING_ROOT
-        .lock()
-        .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
-    if guard.is_some() {
-        return Err(ProtocolError::PqSigningUnavailable(
-            "PQ seal v1 provisioning root already configured",
-        ));
-    }
-    *guard = Some(root);
-    Ok(())
-}
-
-#[cfg(all(feature = "ml-dsa-65", test))]
-pub(crate) fn reset_pq_seal_v1_provisioning_root_for_tests() {
-    if let Ok(mut guard) = PLATFORM_PROVISIONING_ROOT.lock() {
-        *guard = None;
-    }
-}
+// The platform provisioning root (the `PLATFORM_PROVISIONING_ROOT` global +
+// `set_pq_seal_v1_provisioning_root` / `resolve_provisioning_root` / the test reset + presence
+// checks) now lives in the always-compiled `crate::seal_root` module, shared by the producer
+// `pq-seal-v1` seal and the Agent Gateway `pq-agent-keystore-v1` keystore (distinct KDF domains keep
+// the key material isolated; see that module's docs).
 #[cfg(feature = "ml-dsa-65")]
 const SEALED_BLOB_V0_MAGIC: &[u8; 8] = b"2DHSMV0\0";
 
@@ -81,7 +57,7 @@ impl Drop for SealedSignerTestGuard {
     fn drop(&mut self) {
         reset_installed_pq_signer_for_tests();
         #[cfg(feature = "ml-dsa-65")]
-        reset_pq_seal_v1_provisioning_root_for_tests();
+        crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
     }
 }
 
@@ -249,38 +225,8 @@ mod v1_seal {
         h.finalize().into()
     }
 
-    // Returns the root in a `Zeroizing` so every *transient* caller copy is scrubbed on drop. (The
-    // process-lifetime copy in PLATFORM_PROVISIONING_ROOT is NOT scrubbed during operation — closing
-    // that needs mlock / no-core-dump, which is orthogonal to zeroize.)
-    pub(crate) fn resolve_provisioning_root() -> Result<zeroize::Zeroizing<[u8; 32]>, ProtocolError> {
-        let guard = super::PLATFORM_PROVISIONING_ROOT
-            .lock()
-            .map_err(|_| ProtocolError::PqSigningUnavailable("pq seal platform root mutex poisoned"))?;
-        // copy_from_slice into a pre-zeroed Zeroizing buffer so the secret is never materialized as a
-        // bare `[u8;32]` Copy temporary on the stack (which has no Drop and would not be scrubbed).
-        if let Some(root) = guard.as_ref() {
-            let mut out = zeroize::Zeroizing::new([0u8; 32]);
-            out.copy_from_slice(root);
-            return Ok(out);
-        }
-        drop(guard);
-        #[cfg(any(test, feature = "reference-seal-v1-root"))]
-        {
-            // The `&[u8; 32]` annotation keeps the fixture-length check at COMPILE time (a malformed
-            // fixture fails the build) instead of a runtime panic in copy_from_slice.
-            let reference_root: &[u8; 32] =
-                include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
-            let mut out = zeroize::Zeroizing::new([0u8; 32]);
-            out.copy_from_slice(reference_root);
-            return Ok(out);
-        }
-        #[cfg(not(any(test, feature = "reference-seal-v1-root")))]
-        {
-            Err(ProtocolError::PqSigningUnavailable(
-                "PQ seal v1 provisioning root not configured (call set_pq_seal_v1_provisioning_root at enclave boot)",
-            ))
-        }
-    }
+    // `resolve_provisioning_root` now lives in `crate::seal_root` (shared with the agent keystore).
+    pub(crate) use crate::seal_root::resolve_provisioning_root;
 
     pub fn pq_seal_v1_expected_blob_len() -> usize {
         SEALED_BLOB_V1_HEADER_LEN + PLAINTEXT_LEN + 16
@@ -460,23 +406,8 @@ pub use v1_seal::{
     verify_sealed_blob_v1_with_root,
 };
 
-/// Whether the platform boot hook installed a provisioning root (not the CI/test fallback).
-#[cfg(feature = "ml-dsa-65")]
-pub fn is_platform_pq_seal_v1_provisioning_root_set() -> bool {
-    PLATFORM_PROVISIONING_ROOT
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|_| ()))
-        .is_some()
-}
-
-/// Whether v1 unseal can resolve a provisioning root (platform, reference-seal, or `cfg(test)`).
-/// Presence-only — does not materialize the secret root (mirrors `resolve_provisioning_root`'s logic).
-#[cfg(feature = "ml-dsa-65")]
-pub fn is_pq_seal_v1_provisioning_root_configured() -> bool {
-    is_platform_pq_seal_v1_provisioning_root_set()
-        || cfg!(any(test, feature = "reference-seal-v1-root"))
-}
+// `is_platform_pq_seal_v1_provisioning_root_set` / `is_pq_seal_v1_provisioning_root_configured`
+// moved to `crate::seal_root` (shared).
 
 #[cfg(all(feature = "ml-dsa-65", test))]
 mod v0_seal {
@@ -654,12 +585,12 @@ mod tests {
     fn platform_provisioning_root_install_and_sign() {
         let _guard = SealedSignerTestGuard::acquire();
         reset_installed_pq_signer_for_tests();
-        reset_pq_seal_v1_provisioning_root_for_tests();
+        crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
         let root: [u8; 32] =
             *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
-        set_pq_seal_v1_provisioning_root(root).unwrap();
-        assert!(set_pq_seal_v1_provisioning_root(root).is_err());
-        assert!(is_pq_seal_v1_provisioning_root_configured());
+        crate::seal_root::set_pq_seal_v1_provisioning_root(root).unwrap();
+        assert!(crate::seal_root::set_pq_seal_v1_provisioning_root(root).is_err());
+        assert!(crate::seal_root::is_pq_seal_v1_provisioning_root_configured());
 
         let measurement = b"enclave-measurement-placeholder";
         let sk = std::fs::read(
