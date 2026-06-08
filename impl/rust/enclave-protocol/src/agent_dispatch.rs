@@ -23,9 +23,10 @@ use crate::agent_identity::{
     public_identity_from_entry, sign_identity_proof, IdentityProof, PublicIdentity,
     AGENT_GATEWAY_VERSION,
 };
-use crate::agent_keystore::KeystoreBody;
+use crate::agent_keystore::{KeyPurpose, KeystoreBody};
 use crate::secp256k1::Keypair;
 use ciborium::value::Value;
+use std::sync::Mutex;
 
 /// Fixed command-domain string bound in the envelope (spec §10.2, key 3).
 pub const COMMAND_DOMAIN: &str = "2d-hsm/agent-gateway/v1";
@@ -301,6 +302,122 @@ fn handle_prove_identity(
     Ok(AgentResponse::ProveIdentity(proof))
 }
 
+// ===========================================================================================
+// Frame-layer integration: the installed-keystore slot + the entry point the lib.rs 0x40 dispatch
+// arm calls. (Mirrors the pq_signer INSTALLED_SIGNER slot pattern.)
+// ===========================================================================================
+
+/// Process-global slot holding this enclave's unsealed Agent Gateway keystore. An agent-profile
+/// instance installs it once at boot; a producer-profile instance never does, so an incoming `0x40`
+/// frame on a producer instance is rejected as `WrongProfile` (profile derived from slot presence).
+static INSTALLED_KEYSTORE: Mutex<Option<KeystoreBody>> = Mutex::new(None);
+
+/// Install the unsealed keystore (agent-profile boot). This slice serves read-only opcodes, so an
+/// install-once guard + the mutating GENERATE_KEYS re-seal path land with the capability/seal slice.
+pub fn install_agent_keystore(body: KeystoreBody) {
+    if let Ok(mut guard) = INSTALLED_KEYSTORE.lock() {
+        *guard = Some(body);
+    }
+}
+
+/// Whether an agent keystore is installed (i.e. this instance runs the Agent Gateway profile).
+pub fn is_agent_keystore_installed() -> bool {
+    INSTALLED_KEYSTORE.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+#[cfg(test)]
+pub fn reset_agent_keystore_for_tests() {
+    if let Ok(mut guard) = INSTALLED_KEYSTORE.lock() {
+        *guard = None;
+    }
+}
+
+/// Frame-layer entry point: dispatch a `0x40` inner-envelope `payload` against the installed
+/// keystore and return the encoded response BODY — a per-opcode success map or a §10.9 error map.
+/// Always returns a body (never errors out of band), so the wire layer just frames it. Profile is
+/// derived from slot presence: no installed keystore ⇒ not an agent instance ⇒ `WrongProfile`.
+pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
+    let result = match INSTALLED_KEYSTORE.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(keystore) => dispatch_agent(Profile::AgentGateway, payload, keystore),
+            None => Err(AgentError::WrongProfile),
+        },
+        Err(_) => Err(AgentError::SealFailed), // poisoned lock — fail closed
+    };
+    match result {
+        Ok(resp) => encode_agent_response(&resp),
+        Err(e) => encode_agent_error(e),
+    }
+}
+
+fn key_purpose_code(p: KeyPurpose) -> u64 {
+    match p {
+        KeyPurpose::AgentTransferK1 => 1,
+        KeyPurpose::AgentFaucetTreasuryK1 => 2,
+    }
+}
+
+fn encode_body(map: Vec<(Value, Value)>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // into_writer is infallible for these owned in-memory Values; a serialize error can't occur.
+    let _ = ciborium::ser::into_writer(&Value::Map(map), &mut buf);
+    buf
+}
+
+/// Encode a success response body (per-opcode integer-key CBOR map).
+fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
+    match resp {
+        // PUBLIC_IDENTITY response (spec §10.4).
+        AgentResponse::PublicIdentity(id) => encode_body(vec![
+            (Value::Integer(1.into()), Value::Bytes(id.pubkey_uncompressed.to_vec())),
+            (Value::Integer(2.into()), Value::Bytes(id.eth_address.to_vec())),
+            (Value::Integer(3.into()), Value::Text(id.tron_address.clone())),
+            (Value::Integer(4.into()), Value::Bytes(id.key_ref.to_vec())),
+            (Value::Integer(5.into()), Value::Integer(key_purpose_code(id.key_purpose).into())),
+            (Value::Integer(6.into()), Value::Integer((id.agent_version as u64).into())),
+        ]),
+        // PROVE_IDENTITY response: low-S recoverable signature + the bound address/pubkey.
+        AgentResponse::ProveIdentity(proof) => encode_body(vec![
+            (Value::Integer(1.into()), Value::Bytes(proof.signature.r.to_vec())),
+            (Value::Integer(2.into()), Value::Bytes(proof.signature.s.to_vec())),
+            (Value::Integer(3.into()), Value::Integer((proof.signature.recovery_id as u64).into())),
+            (Value::Integer(4.into()), Value::Bytes(proof.address.to_vec())),
+            (Value::Integer(5.into()), Value::Bytes(proof.pubkey_uncompressed.to_vec())),
+        ]),
+    }
+}
+
+/// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
+fn encode_agent_error(e: AgentError) -> Vec<u8> {
+    let reason = match e {
+        AgentError::Malformed => "agent: malformed request",
+        AgentError::WrongProfile => "agent: wrong profile",
+        AgentError::KeyPurposeMismatch => "agent: key purpose mismatch",
+        AgentError::CapabilityRejected => "agent: capability rejected",
+        AgentError::CapExceeded => "agent: cap exceeded",
+        AgentError::NotConfigured => "agent: not configured",
+        AgentError::SealFailed => "agent: seal failed",
+    };
+    encode_body(vec![
+        (Value::Integer(1.into()), Value::Integer((e.code() as u64).into())),
+        (Value::Integer(2.into()), Value::Text(reason.to_string())),
+    ])
+}
+
+/// Decode an agent response/error body to its `{code, reason}` or success-map for assertions.
+#[cfg(test)]
+pub fn decode_agent_error_code(body: &[u8]) -> Option<u8> {
+    let v: Value = ciborium::de::from_reader(body).ok()?;
+    let Value::Map(m) = v else { return None };
+    let code = map_get(&m, 1).and_then(as_u64)?;
+    // a success PUBLIC_IDENTITY/PROVE map also has key 1 (bytes), so only treat int key1 as an error
+    if matches!(map_get(&m, 1), Some(Value::Integer(_))) {
+        u8::try_from(code).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +652,34 @@ mod tests {
         assert_eq!(AgentError::CapExceeded.code(), 0x44);
         assert_eq!(AgentError::NotConfigured.code(), 0x45);
         assert_eq!(AgentError::SealFailed.code(), 0x46);
+    }
+
+    /// Frame-layer path through the installed-keystore slot. Single test (the slot is process-global)
+    /// to avoid cross-test interference; it covers the no-keystore (producer) and installed paths.
+    #[test]
+    fn frame_handler_via_installed_keystore_slot() {
+        reset_agent_keystore_for_tests();
+        let (body, key_ref) = body_with_key();
+
+        // No keystore installed ⇒ producer/uninstalled ⇒ WrongProfile (0x41) error body.
+        let pubid_env =
+            envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
+        let err_body = handle_agent_gateway_frame(&pubid_env);
+        assert_eq!(decode_agent_error_code(&err_body), Some(0x41));
+
+        // Install the keystore ⇒ PUBLIC_IDENTITY returns a success body (key 1 = 65-byte pubkey).
+        install_agent_keystore(body);
+        let ok_body = handle_agent_gateway_frame(&pubid_env);
+        assert_eq!(decode_agent_error_code(&ok_body), None, "success body, not an error map");
+        let v: Value = ciborium::de::from_reader(&ok_body[..]).unwrap();
+        let Value::Map(m) = v else { panic!("response is a map") };
+        assert_eq!(as_bytes(map_get(&m, 1).unwrap()).unwrap().len(), 65, "pubkey 65B");
+        assert_eq!(as_bytes(map_get(&m, 4).unwrap()).unwrap(), key_ref, "key_ref echoed");
+
+        // Unknown key_ref ⇒ collapsed 0x42 error body.
+        let bad = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(vec![0xfe; 32]))]);
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&bad)), Some(0x42));
+
+        reset_agent_keystore_for_tests();
     }
 }

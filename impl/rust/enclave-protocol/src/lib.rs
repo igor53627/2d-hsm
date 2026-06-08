@@ -235,6 +235,10 @@ pub enum Command {
     SignAuthorizationTicket(SignAuthorizationTicketRequest),
     ArmForProduction(ArmForProductionRequest),
     GetStatus(GetStatusRequest),
+    /// Agent Gateway (0x40) — carries the raw inner-envelope CBOR; decoded/routed by
+    /// `agent_dispatch` (the envelope is self-describing: opcode is inside).
+    #[cfg(feature = "agent-gateway")]
+    AgentGateway(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +248,10 @@ pub enum Response {
     ArmForProduction(ArmForProductionResponse),
     GetStatus(GetStatusResponse),
     Error(String),
+    /// Agent Gateway (0x40) — the already-encoded response body (a per-opcode success map or a
+    /// §10.9 `{code, reason}` error map, built by `agent_dispatch`).
+    #[cfg(feature = "agent-gateway")]
+    AgentGateway(Vec<u8>),
 }
 
 /// Top-level framed message.
@@ -1356,9 +1364,14 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
             decode_arm_for_production_request(payload)?,
         )),
         MessageType::GetStatus => Ok(Command::GetStatus(decode_get_status_request(payload)?)),
-        // Reserved by TASK-7.1; agent command decoding/handling lands in TASK-7.6. Fail closed.
+        // Agent Gateway (0x40): carry the raw inner envelope; agent_dispatch decodes + routes it
+        // (self-describing — opcode is inside). Built only under the `agent-gateway` feature; a
+        // build without it keeps the fail-closed reserved behavior.
+        #[cfg(feature = "agent-gateway")]
+        MessageType::AgentGateway => Ok(Command::AgentGateway(payload.to_vec())),
+        #[cfg(not(feature = "agent-gateway"))]
         MessageType::AgentGateway => Err(ProtocolError::WireProtocol(
-            "agent gateway commands not yet implemented (reserved by TASK-7.1; see TASK-7.6)",
+            "agent gateway commands require the agent-gateway feature (reserved by TASK-7.1)",
         )),
     }
 }
@@ -1375,6 +1388,9 @@ fn encode_wire_response(msg_type: MessageType, response: &Response) -> Result<Ve
         (MessageType::SignAuthorizationTicket, Response::SignAuthorizationTicket(r)) => {
             encode_sign_authorization_ticket_response(r)
         }
+        // Agent Gateway body is pre-encoded by agent_dispatch (success map or §10.9 error map).
+        #[cfg(feature = "agent-gateway")]
+        (MessageType::AgentGateway, Response::AgentGateway(body)) => Ok(body.clone()),
         (_, Response::Error(msg)) => encode_wire_error(1, msg),
         (expected, other) => encode_wire_error(
             1,
@@ -1628,6 +1644,12 @@ pub fn dispatch_command(cmd: Command) -> Response {
         Command::GetStatus(_) => Response::Error(
             "GET_STATUS requires dispatch_command_with_state".to_string(),
         ),
+        // Agent Gateway uses its own installed-keystore slot (not EnclaveState), so it routes the
+        // same in both dispatchers; the body is built (success or §10.9 error) by agent_dispatch.
+        #[cfg(feature = "agent-gateway")]
+        Command::AgentGateway(payload) => {
+            Response::AgentGateway(agent_dispatch::handle_agent_gateway_frame(&payload))
+        }
     }
 }
 
@@ -1666,6 +1688,10 @@ pub fn dispatch_command_with_state(
             }
         }
         Command::GetStatus(_req) => Response::GetStatus(build_get_status_response(state)),
+        #[cfg(feature = "agent-gateway")]
+        Command::AgentGateway(payload) => {
+            Response::AgentGateway(agent_dispatch::handle_agent_gateway_frame(&payload))
+        }
     }
 }
 
@@ -3685,17 +3711,23 @@ mod agent_gateway_framing_tests {
         assert_eq!(peek_msg_type_from_frame(&[]), None);
     }
 
-    // A 0x40 frame is recognized at the framing layer but command handling fails
-    // closed until TASK-7.6 (reserved namespace).
+    // A 0x40 frame is recognized at the framing layer. WITHOUT the agent-gateway feature the
+    // reserved namespace fails closed at decode; WITH it, 0x40 decodes to a raw-payload
+    // AgentGateway command (agent_dispatch routes/encodes the response, incl. §10.9 errors — the
+    // end-to-end frame path is exercised in agent_dispatch::tests::frame_handler_*).
     #[test]
-    fn agent_gateway_frame_decodes_but_command_fails_closed() {
+    fn agent_gateway_frame_decode_per_feature() {
         let frame = encode_message(MessageType::AgentGateway, &[0xA0]).unwrap(); // 0xA0 = empty CBOR map
         let decoded = decode_message(&frame).unwrap();
         assert_eq!(decoded.msg_type, MessageType::AgentGateway);
-        assert!(matches!(
-            decode_wire_command(decoded.msg_type, &decoded.payload),
-            Err(ProtocolError::WireProtocol(_))
-        ));
+        let cmd = decode_wire_command(decoded.msg_type, &decoded.payload);
+        #[cfg(feature = "agent-gateway")]
+        assert!(matches!(cmd, Ok(Command::AgentGateway(_))), "0x40 decodes under agent-gateway");
+        #[cfg(not(feature = "agent-gateway"))]
+        assert!(
+            matches!(cmd, Err(ProtocolError::WireProtocol(_))),
+            "0x40 reserved/fail-closed without the agent-gateway feature"
+        );
     }
 
     // AC#20: an unknown-type or reserved-agent request yields an error frame that
