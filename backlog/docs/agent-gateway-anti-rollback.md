@@ -98,9 +98,21 @@ boot; rotation is a reviewed reprovisioning (re-seal under the new root).
 `SHA3-512("2d-hsm-snp-report-data-v1" ‖ pq_pubkey)` (`snp_report.rs`). The Agent Gateway is a
 **separate profile/measurement**, so its enclave uses its **own** domain-separated
 `report_data = SHA3-512("2d-hsm-agent-anchor-handshake-v1" ‖ treasury_id ‖ freshness_nonce)` for the
-anchor handshake — binding the per-(re)start nonce + secp256k1 treasury identity, **not** the
+anchor handshake — binding the per-(re)start nonce + the keystore-instance identity, **not** the
 producer pq_pubkey. The anchor verifies that fresh attestation (agent measurement on the allowlist +
-VCEK) before advancing or reporting.
+VCEK) before advancing or reporting. **Concrete `treasury_id`** (impl, `agent_anchor.rs`): the
+plaintext-config keystore-instance scope `twod_chain_id (8B BE) ‖ len(environment_identifier) (4B BE)
+‖ environment_identifier` — the **same tuple the capability envelope scopes to** (§10.5), present in
+sealed config from provisioning so the handshake works on a fresh keystore **before** the first
+GENERATE_KEYS mints a secp256k1 treasury key. The secp256k1 treasury pubkey is deliberately **not**
+the handshake id (it does not exist pre-keygen). This identifies the keystore **instance by scope** —
+it does **not** by itself make clones safe: under Option A the anchor is a single per-scope counter
+with **no fencing of concurrent attestations**, so two clones at one `(chain_id, environment_identifier)`
+would churn each other's epoch (each sees the other's bump as "anchor ahead") rather than double-spend
+silently, but the active-active prohibition of §4 still stands and stays operator-procedural under
+Option A. Fencing duplicate live attestations per scope (reject a second concurrent instance) is the
+upgrade the Option B append-only ledger provides; an Option-A anchor MAY add such fencing, but the
+verify slice does not assume it.
 
 **Per-dispense (seal-before-emit, AC#2).** Within the TASK-7.4 serialized single-writer commit,
 each fund-moving operation (faucet dispense; and each administrative counter advance) **bumps the
@@ -274,3 +286,112 @@ audited opt-out). **Liveness DoS (accepted availability residual):** because pro
 that channel to wedge all fund custody. This is **fail-closed** — no fund loss, no rollback, and the
 host gains nothing — but it is a deliberate availability denial the host can trigger at will; HA +
 monitored anchor connectivity is the operational mitigation.
+
+## §8 Implementation — verify-only slice (`agent_anchor.rs`, TASK-7.7)
+
+This anti-rollback anchor module is TASK-7.7's *own* mechanism (the freshness binding 7.7 adds on top
+of the TASK-7.6 Agent Gateway signer); it is built under the shared `agent-gateway` feature. The
+TASK-7.7 ACs/DoD are the **design** acceptance (complete); the task stays In Progress to track these
+implementation slices.
+
+The first implementation slice (feature `agent-gateway`, pure + unit-tested with a mock anchor key)
+lands the enclave's **anchor-response verification + boot reconcile** core. It is deliberately
+*anchor-agnostic*: the enclave only verifies a signed response against the sealed `anchor_root`. WHO
+signs — an operator HSM, a quorum, or a **chain-bridge** that reads 2D-chain state (recorded via
+ordinary transactions to a normal contract) and signs the current mark — is a provisioning choice
+that does not change this code. This hybrid framing is the session's **"Variant C"**: it is the §3
+Option-A verify mechanism *extended with optional chain-block binding* so a chain-backed anchor (or a
+later direct merkle-read path) can back it **without a wire change**. It is **not** the Decisions-table
+"Option C" (operator-signed boot-auth, restore-seeding only).
+
+**Domains.** Response signing preimage prefix `ANCHOR_DOMAIN = "2d-hsm/agent-anchor/v1\0"` (trailing
+NUL part of the label); handshake `report_data` domain `"2d-hsm-agent-anchor-handshake-v1"` (§3).
+
+**Anchor freshness response (canonical-CBOR int-key map) — v1 PROVISIONAL.** This wire format is
+**draft, not frozen.** The verify code implements the shape below, but two signed/compared fields it
+already consumes — `structural_version` (key 5) and `marks_digest` (key 6) — depend on a concrete
+construction that is finalized by the seeding + boot-wiring slices (see the blocking ACs in the task).
+Until then the response format MUST be treated as provisional and may take a wire-format bump; nothing
+is wired to it yet, so this carries no compatibility cost. Keys `1..=7` are **always** signed, plus
+optional `8/9` **only when chain-bound** (both-or-neither); key `13` (the signature) is excluded from
+the preimage. The signed preimage is `ANCHOR_DOMAIN ‖ canonical-CBOR({signed keys})` built with the
+**same** RFC 8949 §4.2.1 shortest-form encoders the capability verifier uses, so a conformant anchor
+signer matches byte-for-byte. Signature = Ed25519 (64B), verified `verify_strict` against the sealed
+`anchor_root`.
+
+| key | field | type | notes |
+|----|-------|------|-------|
+| 1 | `version` | uint | must == 1 |
+| 2 | `chain_id` | uint | == sealed `twod_chain_id` (scope) |
+| 3 | `environment_identifier` | text | == sealed `environment_identifier` (scope) |
+| 4 | `epoch` | uint | authoritative freshness epoch |
+| 5 | `structural_version` | uint | bumped by key/config mutations the anchor cannot reconstruct (**construction PINNED-BEFORE-USE — see below**) |
+| 6 | `marks_digest` | bytes(32) | digest of authoritative counter/spend high-water (**construction PINNED-BEFORE-USE — see below**) |
+| 7 | `nonce` | bytes(32) | must echo the enclave's fresh per-(re)start challenge |
+| 8 | `chain_height` | uint | **optional**, chain-backed anchor only |
+| 9 | `chain_block_hash` | bytes(32) | **optional**, chain-backed anchor only |
+| 13 | `signature` | bytes(64) | Ed25519 over the preimage above |
+
+**`marks_digest` (key 6) — construction (intended shape; PINNED-BEFORE-USE).** Key 6 is a **signed**
+field that the same-epoch `Fresh` compare (`anchor.marks_digest == local_marks_digest`) already
+consumes, so the anchor signer and enclave MUST derive identical bytes or every reboot fails closed
+(`Inconsistent` — a hard liveness break). The **intended** construction is
+`marks_digest = SHA3-256("2d-hsm/agent-anchor-marks/v1\0" ‖ canonical-CBOR(marks_payload))`, with
+`marks_payload` an RFC 8949 §4.2.1 canonical int-keyed encoding of the authoritative high-water state
+— the capability counter high-water table (per `(authority, scope_class, scope_target)` tuple,
+ascending), the faucet `cumulative_spend`/`lifetime_spend`, and the strict recovery counter. **This is
+provisional:** the exact `marks_payload` map keys, tuple encoding, sort order, integer units, and test
+vectors are pinned by the **seeding slice** (blocking AC) before anything computes or compares a real
+digest. **Adopt-forward delivery:** the digest is the signed *commitment*; the actual `marks_payload`
+is delivered to the enclave alongside the response (a separate payload, since it can be large) and the
+seeding slice MUST recompute its SHA3-256 and check it equals the signed key 6 **before** adopting — so
+a digest-only freshness response already authenticates the later-delivered marks (no unauthenticated
+side channel).
+
+**`structural_version` (key 5) — definition (PINNED-BEFORE-USE).** `reconcile` already compares the
+local `structural_version` to the anchor's, but the sealed body today carries only `freshness_epoch`.
+The **intended** definition: a `u64` in the `pq-agent-keystore-v1` encrypted body, init `1`, bumped by
+**exactly one** event set — each committed structural mutation that the anchor cannot reconstruct
+(GENERATE_KEYS, and the key/config-changing CONFIGURE_TREASURY sub-ops). **Provisional:** the exact
+sealed field, initial value, the precise bump-event list, the migration rule for existing blobs, and
+test vectors are pinned by the **boot-wiring slice** (blocking AC) before `reconcile` is wired into
+boot. Until then `structural_version` is a design placeholder the verify logic is written against; do
+**not** map it onto `monotonic_treasury_config_version` or any existing field without that decision.
+
+Strict decode (else `Malformed`): keys ⊆ `{1..=9, 13}`, no duplicates, all required present, fixed
+byte-lengths exact, and keys 8/9 **both-or-neither** (a chain attestation binds to a finalized block).
+
+**`verify_anchor_response(response_map, expected_nonce, config)`** → `AnchorState` or fail-closed:
+parse → `version == 1` → Ed25519 `verify_strict` vs `config.anchor_root` → scope (`chain_id` ∧
+`environment_identifier` == sealed config) → nonce echo == `expected_nonce`. Because the handshake is a
+**boot-time ceremony** (not a per-request, host-probeable surface), the reject reasons are coarse
+fail-closed variants — `Malformed` / `SignatureInvalid` / `ScopeMismatch` / `NonceMismatch` — **not**
+the §10.9 anti-oracle band.
+
+**`reconcile(local_epoch, local_structural_version, local_marks_digest, anchor)`** → implements §3:
+`anchor.epoch < local` ⇒ `FailClosed(AnchorBehind)`; `==` ⇒ `Fresh` iff `structural_version` **and**
+`marks_digest` match, else `FailClosed(Inconsistent)`; `>` ⇒ `AdoptForward{epoch}` iff
+`structural_version` matches (counter/spend-only gap the anchor's marks fully describe), else
+`FailClosed(StructuralGap)` — **any** structural mismatch: the normal case is the anchor ahead (a
+dropped GENERATE_KEYS/CONFIGURE_TREASURY ⇒ restore from backup), and the defensive case is the
+contradictory "epoch ahead but structural behind" (a forged/inconsistent anchor) which also fails
+closed.
+
+**`anchor_handshake_report_data(chain_id, environment_identifier, nonce)`** fixes the 64-byte SNP
+`report_data` the enclave's handshake attestation must commit to (the concrete `treasury_id` tuple of
+§3, length-prefixed env for unambiguous binding).
+
+**Decode contract (load-bearing).** `verify_anchor_response` takes an already-decoded CBOR map and
+checks the signature over the *re-encoded* canonical preimage of the parsed fields — it binds the
+field *values*, not the received wire bytes (same convention as the §10.5 capability verifier). The
+boot-wiring decode step that produces that map therefore **MUST** be a strict/canonical CBOR reader:
+reject non-shortest integers, indefinite-length items, duplicate keys, and trailing bytes. Otherwise a
+host could submit a non-canonical encoding of an otherwise-valid signed response and have it verify.
+This strict reader should be the **shared** helper that also serves the capability/dispatch decoders
+(see the map-accessor consolidation follow-up), not a third hand-rolled one.
+
+**Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
+the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, the strict
+canonical wire decoder above, wiring verify+reconcile into boot/install, per-op `epoch` bump +
+seal-before-emit, and seeding the body's counter/spend from the anchor's authoritative marks (asserting
+adopted marks ≥ local). The live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.

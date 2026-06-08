@@ -128,6 +128,10 @@ pub mod agent_dispatch;
 // contiguous-counter CHECK for privileged opcodes (verify-only; advance/payload-binding deferred).
 #[cfg(feature = "agent-gateway")]
 pub mod agent_capability;
+// Agent Gateway anti-rollback anchor (TASK-7.7). Verify-only slice: Ed25519 freshness-response
+// verify against the sealed `anchor_root` + boot reconcile (Variant C: enclave is anchor-agnostic).
+#[cfg(feature = "agent-gateway")]
+pub mod agent_anchor;
 mod wire;
 
 use serde::{Deserialize, Serialize};
