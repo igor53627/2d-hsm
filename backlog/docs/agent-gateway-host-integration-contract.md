@@ -19,7 +19,7 @@ scheme, error band), `agent-gateway-keystore-backup-format.md` (sealed authoriti
 | Doc landing | A focused companion doc (this file), parallel to the other `agent-gateway-*.md`; design doc stays enclave-centric. |
 | Capability carrier | Operator ceremony **pre-signs** Ed25519 capabilities (admin/recovery authority, offline) → stored in tiered Vault paths **indexed by `request_id`** → host fetches and forwards at envelope key 5. Host sees cap fields but cannot forge/mutate them (TEE re-verifies the signature). |
 | `command_class` folding (AC#18) | **Coarse** default — **five** folded classes `generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`, `restore_backup` (vsock §10.6), each its own `scope_target` lane so a stalled cap in one can't wedge another. Recovery has **two distinct** properties: `restore_backup` is its own folded `command_class` lane, **and** recovery ops (`RESTORE_BACKUP` + `reset_lifetime_breaker`) are sequenced by the **independent strict recovery counter** (never rolls back). Finer per-sub-op lanes are an operator-tunable if `configure_treasury` self-wedges. |
-| Expiry / revocation | **Host-side only** (Vault short-TTL tokens / drop the pre-signed cap on revoke) **plus counter-burn** for hard revocation. The **TEE does not enforce expiry** (no clock) — residual, see §5. |
+| Expiry / revocation | **Host-side only** (Vault short-TTL tokens / drop the pre-signed cap). **Counter-burn** hard-revokes only command-class lanes that have a safe no-op (`configure_treasury`); keygen/export/recovery lanes have no harmless burn and stay **host-side-drop only** until a TEE revoke/counter-advance op (see §5). The **TEE does not enforce expiry** (no clock). |
 | Transfer dest/amount limits | **Host/OPA only** (`data.config` allowlist) — there is **no** TEE per-agent transfer destination/amount cap yet. Residual, see §5. |
 
 ## §1 The five capability tiers (host model) — AC#1
@@ -37,11 +37,11 @@ signing.
 
 | # | Capability (AC#1) | Commands | Issuer / key-5 cap | Counter | Scope |
 |---|-------------------|----------|--------------------|---------|-------|
-| **1 runtime signing** | `SIGN_TRANSFER`(4), `agent_transfer_k1` | **none** (no cap) | none — bounded by sealed key-purpose + canonical EIP-155 + sealed chain_id | transfer key |
-| **2 faucet-treasury signing** | `SIGN_FAUCET_DISPENSE`(5), `agent_faucet_treasury_k1` | **none** (no cap) | none — bounded by sealed key-purpose + per-dispense/cumulative/lifetime caps + seal-before-emit | `to` ∈ active transfer-key set |
-| **3 provisioning/refill** | `GENERATE_KEYS`(1: transfer count≥1 \| faucet count=1 singleton), `CONFIGURE_TREASURY`(6: set_limits/refill_budget/raise_lifetime_breaker) | `admin_authority_pk` | contiguous per `(authority,env,scope_class,scope_target)`; `command_class`∈{generate_transfer, generate_faucet, configure_treasury} | transfer=**fleet**; treasury+config=**enclave** |
-| **4 backup export** | `EXPORT_BACKUP`(7) | `admin_authority_pk` (export role) | contiguous; `command_class=export_backup` | enclave |
-| **5 restore/recovery** | `RESTORE_BACKUP`(8), `CONFIGURE_TREASURY` reset_lifetime_breaker | `recovery_authority_pk` (`is_recovery=true`) | **single strict recovery counter** — shared by restore + reset_lifetime_breaker (per vsock §10.6), never rolls back | enclave, fresh-TEE |
+| 1 | **runtime signing** | `SIGN_TRANSFER`(4), `agent_transfer_k1` | **none** (no cap) | none — bounded by sealed key-purpose + canonical EIP-155 + sealed chain_id | transfer key |
+| 2 | **faucet-treasury signing** | `SIGN_FAUCET_DISPENSE`(5), `agent_faucet_treasury_k1` | **none** (no cap) | none — bounded by sealed key-purpose + per-dispense/cumulative/lifetime caps + seal-before-emit | `to` ∈ active transfer-key set |
+| 3 | **provisioning/refill** | `GENERATE_KEYS`(1: transfer count≥1 \| faucet count=1 singleton), `CONFIGURE_TREASURY`(6: set_limits/refill_budget/raise_lifetime_breaker) | `admin_authority_pk` | contiguous per `(authority,env,scope_class,scope_target)`; `command_class`∈{generate_transfer, generate_faucet, configure_treasury} | transfer=**fleet**; treasury+config=**enclave** |
+| 4 | **backup export** | `EXPORT_BACKUP`(7) | `admin_authority_pk` (export role) | contiguous; `command_class=export_backup` | enclave |
+| 5 | **restore/recovery** | `RESTORE_BACKUP`(8), `CONFIGURE_TREASURY` reset_lifetime_breaker | `recovery_authority_pk` (`is_recovery=true`) | **single strict recovery counter** — shared by restore + reset_lifetime_breaker (per vsock §10.6), never rolls back | enclave, fresh-TEE |
 
 **Distinctness + ordering (AC#1/#2):** runtime signing < faucet-treasury signing (distinct
 key purpose + spend caps), both < provisioning/refill < backup export < restore/recovery
