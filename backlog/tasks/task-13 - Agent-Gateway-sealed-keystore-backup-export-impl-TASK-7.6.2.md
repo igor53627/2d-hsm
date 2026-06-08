@@ -1,10 +1,10 @@
 ---
 id: TASK-13
 title: Agent Gateway sealed keystore + backup export impl (TASK-7.6.2)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-08 08:09'
-updated_date: '2026-06-08 08:46'
+updated_date: '2026-06-08 11:34'
 labels:
   - agent-gateway
   - keystore

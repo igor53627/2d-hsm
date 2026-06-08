@@ -77,6 +77,10 @@ pub mod snp_verify;
 // keeping it out of the producer ML-DSA signing path.
 #[cfg(feature = "agent-gateway")]
 pub mod secp256k1;
+// Agent Gateway sealed keystore envelope (TASK-7.6.2). `pq-agent-keystore-v1` seal/unseal,
+// mirroring the producer `pq-seal-v1` primitives with distinct magic + KDF/measurement domains.
+#[cfg(feature = "agent-gateway")]
+pub mod agent_keystore;
 mod wire;
 
 use serde::{Deserialize, Serialize};
