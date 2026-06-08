@@ -23,5 +23,5 @@ TASK-7.2 implementation. pq-agent-keystore-v1 sealed multi-key CBOR store (magic
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) — the Full 3x3 vendor matrix + compact is mandatory before merge per AGENTS.md and the .roborev.toml high_risk_paths (impl/, src/, backlog/docs/*agent-gateway*).
+Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) — the Full Matrix (Reduced Matrix + the 2×3 concurrency floor from ~/pse/roborev/pse-review-2x3.sh; 3×3 vendor sign-off optional) + compact is mandatory before merge per AGENTS.md and the .roborev.toml high_risk_paths (impl/, src/, backlog/docs/*agent-gateway*).
 <!-- SECTION:NOTES:END -->

@@ -24,5 +24,5 @@ TASK-7.4 implementation. Opcodes SIGN_TRANSFER(4), SIGN_FAUCET_DISPENSE(5), CONF
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) — the Full 3x3 vendor matrix + compact is mandatory before merge per AGENTS.md and the .roborev.toml high_risk_paths (impl/, src/, backlog/docs/*agent-gateway*).
+Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) — the Full Matrix (Reduced Matrix + the 2×3 concurrency floor from ~/pse/roborev/pse-review-2x3.sh; 3×3 vendor sign-off optional) + compact is mandatory before merge per AGENTS.md and the .roborev.toml high_risk_paths (impl/, src/, backlog/docs/*agent-gateway*).
 <!-- SECTION:NOTES:END -->
