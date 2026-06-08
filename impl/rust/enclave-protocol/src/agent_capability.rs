@@ -312,9 +312,10 @@ pub(crate) fn verify_capability(
 
     // (2b) Authority TIER per opcode (design doc "Capability tiers"): GENERATE_KEYS(1) +
     // EXPORT_BACKUP(7) are admin-tier; RESTORE_BACKUP(8) is recovery-tier; CONFIGURE_TREASURY(6) is
-    // admin OR recovery (the per-sub-op tier — e.g. reset_lifetime_breaker → recovery — is enforced
-    // by the handler). Enforcing this here stops an admin authority from authorizing a restore and a
-    // recovery authority from authorizing keygen/export. A tier mismatch is an authorization failure
+    // tier-checked per sub-op here (reset_lifetime_breaker → recovery; set_limits/refill/raise →
+    // admin) — only binding the cap's sub-op to the *request's* sub-op is deferred to the handler.
+    // Enforcing this here stops an admin authority from authorizing a restore and a recovery
+    // authority from authorizing keygen/export. A tier mismatch is an authorization failure
     // (0x43, anti-oracle), not a structural error. From here on EVERY failure collapses to 0x43.
     let tier_ok = match cap.command_opcode {
         1 | 7 => !cap.is_recovery, // admin-only
