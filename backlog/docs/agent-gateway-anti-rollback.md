@@ -106,7 +106,8 @@ VCEK) before advancing or reporting.
 each fund-moving operation (faucet dispense; and each administrative counter advance) **bumps the
 remote counter to `epoch+1` and seals the new epoch into the keystore body in the same commit BEFORE
 the signature/refs are emitted**. Default **`lease=1`**: one synchronous remote bump per signature →
-**zero replay window** (a rolled-back blob is strictly behind the anchor and rejected). **All
+**zero replay window** (a rolled-back blob is strictly behind the anchor, so the anchor's higher mark
+binds and the rollback gains nothing — adopt-forward). **All
 administrative, recovery, and treasury-config counter advances are ALWAYS synchronous (`lease=1`)** —
 never amortized. A **naive `lease=N`** (the blob-wide `freshness_epoch` staying equal to
 anchor-current for the whole window) is **NOT bounded**: a host can repeatedly snapshot and replay
@@ -139,8 +140,10 @@ the strict recovery counter is likewise pinned.
 
 **Boot/restore seeding (AC#3).** Counter high-water marks and faucet spend are seeded at boot/restore
 from the anchor's **authenticated current marks** (or from authenticated recovery material whose
-target is bound to the strict recovery counter) — **never zero, never from a stale backup**; if the
-restored blob's epoch is behind the anchor it is rejected. Option C (operator-signed boot
+target is bound to the strict recovery counter) — **never zero, never from a stale backup**: the
+backup's own stale marks are never trusted; counters are seeded from the anchor's authenticated
+current marks (adopt-forward), and the operation fails closed only if those authenticated marks are
+unavailable or the divergence is unresolvable. Option C (operator-signed boot
 authorization) may supply the seed values **only** when bound to the anchor's challenge-response,
 never as a standalone replayable static authorization.
 
@@ -223,7 +226,9 @@ is used.
 Restore and failover seed counter high-water marks + faucet spend from **authenticated material**
 (the anchor's current marks, or recovery material bound to the strict recovery counter), and
 **never** reset to zero from a stale backup (consumes the TASK-7.2 AC#11/#12 contract). A restored
-blob whose `freshness_epoch` is behind the anchor is rejected. Fresh-TEE restore additionally runs
+blob's own stale `freshness_epoch`/marks are never trusted as authoritative — counters are seeded
+from the anchor's authenticated current marks (adopt-forward); restore fails closed only when those
+marks are unavailable or the divergence is unresolvable. Fresh-TEE restore additionally runs
 the TASK-7.2 attested-ingress ceremony; the new instance registers with the anchor (fresh SNP
 attestation) before it may emit fund-moving signatures.
 
@@ -234,7 +239,8 @@ attestation) before it may emit fund-moving signatures.
   binds (defeating the rollback/replay), the core anti-rollback assertion. It then adopts those marks
   (crash-reconcile, below) or fails closed (anchor unavailable, or a structural-mutation gap).
 - **Per-dispense `lease=1`:** a fund signature is emitted only after the remote bump + seal commit;
-  simulated anchor failure ⇒ no signature (0x4x). A rolled-back blob after a dispense is rejected.
+  simulated anchor failure ⇒ no signature (0x4x). A rolled-back blob after a dispense does not enable
+  replay — the anchor's higher spend mark binds (adopt-forward), so the double-spend is refused.
 - **Crash reconciliation (adopt-forward, never infer emission):** a dropped seal/ack leaving the
   anchor **ahead** of the blob by a **counter/spend advance the recorded marks fully describe**
   (anchor=`epoch+k`, blob=`epoch`) ⇒ restart **adopts the anchor's authoritative epoch + counter/spend
@@ -248,8 +254,8 @@ attestation) before it may emit fund-moving signatures.
   sub-cursor that rejects a reused cursor; admin/recovery/config advances are always synchronous.
 - **Counter + spend coverage:** rollback of the capability counter table AND of `cumulative_spend`/
   `lifetime_spend` are both detected.
-- **Restore never-zero:** restore from a stale backup with a behind epoch is rejected; seeding is
-  from authenticated marks (AC#3).
+- **Restore never-zero:** restore from a stale backup never seeds counters from the backup's own
+  (would-be-zero/stale) marks; they are seeded from the anchor's authenticated marks instead (AC#3).
 - **Active-active:** under Option A the single-instance rule is operator-procedural (the enclave
   cannot detect a clone) — provisioning/runbook must enforce one instance per faucet key; under
   **Option B** the global ledger **enforces** the cumulative cap under concurrent appends (AC#4).
