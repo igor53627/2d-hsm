@@ -47,6 +47,14 @@ compile_error!(
     "lab file provisioning features are for debug/integration builds only, not release"
 );
 
+// AGENT_K1_PROVE_IDENTITY signing is non-collision-unproven against EIP-2718 typed txs until the
+// 2D type-0x19 reservation merges (2D PR #144 / vsock spec §10.8). Hard-ban it from release builds.
+#[cfg(all(release_build, feature = "agent-prove-identity-preview"))]
+compile_error!(
+    "`agent-prove-identity-preview` (AGENT_K1_PROVE_IDENTITY signing) must not be enabled in \
+     release builds until the 2D EIP-2718 type-0x19 reservation merges (vsock spec §10.8)"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;

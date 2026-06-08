@@ -29,6 +29,9 @@ use std::sync::Mutex;
 /// Fixed command-domain string bound in the envelope (spec §10.2, key 3).
 pub const COMMAND_DOMAIN: &str = "2d-hsm/agent-gateway/v1";
 
+/// Max `request_id` length — a small correlation/audit handle, not a payload.
+const MAX_REQUEST_ID_LEN: usize = 64;
+
 /// Agent error band (spec §10.9). Variants collapse distinct internal failures to a single
 /// host-observable code (anti-oracle); the wire code is [`AgentError::code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +174,18 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
     let Value::Map(map) = value else {
         return Err(AgentError::Malformed);
     };
+    // Strict envelope: every key must be a known integer 1..=7, and none may repeat. Unknown or
+    // duplicate keys ⇒ Malformed (no silent first-match resolution; the wire format stays
+    // unambiguous for future capability/payload binding).
+    let mut seen = 0u8; // bitmask of keys 1..=7
+    for (k, _) in &map {
+        let key = as_u64(k).filter(|n| (1..=7).contains(n)).ok_or(AgentError::Malformed)?;
+        let bit = 1u8 << (key - 1);
+        if seen & bit != 0 {
+            return Err(AgentError::Malformed); // duplicate key
+        }
+        seen |= bit;
+    }
     let agent_version = map_get(&map, 1)
         .and_then(as_u64)
         .and_then(|v| u8::try_from(v).ok())
@@ -183,7 +198,12 @@ fn decode_envelope(payload: &[u8]) -> Result<AgentEnvelope, AgentError> {
         Some(Value::Text(s)) => s.clone(),
         _ => return Err(AgentError::Malformed),
     };
-    let request_id = map_get(&map, 4).and_then(as_bytes).map(|b| b.to_vec()).ok_or(AgentError::Malformed)?;
+    // request_id is a small correlation handle; cap it (an adversarial host could otherwise force a
+    // large transient allocation per frame within the MAX_MESSAGE_SIZE budget).
+    let request_id = match map_get(&map, 4).and_then(as_bytes) {
+        Some(b) if b.len() <= MAX_REQUEST_ID_LEN => b.to_vec(),
+        _ => return Err(AgentError::Malformed),
+    };
     let has_capability = map_get(&map, 5).is_some();
     // key_ref (envelope key 6) is required to be 32 bytes when present.
     let key_ref = match map_get(&map, 6) {
@@ -306,11 +326,13 @@ fn handle_prove_identity(
     let verifier_nonce = env.verifier_nonce.ok_or(AgentError::Malformed)?;
     let entry =
         crate::agent_identity::find_entry(keystore, &key_ref).ok_or(AgentError::KeyPurposeMismatch)?;
-    let secret: [u8; 32] = entry
-        .secret_scalar
-        .as_slice()
-        .try_into()
-        .map_err(|_| AgentError::KeyPurposeMismatch)?;
+    // Hold the loaded scalar in Zeroizing so it is scrubbed on drop / early return (7.2 AC#15) —
+    // a plain `[u8; 32]` would linger on the enclave stack.
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    if entry.secret_scalar.len() != 32 {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    secret.copy_from_slice(&entry.secret_scalar);
     let keypair = Keypair::from_secret_bytes(&secret).map_err(|_| AgentError::KeyPurposeMismatch)?;
     let proof = sign_identity_proof(
         &keypair,
@@ -333,11 +355,18 @@ fn handle_prove_identity(
 /// frame on a producer instance is rejected as `WrongProfile` (profile derived from slot presence).
 static INSTALLED_KEYSTORE: Mutex<Option<KeystoreBody>> = Mutex::new(None);
 
-/// Install the unsealed keystore (agent-profile boot). This slice serves read-only opcodes, so an
-/// install-once guard + the mutating GENERATE_KEYS re-seal path land with the capability/seal slice.
-pub fn install_agent_keystore(body: KeystoreBody) {
-    if let Ok(mut guard) = INSTALLED_KEYSTORE.lock() {
-        *guard = Some(body);
+/// Install the unsealed keystore (agent-profile boot). **Install-once**: returns `false` (and does
+/// NOT overwrite) if a keystore is already installed, so a second call (a boot race or caller
+/// mistake) can't silently clobber the live store and dangle existing `key_ref` handles. The
+/// mutating GENERATE_KEYS re-seal/swap path lands with the capability/seal slice.
+#[must_use]
+pub fn install_agent_keystore(body: KeystoreBody) -> bool {
+    match INSTALLED_KEYSTORE.lock() {
+        Ok(mut guard) if guard.is_none() => {
+            *guard = Some(body);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -710,7 +739,7 @@ mod tests {
         assert_eq!(decode_agent_error_code(&err_body), Some(0x41));
 
         // Install the keystore ⇒ PUBLIC_IDENTITY returns a success body (key 1 = 65-byte pubkey).
-        install_agent_keystore(body);
+        assert!(install_agent_keystore(body), "install-once succeeds on an empty slot");
         let ok_body = handle_agent_gateway_frame(&pubid_env);
         assert_eq!(decode_agent_error_code(&ok_body), None, "success body, not an error map");
         let v: Value = ciborium::de::from_reader(&ok_body[..]).unwrap();

@@ -121,12 +121,16 @@ pub fn generate_keys(
         let eth_address = keypair.eth_address();
         let tron_address = tron_address_from_body(&eth_address);
 
+        // Copy the secret into a pre-zeroed Zeroizing buffer (repo rule: don't `to_vec()` a Copy
+        // `[u8; 32]` into Zeroizing, which can leave an un-scrubbed temporary).
+        let mut secret_scalar = Zeroizing::new(vec![0u8; 32]);
+        secret_scalar.copy_from_slice(&secret[..]);
         staged.push(KeyEntry {
             key_ref,
             purpose,
             algorithm: KeyAlgorithm::Secp256k1,
             public_identity: pubkey_uncompressed.to_vec(),
-            secret_scalar: Zeroizing::new(secret.to_vec()),
+            secret_scalar,
             creation_metadata: creation,
             backup_export_metadata: BackupExportMetadata::default(),
         });
