@@ -22,7 +22,11 @@ use crate::secp256k1::{
     Secp256k1Error,
 };
 
-/// EIP-191 non-transaction domain byte (disjoint from eth RLP `≥0xc0` and TRON protobuf `0x0a`).
+/// EIP-191 non-transaction domain byte. Structurally disjoint from eth RLP (`≥0xc0`) and TRON
+/// protobuf (`0x0a`), BUT `0x19` IS a legal EIP-2718 typed-tx `TransactionType` — so disjointness
+/// from typed txs holds only as the *pinned 2D policy* that type `0x19` is permanently reserved/
+/// unassigned. Until that lands in a merged 2D commit (PR #144 / vsock §10.8), PROVE_IDENTITY
+/// signing stays gated off (the `agent-prove-identity-preview` production gate).
 const EIP191_DOMAIN: u8 = 0x19;
 /// Pinned identity-proof label (TASK-7.1 AC#15 / `identity_proof_v1`).
 pub const IDENTITY_PROOF_LABEL: &str = "2d-hsm/agent-identity-proof/v1";

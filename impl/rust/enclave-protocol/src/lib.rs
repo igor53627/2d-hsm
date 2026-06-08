@@ -23,6 +23,17 @@ compile_error!(
     "features `ml-dsa-65` and `test-support` are mutually exclusive; do not use --all-features"
 );
 
+// Production role isolation (vsock spec §10.2): a signer binary is EITHER the producer (ML-DSA
+// AuthorizationTicket signer) OR the Agent Gateway secp256k1 signer — never both. Enforcing it at
+// compile time makes a single instance structurally incapable of cross-role command execution
+// (e.g. an agent instance signing a producer AuthorizationTicket), so the runtime profile gate
+// never has to defend a both-roles binary that should not exist.
+#[cfg(all(feature = "ml-dsa-65", feature = "agent-gateway"))]
+compile_error!(
+    "features `ml-dsa-65` (producer role) and `agent-gateway` (Agent Gateway role) are mutually \
+     exclusive — a signer binary serves exactly one role (production role isolation, vsock §10.2)"
+);
+
 #[cfg(all(
     release_build,
     any(
