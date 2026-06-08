@@ -22,13 +22,11 @@
 //! structural/format errors surface as `0x40 AGENT_MALFORMED`.
 //!
 //! ## Deferred to the per-opcode handler / mutation slices (NOT done here)
-//! - **`treasury_sub_op` value + per-sub-op tier + request binding** (§10.5/§10.7, opcode 6): the
-//!   cap's signed sub-op is parsed and the presence rule (key 3 iff opcode 6) is enforced, but (a) the
-//!   sub-op VALUE set (`set_limits`/`refill_budget`/`raise_lifetime_breaker`/`reset_lifetime_breaker`)
-//!   is not yet numerically pinned in the spec, (b) the per-sub-op tier (`reset_lifetime_breaker` →
-//!   recovery) and (c) binding it to the *request's* sub-op all need the `CONFIGURE_TREASURY` handler
-//!   (which defines the enum and decodes the request sub-op). The opcode-level tier (treasury = admin
-//!   OR recovery) IS enforced here.
+//! - **`treasury_sub_op == request.sub_op` binding** (§10.5, opcode 6): the cap's signed sub-op is
+//!   range-checked to `{0..=3}` (§10.3) at decode, and its per-sub-op tier is enforced
+//!   (`reset_lifetime_breaker(3)` → recovery, `0..=2` → admin). Only binding the cap's sub-op to the
+//!   *request's* sub-op is deferred — the envelope does not yet decode a request sub-op (that lands
+//!   with the `CONFIGURE_TREASURY` handler; transitively also covered by `payload_binding`).
 //! - **`key_purpose` ↔ key-entry** check (`0x42`, collapses key-not-found + wrong-purpose): needs the
 //!   `key_ref` lookup performed inside each opcode handler.
 //! - **`payload_binding`** (`keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical params)`): needs the
@@ -64,6 +62,10 @@ const OPCODE_CONFIGURE_TREASURY: u8 = 6;
 /// Opcodes a capability may authorize — the privileged set (§10.3/§10.5):
 /// `GENERATE_KEYS(1)`, `CONFIGURE_TREASURY(6)`, `EXPORT_BACKUP(7)`, `RESTORE_BACKUP(8)`.
 const PRIVILEGED_OPCODES: [u8; 4] = [1, OPCODE_CONFIGURE_TREASURY, 7, 8];
+/// Treasury sub-ops (§10.3): `0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker,
+/// 3 reset_lifetime_breaker`. `reset_lifetime_breaker` is recovery-tier; `0..=2` are admin-tier.
+const MAX_TREASURY_SUB_OP: u8 = 3;
+const TREASURY_SUB_OP_RESET_LIFETIME_BREAKER: u8 = 3;
 /// Upper bound on `scope_target` bytes — a defensive read-side cap (the field is host-influenced and
 /// later lands in sealed state; keep it small here so a malformed cap is rejected cheaply).
 const MAX_SCOPE_TARGET_LEN: usize = 64;
@@ -146,7 +148,13 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
             if command_opcode != OPCODE_CONFIGURE_TREASURY {
                 return Err(AgentError::Malformed); // sub-op on a non-treasury cap
             }
-            Some(u8::try_from(as_u64(v).ok_or(AgentError::Malformed)?).map_err(|_| AgentError::Malformed)?)
+            let sub = u8::try_from(as_u64(v).ok_or(AgentError::Malformed)?)
+                .map_err(|_| AgentError::Malformed)?;
+            // §10.3: sub-op ∈ {0..=3}; an unknown sub-op is a structural field error (§10.9 0x40).
+            if sub > MAX_TREASURY_SUB_OP {
+                return Err(AgentError::Malformed);
+            }
+            Some(sub)
         }
         None => {
             if command_opcode == OPCODE_CONFIGURE_TREASURY {
@@ -309,10 +317,15 @@ pub(crate) fn verify_capability(
     // recovery authority from authorizing keygen/export. A tier mismatch is an authorization failure
     // (0x43, anti-oracle), not a structural error. From here on EVERY failure collapses to 0x43.
     let tier_ok = match cap.command_opcode {
-        1 | 7 => !cap.is_recovery,            // admin-only
-        8 => cap.is_recovery,                 // recovery-only
-        OPCODE_CONFIGURE_TREASURY => true,    // admin or recovery (sub-op tier in the handler)
-        _ => false,                           // unreachable: opcode ∈ PRIVILEGED_OPCODES
+        1 | 7 => !cap.is_recovery, // admin-only
+        8 => cap.is_recovery,      // recovery-only
+        OPCODE_CONFIGURE_TREASURY => match cap.treasury_sub_op {
+            // §10.3/§10.7: reset_lifetime_breaker(3) = recovery; set_limits/refill/raise (0..=2) = admin.
+            Some(TREASURY_SUB_OP_RESET_LIFETIME_BREAKER) => cap.is_recovery,
+            Some(_) => !cap.is_recovery,
+            None => false, // unreachable: opcode 6 ⇒ sub_op present (parse presence rule)
+        },
+        _ => false, // unreachable: opcode ∈ PRIVILEGED_OPCODES
     };
     if !tier_ok {
         return Err(AgentError::CapabilityRejected);
@@ -907,5 +920,54 @@ mod tests {
         assert_eq!(pre[CAP_DOMAIN.len()], 0xAC);
         let cap = b.build(&admin_signing_key());
         assert_eq!(verify_capability(&cap, 6, rid, &cfg, &[]), Ok(()));
+    }
+
+    #[test]
+    fn treasury_sub_op_out_of_range_is_malformed() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        let mut b = CapBuilder::new(6, rid, 1);
+        b.cap.treasury_sub_op = Some(4); // §10.3 pins sub-op ∈ {0..=3}
+        let cap = b.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 6, rid, &cfg, &[]),
+            Err(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn reset_lifetime_breaker_requires_recovery_tier() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // sub_op 3 (reset_lifetime_breaker) is recovery-tier: admin flag rejected...
+        let mut admin_tier = CapBuilder::new(6, rid, 1);
+        admin_tier.cap.treasury_sub_op = Some(3);
+        admin_tier.cap.is_recovery = false;
+        assert_eq!(
+            verify_capability(&admin_tier.build(&admin_signing_key()), 6, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected)
+        );
+        // ...recovery flag (signed by recovery key) accepted.
+        let mut rec = CapBuilder::new(6, rid, 1);
+        rec.cap.treasury_sub_op = Some(3);
+        rec.cap.is_recovery = true;
+        assert_eq!(
+            verify_capability(&rec.build(&recovery_signing_key()), 6, rid, &cfg, &[]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn admin_treasury_sub_op_rejects_recovery_flag() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // sub_op 0 (set_limits) is admin-tier; is_recovery=true ⇒ tier mismatch ⇒ 0x43.
+        let mut b = CapBuilder::new(6, rid, 1);
+        b.cap.treasury_sub_op = Some(0);
+        b.cap.is_recovery = true;
+        assert_eq!(
+            verify_capability(&b.build(&recovery_signing_key()), 6, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected)
+        );
     }
 }
