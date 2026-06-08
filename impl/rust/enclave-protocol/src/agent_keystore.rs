@@ -18,6 +18,7 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use serde::{Deserialize, Serialize};
 use sha3::{Digest as _, Sha3_256};
 use zeroize::Zeroizing;
 
@@ -57,6 +58,15 @@ pub enum KeystoreError {
     Decrypt,
     /// CSPRNG unavailable when generating a seal nonce.
     Csprng,
+    /// Canonical-CBOR (de)serialization of the keystore body failed (incl. deny-unknown-fields).
+    Cbor,
+    /// `environment_identifier` failed the TASK-7.1 §10.6 rules (1..=64, `[a-z0-9-]`, no
+    /// leading/trailing/double hyphen).
+    InvalidEnvironmentId,
+    /// Key-entry count over `MAX_TOTAL_KEY_ENTRIES` (AC#5 capacity guard).
+    CapacityExceeded,
+    /// A fixed-length byte field (public identity 65 B, secret scalar 32 B) had the wrong length.
+    InvalidFieldLength,
 }
 
 /// `SHA3-256(domain ‖ enclave_measurement)` — the measurement digest bound into the header + AAD.
@@ -168,6 +178,237 @@ pub fn unseal_keystore(
     Ok(Zeroizing::new(plain))
 }
 
+// ===========================================================================================
+// Keystore body — the canonical-CBOR plaintext sealed by the envelope above.
+// (`agent-gateway-keystore-backup-format.md` §Plaintext: config/identity, entry list, counter
+// high-water table, faucet state, audit ring.) All structs are `deny_unknown_fields` so an
+// unexpected field fails closed rather than being silently dropped on a forward-migration read.
+// ===========================================================================================
+
+/// Max key entries sealed in one keystore (AC#5 total-capacity guard, enforced before seal).
+pub const MAX_TOTAL_KEY_ENTRIES: usize = 4096;
+/// Max entries minted in a single `AGENT_K1_GENERATE_KEYS` batch (AC#5).
+pub const MAX_BATCH_SIZE: usize = 256;
+
+const SECP256K1_UNCOMPRESSED_LEN: usize = 65;
+const SECRET_SCALAR_LEN: usize = 32;
+
+/// Purpose of a stored key — singleton treasury/faucet source vs batch transfer-signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyPurpose {
+    AgentFaucetTreasuryK1,
+    AgentTransferK1,
+}
+
+/// Signing algorithm for a stored key (secp256k1 only in this slice).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAlgorithm {
+    Secp256k1,
+}
+
+/// Config-version + counter snapshot + batch id captured at key creation (AC#18 atomic keygen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreationMetadata {
+    pub config_version: u64,
+    pub counter_snapshot: u64,
+    pub batch_id: u64,
+}
+
+/// Per-entry DR-backup bookkeeping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupExportMetadata {
+    /// Monotonic export sequence at which this entry was last included in a backup (0 = never).
+    pub last_exported_seq: u64,
+}
+
+/// One stored agent key. The 32-byte secret scalar is **sealed here** (same-enclave restart
+/// material) and held in `Zeroizing` in memory; `Debug` redacts it so it never reaches a log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyEntry {
+    /// Opaque random handle returned to the host (never the secret or a guessable index).
+    pub key_ref: [u8; 32],
+    pub purpose: KeyPurpose,
+    pub algorithm: KeyAlgorithm,
+    /// Uncompressed SEC1 public identity (`0x04 || X || Y`, 65 bytes).
+    pub public_identity: Vec<u8>,
+    /// 32-byte secret scalar — confidential; zeroized on drop.
+    pub secret_scalar: Zeroizing<Vec<u8>>,
+    pub creation_metadata: CreationMetadata,
+    #[serde(default)]
+    pub backup_export_metadata: BackupExportMetadata,
+}
+
+impl core::fmt::Debug for KeyEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Never print the secret scalar.
+        f.debug_struct("KeyEntry")
+            .field("key_ref", &self.key_ref)
+            .field("purpose", &self.purpose)
+            .field("algorithm", &self.algorithm)
+            .field("public_identity", &self.public_identity)
+            .field("secret_scalar", &"<redacted>")
+            .field("creation_metadata", &self.creation_metadata)
+            .field("backup_export_metadata", &self.backup_export_metadata)
+            .finish()
+    }
+}
+
+/// One row of the counter high-water table (AC#8/#11): the highest accepted capability counter for
+/// a `(authority, environment, scope)` tuple. Acceptance rule (TASK-7.1): `incoming == highest+1`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterEntry {
+    pub authority: [u8; 32],
+    pub environment_identifier: String,
+    pub scope_class: u8,
+    pub scope_target: Vec<u8>,
+    pub highest_accepted_counter: u64,
+}
+
+/// Faucet caps + spend state (AC#8/#17). Amounts are big-endian `u256` (2D native token, per
+/// TASK-7.4). Spend counters are keyed independently of the treasury `key_ref`, so they survive
+/// treasury-key rotation (AC#17 — never reset on key replacement; arithmetic lives in TASK-7.4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaucetState {
+    pub per_dispense_max_amount: [u8; 32],
+    pub max_gas_limit: u64,
+    pub max_effective_gas_fee_rate: u64,
+    /// Refillable cumulative spend (resettable by treasury config).
+    pub cumulative_native_spend: [u8; 32],
+    /// Lifetime spend from genesis — never reset, even on treasury-key rotation.
+    pub lifetime_spend: [u8; 32],
+    /// Optional lifetime circuit-breaker threshold (TASK-7.4 §2).
+    pub circuit_breaker_threshold: Option<[u8; 32]>,
+}
+
+/// One privileged-op audit record (AC#14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRecord {
+    pub seq: u64,
+    pub op: u8,
+    pub authority: [u8; 32],
+    pub counter: u64,
+    pub config_version: u64,
+}
+
+/// Bounded audit ring + `last_exported_seq` backpressure (AC#14): privileged ops must fail closed
+/// rather than overwrite un-exported entries (enforcement lives with the mutation path, later).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRing {
+    pub records: Vec<AuditRecord>,
+    pub capacity: u32,
+    pub last_exported_seq: u64,
+    pub next_seq: u64,
+}
+
+/// Config / identity block (AC#8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeystoreConfig {
+    pub twod_chain_id: u64,
+    pub environment_identifier: String,
+    pub admin_authority_pk: [u8; 32],
+    pub recovery_authority_pk: [u8; 32],
+    /// Operator recovery **public** key for DR wrapping (ML-KEM-1024; private side stays offline).
+    pub backup_recovery_wrapping_pubkey: Vec<u8>,
+    pub monotonic_treasury_config_version: u64,
+    /// Reserved for a future authority-rotation task (no format bump needed).
+    pub authority_epoch: u64,
+}
+
+/// The full keystore plaintext: everything sealed inside one `pq-agent-keystore-v1` commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeystoreBody {
+    pub config: KeystoreConfig,
+    pub entries: Vec<KeyEntry>,
+    pub counters: Vec<CounterEntry>,
+    pub faucet: FaucetState,
+    pub audit: AuditRing,
+}
+
+/// `environment_identifier` rules (TASK-7.1 §10.6): UTF-8, length `1..=64`, `[a-z0-9-]`, no
+/// leading/trailing hyphen, no doubled hyphen.
+fn validate_environment_identifier(s: &str) -> Result<(), KeystoreError> {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > 64 {
+        return Err(KeystoreError::InvalidEnvironmentId);
+    }
+    if b[0] == b'-' || b[b.len() - 1] == b'-' {
+        return Err(KeystoreError::InvalidEnvironmentId);
+    }
+    let mut prev_hyphen = false;
+    for &c in b {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-';
+        if !ok {
+            return Err(KeystoreError::InvalidEnvironmentId);
+        }
+        if c == b'-' && prev_hyphen {
+            return Err(KeystoreError::InvalidEnvironmentId);
+        }
+        prev_hyphen = c == b'-';
+    }
+    Ok(())
+}
+
+impl KeystoreBody {
+    /// Structural validation enforced on both seal (before commit) and unseal (after decrypt):
+    /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
+    pub fn validate(&self) -> Result<(), KeystoreError> {
+        validate_environment_identifier(&self.config.environment_identifier)?;
+        if self.entries.len() > MAX_TOTAL_KEY_ENTRIES {
+            return Err(KeystoreError::CapacityExceeded);
+        }
+        for e in &self.entries {
+            if e.public_identity.len() != SECP256K1_UNCOMPRESSED_LEN {
+                return Err(KeystoreError::InvalidFieldLength);
+            }
+            if e.secret_scalar.len() != SECRET_SCALAR_LEN {
+                return Err(KeystoreError::InvalidFieldLength);
+            }
+        }
+        for c in &self.counters {
+            validate_environment_identifier(&c.environment_identifier)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate + canonical-CBOR-encode the body, then seal it (CSPRNG nonce). The transient CBOR
+/// buffer holds plaintext secrets and is zeroized on drop; the returned sealed blob is encrypted.
+pub fn seal_body(
+    body: &KeystoreBody,
+    provisioning_root: &[u8; 32],
+    enclave_measurement: &[u8],
+) -> Result<Vec<u8>, KeystoreError> {
+    body.validate()?;
+    let mut cbor = Zeroizing::new(Vec::new());
+    ciborium::ser::into_writer(body, &mut *cbor).map_err(|_| KeystoreError::Cbor)?;
+    seal_keystore(&cbor, provisioning_root, enclave_measurement)
+}
+
+/// Unseal + CBOR-decode + validate the keystore body. `deny_unknown_fields` + the post-decode
+/// `validate()` make an unexpected field or malformed entry fail closed (no best-effort parse).
+pub fn unseal_body(
+    blob: &[u8],
+    provisioning_root: &[u8; 32],
+    enclave_measurement: &[u8],
+) -> Result<KeystoreBody, KeystoreError> {
+    let cbor = unseal_keystore(blob, provisioning_root, enclave_measurement)?;
+    let body: KeystoreBody =
+        ciborium::de::from_reader(&cbor[..]).map_err(|_| KeystoreError::Cbor)?;
+    body.validate()?;
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +518,159 @@ mod tests {
             h.finalize().into()
         };
         assert_ne!(&keystore_key[..], &producer_key[..], "keystore vs producer AEAD key must differ");
+    }
+
+    // --- keystore body (CBOR plaintext) ---
+
+    fn sample_entry(purpose: KeyPurpose, secret_fill: u8, pub_fill: u8, key_ref_fill: u8) -> KeyEntry {
+        let mut public_identity = vec![0x04u8; SECP256K1_UNCOMPRESSED_LEN];
+        for b in public_identity[1..].iter_mut() {
+            *b = pub_fill;
+        }
+        KeyEntry {
+            key_ref: [key_ref_fill; 32],
+            purpose,
+            algorithm: KeyAlgorithm::Secp256k1,
+            public_identity,
+            secret_scalar: Zeroizing::new(vec![secret_fill; SECRET_SCALAR_LEN]),
+            creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 7 },
+            backup_export_metadata: BackupExportMetadata::default(),
+        }
+    }
+
+    fn sample_body() -> KeystoreBody {
+        KeystoreBody {
+            config: KeystoreConfig {
+                twod_chain_id: 11565,
+                environment_identifier: "mainnet".to_string(),
+                admin_authority_pk: [0xa1; 32],
+                recovery_authority_pk: [0xa2; 32],
+                backup_recovery_wrapping_pubkey: vec![0xb0; 1568],
+                monotonic_treasury_config_version: 3,
+                authority_epoch: 0,
+            },
+            entries: vec![
+                sample_entry(KeyPurpose::AgentFaucetTreasuryK1, 0x77, 0x33, 0x01),
+                sample_entry(KeyPurpose::AgentTransferK1, 0x88, 0x44, 0x02),
+            ],
+            counters: vec![CounterEntry {
+                authority: [0xa1; 32],
+                environment_identifier: "mainnet".to_string(),
+                scope_class: 1,
+                scope_target: vec![0x10, 0x20, 0x30],
+                highest_accepted_counter: 42,
+            }],
+            faucet: FaucetState {
+                per_dispense_max_amount: [0; 32],
+                max_gas_limit: 21000,
+                max_effective_gas_fee_rate: 100,
+                cumulative_native_spend: [0; 32],
+                lifetime_spend: [0; 32],
+                circuit_breaker_threshold: None,
+            },
+            audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
+        }
+    }
+
+    #[test]
+    fn body_round_trip() {
+        let body = sample_body();
+        let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
+        let out = unseal_body(&blob, &ROOT, MEAS_A).unwrap();
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn body_no_plaintext_secret_leak() {
+        let body = sample_body(); // treasury secret 0x77×32, transfer secret 0x88×32
+        let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
+        assert!(
+            !blob.windows(SECRET_SCALAR_LEN).any(|w| w == [0x77u8; SECRET_SCALAR_LEN]),
+            "treasury secret scalar must not appear in the sealed blob"
+        );
+        assert!(
+            !blob.windows(SECRET_SCALAR_LEN).any(|w| w == [0x88u8; SECRET_SCALAR_LEN]),
+            "transfer secret scalar must not appear in the sealed blob"
+        );
+    }
+
+    #[test]
+    fn environment_identifier_rules() {
+        for ok in ["mainnet", "test-net-2", "a", "x9", "2d"] {
+            assert!(validate_environment_identifier(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", "-x", "x-", "a--b", "Main", "x_y", "под"] {
+            assert_eq!(
+                validate_environment_identifier(bad),
+                Err(KeystoreError::InvalidEnvironmentId),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(validate_environment_identifier(&"a".repeat(64)).is_ok());
+        assert_eq!(
+            validate_environment_identifier(&"a".repeat(65)),
+            Err(KeystoreError::InvalidEnvironmentId)
+        );
+    }
+
+    #[test]
+    fn capacity_exceeded_rejected() {
+        let mut body = sample_body();
+        body.entries = (0..(MAX_TOTAL_KEY_ENTRIES + 1))
+            .map(|_| sample_entry(KeyPurpose::AgentTransferK1, 0x01, 0x02, 0x03))
+            .collect();
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+    }
+
+    #[test]
+    fn invalid_field_length_rejected() {
+        let mut body = sample_body();
+        body.entries[0].secret_scalar = Zeroizing::new(vec![0x77; SECRET_SCALAR_LEN - 1]);
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+
+        let mut body2 = sample_body();
+        body2.entries[0].public_identity = vec![0x04; SECP256K1_UNCOMPRESSED_LEN - 1];
+        assert_eq!(seal_body(&body2, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+    }
+
+    #[test]
+    fn invalid_environment_id_rejected_on_seal() {
+        let mut body = sample_body();
+        body.config.environment_identifier = "Main--net".to_string();
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidEnvironmentId));
+    }
+
+    #[test]
+    fn deny_unknown_fields_rejected() {
+        use ciborium::value::Value;
+        // A CreationMetadata map carrying an extra, unmodeled field must fail to decode.
+        let with_extra = Value::Map(vec![
+            (Value::from("config_version"), Value::from(1u64)),
+            (Value::from("counter_snapshot"), Value::from(2u64)),
+            (Value::from("batch_id"), Value::from(3u64)),
+            (Value::from("bogus"), Value::from(9u64)),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&with_extra, &mut buf).unwrap();
+        let r: Result<CreationMetadata, _> = ciborium::de::from_reader(&buf[..]);
+        assert!(r.is_err(), "deny_unknown_fields must reject the extra 'bogus' key");
+
+        // Sanity: the same map without the extra key decodes.
+        let clean = Value::Map(vec![
+            (Value::from("config_version"), Value::from(1u64)),
+            (Value::from("counter_snapshot"), Value::from(2u64)),
+            (Value::from("batch_id"), Value::from(3u64)),
+        ]);
+        let mut buf2 = Vec::new();
+        ciborium::ser::into_writer(&clean, &mut buf2).unwrap();
+        let cm: CreationMetadata = ciborium::de::from_reader(&buf2[..]).unwrap();
+        assert_eq!(cm, CreationMetadata { config_version: 1, counter_snapshot: 2, batch_id: 3 });
+    }
+
+    #[test]
+    fn body_measurement_binding() {
+        let body = sample_body();
+        let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
+        assert_eq!(unseal_body(&blob, &ROOT, MEAS_B), Err(KeystoreError::MeasurementMismatch));
     }
 }
