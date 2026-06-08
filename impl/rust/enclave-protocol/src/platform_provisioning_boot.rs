@@ -3,7 +3,8 @@
 //! Production images call [`set_pq_seal_v1_provisioning_root`] from vTPM / SNP / Nitro integration.
 //! This module provides a single boot entrypoint and an optional file-based loader for local labs.
 
-use crate::pq_signer::set_pq_seal_v1_provisioning_root;
+#[cfg(feature = "ml-dsa-65")]
+use crate::seal_root::set_pq_seal_v1_provisioning_root;
 use crate::ProtocolError;
 
 /// Configure the PQ seal v1 provisioning root once at enclave boot (before `install_sealed_pq_signer`).
@@ -56,10 +57,12 @@ fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], Proto
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
-    use crate::pq_signer::{
-        is_platform_pq_seal_v1_provisioning_root_set, SealedSignerTestGuard,
-    };
+    #[cfg(feature = "ml-dsa-65")]
+    use crate::pq_signer::SealedSignerTestGuard;
+    #[cfg(feature = "ml-dsa-65")]
+    use crate::seal_root::is_platform_pq_seal_v1_provisioning_root_set;
 
     #[cfg(all(
         feature = "ml-dsa-65",

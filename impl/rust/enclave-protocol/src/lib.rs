@@ -86,6 +86,8 @@ mod host_test_fixtures;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
 mod pq_signer;
+// Shared platform provisioning root (producer pq-seal-v1 + agent pq-agent-keystore-v1); always built.
+mod seal_root;
 /// SEV-SNP attestation report fetch (configfs-tsm) + launch-measurement extraction (TASK-5 Phase 3).
 pub mod snp_report;
 /// Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). Off by default — not part
@@ -163,11 +165,15 @@ pub use pq_signer::{
 #[cfg(feature = "ml-dsa-65")]
 pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
 pub use uds_listen::{bind_unix_listener, default_dev_socket_dir};
+// Shared provisioning-root API — always available so both the producer and the agent profile can
+// set/check the platform root at boot (the secret + KDFs stay role-separated; see `seal_root`).
+pub use seal_root::{
+    is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
+    set_pq_seal_v1_provisioning_root,
+};
 #[cfg(feature = "ml-dsa-65")]
 pub use pq_signer::{
-    is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
-    pq_seal_v1_expected_blob_len,
-    pq_seal_v1_measurement_digest, set_pq_seal_v1_provisioning_root, SEALED_BLOB_V1_MAGIC,
+    pq_seal_v1_expected_blob_len, pq_seal_v1_measurement_digest, SEALED_BLOB_V1_MAGIC,
     SEALED_BLOB_V1_HEADER_LEN, SEALED_BLOB_V1_VERSION,
 };
 #[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]
