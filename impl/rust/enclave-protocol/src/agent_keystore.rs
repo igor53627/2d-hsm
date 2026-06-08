@@ -211,6 +211,9 @@ pub const MAX_AUDIT_CAPACITY: u32 = 65_536;
 
 const SECP256K1_UNCOMPRESSED_LEN: usize = 65;
 const SECRET_SCALAR_LEN: usize = 32;
+/// ML-KEM-1024 encapsulation (public) key length, FIPS 203 (the DR-backup wrapping key). v1 wraps
+/// to a single ML-KEM-1024 key; a future `X25519+ML-KEM` hybrid would be a `format_version` bump.
+const ML_KEM_1024_ENCAPS_KEY_LEN: usize = 1568;
 
 /// Purpose of a stored key — singleton treasury/faucet source vs batch transfer-signing key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,7 +346,9 @@ pub struct KeystoreConfig {
     pub authority_epoch: u64,
     /// Pinned anti-rollback **anchor** identity — the Ed25519 public key the enclave verifies the
     /// anchor's freshness responses against (TASK-7.7). 7.2 only **stores** it; 7.7 owns the
-    /// mechanism. Installed at provisioning; changing it is a reviewed `format_version` bump.
+    /// mechanism. Installed at provisioning. Rotating this value is a reviewed reprovision/reseal
+    /// transition (a new sealed config), **not** a `format_version` bump — `format_version` changes
+    /// only for incompatible on-disk layout/encoding changes.
     pub anchor_root: [u8; 32],
 }
 
@@ -392,6 +397,10 @@ impl KeystoreBody {
     /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
     pub fn validate(&self) -> Result<(), KeystoreError> {
         validate_environment_identifier(&self.config.environment_identifier)?;
+        // The DR-backup wrapping key must be a well-formed ML-KEM-1024 encapsulation key.
+        if self.config.backup_recovery_wrapping_pubkey.len() != ML_KEM_1024_ENCAPS_KEY_LEN {
+            return Err(KeystoreError::InvalidFieldLength);
+        }
         if self.entries.len() > MAX_TOTAL_KEY_ENTRIES
             || self.counters.len() > MAX_COUNTER_ENTRIES
         {
@@ -472,8 +481,14 @@ pub fn unseal_body(
     enclave_measurement: &[u8],
 ) -> Result<KeystoreBody, KeystoreError> {
     let cbor = unseal_keystore(blob, provisioning_root, enclave_measurement)?;
+    // Decode through a cursor and require the WHOLE plaintext to be consumed: a valid body prefix
+    // followed by trailing bytes must fail closed (strict format contract, no best-effort parse).
+    let mut cursor = std::io::Cursor::new(&cbor[..]);
     let body: KeystoreBody =
-        ciborium::de::from_reader(&cbor[..]).map_err(|_| KeystoreError::Cbor)?;
+        ciborium::de::from_reader(&mut cursor).map_err(|_| KeystoreError::Cbor)?;
+    if cursor.position() != cbor.len() as u64 {
+        return Err(KeystoreError::Cbor);
+    }
     body.validate()?;
     Ok(body)
 }
@@ -765,6 +780,50 @@ mod tests {
         assert_eq!(unseal_body(&blob, &ROOT, MEAS_B), Err(KeystoreError::MeasurementMismatch));
     }
 
+    #[test]
+    fn counter_environment_must_match_config() {
+        let mut body = sample_body();
+        body.counters[0].environment_identifier = "testnet".to_string(); // valid format, wrong env
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidEnvironmentId));
+    }
+
+    #[test]
+    fn wrapping_pubkey_length_enforced() {
+        let mut body = sample_body();
+        body.config.backup_recovery_wrapping_pubkey = vec![0xb0; 32]; // not ML-KEM-1024 size
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+    }
+
+    #[test]
+    fn audit_records_cannot_exceed_capacity() {
+        let mut body = sample_body();
+        body.audit.capacity = 2;
+        body.audit.records = vec![
+            AuditRecord { seq: 1, op: 1, authority: [0; 32], counter: 1, config_version: 1 };
+            3
+        ];
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+    }
+
+    #[test]
+    fn audit_capacity_bounded() {
+        let mut body = sample_body();
+        body.audit.capacity = MAX_AUDIT_CAPACITY + 1;
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+    }
+
+    #[test]
+    fn unseal_body_rejects_trailing_bytes() {
+        // Seal a body's CBOR with extra trailing bytes through the raw envelope; unseal_body must
+        // reject it (strict full-consumption parse), not accept the valid prefix.
+        let body = sample_body();
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&body, &mut cbor).unwrap();
+        cbor.extend_from_slice(b"trailing-garbage");
+        let blob = seal_keystore(&cbor, &ROOT, MEAS_A).unwrap();
+        assert_eq!(unseal_body(&blob, &ROOT, MEAS_A), Err(KeystoreError::Cbor));
+    }
+
     // --- frozen golden vector (format-drift guard) ---
 
     const GOLDEN_ROOT: [u8; 32] = [0x3c; 32];
@@ -782,7 +841,7 @@ mod tests {
                 environment_identifier: "mainnet".to_string(),
                 admin_authority_pk: [0x01; 32],
                 recovery_authority_pk: [0x02; 32],
-                backup_recovery_wrapping_pubkey: vec![0xab, 0xcd, 0xef, 0x10],
+                backup_recovery_wrapping_pubkey: vec![0xab; ML_KEM_1024_ENCAPS_KEY_LEN],
                 monotonic_treasury_config_version: 1,
                 authority_epoch: 0,
                 anchor_root: [0x03; 32],
@@ -829,7 +888,7 @@ mod tests {
         };
         assert_eq!(
             (blob.len(), hex::encode(digest)),
-            (1102usize, "18700ccb7c446e93bc4798997e440fc74f72383f86d90e8ed749305fc408afdc".to_string()),
+            (4233usize, "c55edc09ac4eeb1349887e64a175838045f5a4c704637fc994f8628adc3ec4df".to_string()),
             "keystore golden blob changed — if intentional, bump format_version + update this vector"
         );
 
