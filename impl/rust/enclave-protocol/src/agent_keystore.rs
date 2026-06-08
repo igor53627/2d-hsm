@@ -233,6 +233,18 @@ pub const MAX_COUNTER_ENTRIES: usize = 65_536;
 /// Bound on the audit ring capacity (and therefore the materialized record vector).
 pub const MAX_AUDIT_CAPACITY: u32 = 65_536;
 
+/// Headroom reserved below `MAX_MESSAGE_SIZE` for the framing that wraps a sealed keystore when it
+/// is transmitted back into the enclave: the 2-byte frame header (version+type, `lib.rs:261`), the
+/// wire length prefix, and the Agent Gateway install/restore CBOR envelope around the blob (defined
+/// in TASK-7.6.3). Generously sized — the install/restore encoder MUST also honor
+/// [`MAX_KEYSTORE_BLOB_SIZE`] so a sealed blob is always re-installable.
+const KEYSTORE_FRAMING_RESERVE: usize = 1024;
+/// Max sealed keystore blob size. A larger blob could seal but be impossible to send back into the
+/// enclave over vsock (frame + envelope would exceed `MAX_MESSAGE_SIZE`) → permanent lockout, since
+/// Nitro persists the sealed blob via the untrusted host and re-installs it on boot.
+pub const MAX_KEYSTORE_BLOB_SIZE: usize =
+    (crate::MAX_MESSAGE_SIZE as usize) - KEYSTORE_FRAMING_RESERVE;
+
 const SECP256K1_UNCOMPRESSED_LEN: usize = 65;
 const SECRET_SCALAR_LEN: usize = 32;
 /// ML-KEM-1024 encapsulation (public) key length, FIPS 203 (the DR-backup wrapping key). v1 wraps
@@ -498,9 +510,10 @@ pub fn seal_body(
     ciborium::ser::into_writer(body, &mut counter).map_err(|_| KeystoreError::Cbor)?;
     // The sealed blob is persisted by the (untrusted) host and re-installed over vsock on boot —
     // Nitro enclaves have no persistent storage. Reject any body whose sealed size would exceed the
-    // vsock MAX_MESSAGE_SIZE budget, so a too-large keystore fails closed at seal time rather than
-    // becoming an un-loadable blob (permanent lockout) at install time.
-    if HEADER_LEN + counter.0 + TAG_LEN > crate::MAX_MESSAGE_SIZE as usize {
+    // install budget (MAX_MESSAGE_SIZE minus frame + CBOR-envelope headroom), so a too-large
+    // keystore fails closed at seal time rather than becoming an un-loadable blob (lockout) when it
+    // is framed and sent back at install time.
+    if HEADER_LEN + counter.0 + TAG_LEN > MAX_KEYSTORE_BLOB_SIZE {
         return Err(KeystoreError::BlobTooLarge);
     }
     // Pass 2: serialize into an exact-capacity Zeroizing buffer (no reallocation → no leaked copy).
