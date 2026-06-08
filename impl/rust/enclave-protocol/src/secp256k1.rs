@@ -21,6 +21,8 @@ pub enum Secp256k1Error {
     Csprng,
     /// Secret scalar invalid (zero or >= group order).
     InvalidSecret,
+    /// Public key is not a well-formed uncompressed SEC1 point (`0x04 || X || Y`).
+    InvalidPublicKey,
     /// Signing failed.
     Sign,
     /// Signature/recovery-id malformed or public-key recovery failed.
@@ -83,8 +85,15 @@ impl Keypair {
     }
 
     /// 2D / Ethereum 20-byte address: `keccak256(X || Y)[12..32]`.
+    ///
+    /// Infallible: the verifying key's uncompressed encoding is always `0x04 || X || Y`, so this
+    /// derives directly from `X || Y` rather than forcing callers to handle an impossible error.
     pub fn eth_address(&self) -> [u8; 20] {
-        eth_address_from_uncompressed(&self.public_key_uncompressed())
+        let pk = self.public_key_uncompressed();
+        let hash = keccak256(&pk[1..]);
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&hash[12..]);
+        out
     }
 
     /// TRON address: Base58Check(`0x41 || body20`) over the same 20-byte body (unified account).
@@ -133,11 +142,17 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 }
 
 /// eth address from an uncompressed SEC1 pubkey (`0x04 || X || Y`): `keccak256(X || Y)[12..32]`.
-pub fn eth_address_from_uncompressed(pubkey65: &[u8; 65]) -> [u8; 20] {
+///
+/// Validates the `0x04` prefix for untrusted input — a compressed/malformed prefix would otherwise
+/// silently hash the wrong 64 bytes and yield a bogus address.
+pub fn eth_address_from_uncompressed(pubkey65: &[u8; 65]) -> Result<[u8; 20], Secp256k1Error> {
+    if pubkey65[0] != 0x04 {
+        return Err(Secp256k1Error::InvalidPublicKey);
+    }
     let hash = keccak256(&pubkey65[1..]);
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash[12..]);
-    out
+    Ok(out)
 }
 
 /// TRON Base58Check address from the 20-byte body: Base58(`0x41 || body || dsha256(0x41||body)[..4]`).
@@ -245,7 +260,7 @@ mod tests {
         );
         let rec = recover_pubkey_uncompressed(&h, &sig).unwrap();
         assert_eq!(
-            eth_address_from_uncompressed(&rec).to_vec(),
+            eth_address_from_uncompressed(&rec).unwrap().to_vec(),
             unhex(o["recovered_from"].as_str().unwrap()),
             "recovered from"
         );
@@ -299,5 +314,15 @@ mod tests {
         assert!(eth_head >= 0xc0, "eth RLP list head >= 0xc0");
         assert_eq!(id_head, 0x19, "identity EIP-191 0x19");
         assert!(id_head < 0xc0 && eth_head != id_head, "disjoint domains");
+    }
+
+    #[test]
+    fn eth_address_rejects_non_uncompressed_prefix() {
+        let mut bad = [0x04u8; 65];
+        bad[0] = 0x02; // not an uncompressed SEC1 point
+        assert_eq!(
+            eth_address_from_uncompressed(&bad),
+            Err(Secp256k1Error::InvalidPublicKey)
+        );
     }
 }
