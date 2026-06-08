@@ -448,8 +448,13 @@ fn handle_generate_keys(
     let creation = CreationMetadata {
         config_version: keystore.config.monotonic_treasury_config_version,
         counter_snapshot: verified.counter,
+        // batch_id = the capability counter: the per-(authority, scope_class, scope_target) batch
+        // SEQUENCE number, not a global id — full provenance is (authority, scope, batch_id).
         batch_id: verified.counter,
     };
+    // NOTE (deferred, AC#14): a privileged-op audit record (op, authority, counter, config_version)
+    // into `candidate.audit` + the last_exported_seq backpressure is NOT written here yet — it lands
+    // with the audit-ring slice (tracked as a TASK-7.6 follow-up).
     let keys =
         generate_keys(&mut candidate, purpose, count_usize, creation).map_err(map_keygen_error)?;
     candidate
@@ -459,7 +464,12 @@ fn handle_generate_keys(
             &verified.scope_target,
             verified.counter,
         )
-        .map_err(|_| AgentError::SealFailed)?;
+        .map_err(|e| match e {
+            // Counter table full → CapExceeded (0x44); a regression / anything else is an internal
+            // invariant break → fail closed (0x46), no swap.
+            crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
+            _ => AgentError::SealFailed,
+        })?;
     Ok(AgentResponse::GenerateKeys { keys, candidate: Box::new(candidate) })
 }
 
@@ -604,10 +614,17 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
             (Value::Integer(4.into()), Value::Bytes(proof.address.to_vec())),
             (Value::Integer(5.into()), Value::Bytes(proof.pubkey_uncompressed.to_vec())),
         ]),
-        // GENERATE_KEYS is normally encoded by the frame layer WITH the sealed blob
-        // (`encode_generate_keys_response`); this arm only keeps the match exhaustive (e.g. a direct
-        // `encode_agent_response` call in a unit test) — the sealed blob is then empty.
-        AgentResponse::GenerateKeys { keys, .. } => encode_generate_keys_response(keys, &[]),
+        // GENERATE_KEYS MUST be encoded by the frame layer WITH its sealed blob
+        // (`encode_generate_keys_response`); reaching the generic encoder would emit a persist-less
+        // (blob-less) success. Catch the misuse in debug/test; in release fail closed to an error body
+        // rather than fabricate a success the host can't persist.
+        AgentResponse::GenerateKeys { .. } => {
+            debug_assert!(
+                false,
+                "GenerateKeys must be encoded by the frame layer with its sealed blob"
+            );
+            encode_agent_error(AgentError::SealFailed)
+        }
     }
 }
 

@@ -86,7 +86,10 @@ mod host_test_fixtures;
 #[cfg(feature = "ml-dsa-65")]
 mod mldsa65;
 mod pq_signer;
-// Shared platform provisioning root (producer pq-seal-v1 + agent pq-agent-keystore-v1); always built.
+// Shared platform provisioning root (producer pq-seal-v1 + agent pq-agent-keystore-v1). Compiled only
+// for the seal-capable profiles — it uses the optional `zeroize` dep that only those features pull in,
+// so the bare no-feature build must not include it.
+#[cfg(any(feature = "ml-dsa-65", feature = "agent-gateway"))]
 mod seal_root;
 /// SEV-SNP attestation report fetch (configfs-tsm) + launch-measurement extraction (TASK-5 Phase 3).
 pub mod snp_report;
@@ -165,8 +168,9 @@ pub use pq_signer::{
 #[cfg(feature = "ml-dsa-65")]
 pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
 pub use uds_listen::{bind_unix_listener, default_dev_socket_dir};
-// Shared provisioning-root API — always available so both the producer and the agent profile can
+// Shared provisioning-root API — available to both the producer and the agent profile so each can
 // set/check the platform root at boot (the secret + KDFs stay role-separated; see `seal_root`).
+#[cfg(any(feature = "ml-dsa-65", feature = "agent-gateway"))]
 pub use seal_root::{
     is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
     set_pq_seal_v1_provisioning_root,
