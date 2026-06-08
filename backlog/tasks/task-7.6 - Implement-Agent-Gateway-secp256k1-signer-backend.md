@@ -1,9 +1,10 @@
 ---
 id: TASK-7.6
 title: Implement Agent Gateway secp256k1 signer backend
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
+updated_date: '2026-06-08 08:09'
 labels:
   - agent-gateway
   - secp256k1
