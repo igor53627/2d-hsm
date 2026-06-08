@@ -16,7 +16,11 @@
 //!
 //! Built only under the `agent-gateway` feature.
 
-use crate::secp256k1::{keccak256, Keypair, RecoverableSignature, Secp256k1Error};
+use crate::agent_keystore::{KeyEntry, KeyPurpose, KeystoreBody};
+use crate::secp256k1::{
+    eth_address_from_uncompressed, keccak256, tron_address_from_body, Keypair, RecoverableSignature,
+    Secp256k1Error,
+};
 
 /// EIP-191 non-transaction domain byte (disjoint from eth RLP `≥0xc0` and TRON protobuf `0x0a`).
 const EIP191_DOMAIN: u8 = 0x19;
@@ -105,9 +109,54 @@ pub fn sign_identity_proof(
     Ok(IdentityProof { signature, pubkey_uncompressed, address, signing_hash })
 }
 
+/// Agent Gateway backend version reported with the public identity (TASK-7.1 §10).
+pub const AGENT_GATEWAY_VERSION: u8 = 1;
+
+/// The `AGENT_K1_PUBLIC_IDENTITY` response (TASK-7.3 §AC#4): the unified-account public identity for
+/// one stored key. `key_purpose` is **non-authoritative** convenience metadata (returned over the
+/// untrusted host path) — a verifier authenticates a key by its signed address, never by this field.
+pub struct PublicIdentity {
+    pub pubkey_uncompressed: [u8; 65],
+    pub eth_address: [u8; 20],
+    pub tron_address: String,
+    pub key_ref: [u8; 32],
+    pub key_purpose: KeyPurpose,
+    pub agent_version: u8,
+}
+
+/// Look up a sealed `KeyEntry` by its opaque `key_ref` (linear scan over the sealed entry list).
+/// Returns `None` if absent — the caller collapses not-found into the anti-oracle error band so it
+/// is indistinguishable from a key-purpose mismatch (TASK-7.3 §error exposure).
+pub fn find_entry<'a>(body: &'a KeystoreBody, key_ref: &[u8; 32]) -> Option<&'a KeyEntry> {
+    body.entries.iter().find(|e| &e.key_ref == key_ref)
+}
+
+/// Build the `PUBLIC_IDENTITY` response from a sealed entry, deriving both addresses from the
+/// entry's stored uncompressed SEC1 public identity. Re-validates the `0x04` prefix + on-curve point
+/// (defense-in-depth — the keystore is trusted, but a malformed entry fails closed rather than
+/// emitting a bogus address). Chain/environment/domain checks live in the dispatch layer.
+pub fn public_identity_from_entry(entry: &KeyEntry) -> Result<PublicIdentity, Secp256k1Error> {
+    let pubkey_uncompressed: [u8; 65] = entry
+        .public_identity
+        .as_slice()
+        .try_into()
+        .map_err(|_| Secp256k1Error::InvalidPublicKey)?;
+    let eth_address = eth_address_from_uncompressed(&pubkey_uncompressed)?;
+    let tron_address = tron_address_from_body(&eth_address);
+    Ok(PublicIdentity {
+        pubkey_uncompressed,
+        eth_address,
+        tron_address,
+        key_ref: entry.key_ref,
+        key_purpose: entry.purpose,
+        agent_version: AGENT_GATEWAY_VERSION,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_keystore::{BackupExportMetadata, CreationMetadata, KeyAlgorithm};
     use serde_json::Value;
 
     const IDP: &str = include_str!("../testvectors/agent-gateway/identity_proof_v1.json");
@@ -205,5 +254,80 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert!(c.len() < a.len(), "shorter env-id ⇒ shorter preimage");
+    }
+
+    // --- PUBLIC_IDENTITY ---
+
+    fn entry_from_keys(name: &str, purpose: KeyPurpose, key_ref: [u8; 32]) -> KeyEntry {
+        let k: Value = serde_json::from_str(KEYS).unwrap();
+        KeyEntry {
+            key_ref,
+            purpose,
+            algorithm: KeyAlgorithm::Secp256k1,
+            public_identity: unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+            secret_scalar: zeroize::Zeroizing::new(vec![0u8; 32]), // unused by PUBLIC_IDENTITY
+            creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+            backup_export_metadata: BackupExportMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn public_identity_derives_pinned_addresses() {
+        let k: Value = serde_json::from_str(KEYS).unwrap();
+        for (name, purpose) in [
+            ("transfer_key", KeyPurpose::AgentTransferK1),
+            ("treasury_key", KeyPurpose::AgentFaucetTreasuryK1),
+        ] {
+            let entry = entry_from_keys(name, purpose, [0x07; 32]);
+            let id = public_identity_from_entry(&entry).unwrap();
+            assert_eq!(
+                id.pubkey_uncompressed.to_vec(),
+                unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+                "{name} pubkey"
+            );
+            assert_eq!(
+                format!("0x{}", hex::encode(id.eth_address)),
+                k[name]["eth_address"].as_str().unwrap(),
+                "{name} eth address"
+            );
+            assert_eq!(id.tron_address, k[name]["tron_address"].as_str().unwrap(), "{name} TRON address");
+            assert_eq!(id.key_purpose, purpose, "{name} purpose");
+            assert_eq!(id.agent_version, AGENT_GATEWAY_VERSION);
+        }
+    }
+
+    #[test]
+    fn find_entry_by_key_ref() {
+        use crate::agent_keystore::{AuditRing, FaucetState, KeystoreConfig};
+        let body = KeystoreBody {
+            config: KeystoreConfig {
+                twod_chain_id: 11565,
+                environment_identifier: "testnet".to_string(),
+                admin_authority_pk: [0; 32],
+                recovery_authority_pk: [0; 32],
+                backup_recovery_wrapping_pubkey: vec![],
+                monotonic_treasury_config_version: 0,
+                authority_epoch: 0,
+                anchor_root: [0; 32],
+            },
+            entries: vec![
+                entry_from_keys("transfer_key", KeyPurpose::AgentTransferK1, [0x11; 32]),
+                entry_from_keys("treasury_key", KeyPurpose::AgentFaucetTreasuryK1, [0x22; 32]),
+            ],
+            counters: vec![],
+            faucet: FaucetState {
+                per_dispense_max_amount: [0; 32],
+                max_gas_limit: 0,
+                max_effective_gas_fee_rate: 0,
+                cumulative_native_spend: [0; 32],
+                lifetime_spend: [0; 32],
+                circuit_breaker_threshold: None,
+            },
+            audit: AuditRing { records: vec![], capacity: 0, last_exported_seq: 0, next_seq: 0 },
+            freshness_epoch: 0,
+        };
+        assert_eq!(find_entry(&body, &[0x11; 32]).unwrap().purpose, KeyPurpose::AgentTransferK1);
+        assert_eq!(find_entry(&body, &[0x22; 32]).unwrap().purpose, KeyPurpose::AgentFaucetTreasuryK1);
+        assert!(find_entry(&body, &[0xff; 32]).is_none(), "unknown key_ref ⇒ None");
     }
 }
