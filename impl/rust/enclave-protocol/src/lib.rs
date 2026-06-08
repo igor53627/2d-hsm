@@ -84,6 +84,9 @@ pub mod agent_keystore;
 // Agent Gateway identity proof (TASK-7.6.3). EIP-191 0x19 PROVE_IDENTITY preimage + signer.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_identity;
+// Agent Gateway key generation (TASK-7.6.3). GENERATE_KEYS keystore-mutation core.
+#[cfg(feature = "agent-gateway")]
+pub mod agent_keygen;
 mod wire;
 
 use serde::{Deserialize, Serialize};
