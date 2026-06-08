@@ -51,20 +51,20 @@ pub(crate) fn as_bytes32(v: &Value) -> Option<[u8; 32]> {
 
 /// Strict integer-key check for a decoded wire map: every key is an integer accepted by `allowed`
 /// and **no key repeats**. Returns `false` on any violation so the caller can map it to its own
-/// `Malformed` band. Supports keys in `1..=16` (every agent-gateway schema uses keys ≤ 13); a key of
-/// `0` or `> 16` is rejected **before** the bitmask shift, so a hostile key can never trigger a shift
-/// over/underflow (the `allowed` predicate is checked first, but the explicit bound is defence in
-/// depth against a future over-wide predicate).
+/// `Malformed` band. Supports keys in `1..=64` (every agent-gateway schema uses keys ≤ 13; the bound
+/// matches `MAX_MAP_ENTRIES`); a key of `0` or `> 64` is rejected **before** the bitmask shift, so a
+/// hostile key can never trigger a shift over/underflow (the `allowed` predicate is checked first, but
+/// the explicit bound is defence in depth against a future over-wide predicate).
 pub(crate) fn check_strict_keys(map: &[(Value, Value)], allowed: impl Fn(u64) -> bool) -> bool {
-    let mut seen: u16 = 0;
+    let mut seen: u64 = 0;
     for (k, _) in map {
         let Some(n) = as_u64(k) else {
             return false;
         };
-        if !allowed(n) || !(1..=16).contains(&n) {
+        if !allowed(n) || !(1..=64).contains(&n) {
             return false;
         }
-        let bit = 1u16 << (n - 1);
+        let bit = 1u64 << (n - 1);
         if seen & bit != 0 {
             return false; // duplicate key
         }
