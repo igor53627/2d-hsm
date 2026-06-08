@@ -4,10 +4,14 @@ title: Agent Gateway transfer + faucet signing + caps impl (TASK-7.6.4)
 status: To Do
 assignee: []
 created_date: '2026-06-08 08:09'
+updated_date: '2026-06-08 08:24'
 labels:
   - agent-gateway
   - implementation
-dependencies: []
+dependencies:
+  - TASK-12
+  - TASK-13
+  - TASK-14
 ordinal: 19000
 ---
 

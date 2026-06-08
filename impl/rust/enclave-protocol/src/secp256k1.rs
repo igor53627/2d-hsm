@@ -94,19 +94,32 @@ impl Keypair {
     }
 
     /// RFC 6979 deterministic, low-S normalized, recoverable signature over a 32-byte prehash.
-    /// Signs only a precomputed keccak256 hash — there is no arbitrary/generic-digest entry point.
-    pub fn sign_prehashed(&self, hash32: &[u8; 32]) -> Result<RecoverableSignature, Secp256k1Error> {
+    ///
+    /// **Crate-internal** (`pub(crate)`): there is intentionally no public, caller-reachable signing
+    /// entry point that takes an arbitrary digest — that is the no-generic-digest invariant. The
+    /// public, structured EIP-155 / EIP-191 signers (TASK-7.6.3/7.6.4) build the keccak256 preimage
+    /// internally and call this primitive; external crates cannot reach it.
+    pub(crate) fn sign_prehashed(
+        &self,
+        hash32: &[u8; 32],
+    ) -> Result<RecoverableSignature, Secp256k1Error> {
         let (sig, rid): (Signature, RecoveryId) = self
             .signing_key
             .sign_prehash_recoverable(hash32)
             .map_err(|_| Secp256k1Error::Sign)?;
         // ecdsa `SigningKey` normalizes S to the low half by default; `rid` accounts for the flip.
+        // Reject the (astronomically rare) x-reduced recovery ids 2/3: EIP-155 `v = chain_id*2+35+rid`
+        // expects y-parity only (0/1), so fail closed rather than emit a `v` the 2D verifier rejects.
+        let recovery_id = rid.to_byte();
+        if recovery_id > 1 {
+            return Err(Secp256k1Error::Sign);
+        }
         let bytes = sig.to_bytes();
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];
         r.copy_from_slice(&bytes[..32]);
         s.copy_from_slice(&bytes[32..]);
-        Ok(RecoverableSignature { r, s, recovery_id: rid.to_byte() })
+        Ok(RecoverableSignature { r, s, recovery_id })
     }
 }
 

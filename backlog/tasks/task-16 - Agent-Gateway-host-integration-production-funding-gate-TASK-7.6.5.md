@@ -4,12 +4,14 @@ title: Agent Gateway host integration + production-funding gate (TASK-7.6.5)
 status: To Do
 assignee: []
 created_date: '2026-06-08 08:09'
+updated_date: '2026-06-08 08:24'
 labels:
   - agent-gateway
   - opa
   - vault
   - implementation
-dependencies: []
+dependencies:
+  - TASK-15
 ordinal: 20000
 ---
 

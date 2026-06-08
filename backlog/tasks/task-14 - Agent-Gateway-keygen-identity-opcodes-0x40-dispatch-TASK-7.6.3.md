@@ -4,10 +4,13 @@ title: Agent Gateway keygen + identity opcodes + 0x40 dispatch (TASK-7.6.3)
 status: To Do
 assignee: []
 created_date: '2026-06-08 08:09'
+updated_date: '2026-06-08 08:24'
 labels:
   - agent-gateway
   - implementation
-dependencies: []
+dependencies:
+  - TASK-12
+  - TASK-13
 ordinal: 18000
 ---
 
