@@ -103,17 +103,11 @@ pub fn generate_keys(
         }
         seen.insert(key_ref);
 
-        // Valid secret scalar from the TEE CSPRNG (rejection-sample < n, non-zero), held zeroized.
-        let mut sk = Zeroizing::new([0u8; 32]);
-        let mut keypair = None;
-        for _ in 0..RNG_RETRIES {
-            getrandom::getrandom(&mut sk[..]).map_err(|_| GenerateKeysError::Csprng)?;
-            if let Ok(kp) = Keypair::from_secret_bytes(&sk) {
-                keypair = Some(kp);
-                break;
-            }
-        }
-        let keypair = keypair.ok_or(GenerateKeysError::Csprng)?;
+        // Keypair + its secret via the single canonical secp256k1 keygen path (rejection-samples a
+        // valid non-zero scalar < n, scrubbing each rejected draw). The secret is returned in
+        // Zeroizing only so we can seal it into the entry.
+        let (keypair, secret) =
+            Keypair::generate_with_secret().map_err(|_| GenerateKeysError::Csprng)?;
         let pubkey_uncompressed = keypair.public_key_uncompressed();
         let eth_address = keypair.eth_address();
         let tron_address = tron_address_from_body(&eth_address);
@@ -123,7 +117,7 @@ pub fn generate_keys(
             purpose,
             algorithm: KeyAlgorithm::Secp256k1,
             public_identity: pubkey_uncompressed.to_vec(),
-            secret_scalar: Zeroizing::new(sk.to_vec()),
+            secret_scalar: Zeroizing::new(secret.to_vec()),
             creation_metadata: creation,
             backup_export_metadata: BackupExportMetadata::default(),
         });
