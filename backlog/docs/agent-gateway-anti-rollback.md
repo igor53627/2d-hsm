@@ -29,7 +29,7 @@ provisioning root (provisioning-runbook §7.1).
 | Per-dispense binding | **`lease=1` (synchronous) by default** — a remote bump per fund-moving signature, zero replay window; admin/recovery/config advances are **always** `lease=1`. A naive `lease=N` is **unbounded** (§3); a safe `lease=N` needs anchor-visible lease IDs + a consumed sub-cursor, low-value faucets only, as an explicitly accepted bounded loss. Default/recommended `lease=1`. |
 | AC#5 gate | **Hard block by default + a single loud audited opt-out** that forces the operator to record the verbatim TASK-7.2 AC#10 residual-risk acknowledgment. Never a silent default. |
 | Anchor trust | The anchor runs under **separation of duties** from the host runtime and must itself be **anti-rollback-durable** (if the anchor can be rolled back the guarantee collapses); a quorum-signed anchor is preferred for high-value treasuries. |
-| Anchor unavailable | **Fail closed** on all fund-custody commands (consistent with 7.4 seal-before-emit). Only the **remaining count** of an already-issued `lease=N` may continue — the lease is bounded by `N` consumed units, **never a time/TTL** (enclave time is host-controlled, so a time-based window would be host-extendable). Read-only / status / attestation stay available. |
+| Anchor unavailable | **Fail closed on ALL fund-custody commands** — every fund-moving op needs a synchronous anchor bump+ack (`lease=1`, and a safe `lease=N` also acks the anchor **per spend**), so **no fund custody proceeds offline** and there is no host-rollbackable offline window. Read-only / status / attestation stay available; the host can deny liveness but never fund custody or rollback. |
 
 ## §1 Rollback threat model + protected sealed state (AC#2)
 
@@ -115,12 +115,15 @@ pre-commits `N` and the enclave only seals the cursor locally" is **rejected** �
 live in host-rollbackable sealed state the anchor never sees, making replay unbounded. This per-spend
 ack removes most of `lease=N`'s round-trip savings. **Production default and recommendation is `lease=1`.**
 
-**Crash/partition reconciliation.** The remote bump is **idempotent**, keyed by the dispense
-`request_id`: if the anchor recorded `epoch+1` but the local seal-then-emit did not complete (a
-dropped seal/ack), on restart the enclave re-reads the anchor; when the anchor is exactly one ahead
-for a `request_id` whose signature was **never emitted**, it **reconciles forward** (re-seals to the
-anchor epoch, discards the un-emitted op) rather than self-wedging. A gap > 1, or an
-emitted-but-unsealed signature, fails closed for operator intervention — preserving no-over-dispense
+**Crash/partition reconciliation.** The remote bump is **atomic with recording the authoritative
+post-operation marks** at the anchor — the new `epoch` **and** the resulting counter/spend
+high-water — keyed by `request_id`. On restart the enclave re-reads the anchor's authoritative marks;
+if they are **ahead of** the local sealed blob it **adopts them** (re-seals to the anchor's epoch +
+marks). So a dropped seal/ack cannot lose a spend debit, and a host that received a signature **cannot
+hide the debit** by rolling the blob back — the debit lives at the anchor. The enclave never
+reconciles by *guessing* whether a signature was emitted; it **adopts the anchor's recorded state**.
+A divergence the anchor cannot resolve — the anchor **behind** the blob (`freshness_epoch >
+anchor-current`, §3) — fails closed for operator intervention. This preserves no-over-dispense
 without a permanent self-wedge on a single dropped ack.
 
 **Coverage (AC#2).** The same epoch gate protects **both** the capability counter high-water table
