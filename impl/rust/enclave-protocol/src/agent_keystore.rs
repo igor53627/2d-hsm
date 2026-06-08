@@ -684,4 +684,77 @@ mod tests {
         let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
         assert_eq!(unseal_body(&blob, &ROOT, MEAS_B), Err(KeystoreError::MeasurementMismatch));
     }
+
+    // --- frozen golden vector (format-drift guard) ---
+
+    const GOLDEN_ROOT: [u8; 32] = [0x3c; 32];
+    const GOLDEN_MEAS: &[u8] = b"golden-keystore-measurement-v1";
+    const GOLDEN_NONCE: [u8; NONCE_LEN] = [0x5a; NONCE_LEN];
+
+    fn golden_body() -> KeystoreBody {
+        let mut public_identity = vec![0x04u8; SECP256K1_UNCOMPRESSED_LEN];
+        for (i, b) in public_identity[1..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        KeystoreBody {
+            config: KeystoreConfig {
+                twod_chain_id: 11565,
+                environment_identifier: "mainnet".to_string(),
+                admin_authority_pk: [0x01; 32],
+                recovery_authority_pk: [0x02; 32],
+                backup_recovery_wrapping_pubkey: vec![0xab, 0xcd, 0xef, 0x10],
+                monotonic_treasury_config_version: 1,
+                authority_epoch: 0,
+                anchor_root: [0x03; 32],
+            },
+            entries: vec![KeyEntry {
+                key_ref: [0x07; 32],
+                purpose: KeyPurpose::AgentFaucetTreasuryK1,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity,
+                secret_scalar: Zeroizing::new(vec![0x09; SECRET_SCALAR_LEN]),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                backup_export_metadata: BackupExportMetadata::default(),
+            }],
+            counters: vec![],
+            faucet: FaucetState {
+                per_dispense_max_amount: [0; 32],
+                max_gas_limit: 21000,
+                max_effective_gas_fee_rate: 100,
+                cumulative_native_spend: [0; 32],
+                lifetime_spend: [0; 32],
+                circuit_breaker_threshold: None,
+            },
+            audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
+            freshness_epoch: 1,
+        }
+    }
+
+    /// Frozen `pq-agent-keystore-v1` golden vector: a fixed body sealed under fixed
+    /// root/measurement/nonce yields a byte-stable blob. Any change to the sealed layout, the
+    /// canonical-CBOR body encoding, or a struct field flips this hash — if intentional, that is a
+    /// `format_version` bump + a reviewed vector update (mirrors the producer `pq-seal-v1` fixture).
+    #[test]
+    fn golden_keystore_blob_is_frozen() {
+        let body = golden_body();
+        body.validate().unwrap();
+        let mut cbor = Zeroizing::new(Vec::new());
+        ciborium::ser::into_writer(&body, &mut *cbor).unwrap();
+        let blob = seal_keystore_with_nonce(&cbor, &GOLDEN_ROOT, GOLDEN_MEAS, &GOLDEN_NONCE).unwrap();
+
+        let digest: [u8; 32] = {
+            let mut h = Sha3_256::new();
+            h.update(&blob);
+            h.finalize().into()
+        };
+        assert_eq!(
+            (blob.len(), hex::encode(digest)),
+            (1090usize, "c2cf7e635b07c0e9044fff8e53c15e09e8fdeabab1ceb6bbbc26705c74aed405".to_string()),
+            "keystore golden blob changed — if intentional, bump format_version + update this vector"
+        );
+
+        // Round-trip from the frozen inputs.
+        let out = unseal_body(&blob, &GOLDEN_ROOT, GOLDEN_MEAS).unwrap();
+        assert_eq!(out, body);
+    }
 }
