@@ -29,7 +29,7 @@ provisioning root (provisioning-runbook §7.1).
 | Per-dispense binding | **`lease=1` (synchronous) by default** — a remote bump per fund-moving signature, zero replay window; admin/recovery/config advances are **always** `lease=1`. A naive `lease=N` is **unbounded** (§3); a safe `lease=N` needs anchor-visible lease IDs + a consumed sub-cursor, low-value faucets only, as an explicitly accepted bounded loss. Default/recommended `lease=1`. |
 | AC#5 gate | **Hard block by default + a single loud audited opt-out** that forces the operator to record the verbatim TASK-7.2 AC#10 residual-risk acknowledgment. Never a silent default. |
 | Anchor trust | The anchor runs under **separation of duties** from the host runtime and must itself be **anti-rollback-durable** (if the anchor can be rolled back the guarantee collapses); a quorum-signed anchor is preferred for high-value treasuries. |
-| Anchor unavailable | **Fail closed** on all fund-custody commands (consistent with 7.4 seal-before-emit); only an unexpired `lease=N` window may continue; read-only / status / attestation stay available. |
+| Anchor unavailable | **Fail closed** on all fund-custody commands (consistent with 7.4 seal-before-emit). Only the **remaining count** of an already-issued `lease=N` may continue — the lease is bounded by `N` consumed units, **never a time/TTL** (enclave time is host-controlled, so a time-based window would be host-extendable). Read-only / status / attestation stay available. |
 
 ## §1 Rollback threat model + protected sealed state (AC#2)
 
@@ -82,8 +82,11 @@ authenticated: the enclave proves it is a genuine current instance with a fresh 
 (the format extension above), covering `(treasury_id, epoch/marks, the enclave's fresh
 channel-binding nonce)` as **canonical CBOR**. On every (re)start the enclave issues a fresh nonce,
 verifies the signed response against the pinned `anchor_root`, and **refuses any sealed blob whose
-`freshness_epoch` < the authenticated anchor-current** (stale → fail closed). A host controlling
-vsock therefore cannot replay a stale low-epoch response or route the enclave to a spoofed anchor.
+`freshness_epoch` < the authenticated anchor-current** (stale → fail closed). An epoch **ahead** of
+the anchor (`freshness_epoch > anchor-current`, beyond the single-step crash-reconcile of §3)
+indicates the **anchor itself was rolled back** or is inconsistent and **also fails closed** — the
+enclave never silently accepts a blob ahead of the anchor. A host controlling vsock therefore cannot
+replay a stale low-epoch response or route the enclave to a spoofed anchor.
 **`anchor_root` lifecycle:** installed at provisioning into the sealed config; verified at every
 boot; rotation is a reviewed reprovisioning (re-seal under the new root).
 
@@ -162,11 +165,15 @@ lib.optionals isProd [...]`, like `!(productionMode && labFixtures)`). Add a gue
 endpoint/credential override args. **`operator-signed-boot` is NOT a standalone passing mode** (it is
 replay-vulnerable alone, §3) — it is permitted only as the boot/restore challenge-response sub-mode of
 `remote-counter`, never to satisfy the production assertion by itself. Assertion:
-`assertion = !(productionMode && agentAntiRollbackEnabled && agentAntiRollbackMode == "none");`
-with a message pointing to this doc, where `agentAntiRollbackEnabled` is true on any profile that
-installs an operational faucet/transfer signer. A lab override aimed at a stub endpoint counts as
-`none` (usesLab-style comparison) so the gate cannot be defeated by a no-op. This **fails the build**,
-exactly like the mainnet trust/seal gate.
+`assertion = !(productionMode && agentAntiRollbackEnabled && agentAntiRollbackMode == "none" && !antiRollbackResidualOptOut);`
+with a message pointing to this doc. `agentAntiRollbackEnabled` is **derived, not a free-defaulting
+param** — it is forced `true` by the same profile logic that installs an operational faucet/transfer
+signer, so a new profile cannot silently leave it falsy (Nix optional params default falsy) and
+bypass the gate. `antiRollbackResidualOptOut` is the **measured/sealed** opt-out (build-time, captured
+in the enclave measurement; §5) and is the **only** way the assertion passes with `mode == "none"`, so
+the opt-out is explicit in the formula, never an undocumented escape. A lab override aimed at a stub
+endpoint counts as `none` (usesLab-style comparison) so the gate cannot be defeated by a no-op. This
+**fails the build**, exactly like the mainnet trust/seal gate.
 
 **Layer 2 — Rust dispatch gate.** (a) compile-time: in the `release_build` cfg family,
 `compile_error!` on any lab/stub anti-rollback feature in release. (b) runtime fail-closed: inside
