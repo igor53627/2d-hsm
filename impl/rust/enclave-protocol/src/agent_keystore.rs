@@ -449,6 +449,41 @@ fn validate_environment_identifier(s: &str) -> Result<(), KeystoreError> {
 }
 
 impl KeystoreBody {
+    /// Advance the contiguous capability counter for the tuple `(authority, environment_identifier,
+    /// scope_class, scope_target)` to `incoming` (the verified `highest + 1`): update the existing
+    /// row, or insert a new one (first counter) if none exists. The caller mutates a CANDIDATE body
+    /// then seals it. New rows are bounded by [`MAX_COUNTER_ENTRIES`] (fail-closed on overflow).
+    pub(crate) fn advance_counter(
+        &mut self,
+        authority: &[u8; 32],
+        scope_class: u8,
+        scope_target: &[u8],
+        incoming: u64,
+    ) -> Result<(), KeystoreError> {
+        let env = self.config.environment_identifier.clone();
+        if let Some(c) = self.counters.iter_mut().find(|c| {
+            &c.authority == authority
+                && c.environment_identifier == env
+                && c.scope_class == scope_class
+                && c.scope_target == scope_target
+        }) {
+            c.highest_accepted_counter = incoming;
+            return Ok(());
+        }
+        if self.counters.len() >= MAX_COUNTER_ENTRIES {
+            return Err(KeystoreError::CapacityExceeded);
+        }
+        self.counters.push(CounterEntry {
+            authority: *authority,
+            environment_identifier: env,
+            scope_class,
+            scope_target: scope_target.to_vec(),
+            highest_accepted_counter: incoming,
+        });
+        Ok(())
+    }
+
+
     /// Structural validation enforced on both seal (before commit) and unseal (after decrypt):
     /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
     pub fn validate(&self) -> Result<(), KeystoreError> {

@@ -90,6 +90,23 @@ struct Capability {
     signature: [u8; 64],
 }
 
+/// The verified-capability data a privileged handler needs after [`verify_capability`] passes: the
+/// counter tuple (to advance the counter), the signed `payload_binding` (to bind the request params),
+/// and `key_purpose` (to bind the op's key purpose). `environment_identifier` is the sealed config's
+/// (the cap's was checked byte-exact), so it is not duplicated here.
+pub(crate) struct VerifiedCapability {
+    /// The sealed authority pubkey that verified this cap (admin or recovery) — counter-tuple key.
+    pub authority: [u8; 32],
+    pub scope_class: u8,
+    pub scope_target: Vec<u8>,
+    /// The accepted counter value (== highest_accepted_counter + 1); the handler advances to this.
+    pub counter: u64,
+    /// keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical-CBOR(params)) — the handler recomputes
+    /// from the actual request payload and compares (the last gate before mutation).
+    pub payload_binding: [u8; 32],
+    pub key_purpose: u8,
+}
+
 fn cap_get(map: &[(Value, Value)], key: u64) -> Option<&Value> {
     map.iter()
         .find(|(k, _)| matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(key)))
@@ -222,7 +239,7 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
 
 /// Append a CBOR unsigned head/value (major type `major`, argument `val`) in **shortest form**
 /// (RFC 8949 §4.2.1 deterministic encoding). Used for both map/key headers and integer values.
-fn put_uint(out: &mut Vec<u8>, major: u8, val: u64) {
+pub(crate) fn put_uint(out: &mut Vec<u8>, major: u8, val: u64) {
     let mt = major << 5;
     if val < 24 {
         out.push(mt | val as u8);
@@ -241,12 +258,12 @@ fn put_uint(out: &mut Vec<u8>, major: u8, val: u64) {
     }
 }
 
-fn put_text(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_text(out: &mut Vec<u8>, s: &str) {
     put_uint(out, 3, s.len() as u64);
     out.extend_from_slice(s.as_bytes());
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_uint(out, 2, b.len() as u64);
     out.extend_from_slice(b);
 }
@@ -290,12 +307,26 @@ fn signed_preimage(cap: &Capability) -> Vec<u8> {
     out
 }
 
-/// Verify a capability for a privileged opcode against the sealed config + counters (verify-only;
-/// see the module docs for the deferred `key_purpose`/`payload_binding`/advance steps).
+/// Verify a capability for a privileged opcode against the sealed config + counters, returning the
+/// [`VerifiedCapability`] data the handler binds (`payload_binding`) + advances (the counter tuple).
 ///
 /// `cap_map` is the raw inner-envelope key-`5` map; `request_opcode`/`request_id` come from the outer
-/// envelope. Returns `Ok(())` if the capability is authentic and authorized for this request and its
-/// counter is the expected next value; otherwise an anti-oracle [`AgentError`].
+/// envelope. `Ok(VerifiedCapability)` if the capability is authentic and authorized for this request
+/// and its counter is the expected next value; otherwise an anti-oracle [`AgentError`].
+pub(crate) fn verify_capability_extract(
+    cap_map: &[(Value, Value)],
+    request_opcode: u8,
+    request_id: &[u8],
+    config: &KeystoreConfig,
+    counters: &[CounterEntry],
+) -> Result<VerifiedCapability, AgentError> {
+    verify_capability_extract_inner(cap_map, request_opcode, request_id, config, counters)
+}
+
+/// Verify-only predicate: `Ok(())` if the capability is authentic + authorized for this request and
+/// counter-contiguous, else the anti-oracle [`AgentError`]. Test-only — the live seam calls
+/// [`verify_capability_extract`] (handlers need the verified data to bind `payload_binding` + advance).
+#[cfg(test)]
 pub(crate) fn verify_capability(
     cap_map: &[(Value, Value)],
     request_opcode: u8,
@@ -303,6 +334,17 @@ pub(crate) fn verify_capability(
     config: &KeystoreConfig,
     counters: &[CounterEntry],
 ) -> Result<(), AgentError> {
+    verify_capability_extract_inner(cap_map, request_opcode, request_id, config, counters)
+        .map(|_| ())
+}
+
+fn verify_capability_extract_inner(
+    cap_map: &[(Value, Value)],
+    request_opcode: u8,
+    request_id: &[u8],
+    config: &KeystoreConfig,
+    counters: &[CounterEntry],
+) -> Result<VerifiedCapability, AgentError> {
     let cap = parse_capability(cap_map)?;
 
     // (2) format version (unknown ⇒ MALFORMED, not an oracle).
@@ -382,7 +424,34 @@ pub(crate) fn verify_capability(
         return Err(AgentError::CapabilityRejected);
     }
 
-    Ok(())
+    Ok(VerifiedCapability {
+        authority: *authority,
+        scope_class: cap.scope_class,
+        scope_target: cap.scope_target,
+        counter: cap.counter,
+        payload_binding: cap.payload_binding,
+        key_purpose: cap.key_purpose,
+    })
+}
+
+/// Recompute a capability's `payload_binding` preimage hash from the actual request:
+/// `keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical_params)`. The handler compares this to the
+/// signed [`VerifiedCapability::payload_binding`] (the last gate before mutation). `canonical_params`
+/// is the RFC 8949 canonical CBOR of the per-opcode payload map (built with [`put_uint`] et al.).
+pub(crate) fn payload_binding(
+    opcode: u8,
+    sub_op: Option<u8>,
+    request_id: &[u8],
+    canonical_params: &[u8],
+) -> [u8; 32] {
+    let mut pre = Vec::with_capacity(2 + request_id.len() + canonical_params.len());
+    pre.push(opcode);
+    if let Some(s) = sub_op {
+        pre.push(s);
+    }
+    pre.extend_from_slice(request_id);
+    pre.extend_from_slice(canonical_params);
+    crate::secp256k1::keccak256(&pre)
 }
 
 /// Encode a parsed [`Capability`] back to its inner-envelope key-5 CBOR map (keys 1..13).
@@ -423,6 +492,7 @@ pub(crate) fn test_signed_capability(
     environment_identifier: &str,
     scope_class: u8,
     scope_target: &[u8],
+    payload_binding: [u8; 32],
 ) -> Vec<(Value, Value)> {
     use ed25519_dalek::Signer;
     let treasury_sub_op = if opcode == OPCODE_CONFIGURE_TREASURY { Some(1u8) } else { None };
@@ -437,7 +507,7 @@ pub(crate) fn test_signed_capability(
         scope_target: scope_target.to_vec(),
         counter,
         request_id: request_id.to_vec(),
-        payload_binding: [0xab; 32],
+        payload_binding,
         is_recovery,
         signature: [0u8; 64],
     };

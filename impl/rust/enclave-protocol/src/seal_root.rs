@@ -38,7 +38,9 @@ pub fn set_pq_seal_v1_provisioning_root(root: [u8; 32]) -> Result<(), ProtocolEr
     Ok(())
 }
 
+// Used by the producer (ml-dsa-65) tests; dead under an agent-gateway-only test build.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_pq_seal_v1_provisioning_root_for_tests() {
     if let Ok(mut guard) = PLATFORM_PROVISIONING_ROOT.lock() {
         *guard = None;
@@ -64,6 +66,9 @@ pub fn is_pq_seal_v1_provisioning_root_configured() -> bool {
 /// Resolve the provisioning root into a `Zeroizing` so every *transient* caller copy is scrubbed on
 /// drop. (The process-lifetime copy in [`PLATFORM_PROVISIONING_ROOT`] is NOT scrubbed during
 /// operation — that needs mlock / no-core-dump, orthogonal to zeroize.)
+// The returns are cfg-conditional (platform / reference-seal / not-configured), so the explicit
+// `return`s are needed under some feature combos even where clippy sees the last one as redundant.
+#[allow(clippy::needless_return)]
 pub(crate) fn resolve_provisioning_root() -> Result<zeroize::Zeroizing<[u8; 32]>, ProtocolError> {
     let guard = PLATFORM_PROVISIONING_ROOT
         .lock()
