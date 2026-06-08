@@ -1,10 +1,10 @@
 ---
 id: TASK-12
 title: Agent Gateway secp256k1 primitives module (TASK-7.6.1)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-08 08:09'
-updated_date: '2026-06-08 08:46'
+updated_date: '2026-06-08 09:13'
 labels:
   - agent-gateway
   - secp256k1
@@ -24,3 +24,9 @@ First implementation increment of TASK-7.6 (per AC#2 split). Pure crypto module 
 <!-- SECTION:NOTES:BEGIN -->
 Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) — the Full 3x3 vendor matrix + compact is mandatory before merge per AGENTS.md and the .roborev.toml high_risk_paths (impl/, src/, backlog/docs/*agent-gateway*).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+src/secp256k1.rs merged (PR #34, squash) behind the agent-gateway cargo feature. Pure secp256k1 primitives: getrandom CSPRNG keygen (zeroize-on-drop SigningKey), uncompressed SEC1 pubkey, eth address keccak256(X||Y)[12:32] + TRON Base58Check (validated 0x04 prefix on the free helper; infallible Keypair accessors by invariant), RFC6979 deterministic low-S recoverable signing over a 32-byte keccak prehash (sign_prehashed is pub(crate) — no generic-digest entry), recover_pubkey_uncompressed; reject x-reduced recovery ids (>1). 7 tests pass byte-exact vs the frozen 2D vectors (keys.json/ordinary_tx_v1/identity_proof_v1) incl. v=23166 + recover==from; default build unchanged (zero producer regression). Verified by roborev 3x3 + compact + /code-review (0 crypto bugs) + 13 PR bot comments resolved + CI 4/4 green. Deps k256 0.13/bs58/sha2. Next: TASK-13 (7.6.2 keystore) / TASK-14 (7.6.3 keygen+dispatch).
+<!-- SECTION:FINAL_SUMMARY:END -->
