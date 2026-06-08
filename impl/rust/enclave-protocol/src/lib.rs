@@ -73,6 +73,10 @@ pub mod snp_report;
 /// of the enclave signing path; enable with `--features snp-verify`.
 #[cfg(feature = "snp-verify")]
 pub mod snp_verify;
+// Agent Gateway secp256k1 signer primitives (TASK-7.6.1). Compiled only under `agent-gateway`,
+// keeping it out of the producer ML-DSA signing path.
+#[cfg(feature = "agent-gateway")]
+pub mod secp256k1;
 mod wire;
 
 use serde::{Deserialize, Serialize};
