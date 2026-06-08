@@ -10,9 +10,9 @@
 //! same SNP root (format-/key-level role isolation — see
 //! `backlog/docs/agent-gateway-keystore-backup-format.md`).
 //!
-//! The plaintext here is opaque bytes: the canonical-CBOR keystore body (config/identity, key
-//! entries, counter high-water table, faucet state, audit ring) is (de)serialized in a later
-//! slice and sealed/unsealed through this envelope. Multi-byte header integers are big-endian.
+//! The plaintext here is opaque bytes: the deterministic-CBOR keystore body (config/identity, key
+//! entries, counter high-water table, faucet state, audit ring) is (de)serialized and sealed/
+//! unsealed through this envelope. Multi-byte header integers are big-endian.
 //!
 //! Built only under the `agent-gateway` feature, alongside the secp256k1 backend.
 
@@ -97,7 +97,7 @@ fn derive_aead_key(
 /// Seal an opaque keystore body with a caller-supplied nonce (deterministic — for golden vectors).
 ///
 /// Production callers should use [`seal_keystore`] (platform CSPRNG nonce). The body is the
-/// canonical-CBOR keystore plaintext; this function does not interpret it.
+/// deterministic-CBOR keystore plaintext; this function does not interpret it.
 pub fn seal_keystore_with_nonce(
     body: &[u8],
     provisioning_root: &[u8; 32],
@@ -179,16 +179,30 @@ pub fn unseal_keystore(
 }
 
 // ===========================================================================================
-// Keystore body — the canonical-CBOR plaintext sealed by the envelope above.
+// Keystore body — the CBOR plaintext sealed by the envelope above.
 // (`agent-gateway-keystore-backup-format.md` §Plaintext: config/identity, entry list, counter
 // high-water table, faucet state, audit ring.) All structs are `deny_unknown_fields` so an
 // unexpected field fails closed rather than being silently dropped on a forward-migration read.
+//
+// Encoding note (format_version 1): this uses **deterministic** CBOR — serde emits struct fields
+// in declaration order and every collection is a `Vec` (no map/HashMap), so a given body always
+// encodes to the same bytes (the golden vector locks this). It is NOT RFC 8949 *canonical* CBOR,
+// and byte fields (`[u8; N]`, `Vec<u8>`) serialize as CBOR integer-arrays, not byte strings.
+// Switching to byte-string encoding (smaller) or strict canonical ordering would change the bytes
+// and is therefore a deliberate `format_version` bump + golden-vector update, never a silent edit.
 // ===========================================================================================
 
 /// Max key entries sealed in one keystore (AC#5 total-capacity guard, enforced before seal).
 pub const MAX_TOTAL_KEY_ENTRIES: usize = 4096;
-/// Max entries minted in a single `AGENT_K1_GENERATE_KEYS` batch (AC#5).
+/// Max entries minted in a single `AGENT_K1_GENERATE_KEYS` batch (AC#5). NOTE: per-batch
+/// enforcement lands with the keygen mutation path (TASK-7.6.3); this slice only seals/validates
+/// the at-rest store, so the constant is the shared limit those callers will check.
 pub const MAX_BATCH_SIZE: usize = 256;
+/// Bound on the counter high-water table (defense-in-depth; the table is one row per active
+/// `(authority, environment, scope)` and should never approach this).
+pub const MAX_COUNTER_ENTRIES: usize = 65_536;
+/// Bound on the audit ring capacity (and therefore the materialized record vector).
+pub const MAX_AUDIT_CAPACITY: u32 = 65_536;
 
 const SECP256K1_UNCOMPRESSED_LEN: usize = 65;
 const SECRET_SCALAR_LEN: usize = 32;
@@ -373,7 +387,9 @@ impl KeystoreBody {
     /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
     pub fn validate(&self) -> Result<(), KeystoreError> {
         validate_environment_identifier(&self.config.environment_identifier)?;
-        if self.entries.len() > MAX_TOTAL_KEY_ENTRIES {
+        if self.entries.len() > MAX_TOTAL_KEY_ENTRIES
+            || self.counters.len() > MAX_COUNTER_ENTRIES
+        {
             return Err(KeystoreError::CapacityExceeded);
         }
         for e in &self.entries {
@@ -385,13 +401,25 @@ impl KeystoreBody {
             }
         }
         for c in &self.counters {
+            // One sealed keystore is one environment: every counter row must carry the keystore's
+            // own environment_identifier (format-valid AND equal to config), not just a well-formed
+            // one. A mismatch is a structural invariant break (enclave bug / migration error).
             validate_environment_identifier(&c.environment_identifier)?;
+            if c.environment_identifier != self.config.environment_identifier {
+                return Err(KeystoreError::InvalidEnvironmentId);
+            }
+        }
+        // Audit ring: capacity bounded, and the materialized record vector cannot exceed it.
+        if self.audit.capacity > MAX_AUDIT_CAPACITY
+            || self.audit.records.len() as u64 > self.audit.capacity as u64
+        {
+            return Err(KeystoreError::CapacityExceeded);
         }
         Ok(())
     }
 }
 
-/// Validate + canonical-CBOR-encode the body, then seal it (CSPRNG nonce). The transient CBOR
+/// Validate + deterministically CBOR-encode the body, then seal it (CSPRNG nonce). The transient CBOR
 /// buffer holds plaintext secrets and is zeroized on drop; the returned sealed blob is encrypted.
 pub fn seal_body(
     body: &KeystoreBody,
@@ -428,7 +456,7 @@ mod tests {
     const NONCE: [u8; NONCE_LEN] = [0x22; NONCE_LEN];
 
     fn body() -> Vec<u8> {
-        // Stand-in for the canonical-CBOR keystore body (opaque to this layer).
+        // Stand-in for the deterministic-CBOR keystore body (opaque to this layer).
         b"agent-keystore-body: config + entries + counters + faucet + audit".to_vec()
     }
 
@@ -593,16 +621,36 @@ mod tests {
 
     #[test]
     fn body_no_plaintext_secret_leak() {
+        // The secret scalar is a CBOR byte value `0x<fill>` per element; for fill > 0x17 ciborium
+        // emits the two-byte head+value pair `0x18 <fill>`, so the on-wire run of a 32-byte secret
+        // of `fill` bytes is `(0x18 fill) × 32`. Search for THAT pattern (not a raw `[fill;32]`,
+        // which never appears in the CBOR encoding and would make this test vacuous).
+        let secret_pattern = |fill: u8| -> Vec<u8> {
+            [0x18u8, fill].iter().copied().cycle().take(2 * SECRET_SCALAR_LEN).collect()
+        };
         let body = sample_body(); // treasury secret 0x77×32, transfer secret 0x88×32
+
+        // Sanity: the pattern IS present in the unencrypted CBOR plaintext — so a match in the
+        // sealed blob below would be a real leak, and an absence is meaningful (not by construction).
+        let mut plaintext = Vec::new();
+        ciborium::ser::into_writer(&body, &mut plaintext).unwrap();
+        for fill in [0x77u8, 0x88] {
+            let p = secret_pattern(fill);
+            assert!(
+                plaintext.windows(p.len()).any(|w| w == p.as_slice()),
+                "sanity: secret 0x{fill:02x} must be present in the plaintext CBOR"
+            );
+        }
+
+        // The sealed (encrypted) blob must NOT contain either secret's on-wire encoding.
         let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
-        assert!(
-            !blob.windows(SECRET_SCALAR_LEN).any(|w| w == [0x77u8; SECRET_SCALAR_LEN]),
-            "treasury secret scalar must not appear in the sealed blob"
-        );
-        assert!(
-            !blob.windows(SECRET_SCALAR_LEN).any(|w| w == [0x88u8; SECRET_SCALAR_LEN]),
-            "transfer secret scalar must not appear in the sealed blob"
-        );
+        for fill in [0x77u8, 0x88] {
+            let p = secret_pattern(fill);
+            assert!(
+                !blob.windows(p.len()).any(|w| w == p.as_slice()),
+                "secret 0x{fill:02x} must not appear in the sealed blob"
+            );
+        }
     }
 
     #[test]
@@ -732,7 +780,7 @@ mod tests {
 
     /// Frozen `pq-agent-keystore-v1` golden vector: a fixed body sealed under fixed
     /// root/measurement/nonce yields a byte-stable blob. Any change to the sealed layout, the
-    /// canonical-CBOR body encoding, or a struct field flips this hash — if intentional, that is a
+    /// deterministic-CBOR body encoding, or a struct field flips this hash — if intentional, that is a
     /// `format_version` bump + a reviewed vector update (mirrors the producer `pq-seal-v1` fixture).
     #[test]
     fn golden_keystore_blob_is_frozen() {
