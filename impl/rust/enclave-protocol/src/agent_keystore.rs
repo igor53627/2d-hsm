@@ -28,7 +28,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest as _, Sha3_256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// `b"2DAGTKS\0"` — distinct from the producer `b"2DHSMV1\0"` so the two blob families can never
 /// be cross-parsed (format-level role separation, AC#2).
@@ -118,8 +118,10 @@ fn derive_aead_key(
     // Copy into a pre-zeroed Zeroizing buffer rather than `Zeroizing::new(finalize().into())`:
     // the latter materializes a bare `[u8; 32]` (a `Copy` type, no `Drop`) on the stack that is
     // never scrubbed (repo zeroize rule; cf. `pq_signer.rs` resolve_provisioning_root).
+    let mut digest = h.finalize(); // GenericArray holding the raw key bytes
     let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(h.finalize().as_slice());
+    key.copy_from_slice(digest.as_slice());
+    digest.as_mut_slice().zeroize(); // scrub the hasher-output temporary too
     key
 }
 
@@ -904,6 +906,33 @@ mod tests {
         cbor.extend_from_slice(b"trailing-garbage");
         let blob = seal_keystore(&cbor, &ROOT, MEAS_A).unwrap();
         assert_eq!(unseal_body(&blob, &ROOT, MEAS_A), Err(KeystoreError::Cbor));
+    }
+
+    #[test]
+    fn blob_size_budget_boundary() {
+        // A body whose sealed size lands ABOVE MAX_KEYSTORE_BLOB_SIZE but still WITHIN
+        // MAX_MESSAGE_SIZE must be rejected — guards against a regression that checks
+        // MAX_MESSAGE_SIZE (which the far-oversized test above would not catch).
+        let sealed_size = |b: &KeystoreBody| -> usize {
+            let mut v = Vec::new();
+            ciborium::ser::into_writer(b, &mut v).unwrap();
+            HEADER_LEN + v.len() + TAG_LEN
+        };
+        let target = MAX_KEYSTORE_BLOB_SIZE + 1; // smallest over-limit sealed size
+        let mut body = sample_body();
+        // scope_target bytes <= 0x17 encode as 1 CBOR byte each, and at ~1 MiB the CBOR array
+        // header size is constant, so sealed size is linear in the padding length — one correction
+        // pass lands it exactly on `target`.
+        body.counters[0].scope_target = vec![0x01u8; target];
+        let s0 = sealed_size(&body);
+        let len1 = (target as isize + (target as isize - s0 as isize)) as usize;
+        body.counters[0].scope_target = vec![0x01u8; len1];
+        let s1 = sealed_size(&body);
+        assert!(
+            s1 > MAX_KEYSTORE_BLOB_SIZE && s1 <= crate::MAX_MESSAGE_SIZE as usize,
+            "boundary blob sealed={s1} not in (MAX_KEYSTORE_BLOB_SIZE, MAX_MESSAGE_SIZE]"
+        );
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::BlobTooLarge));
     }
 
     // --- frozen golden vector (format-drift guard) ---
