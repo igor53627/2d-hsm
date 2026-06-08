@@ -89,7 +89,7 @@ roborev review --dirty --type security --agent opencode --model xai/grok-4.3   #
 
 **Full Matrix (when required by the rules above):**
 ```bash
-# Reduced three (above), then from repo root:
+# Reduced Matrix (all four cells above, grok included), then from repo root:
 ~/pse/roborev/pse-review-2x3.sh --dirty   # 2×3 concurrency floor
 ~/pse/roborev/pse-review-3x3.sh --dirty   # optional 3×3 vendor sign-off
 ```
