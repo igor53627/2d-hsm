@@ -22,10 +22,26 @@
 //! structural/format errors surface as `0x40 AGENT_MALFORMED`.
 //!
 //! ## Deferred to the per-opcode handler / mutation slices (NOT done here)
+//! - **`treasury_sub_op` value + per-sub-op tier + request binding** (§10.5/§10.7, opcode 6): the
+//!   cap's signed sub-op is parsed and the presence rule (key 3 iff opcode 6) is enforced, but (a) the
+//!   sub-op VALUE set (`set_limits`/`refill_budget`/`raise_lifetime_breaker`/`reset_lifetime_breaker`)
+//!   is not yet numerically pinned in the spec, (b) the per-sub-op tier (`reset_lifetime_breaker` →
+//!   recovery) and (c) binding it to the *request's* sub-op all need the `CONFIGURE_TREASURY` handler
+//!   (which defines the enum and decodes the request sub-op). The opcode-level tier (treasury = admin
+//!   OR recovery) IS enforced here.
 //! - **`key_purpose` ↔ key-entry** check (`0x42`, collapses key-not-found + wrong-purpose): needs the
 //!   `key_ref` lookup performed inside each opcode handler.
 //! - **`payload_binding`** (`keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical params)`): needs the
 //!   per-opcode canonical command-param encoding, which lands with the handlers.
+//! - **`scope_class` "financial MUST be enclave" policy** (§10.5/§10.6, AC#12): the structural range
+//!   `{0,1}` is enforced here, but the per-opcode rule (faucet keygen + all treasury config require
+//!   `scope_class == 0`) is a handler concern.
+//! - **recovery-tier counter semantics** (§10.6, AC#11): a recovery (`is_recovery`) capability is
+//!   sequenced by an **independent strict recovery counter** and resyncs a wedged scope
+//!   **forward-only** (`counter > highest`, not `== highest+1`); `RESTORE_BACKUP` +
+//!   `reset_lifetime_breaker` share it. This slice applies the uniform admin contiguity rule to all
+//!   caps (`is_recovery` only selects the verifying authority) — the distinct recovery-counter rule
+//!   lands with the mutation slice.
 //! - **counter ADVANCE + atomic re-seal** (`highest := counter`, clone→seal→persist→swap): part of the
 //!   GENERATE_KEYS-execution / candidate-swap mutation slice (7.2/7.6.x territory).
 //!
@@ -45,6 +61,9 @@ const CAP_DOMAIN: &[u8] = b"2d-hsm/agent-cap/v1\0";
 const CAP_FORMAT_VERSION: u64 = 1;
 /// `treasury_sub_op` (cap key 3) is present iff the capability authorizes `CONFIGURE_TREASURY`.
 const OPCODE_CONFIGURE_TREASURY: u8 = 6;
+/// Opcodes a capability may authorize — the privileged set (§10.3/§10.5):
+/// `GENERATE_KEYS(1)`, `CONFIGURE_TREASURY(6)`, `EXPORT_BACKUP(7)`, `RESTORE_BACKUP(8)`.
+const PRIVILEGED_OPCODES: [u8; 4] = [1, OPCODE_CONFIGURE_TREASURY, 7, 8];
 /// Upper bound on `scope_target` bytes — a defensive read-side cap (the field is host-influenced and
 /// later lands in sealed state; keep it small here so a malformed cap is rejected cheaply).
 const MAX_SCOPE_TARGET_LEN: usize = 64;
@@ -115,7 +134,10 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
 
     let cap_format_version = req_u64(1)?;
     let command_opcode = req_u8(2)?;
-    if !(1..=8).contains(&command_opcode) {
+    // Capabilities only ever authorize privileged opcodes (§10.3/§10.5); a cap for a read/runtime or
+    // out-of-range opcode is structurally invalid. (The dispatch seam also binds command_opcode to
+    // the request opcode, but reject it here too — defense in depth, not caller-dependent.)
+    if !PRIVILEGED_OPCODES.contains(&command_opcode) {
         return Err(AgentError::Malformed);
     }
     // key 3 present iff opcode is CONFIGURE_TREASURY.
@@ -138,11 +160,19 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
         return Err(AgentError::Malformed);
     }
     let chain_id = req_u64(5)?;
+    // §10.6: environment_identifier is UTF-8, 1..=64, [a-z0-9-], no leading/trailing/double hyphen.
+    // Reuse the keystore validator so a malformed env fails closed AT DECODE (0x40), consistent with
+    // the sealed config's own validation (the later byte-exact compare then only sees a valid value).
     let environment_identifier = match cap_get(map, 6) {
-        Some(Value::Text(s)) => s.clone(),
+        Some(Value::Text(s)) if crate::agent_keystore::is_valid_environment_identifier(s) => s.clone(),
         _ => return Err(AgentError::Malformed),
     };
     let scope_class = req_u8(7)?;
+    // §10.5: scope_class ∈ {0=enclave, 1=fleet}. Out-of-range is a structural field error (the
+    // "financial MUST be enclave" *policy* is per-opcode and deferred to the handler — see docs).
+    if scope_class > 1 {
+        return Err(AgentError::Malformed);
+    }
     let scope_target = match cap_get(map, 8).and_then(as_bytes) {
         Some(b) if b.len() <= MAX_SCOPE_TARGET_LEN => b.to_vec(),
         _ => return Err(AgentError::Malformed),
@@ -272,8 +302,24 @@ pub(crate) fn verify_capability(
         return Err(AgentError::Malformed);
     }
 
+    // (2b) Authority TIER per opcode (design doc "Capability tiers"): GENERATE_KEYS(1) +
+    // EXPORT_BACKUP(7) are admin-tier; RESTORE_BACKUP(8) is recovery-tier; CONFIGURE_TREASURY(6) is
+    // admin OR recovery (the per-sub-op tier — e.g. reset_lifetime_breaker → recovery — is enforced
+    // by the handler). Enforcing this here stops an admin authority from authorizing a restore and a
+    // recovery authority from authorizing keygen/export. A tier mismatch is an authorization failure
+    // (0x43, anti-oracle), not a structural error. From here on EVERY failure collapses to 0x43.
+    let tier_ok = match cap.command_opcode {
+        1 | 7 => !cap.is_recovery,            // admin-only
+        8 => cap.is_recovery,                 // recovery-only
+        OPCODE_CONFIGURE_TREASURY => true,    // admin or recovery (sub-op tier in the handler)
+        _ => false,                           // unreachable: opcode ∈ PRIVILEGED_OPCODES
+    };
+    if !tier_ok {
+        return Err(AgentError::CapabilityRejected);
+    }
+
     // (3) Ed25519 verify over canonical CBOR(1..12), against the is_recovery-selected sealed
-    // authority. From here on, EVERY failure collapses to CapabilityRejected (0x43).
+    // authority (now tier-validated above).
     let authority = if cap.is_recovery {
         &config.recovery_authority_pk
     } else {
@@ -305,6 +351,8 @@ pub(crate) fn verify_capability(
     // (6) strict contiguous counter CHECK (§10.6) for the tuple
     // (authority, environment_identifier, scope_class, scope_target). No entry yet ⇒ highest = 0, so
     // the first accepted counter is 1. Read-only: the advance + re-seal lands with the mutation slice.
+    // NOTE: recovery caps (is_recovery) get the same uniform contiguity here; their independent
+    // strict-recovery-counter + forward-only resync rule (§10.6 AC#11) lands with the mutation slice.
     let highest = counters
         .iter()
         .find(|c| {
@@ -480,6 +528,9 @@ mod tests {
     fn contiguous_counter_accept_and_replay_reject() {
         let cfg = test_config();
         let rid = b"req-7";
+        // NOTE: this CHECKS the contiguity rule against an injected high-water (highest=5). The
+        // counter is never ADVANCED in the verify-only slice, so end-to-end "accept then its replay
+        // rejected" (§10.10) only becomes exercisable once the advance + re-seal lands.
         let entry = CounterEntry {
             authority: cfg.admin_authority_pk,
             environment_identifier: TEST_ENV.to_string(),
@@ -515,6 +566,55 @@ mod tests {
     }
 
     #[test]
+    fn admin_tier_opcode_rejects_recovery_flag() {
+        // GENERATE_KEYS(1) is admin-tier; a cap with is_recovery=true is a tier mismatch and is
+        // rejected even when correctly signed by the recovery key.
+        let cfg = test_config();
+        let rid = b"req-1";
+        let mut b = CapBuilder::new(1, rid, 1);
+        b.cap.is_recovery = true;
+        let cap = b.build(&recovery_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn restore_backup_requires_recovery_tier() {
+        // RESTORE_BACKUP(8) is recovery-tier; is_recovery=false is a tier mismatch, rejected even
+        // when correctly signed by the admin key (an admin authority cannot authorize a restore).
+        let cfg = test_config();
+        let rid = b"req-1";
+        let mut b = CapBuilder::new(8, rid, 1);
+        b.cap.is_recovery = false;
+        b.cap.scope_target = b"restore_backup".to_vec();
+        let cap = b.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 8, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn export_backup_is_admin_tier() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // EXPORT_BACKUP(7) admin-tier: admin accepted...
+        let mut ok = CapBuilder::new(7, rid, 1);
+        ok.cap.scope_target = b"export_backup".to_vec();
+        assert_eq!(verify_capability(&ok.build(&admin_signing_key()), 7, rid, &cfg, &[]), Ok(()));
+        // ...recovery flag rejected (tier mismatch).
+        let mut bad = CapBuilder::new(7, rid, 1);
+        bad.cap.is_recovery = true;
+        bad.cap.scope_target = b"export_backup".to_vec();
+        assert_eq!(
+            verify_capability(&bad.build(&recovery_signing_key()), 7, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
     fn recovery_flag_selects_recovery_authority() {
         let cfg = test_config();
         let rid = b"req-1";
@@ -542,11 +642,11 @@ mod tests {
     fn tampered_field_breaks_signature() {
         let cfg = test_config();
         let rid = b"req-1";
-        // Sign a valid cap, then mutate counter post-signing ⇒ preimage no longer matches ⇒ reject.
+        // Sign a valid cap, then mutate a signed field post-signing ⇒ preimage no longer matches ⇒
+        // reject.
         let mut b = CapBuilder::new(1, rid, 1);
         let sig = admin_signing_key().sign(&signed_preimage(&b.cap));
         b.cap.signature = sig.to_bytes();
-        b.cap.counter = 1; // unchanged value still 1, so mutate something else:
         b.cap.scope_target = b"generate_faucet".to_vec(); // changed AFTER signing
         let cap = b.into_map();
         assert_eq!(
@@ -672,5 +772,140 @@ mod tests {
         assert!(pa.starts_with(CAP_DOMAIN));
         // map header for 11 entries (no sub-op) = 0xA0 | 11 = 0xAB, right after the domain.
         assert_eq!(pa[CAP_DOMAIN.len()], 0xAB);
+    }
+
+    #[test]
+    fn counter_overflow_rejected() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        let entry = CounterEntry {
+            authority: cfg.admin_authority_pk,
+            environment_identifier: TEST_ENV.to_string(),
+            scope_class: 0,
+            scope_target: b"generate_transfer".to_vec(),
+            highest_accepted_counter: u64::MAX,
+        };
+        // highest == u64::MAX ⇒ expected = MAX+1 overflows ⇒ reject (no wrap to 0).
+        let cap = CapBuilder::new(1, rid, u64::MAX).build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &cfg, std::slice::from_ref(&entry)),
+            Err(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn recovery_cap_signed_by_admin_rejected() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // is_recovery=true ⇒ verified vs recovery_pk; signed by the ADMIN key ⇒ fails. (The other
+        // direction of the cross-authority check — guards against an inverted authority selector.)
+        let mut b = CapBuilder::new(8, rid, 1);
+        b.cap.is_recovery = true;
+        b.cap.scope_target = b"restore_backup".to_vec();
+        let cap = b.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 8, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn is_recovery_wrong_cbor_type_is_malformed() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // is_recovery encoded as Integer 0 instead of Bool ⇒ structural type error (0x40), so it can
+        // never silently route to the wrong authority.
+        let cap: Vec<(Value, Value)> = CapBuilder::new(1, rid, 1)
+            .build(&admin_signing_key())
+            .into_iter()
+            .map(|(k, v)| {
+                if matches!(&k, Value::Integer(i) if u64::try_from(*i).ok() == Some(12)) {
+                    (k, Value::Integer(0.into()))
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &cfg, &[]),
+            Err(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn scope_mismatch_misses_counter_stream() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        let entry = CounterEntry {
+            authority: cfg.admin_authority_pk,
+            environment_identifier: TEST_ENV.to_string(),
+            scope_class: 0,
+            scope_target: b"generate_transfer".to_vec(),
+            highest_accepted_counter: 5,
+        };
+        // A different scope_target is a different tuple ⇒ highest=0 ⇒ counter 6 is a gap (reject),
+        // counter 1 is the fresh stream's first (accept). Proves the tuple keys on scope_target.
+        let mut gap = CapBuilder::new(1, rid, 6);
+        gap.cap.scope_target = b"generate_faucet".to_vec();
+        assert_eq!(
+            verify_capability(&gap.build(&admin_signing_key()), 1, rid, &cfg, std::slice::from_ref(&entry)),
+            Err(AgentError::CapabilityRejected)
+        );
+        let mut fresh = CapBuilder::new(1, rid, 1);
+        fresh.cap.scope_target = b"generate_faucet".to_vec();
+        assert_eq!(
+            verify_capability(&fresh.build(&admin_signing_key()), 1, rid, &cfg, std::slice::from_ref(&entry)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn scope_class_out_of_range_is_malformed() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        let mut b = CapBuilder::new(1, rid, 1);
+        b.cap.scope_class = 2; // only {0,1} are valid
+        let cap = b.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &cfg, &[]),
+            Err(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn nonprivileged_opcode_capability_is_malformed() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // opcode 2 (PUBLIC_IDENTITY, a read) is not in the privileged set ⇒ parse rejects.
+        let cap = CapBuilder::new(2, rid, 1).build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 2, rid, &cfg, &[]),
+            Err(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn invalid_environment_identifier_is_malformed() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        let mut b = CapBuilder::new(1, rid, 1);
+        b.cap.environment_identifier = "Bad_Env".to_string(); // uppercase + underscore: not [a-z0-9-]
+        let cap = b.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &cfg, &[]),
+            Err(AgentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn valid_treasury_capability_accepted_with_12_entry_preimage() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        let b = CapBuilder::new(6, rid, 1); // CONFIGURE_TREASURY ⇒ sub_op present (12-entry preimage)
+        // 12 entries ⇒ map header 0xA0 | 12 = 0xAC right after the domain.
+        let pre = signed_preimage(&b.cap);
+        assert_eq!(pre[CAP_DOMAIN.len()], 0xAC);
+        let cap = b.build(&admin_signing_key());
+        assert_eq!(verify_capability(&cap, 6, rid, &cfg, &[]), Ok(()));
     }
 }
