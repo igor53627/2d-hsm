@@ -117,7 +117,8 @@ pub enum Profile {
 /// Structured result of a dispatched agent command (CBOR encoding lives in the wire layer).
 pub enum AgentResponse {
     PublicIdentity(PublicIdentity),
-    /// A signed identity proof plus the `request_id` it answers.
+    /// A signed identity proof for the requested key. (The response body does not echo `request_id`;
+    /// correlation is implicit at the synchronous 0x40 frame layer.)
     ProveIdentity(IdentityProof),
 }
 
@@ -355,7 +356,10 @@ fn handle_prove_identity(
         &key_ref,
         &verifier_nonce,
     )
-    .map_err(|_| AgentError::SealFailed)?;
+    // PROVE_IDENTITY never seals — collapse a signing failure (e.g. the ~2^-128 x-reduced
+    // recovery_id rejection) to the same per-key bucket the handler uses above, NOT SealFailed
+    // (0x46 = atomic sealed-commit failed; reserved for the GENERATE_KEYS/CONFIGURE_TREASURY path).
+    .map_err(|_| AgentError::KeyPurposeMismatch)?;
     Ok(AgentResponse::ProveIdentity(proof))
 }
 
