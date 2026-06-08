@@ -226,9 +226,12 @@ attestation) before it may emit fund-moving signatures.
   refuses to start the fund path (fail closed) — the core anti-rollback assertion.
 - **Per-dispense `lease=1`:** a fund signature is emitted only after the remote bump + seal commit;
   simulated anchor failure ⇒ no signature (0x4x). A rolled-back blob after a dispense is rejected.
-- **Crash reconciliation:** a dropped seal/ack leaving anchor=`epoch+1` and blob=`epoch` with no
-  emitted signature ⇒ restart reconciles forward (no self-wedge); a gap > 1, or an emitted-unsealed
-  signature, fails closed for operator intervention.
+- **Crash reconciliation (adopt-forward, never infer emission):** a dropped seal/ack leaving the
+  anchor **ahead** of the blob (anchor=`epoch+k`, blob=`epoch`, any `k ≥ 1`) ⇒ restart **adopts the
+  anchor's authoritative epoch + counter/spend marks** and re-seals forward (no self-wedge), *without*
+  inferring whether a signature was emitted — the debit already lives at the anchor (§3). Fail-closed
+  is reserved for the anchor **behind** the blob (`freshness_epoch > anchor-current`) or a divergence
+  the anchor cannot authoritatively resolve, which require operator intervention.
 - **`lease=N` consumed-cursor:** a naive lease is **unbounded** — test that repeated snapshot/replay
   of a start-of-lease blob within the window is caught only by anchor-visible lease IDs + a consumed
   sub-cursor that rejects a reused cursor; admin/recovery/config advances are always synchronous.
