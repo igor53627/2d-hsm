@@ -624,9 +624,11 @@ pub fn install_anti_rollback_binding(binding: AntiRollbackBinding) -> bool {
     true
 }
 
-/// Whether a boot-resolved anti-rollback binding is installed AND reports the instance live/active
-/// (poison-recovers). Checks `active` (not just presence) so a binding installed with `active == false`
-/// — e.g. the anchor reported the instance stale/not-live — fails closed rather than passing the gate.
+/// Whether a boot-resolved anti-rollback binding is installed AND `active` (poison-recovers). Checks
+/// `active` (not just presence) so a non-`active` binding fails closed rather than passing the gate.
+/// Today `active` means "a `Fresh` reconcile occurred this boot" (set `true` only on the `Fresh` arm of
+/// `boot_reconcile_anti_rollback`); a future Option-B clone-fencing upgrade is what would supply true
+/// anchor-reported liveness and could set it `false` (see [`AntiRollbackBinding::active`]).
 pub(crate) fn is_anti_rollback_configured() -> bool {
     ANTI_ROLLBACK_BINDING
         .lock()

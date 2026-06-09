@@ -31,8 +31,11 @@
 //! - **Exhaustive, wildcard-free match.** The `match decision { Fresh => .., AdoptForward { .. } => ..,
 //!   FailClosed(_) => .. }` has no `_` arm, so a future `ReconcileDecision` variant is a compile error
 //!   here rather than silently falling through to (or away from) an install.
-//! - **Const-init fail-closed default.** `ANTI_ROLLBACK_BINDING` is const-init `None`; if this function
-//!   is never reached, or returns any non-`Ready` outcome, the gate stays unconfigured ⇒ blocked.
+//! - **Const-init fail-closed default.** `ANTI_ROLLBACK_BINDING` is const-init `None`; no non-`Ready`
+//!   outcome installs a NEW binding, so on a clean boot the gate stays unconfigured ⇒ blocked. (The one
+//!   exception is `FailClosed(BindingInstall)` after a double-invoke, where a *prior* valid `Fresh`
+//!   install legitimately remains — an internal sequencing defect the caller must abort on, not this
+//!   call opening the gate; see the `FailClosed` variant doc.)
 //! - **Callee install-once + reject-inactive.** `install_anti_rollback_binding` itself refuses a second
 //!   install and refuses an `!active` binding, so even a buggy double-call can't fail open.
 //!
