@@ -609,11 +609,12 @@ would break `agent_anchor`'s "signature binds exact wire bytes" property; the en
 internals), read by `read_bounded_anchor_response` which checks `MAX_ANCHOR_RESPONSE_LEN` (4096) **before
 allocating** (no OOM from a hostile relay). Two seams, **both deadline-aware**: `BootQuoteProducer`
 (`fetch(report_data, deadline)`) and `BootRelayChannel` (`round_trip(frame, deadline)`, fresh connection
-per call for stale-reply isolation). `RelayAnchorTransport<Q, C>` computes ONE absolute `Instant` deadline
-and passes it to BOTH — so the whole round-trip (quote fetch + connect+write+read) shares one wall-clock
-budget and the driver's per-attempt COUNT bound composes with a real time bound (no leg can hang). It is
-the concrete `AnchorBootTransport` composing fetch-quote → encode-request → channel-relay → return raw
-bytes; every failure folds to the
+per call for stale-reply isolation). `RelayAnchorTransport<Q, C>` gives **each leg its own `timeout`
+deadline** (a fresh `Instant::now() + timeout` computed just before each) — so a hung quote can't stall
+boot AND quote latency can't starve the channel's budget (no false channel timeout). Per-attempt
+wall-clock is ≤ 2×timeout; the driver's per-attempt COUNT bound caps total boot. It is the concrete
+`AnchorBootTransport` composing fetch-quote → encode-request → channel-relay → return raw bytes; every
+failure folds to the
 coarse always-retryable `AnchorTransportError`. **No nonce-precheck** (a precheck-to-retryable would
 downgrade a genuine terminal `VerifyNonceMismatch` into a grind lever); a garbage/wrong-nonce reply is
 safe (terminal downstream). 25 unit tests incl. the FULL composition through the 5b-1 driver + 5a verify
@@ -637,9 +638,11 @@ request golden vector is a 5b-2b test-vector item.
 - **5b-2b — transport + quote leaf** (gated `vsock-transport`): the concrete `VsockBootRelayChannel`
   (`VsockStream::connect` to host CID 2, fresh-per-call, `SO_*TIMEO` + the shared deadline) +
   `SnpQuoteProducer` (delegates to `snp_report::fetch_report`, deadline-honoring). **Endpoint contract
-  (define here):** host CID `2`; the relay **port** = a new `TWOD_HSM_ANCHOR_RELAY_PORT` env (with a
-  documented default const), distinct from the serve `TWOD_HSM_VSOCK_PORT`; the host-side relay daemon
-  binds that port and uses `decode_anchor_boot_request`. Each of the channel + quote must carry an aya
+  (define here):** host CID `2` (`VMADDR_CID_HOST`); the relay **port** = `TWOD_HSM_ANCHOR_RELAY_PORT`
+  env, default **`5001`** (a `DEFAULT_ANCHOR_RELAY_PORT: u32 = 5001` const, one greater than the serve
+  `DEFAULT_VSOCK_PORT = 5000` so the two surfaces never collide); both the enclave channel and the
+  host-side relay daemon read the SAME const/env, and the daemon binds that port and uses
+  `decode_anchor_boot_request`. Each of the channel + quote must carry an aya
   acceptance test for its wall-clock bound (connect/write/read timeouts + non-hanging quote fetch +
   fresh-connection late-reply isolation).
 - **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →

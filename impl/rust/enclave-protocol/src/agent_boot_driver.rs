@@ -56,14 +56,15 @@
 //! test build type- and use-checks it against a mock transport. Slice 5b-2 (real SNP / aya) adds: the
 //! concrete `impl AnchorBootTransport`. Slice **5b-2a** (`agent_boot_relay`) already provides the
 //! generic `RelayAnchorTransport` impl + the boot-relay wire protocol (CI-tested end-to-end through THIS
-//! driver with a mock channel + fake quote). Slice **5b-2b** (aya / `vsock-transport`) adds only the
-//! OS-coupled leaves: the real `VsockBootRelayChannel` (fresh-connection-per-call, deadline-bounded) +
-//! `SnpQuoteProducer` (`snp_report::fetch_report`), the agent-gateway bin + its in-crate boot module
-//! (set platform root → unseal the agent keystore → `install_agent_keystore` →
-//! `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve), the
-//! sealed-blob source + unseal sequencing, and the `AdoptForward` signed raw-marks channel (which would
-//! eventually reclassify `AdoptForwardUnsupported` from terminal to executable — only in 5b-2b+). The
-//! handshake is single-threaded over the challenge/binding process-globals — 5b-2b MUST NOT run it
+//! driver with a mock channel + fake quote). The remaining aya/SNP work is split into ordered,
+//! independently-gated slices (see `agent-gateway-anti-rollback.md` §8): **5b-2b** transport+quote leaf
+//! (`VsockBootRelayChannel` fresh-connection-per-call/deadline-bounded + `SnpQuoteProducer` =
+//! `snp_report::fetch_report`, gated `vsock-transport`); **5b-2c** the agent-gateway bin + boot
+//! sequencing (set platform root → unseal the agent keystore → `install_agent_keystore` →
+//! `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve);
+//! **5b-2d** the sealed-blob source + unseal sequencing; **5b-2e** the `AdoptForward` signed raw-marks
+//! channel (last + separate — it flips `AdoptForwardUnsupported` from terminal to executable). The
+//! handshake is single-threaded over the challenge/binding process-globals — 5b-2c MUST NOT run it
 //! concurrently.
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -106,9 +107,10 @@ pub(crate) trait AnchorBootTransport {
     /// SNP quote fetch, which must itself be non-hanging). The driver bounds the attempt COUNT
     /// (`max_attempts`), not wall-clock time — so a transport (or quote fetch) that blocks forever would
     /// stall boot indefinitely despite the count bound. A timed-out call MUST return
-    /// [`AnchorTransportError`] (retryable) rather than block. (5b-2a's `RelayAnchorTransport` passes the
-    /// SAME absolute deadline to BOTH the quote producer and the relay channel — one shared wall-clock
-    /// budget — so 5b-2b's concrete impls only need to honor that deadline in their I/O.)
+    /// [`AnchorTransportError`] (retryable) rather than block. (5b-2a's `RelayAnchorTransport` gives the
+    /// quote producer AND the relay channel each their own `timeout` deadline — so a hung quote can't
+    /// stall boot and quote latency can't starve the channel; 5b-2b's concrete impls just honor the
+    /// deadline they're handed. Per-attempt wall-clock ≤ 2×timeout; the count bound caps total boot.)
     fn anchor_round_trip(
         &mut self,
         request: &AnchorBootRequest,

@@ -32,10 +32,11 @@
 //! ## UNWIRED — slice 5b-2b adds the platform leaves
 //! Like 5a/5b-1, the module is dead-code in the non-test lib build; the test build drives the FULL
 //! composition (this transport + the 5b-1 driver + 5a verify) end-to-end with a mock channel + fake
-//! quote producer. Slice 5b-2b (aya / `vsock-transport`) supplies ONLY the OS-coupled leaves: the real
-//! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded), the
-//! `SnpQuoteProducer` (delegates to `snp_report::fetch_report`), the agent-gateway bin + boot sequencing,
-//! and the host-side relay daemon (which uses [`decode_anchor_boot_request`]).
+//! quote producer. The remaining aya/SNP work is split into ordered slices (see §8): **5b-2b** the real
+//! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded) +
+//! `SnpQuoteProducer` (delegates to `snp_report::fetch_report`), gated `vsock-transport`, plus the
+//! host-side relay daemon (which uses [`decode_anchor_boot_request`]); **5b-2c** the agent-gateway bin +
+//! boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::agent_boot_driver::{AnchorBootRequest, AnchorBootTransport, AnchorTransportError};
@@ -159,14 +160,18 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
     };
     let nonce = map_get(&map, 4).and_then(as_bytes_n::<32>).ok_or(ProtocolError::WireProtocol("boot request: nonce must be 32 bytes"))?;
     let report_data = map_get(&map, 5).and_then(as_bytes_n::<64>).ok_or(ProtocolError::WireProtocol("boot request: report_data must be 64 bytes"))?;
-    let quote_report = map_get(&map, 6).and_then(as_bytes).ok_or(ProtocolError::WireProtocol("boot request: quote_report must be bytes"))?.to_vec();
-    let cert_chain = map_get(&map, 7).and_then(as_bytes).ok_or(ProtocolError::WireProtocol("boot request: cert_chain must be bytes"))?.to_vec();
-    if quote_report.len() > MAX_QUOTE_REPORT_LEN {
+    // Check each large field's length on the borrowed slice BEFORE cloning, so an over-large field is
+    // rejected without a second owned allocation.
+    let quote_slice = map_get(&map, 6).and_then(as_bytes).ok_or(ProtocolError::WireProtocol("boot request: quote_report must be bytes"))?;
+    if quote_slice.len() > MAX_QUOTE_REPORT_LEN {
         return Err(ProtocolError::WireProtocol("boot request: quote_report too large"));
     }
-    if cert_chain.len() > crate::snp_report::MAX_CERT_CHAIN_LEN {
+    let cert_slice = map_get(&map, 7).and_then(as_bytes).ok_or(ProtocolError::WireProtocol("boot request: cert_chain must be bytes"))?;
+    if cert_slice.len() > crate::snp_report::MAX_CERT_CHAIN_LEN {
         return Err(ProtocolError::WireProtocol("boot request: cert_chain too large"));
     }
+    let quote_report = quote_slice.to_vec();
+    let cert_chain = cert_slice.to_vec();
     // Bind the cleartext (chain, env, nonce) to the quote commitment.
     let expected = crate::agent_anchor::anchor_handshake_report_data(chain_id, &environment_identifier, &nonce);
     if report_data != expected {
@@ -234,11 +239,11 @@ pub(crate) trait BootRelayChannel {
 /// real (5b-2b) impl delegates to `snp_report::fetch_report` (local configfs-tsm file I/O); the test fake
 /// records the `report_data` it was handed (proving the quote↔nonce binding).
 ///
-/// **`deadline` is the SAME absolute instant the relay channel gets** — the whole round-trip (quote
-/// fetch + channel) shares ONE wall-clock budget, so the driver's per-attempt bound covers the quote too
-/// (closing the "a wedged sev-guest/configfs provider hangs boot" gap). `fetch` MUST honor it: bound its
-/// I/O by `deadline` and return [`ProtocolError`] (→ retryable `AnchorTransportError`) rather than block
-/// past it. A wedged provider is a platform fault, but it must still fail promptly, not hang.
+/// **`deadline` bounds the quote fetch's own wall-clock** (`RelayAnchorTransport` gives this leg its own
+/// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't hang boot
+/// AND quote latency can't starve the channel's budget). `fetch` MUST honor it: bound its I/O by
+/// `deadline` and return [`ProtocolError`] (→ retryable `AnchorTransportError`) rather than block past it.
+/// A wedged provider is a platform fault, but it must still fail promptly, not hang.
 pub(crate) trait BootQuoteProducer {
     fn fetch(
         &self,
@@ -267,17 +272,18 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         &mut self,
         request: &AnchorBootRequest,
     ) -> Result<Vec<u8>, AnchorTransportError> {
-        // ONE budget for the whole round-trip — passed to BOTH the quote fetch and the channel — so the
-        // driver's per-attempt COUNT bound composes with a real wall-clock bound (no leg can hang).
-        let deadline = std::time::Instant::now() + self.timeout;
+        // Each leg gets its OWN `timeout` budget (a fresh deadline computed just before it runs), so:
+        // (a) a hung quote fetch is bounded — it can't stall boot; AND (b) quote latency does NOT eat
+        // into the channel's budget (no false channel timeout). Per-attempt wall-clock is therefore
+        // ≤ 2×timeout; the driver bounds the attempt COUNT on top, so total boot stays bounded.
         let (report, cert_chain) = self
             .quote
-            .fetch(&request.report_data, deadline)
+            .fetch(&request.report_data, std::time::Instant::now() + self.timeout)
             .map_err(|_| AnchorTransportError("anchor relay: SNP quote fetch failed"))?;
         let frame = encode_anchor_boot_request(&report, &cert_chain, request)
             .map_err(|_| AnchorTransportError("anchor relay: request encode failed"))?;
         // The returned bytes are UNTRUSTED and returned verbatim — verified downstream by the driver.
-        self.channel.round_trip(&frame, deadline)
+        self.channel.round_trip(&frame, std::time::Instant::now() + self.timeout)
     }
 }
 
