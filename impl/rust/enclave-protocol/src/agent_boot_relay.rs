@@ -32,12 +32,13 @@
 //! ## UNWIRED — slice 5b-2b adds the platform leaves
 //! Like 5a/5b-1, the module is dead-code in the non-test lib build; the test build drives the FULL
 //! composition (this transport + the 5b-1 driver + 5a verify) end-to-end with a mock channel + fake
-//! quote producer. The remaining aya/SNP work is split into ordered slices (see §8): **5b-2b** the real
-//! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded) +
-//! `SnpQuoteProducer` (delegates to the deadline-bounded `snp_report::fetch_report_deadline`, NOT the
-//! unbounded producer `fetch_report`), gated `vsock-transport`, plus the
-//! host-side relay daemon (which uses [`decode_anchor_boot_request`]); **5b-2c** the agent-gateway bin +
-//! boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
+//! quote producer. The remaining aya/SNP work is split into ordered slices (see §8): **5b-2b-ii** the real
+//! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded) + the
+//! host-side relay daemon (which uses [`decode_anchor_boot_request`]) — those are the `vsock-transport`-gated
+//! leaf. (`SnpQuoteProducer` already landed HERE in 5b-2b-i — `agent-gateway`-gated + CI-tested, dead-code
+//! until 5b-2c wires it; it delegates to the deadline-bounded `snp_report::fetch_report_deadline`, NOT the
+//! unbounded producer `fetch_report`. It is NOT behind `vsock-transport`.) Then **5b-2c** the agent-gateway
+//! bin + boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::agent_boot_driver::{AnchorBootRequest, AnchorBootTransport, AnchorTransportError};
@@ -314,6 +315,12 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
 /// "guard before every potentially-blocking write op" contract can't drift between them. (A blocking op
 /// already in flight is still bounded only by the socket `SO_SNDTIMEO` — a 5b-2b-ii obligation; this just
 /// avoids *initiating* a doomed write/flush.)
+///
+/// **Variant caveat (5b-2b-ii):** a deadline lapse returns `ProtocolError::WireProtocol(..)` — whose name
+/// reads as "malformed", but here it is a *timeout*. Per the [`BootRelayChannel`] contract every failure
+/// maps to the always-retryable `AnchorTransportError`, so `VsockBootRelayChannel` MUST map ALL
+/// `ProtocolError` from these cores to a retryable transport close — do NOT key terminal-vs-retryable off
+/// the `ProtocolError` variant (else a timeout becomes a terminal `VerifyMalformed`, burning the budget).
 fn deadline_guarded_write<W: std::io::Write>(
     stream: &mut W,
     bytes: &[u8],

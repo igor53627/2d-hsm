@@ -658,9 +658,9 @@ request golden vector is a 5b-2b test-vector item.
     for the bins): `DEFAULT_ANCHOR_RELAY_PORT=5001` (`VMADDR_CID_HOST=2`) + `anchor_relay_port_from_env()`
     over the shared `serve_vsock_port_from_env` + pure `validate_relay_port` (rejects 0 + same-as-serve-port).
     Splitting it out of `vsock_listen` is what makes the port validation actually CI-tested — it was
-    previously trapped behind the never-compiled `vsock-transport` gate. **21 CI tests** (all run under
-    `cargo test --features agent-gateway`; the `snp_report` + `vsock_addr` subset of 12 also runs in the
-    bare `cargo test` default build): seam full-sequence cleanup on every error leg
+    previously trapped behind the never-compiled `vsock-transport` gate. **22 CI tests** (10 relay +
+    9 `snp_report` seam + 3 `vsock_addr`; all run under `cargo test --features agent-gateway`; the
+    `snp_report` + `vsock_addr` subset of 12 also runs in the bare `cargo test` default build): seam full-sequence cleanup on every error leg
     (create/write/outblob/mid-sequence-timeout) + fast-path + unbounded-None, framing/forward round-trips
     over in-memory duplexes incl. pre-write-deadline guards on both cores, oversize/malformed-pinned
     rejection, cap-before-alloc outblob/auxblob reads, fast-path quote no-hang, `validate_relay_port` +
@@ -712,9 +712,12 @@ request golden vector is a 5b-2b test-vector item.
   `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
   `[[bin]]`. **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d)** — the
-  hard quote bound. **Hard precondition (a checked task item, not just prose):** the 5b-2c `pub` wrapper
-  MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline` into a *serving* path until (d) exists — wiring
-  it sooner reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
+  hard quote bound. **Hard precondition — make it an ENFORCEABLE artifact, not just a checklist line:** the
+  5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline` into a *serving* path until
+  (d) exists. Prefer a structural gate over prose, e.g.: have (d) introduce a `HardBoundedQuoteProducer`
+  type that the live boot-sequencing wrapper requires by signature, so a build lacking (d) **cannot
+  construct** the serving path (compile error) — rather than a runtime/`cfg` check that can be omitted.
+  Wiring it sooner reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
 - **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
@@ -769,10 +772,21 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `quote_timeout`/`relay_timeout` is **deferred to 5b-2c** (the bin that constructs the transport and owns
   operator config) — NOT 5b-2b-i/ii, which keep the single-budget model. 5b-2c, if it splits them, MUST
   restate the resulting total-boot bound as a success criterion so "timeout" is never ambiguous between
-  total-attempt and per-leg.
+  total-attempt and per-leg. **Exact-bound caveat (5b-2b-ii):** the `≤ 2·timeout` bound only holds if the
+  socket `SO_*TIMEO`/connect timeouts are derived from the *remaining* per-leg budget, NOT set equal to the
+  full leg `timeout` — otherwise a single blocked in-flight syscall can overrun a leg by up to one socket
+  timeout (the in-fn checks only bound *initiating* I/O). 5b-2b-ii MUST either use remaining-deadline-based
+  socket timeouts or state the looser real bound (`leg + SO_*TIMEO + connect`) as the success criterion.
 - **Socket-timeout precondition.** `read_bounded_anchor_response`'s deadline is only enforceable if the
   stream has `SO_RCVTIMEO`/non-blocking set. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` +
   `SO_SNDTIMEO` + a **connect** timeout (so connect can't hang either); the aya test verifies all three.
+  The connect/socket timeout **budget is derived from the per-leg `Duration`** (a fraction of it), NOT a
+  separate operator knob, so channel (a) and daemon (b) coordinate on the same source and the total-boot
+  bound stays verifiable.
+- **Serialization premise (write it down).** Quote fetches are **strictly serial within a guest**: the
+  start-of-attempt `remove_entry`+`create_entry` on the FIXED `twod-hsm` entry is only safe if no other
+  fetch overlaps. True for the single boot path today; any future parallel-attempt / split-timeout idea
+  MUST first move to unique-per-attempt entries (+ the option-(iii) orphan GC) or it silently corrupts.
 - **Host-relay daemon (its own 5b-2b sub-checklist).** Define: daemon location + feature gate; the
   upstream enclave→anchor request/response schema; the **error→framing mapping** — a relay/anchor error
   (unavailable, timeout, upstream 5xx) MUST be surfaced to the enclave as a *retryable transport close*
