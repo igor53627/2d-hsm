@@ -15,7 +15,7 @@
   },
   "derived": {
     "report_data_hex": "0d5d1746ba2c870fb7c954028260e3c377966e22a1b3e5d0226695c0ab244c6eb53c8d2fc2328ac22b4a1c1843ed6c60cb97fd5e2780bdddceaa1ded796d28aa",
-    "report_data_construction": "SHA3-512( b\"2d-hsm-agent-anchor-handshake-v1\" || chain_id.to_be_bytes()[8] || (env.len() as u32).to_be_bytes()[4] || env.as_bytes() || nonce[32] )"
+    "report_data_construction": "SHA3-512( domain || u64_be(chain_id) || u32_be(env.len()) || env_utf8 || nonce ) where domain = the ASCII bytes of \"2d-hsm-agent-anchor-handshake-v1\" (no length prefix, no NUL), u64_be = 8-byte big-endian, u32_be = 4-byte big-endian, env_utf8 = the env string's UTF-8 bytes (7 bytes for \"testnet\"), nonce = the 32 nonce bytes. (Bracketed numbers are byte COUNTS, not array indices.)"
   },
   "frame_layout": {
     "header": "[4-byte BE length of the frame BODY = version + type + CBOR map = 233 = 0x000000E9][1-byte PROTOCOL_VERSION = 0x01][1-byte MessageType::AgentBootRelay = 0x41]. NOTE the length counts the version+type bytes too, not just the CBOR payload (231).",

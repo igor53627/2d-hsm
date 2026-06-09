@@ -598,6 +598,15 @@ impl BootRelayChannel for VsockBootRelayChannel {
     }
 }
 
+// Canonical test chain/env, shared by BOTH the agent-gateway `tests` module and the Linux/vsock
+// `vsock_aya_tests` module (siblings — a const in one is not reachable from the other, so they live at
+// module root under `#[cfg(test)]` and both pull them via `use super::*`). Keeps the aya acceptance tests
+// on the same canonical inputs as the rest of the suite.
+#[cfg(test)]
+const ENV: &str = "testnet";
+#[cfg(test)]
+const CHAIN: u64 = 11565;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,9 +619,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::collections::VecDeque;
     use std::time::Duration;
-
-    const ENV: &str = "testnet";
-    const CHAIN: u64 = 11565;
 
     fn anchor_key() -> SigningKey {
         SigningKey::from_bytes(&[5u8; 32])
@@ -1413,11 +1419,14 @@ mod vsock_aya_tests {
     const LOOPBACK_CID: u32 = 1;
 
     fn build_request_frame() -> Vec<u8> {
+        // Use the shared canonical CHAIN/ENV (module-root #[cfg(test)] consts) so the aya tests stay on the
+        // same inputs as the rest of the suite. (Distinct nonce/filler from the golden vector — these are a
+        // separate live-transport fixture, NOT a regression of the frozen golden frame.)
         let nonce = [0x44u8; 32];
-        let rd = crate::agent_anchor::anchor_handshake_report_data(11565, "testnet", &nonce);
+        let rd = crate::agent_anchor::anchor_handshake_report_data(CHAIN, ENV, &nonce);
         let req = AnchorBootRequest {
-            chain_id: 11565,
-            environment_identifier: "testnet",
+            chain_id: CHAIN,
+            environment_identifier: ENV,
             nonce,
             report_data: rd,
         };
