@@ -711,7 +711,12 @@ request golden vector is a 5b-2b test-vector item.
       surfaces `POLLOUT|POLLERR|POLLHUP` so `poll_ready_for` alone already vetoes it, but `SO_ERROR` is the
       *authoritative, portable* connect result — the poll flags alone are not guaranteed across stacks to flag
       every failure with an error bit (Stevens UNP: a clean `POLLOUT` with `SO_ERROR != 0`), so the `SO_ERROR`
-      read is the robust belt-and-suspenders, not dead code to "simplify away"); the
+      read is the robust belt-and-suspenders, not dead code to "simplify away"). **Which arm runs which
+      check:** `poll_ready_for` gates ONLY the polled-completion arm (`EINPROGRESS`/`EINTR` → `poll(POLLOUT)` →
+      inspect `revents`); the synchronous `connect → Ok(())` arm has no `revents` and is validated by
+      `getsockopt(SO_ERROR) == 0` ALONE (a synchronous success is already connected). So criterion (4) is "both
+      checks where both apply", not "both always run" — do NOT add a `poll_ready_for` assertion to the
+      synchronous arm (there are no `revents` there). The
       `poll_ready_for` helper lives in `cancellable_boundary` (extracted here for (a'), its only live caller).
       **`poll_ready_for` is CONNECT/stream-write-readiness ONLY** — it vetoes `POLLHUP`, which is correct for a
       failed connect but WRONG for a pipe read: the future (d) quote-subprocess `POLLIN` path must NOT reuse it,
@@ -720,10 +725,20 @@ request golden vector is a 5b-2b test-vector item.
       and the caller decides — only the success *predicate* is connect-specific.); (5) promote the
       `OwnedFd` to `VsockStream` via `From<OwnedFd>`, then `set_nonblocking(false)` so `DeadlineSocket`'s
       `SO_*TIMEO` take effect; RAII fd drop on every path — no thread, no leak. Needs the nix `socket` feature
-      alongside `poll` (both added). aya acceptance (MET — re-run on the rewritten `poll(POLLOUT)`
-      `connect_bounded`, not inherited from the deleted watchdog path): connect-to-dead-endpoint fails
-      promptly via the poll timeout (no thread leak); a loopback connect round-trips; stalled-peer read still
-      times out within budget (confirms `set_nonblocking(false)` keeps `DeadlineSocket`'s `SO_*TIMEO` live). **HARD PRECONDITION for a live 5b-2c serve
+      alongside `poll` (both added). aya acceptance (re-run on the rewritten `poll(POLLOUT)`
+      `connect_bounded`, not inherited from the deleted watchdog path) — **be precise about WHICH failure mode
+      each test proves**: (i) connect-to-a-no-listener-endpoint fails **promptly via a socket-level connect
+      refusal** (ECONNRESET/refused on the synchronous or `getsockopt(SO_ERROR)` arm) and folds to a retryable
+      error — this proves *prompt refusal + retryable folding*, NOT the poll-timeout path; (ii) a loopback
+      connect round-trips; (iii) stalled-peer **read** still times out within budget (confirms
+      `set_nonblocking(false)` keeps `DeadlineSocket`'s `SO_*TIMEO` live). The **deadline-lapse on a
+      genuinely-wedged in-flight connect** (a *black-holing* host where `connect` returns `EINPROGRESS` and
+      never completes, so `poll_with_deadline(POLLOUT)` lapses at the deadline and the `OwnedFd` drops) is the
+      one mode NOT exercised by a real-vsock aya test — staging a silently-black-holing vsock peer is awkward;
+      it IS covered structurally by the `cancellable_boundary::poll_times_out_when_not_ready` unit test (poll
+      returns at the deadline, no hang) + RAII drop. **Status: implementation + prompt-refusal/round-trip/read-
+      timeout VERIFIED on aya; the in-flight-connect black-hole lapse is unit-level-only, DEFERRED for a real-
+      vsock test (tracked here, not silently claimed).** **HARD PRECONDITION for a live 5b-2c serve
       (mirroring (d)) — SATISFIED:** (a') is landed, so 5b-2c no longer needs the risk-acceptance fallback for
       the connect leg. *(Historical: the PR #54 watchdog soft-bound was bounded by the deadline via
       `recv_timeout` but leaked one thread+fd per truly-wedged connect, bounded by `max_attempts`; that path is
@@ -857,9 +872,17 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   (`max_attempts · 2 · timeout ≤ overall_boot_budget`); the per-leg-deadline guarantee is owned by 5b-2b's
   `round_trip_inner` and would only break if that wiring were later changed to hand `connect_bounded` the
   *overall* boot deadline. **Post-(a') threat model:** with the fd/thread leak gone, a black-holing host no
-  longer exhausts the guest fd table — it instead produces `max_attempts` *prompt* per-leg-timeout lapses, so
-  the **time** invariant above is now the *only* thing bounding a sustained black-hole (the failure mode
-  shifted from fd-exhaustion to budget-consumption). **Term definitions (single source — 5b-2c wires
+  longer exhausts the guest fd table — but note a *sustained black-hole* (host silently drops, never resets)
+  is precisely the case where the connect does NOT fail fast: `poll_with_deadline(POLLOUT)` waits out the
+  **full per-leg `timeout`** before lapsing, so each wedged connect leg consumes up to `timeout` and the
+  worst-case connect-only cost is **`max_attempts · timeout`** (only the no-listener/reset case is *prompt*).
+  The failure mode thus shifted from fd-exhaustion to *budget-consumption*, which makes the **time** invariant
+  `max_attempts · 2 · timeout ≤ overall_boot_budget` the *only* thing now bounding a sustained black-hole.
+  **Enforce it as an artifact, not a prose `MUST` (mirroring the (d) treatment):** because this invariant is
+  now load-bearing as the sole bound, 5b-2c SHOULD enforce it structurally — e.g. a constructor that takes
+  `overall_boot_budget` and returns an error / `debug_assert`s when `max_attempts · 2 · timeout` exceeds it —
+  rather than leaving it an omittable checklist line (the same enforceable-artifact standard the doc applies
+  to (d)). **Term definitions (single source — 5b-2c wires
   both into one check):** `max_attempts` = the value 5b-2c passes to
   `run_boot_anti_rollback_handshake(..., max_attempts)` (driver-clamped to `MAX_BOOT_ATTEMPTS_CEILING = 64`);
   `timeout` = the per-leg `Duration` 5b-2c gives `RelayAnchorTransport::new`; `overall_boot_budget` = a NEW

@@ -461,6 +461,8 @@ use crate::cancellable_boundary::remaining_or_lapsed;
 /// a non-blocking `connect` + [`crate::cancellable_boundary::poll_with_deadline`] on `POLLOUT`. On a
 /// deadline lapse the `poll` returns and the `OwnedFd` drops in-scope (closing the fd, aborting the
 /// connect) — **no watchdog thread, no leaked fd**. Returns a retryable `ProtocolError` on lapse/failure.
+/// (The no-leak guarantee relies on the kernel tearing down the in-flight connect when the last reference to
+/// the socket fd is closed — true for AF_VSOCK, as for TCP: `close()` aborts an unfinished connect.)
 ///
 /// The fd is created `SOCK_NONBLOCK` so the connect can be polled; **after** the connect completes it is
 /// returned to BLOCKING mode (`set_nonblocking(false)`) so the caller's [`DeadlineSocket`]

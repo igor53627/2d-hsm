@@ -187,9 +187,8 @@ mod tests {
     #[test]
     fn poll_ready_for_requires_want_and_rejects_error_flags() {
         use PollFlags as P;
-        // Clean readiness for the requested event -> true.
+        // Primary use: a freshly-writable connect fd -> POLLOUT clean -> ready.
         assert!(poll_ready_for(P::POLLOUT, P::POLLOUT), "bare POLLOUT must be ready");
-        assert!(poll_ready_for(P::POLLIN, P::POLLIN), "bare POLLIN must be ready");
         // want present but ALSO carries an error condition -> false (the (a') connect-failure case:
         // a failed non-blocking connect can surface POLLOUT|POLLERR; treating it as ready would skip
         // the SO_ERROR check). Cover each error flag.
@@ -199,5 +198,22 @@ mod tests {
         // want absent -> false even on an otherwise-clean revents (e.g. POLLIN when we asked POLLOUT).
         assert!(!poll_ready_for(P::POLLIN, P::POLLOUT), "missing want must not be ready");
         assert!(!poll_ready_for(P::empty(), P::POLLOUT), "empty revents must not be ready");
+    }
+
+    #[test]
+    fn poll_ready_for_is_wrong_for_pipe_reads_documents_why_d_must_not_reuse() {
+        use PollFlags as P;
+        // GUARD (not an endorsement): this asserts the EXACT failure that makes `poll_ready_for`
+        // unsuitable for the future (d) quote-subprocess pipe READ. On a pipe, `POLLHUP` is a NORMAL
+        // EOF (the writer closed) and routinely arrives WITH final readable data as `POLLIN|POLLHUP`.
+        // `poll_ready_for` vetoes POLLHUP unconditionally, so it would reject that completed read and
+        // (d) would drop the last quote bytes. Hence (d) must use its own EOF-aware predicate — this
+        // helper is connect/stream-write readiness ONLY. The bare-POLLIN case is asserted too, purely to
+        // show the helper is generic over `want`; it is NOT a sanction to reuse it for pipe reads.
+        assert!(poll_ready_for(P::POLLIN, P::POLLIN), "generic over want: bare POLLIN matches want=POLLIN");
+        assert!(
+            !poll_ready_for(P::POLLIN | P::POLLHUP, P::POLLIN),
+            "POLLIN|POLLHUP (a pipe's EOF-with-data) is REJECTED -> why (d) pipe reads must not reuse this"
+        );
     }
 }
