@@ -478,6 +478,12 @@ fn connect_bounded(
     };
     use std::os::fd::AsRawFd;
 
+    // Upfront deadline check: an already-lapsed deadline at entry is a clean retryable error BEFORE we
+    // allocate an fd. Without this, a synchronous `connect` success (`Ok(())`, e.g. vsock loopback) would
+    // hand back a live stream whose lapse is only caught later in `DeadlineSocket::arm_*` — restoring the
+    // contract that a lapsed deadline at entry fails fast (and avoiding a wasted socket).
+    remaining_or_lapsed(deadline)?;
+
     // Fresh non-blocking vsock SOCK_STREAM fd. NOT vsock 0.5's `VsockSocket` (that is SOCK_DGRAM).
     let fd = socket(
         AddressFamily::Vsock,
@@ -507,10 +513,19 @@ fn connect_bounded(
         Err(_) => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
     }
 
-    // SO_ERROR carries the real non-blocking-connect result and must be 0 even once POLLOUT fired.
+    // SO_ERROR carries the real non-blocking-connect result and must be 0 even once POLLOUT fired
+    // (nix 0.31 `SocketError` is a `GetOnly` i32 sockopt → `Result<i32, Errno>`; 0 = no pending error).
+    // Distinguish the two failure modes so diagnostics aren't misleading: a non-zero SO_ERROR (a real
+    // socket-level connect failure, e.g. ECONNREFUSED) vs. the `getsockopt` syscall itself failing (e.g.
+    // EBADF — a bad fd state, not a connect error).
     match getsockopt(&fd, SocketError) {
         Ok(0) => {}
-        _ => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect SO_ERROR set")),
+        Ok(_) => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect SO_ERROR set")),
+        Err(_) => {
+            return Err(ProtocolError::WireProtocol(
+                "anchor relay: vsock connect getsockopt(SO_ERROR) failed",
+            ))
+        }
     }
 
     // Promote to VsockStream, then restore BLOCKING mode so DeadlineSocket's SO_*TIMEO take effect.
