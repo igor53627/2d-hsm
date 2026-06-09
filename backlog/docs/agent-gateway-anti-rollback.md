@@ -341,12 +341,15 @@ both sides MUST derive identical bytes or every reboot fails closed (`Inconsiste
 break). `marks_digest = SHA3-256("2d-hsm/agent-anchor-marks/v1\0" ‖ marks_payload)` where `marks_payload`
 is hand-built **canonical CBOR** (RFC 8949 §4.2.1 — shortest-form heads, definite length, **not** the
 serde body encoding which renders `[u8;N]` as int-arrays), a 4-key map:
-- **key 1** → array of counter rows, each row the concat `authority (32-byte bstr) ‖ scope_class
-  (CBOR major-0 uint — NOT a raw byte) ‖ scope_target (bstr, length-prefixed) ‖
-  highest_accepted_counter (CBOR uint)`. Rows **sorted ascending** byte-lex on
-  `(authority, scope_class, scope_target)`; `environment_identifier` is **folded out** (it equals
-  `config.environment_identifier` for every row, `validate()`-enforced). The `(authority, scope_class,
-  scope_target)` triple is the unique row key, so the sort is total.
+- **key 1** → a CBOR array of counter rows, each row a CBOR **`array(4)`**
+  `[authority (32-byte bstr), scope_class (CBOR major-0 uint — NOT a raw byte), scope_target (bstr,
+  length-prefixed), highest_accepted_counter (CBOR uint)]`. The whole `marks_payload` is therefore a
+  genuinely **decodable** canonical-CBOR document (not just a hash preimage), so the seeding slice can
+  reconstruct the rows from it. Rows **sorted ascending** byte-lex on `(authority, scope_class,
+  scope_target)`; `environment_identifier` is **folded out** (it equals `config.environment_identifier`
+  for every row, `validate()`-enforced; the implementation also appends env as a final sort tiebreaker
+  so the order stays total even if that precondition is ever violated). The `(authority, scope_class,
+  scope_target)` triple is the unique row key.
 - **key 2** → `cumulative_native_spend` as a fixed 32-byte bstr (u256-BE), **never** a CBOR uint.
 - **key 3** → `lifetime_spend` as a fixed 32-byte bstr.
 - **key 4** → `strict_recovery_counter` as a CBOR uint.
@@ -362,7 +365,11 @@ digest-only response already authenticates the later-delivered marks). **Anchor 
 (to fully FREEZE key 6):** the anchor's authoritative marks model MUST be exactly this row set
 (env folded), identical sort + framing + units, at same-epoch granularity. Key 6 is promoted from
 PINNED-BEFORE-ANCHOR-CO-SIGN to fully FROZEN only on the anchor team's written data-model commitment;
-the enclave encoder is frozen now regardless.
+the enclave encoder is frozen now regardless. **Divergence runbook:** `marks_digest` is *computed*
+from the sealed body, **not stored in it**, so if the anchor team's model differs before co-sign,
+re-spinning the enclave encoder to match costs **no sealed-format bump** (it is not a v2→v3 migration)
+— only a recompute. This is exactly why key 6 can be enclave-frozen now while the cross-component
+contract stays pending.
 
 **`structural_version` (key 5) — FROZEN v1.** A `u64` in the `pq-agent-keystore-v1` encrypted body,
 init **1** (never 0 — same-epoch Fresh equality vs a forged 0-anchor; anchor baseline 1 is normative),

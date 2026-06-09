@@ -450,12 +450,14 @@ impl KeystoreBody {
     /// Canonical-CBOR encoding of the authoritative counter/spend high-water **marks** — the preimage
     /// (after [`MARKS_DOMAIN`]) of the anchor response key-6 digest. FROZEN v1 grammar (design doc §8):
     /// a 4-key map `{1: [rows…], 2: cumulative_native_spend(32B), 3: lifetime_spend(32B),
-    /// 4: strict_recovery_counter(uint)}`, keys ascending, shortest-form. Counter rows are **sorted**
-    /// byte-lex by `(authority, scope_class, scope_target)` — `environment_identifier` is folded out
-    /// (it equals `config.environment_identifier` for every row, `validate()`-enforced) — each row a
-    /// self-delimiting concat `authority(32B bstr) ‖ scope_class(CBOR uint) ‖ scope_target(bstr) ‖
-    /// highest_accepted_counter(CBOR uint)`. Built with the shared canonical encoders, **not** serde
-    /// (the sealed body serializes `[u8;N]` as CBOR int-arrays, which must not be reused here).
+    /// 4: strict_recovery_counter(uint)}`, keys ascending, shortest-form. Each counter row is a CBOR
+    /// **array(4)** `[authority(32B bstr), scope_class(uint), scope_target(bstr),
+    /// highest_accepted_counter(uint)]`, so the whole payload is a genuinely **decodable** canonical
+    /// CBOR document (the seeding slice reconstructs rows from it). Rows are **sorted** byte-lex by
+    /// `(authority, scope_class, scope_target)` — `environment_identifier` is folded out (it equals
+    /// `config.environment_identifier` for every row, `validate()`-enforced). Built with the shared
+    /// canonical encoders, **not** serde (the sealed body serializes `[u8;N]` as CBOR int-arrays, which
+    /// must not be reused here).
     // TODO(agent_cbor): the canonical ENCODER has 3 consumers now (capability/anchor/here); agent_cbor
     // is decode-only today, so reuse agent_capability's encoders in place until they move there.
     fn encode_marks_payload(&self) -> Vec<u8> {
@@ -486,8 +488,11 @@ impl KeystoreBody {
         let mut out = Vec::new();
         put_uint(&mut out, 5, 4); // map header: 4 pairs
         put_uint(&mut out, 0, 1); // key 1 -> counter rows
-        put_uint(&mut out, 4, rows.len() as u64); // array header
+        put_uint(&mut out, 4, rows.len() as u64); // outer array: one element PER ROW
         for r in &rows {
+            // Each row is a 4-element CBOR array so the payload is a genuinely DECODABLE canonical CBOR
+            // document (the seeding slice reconstructs rows from it), not just a hash preimage.
+            put_uint(&mut out, 4, 4); // array(4): [authority, scope_class, scope_target, counter]
             put_bytes(&mut out, &r.authority);
             put_uint(&mut out, 0, u64::from(r.scope_class));
             put_bytes(&mut out, &r.scope_target);
