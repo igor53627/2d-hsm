@@ -465,6 +465,17 @@ fn handle_generate_keys(
             crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
             _ => AgentError::SealFailed,
         })?;
+    // Anti-rollback structural bump (TASK-7.7 key 5): GENERATE_KEYS is a structural mutation the anchor
+    // cannot reconstruct, so bump structural_version per COMMITTED op (once, regardless of `count`).
+    // `checked_add` → SealFailed (0x46) on overflow, never wrap (a wrapped counter would let a restore
+    // masquerade as an adoptable gap). This is a LOCAL-ONLY bump and currently INERT: advancing
+    // `freshness_epoch` + the anchor ack atomically with it (seal-before-emit) and the boot `reconcile`
+    // that reads `structural_version` are the deferred co-slice — nothing reads it at boot yet. It rides
+    // the candidate, so it ships only under `agent-keygen-exec-preview` like the rest of this handler.
+    candidate.structural_version = candidate
+        .structural_version
+        .checked_add(1)
+        .ok_or(AgentError::SealFailed)?;
     Ok(AgentResponse::GenerateKeys { keys, candidate: Box::new(candidate) })
 }
 
@@ -709,6 +720,8 @@ mod tests {
             },
             audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch: 1,
+            structural_version: 1,
+            strict_recovery_counter: 0,
         }
     }
 
@@ -938,6 +951,58 @@ mod tests {
             }
             _ => panic!("expected GenerateKeys"),
         }
+    }
+
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_bumps_structural_version_per_op_local_only() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        assert_eq!(body.structural_version, 1);
+        // count=3: three keys minted in ONE committed op.
+        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+            AgentResponse::GenerateKeys { candidate, .. } => {
+                // +1 per COMMITTED op, regardless of count (NOT +3).
+                assert_eq!(candidate.structural_version, 2);
+                // LOCAL-ONLY: freshness_epoch + strict_recovery_counter untouched (epoch advance + anchor
+                // ack are the deferred seal-before-emit co-slice).
+                assert_eq!(candidate.freshness_epoch, body.freshness_epoch);
+                assert_eq!(candidate.strict_recovery_counter, body.strict_recovery_counter);
+            }
+            _ => panic!("expected GenerateKeys"),
+        }
+    }
+
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_structural_overflow_fails_closed() {
+        use ed25519_dalek::SigningKey;
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        body.structural_version = u64::MAX; // checked_add → None → SealFailed, no swap
+        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::SealFailed)
+        );
     }
 
     #[cfg(feature = "agent-keygen-exec-preview")]

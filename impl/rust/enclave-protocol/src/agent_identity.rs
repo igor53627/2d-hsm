@@ -352,6 +352,8 @@ mod tests {
             },
             audit: AuditRing { records: vec![], capacity: 0, last_exported_seq: 0, next_seq: 0 },
             freshness_epoch: 0,
+            structural_version: 1,
+            strict_recovery_counter: 0,
         };
         assert_eq!(find_entry(&body, &[0x11; 32]).unwrap().purpose, KeyPurpose::AgentTransferK1);
         assert_eq!(find_entry(&body, &[0x22; 32]).unwrap().purpose, KeyPurpose::AgentFaucetTreasuryK1);
