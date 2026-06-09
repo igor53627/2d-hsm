@@ -669,11 +669,13 @@ request golden vector is a 5b-2b test-vector item.
     mix vsock integration, daemon fault semantics, and acceptance infra; review each obligation on its own):
     - **(0) canonical golden vector (BLOCKS (a)+(b)):** commit the `AgentBootRelay` canonical-request byte
       vector to `testvectors/agent-gateway/` FIRST, so the channel + daemon (and any external relay
-      reimplementation) are built against frozen bytes, not prose. NOTE: 5b-2b-i's `relay_forward_once`
-      tests assert against frames built by the *canonical encoder* (`encode_anchor_boot_request`) — which
-      IS the vector's source of truth, so the core is correct — but the frozen vector is what an external
-      relay/anchor must reimplement against, and it is the byte-level regression anchor for the
-      `relay ⊇ anchor` decode-leniency invariant; it was an implicit precondition not met by 5b-2b-i.
+      reimplementation) are built against frozen bytes, not prose. **Ordering inversion (intentional,
+      annotated):** the decode-leniency-relevant code (`relay_forward_once` + `decode_anchor_boot_request`)
+      already landed in 5b-2b-i, asserted against frames from the *canonical encoder*
+      (`encode_anchor_boot_request` — the vector's source of truth), so the in-crate production path is
+      correct NOW; the frozen-bytes regression anchor for external/separate-service reimplementation is
+      added in (0). So: invariant *asserted via the in-crate encoder in 5b-2b-i; frozen-bytes anchor added
+      in 5b-2b-ii(0)* — (0) precedes the channel/daemon, not the already-merged 5b-2b-i core.
     - **(a) channel socket wrapper:** the concrete `VsockBootRelayChannel` (`VsockStream::connect` to
       `VMADDR_CID_HOST`, fresh-per-call, `SO_RCVTIMEO`/`SO_SNDTIMEO`+connect-timeout, delegates to the
       CI-proven `relay_round_trip_over_stream`).
@@ -684,6 +686,14 @@ request golden vector is a 5b-2b test-vector item.
       framing/decoder and risk codec drift). The wrapper owns the Err→close mapping + operator-triage
       logging (oversize/malformed/timeout) + a **serial accept loop** (one deadline-bounded pump at a time;
       revisit only if concurrent enclave boots need it) — see the host-relay daemon requirement below.
+      **Anchor-facing CONNECT timeout (required, symmetric with (a)):** the daemon's upstream-anchor socket
+      MUST set a connect timeout in addition to `SO_RCVTIMEO`/`SO_SNDTIMEO` — `connect()` is bounded by
+      NEITHER `SO_*TIMEO` nor `relay_forward_once`'s in-fn deadline (which operates on already-connected
+      streams), so with the serial loop a black-holing anchor that stalls on connect would wedge the ENTIRE
+      daemon (head-of-line-blocking every queued enclave boot). **Blast-radius note (explicit non-goal):**
+      under the serial loop a slow/wedged pump delays every queued boot by ≤ (per-pump deadline + socket +
+      connect timeouts); those bounds are what keep it tolerable — concurrency (and accept-backlog limits)
+      is the named follow-up trigger if many enclaves boot at once.
     - **(c) feature-build CI:** a new `cargo build --features vsock-transport,agent-gateway` step (so the
       `vsock-transport` leaf can't bit-rot — NOTE: NOT `staging-vsock,agent-gateway`, which fails the
       `ml-dsa-65 ⊕ agent-gateway` role-isolation `compile_error!` since `staging-vsock` pulls
@@ -696,7 +706,10 @@ request golden vector is a 5b-2b test-vector item.
   `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
   `decide_serve(outcome, cfg!(release_build))?` → serve. **Blocked on 5b-2b-ii**, not merely 5b-2b-i:
   `RelayAnchorTransport::new` needs a concrete `BootRelayChannel` (= `VsockBootRelayChannel`), which
-  5b-2b-ii supplies — so 5b-2c cannot be wired even though 5b-2b-i is done.
+  5b-2b-ii supplies — so 5b-2c cannot be wired even though 5b-2b-i is done. **Hard precondition (must be a
+  checked task item, not just prose):** 5b-2c MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
+  into the live serve path until 5b-2b-ii(d)'s hard wall-clock quote bound exists — wiring it sooner
+  reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
 - **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
@@ -711,11 +724,12 @@ verify+driver+transport composition end-to-end (including the response wire fram
 `driver_ready_through_real_response_framing`), so the accumulation bottoms out here. **In the window where
 5b-2b-i is merged but 5b-2b-ii is not, NO production boot path can hang on a wedged quote fetch — because
 there is no current caller**: the quote producer + relay transport are `#[cfg_attr(not(test),
-allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). NOTE this is a
-call-graph guarantee, not a type-enforced one — `fetch_report_deadline` is `pub fn` (crate-public), so the
-obligation is explicit: **`fetch_report_deadline` MUST NOT be wired into any serve-gate / live boot path
-before 5b-2b-ii's hard wall-clock bound lands.** A future in-repo or out-of-tree caller that ignores this
-would silently reintroduce the hang risk.
+allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). The best-effort-deadline
+`fetch_report_deadline` is now **`pub(crate)`**, so the "MUST NOT be wired into a live serve/boot path
+before 5b-2b-ii's hard wall-clock bound lands" obligation is **type-enforced against any out-of-crate
+caller** (a compile error, not just prose); the only in-crate caller is `SnpQuoteProducer::fetch`, itself
+dead-code until 5b-2c. (The unbounded producer `fetch_report` stays `pub` — it has no wall-clock contract
+to violate.)
 
 **5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
 MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
@@ -735,8 +749,11 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   per-attempt configfs entry names** + an explicit abort/leak policy (bounded stuck-reader budget; refuse
   boot past a threshold). Acceptance criteria: **"no stuck worker/process accumulation across repeated
   timeouts"** and **"a subsequent attempt is well-defined (no entry collision) after a timeout"**, plus the
-  aya test that a wedged provider fails the attempt promptly rather than hanging boot. Until it lands, the
-  boot serve-gate (5b-2c) MUST treat the quote-fetch deadline as best-effort.
+  aya test that a wedged provider fails the attempt promptly rather than hanging boot. This matters in the
+  **partial-landing window** where 5b-2b-ii(a)/(b) (channel + daemon) have landed — so 5b-2c is no longer
+  blocked and a live boot path can exist — but (d)'s hard bound has not: in that window the boot serve-gate
+  (5b-2c) MUST treat the quote-fetch deadline as best-effort (and per the 5b-2c precondition, not wire it
+  live at all until (d) lands).
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
   is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout`; total boot ≤
   `max_attempts · 2 · timeout`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
@@ -765,9 +782,14 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   acceptance**, else a request the anchor would have honored becomes a relay `Err` → retryable close that
   silently burns the enclave's attempt budget toward a false terminal. If the anchor is the SAME process
   reusing `decode_anchor_boot_request`, `relay ⊇ anchor` holds trivially. If the anchor is a **separate
-  service** (the likely deployment), this is a **cross-component sync obligation, not a present fact**: the
-  5b-2b-ii(0) canonical golden vector is the contract that pins it — the anchor MUST accept every request
-  the relay's decoder accepts, regression-tested against that vector.
+  service** (the likely deployment), this is a **cross-component sync obligation, not a present fact**.
+  **Sufficiency for the production path:** the enclave *encoder* (`encode_anchor_boot_request`) is canonical,
+  so the only request that ever actually transits the wire is the canonical one — the 5b-2b-ii(0) golden
+  vector freezes exactly that, so freezing it guarantees the production request the anchor must accept.
+  **NOT pinned by that vector:** the broader `relay ⊇ anchor` *superset* (the relay decoder is lenient and
+  accepts non-canonical inputs the canonical vector contains none of) is **defense-in-depth, not regression-
+  protected by a single canonical vector**; if a separate anchor must provably honor the full leniency set,
+  that requires differential/property tests of non-canonical inputs against the anchor, tracked separately.
 - **Canonical request golden vector** — add an `AgentBootRelay` canonical-request test vector to
   `testvectors/agent-gateway/` **before** any host-daemon/channel implementation, so external/later relay
   work implements against bytes, not prose (the encoder is canonical; the decoder is lenient).

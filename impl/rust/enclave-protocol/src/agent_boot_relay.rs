@@ -309,22 +309,41 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
 /// in-memory duplex — the real `VsockBootRelayChannel` (5b-2b-ii, `vsock-transport`) is a thin wrapper
 /// that connects a `VsockStream`, sets the socket timeouts, and calls this.
 ///
-/// **Deadline coverage:** this fn checks the deadline before the write, and the bounded read enforces it
-/// across reads. The blocking `write_all`/`flush` itself is bounded ONLY by the socket's `SO_SNDTIMEO`
-/// (and the read by `SO_RCVTIMEO`) — so 5b-2b-ii's wrapper MUST set BOTH (+ a connect timeout) for the
-/// per-attempt wall-clock to actually hold against a black-holing relay; the in-fn check alone does not
-/// bound a stalled in-kernel write. `request_frame` is ALREADY a complete `0x41` frame — written verbatim,
-/// never re-framed. Returns the raw response bytes for the driver to verify (never parsed here).
+/// **Deadline coverage:** via [`deadline_guarded_write`] this fn checks the deadline before the write AND
+/// before the flush, and the bounded read enforces it across reads. The blocking `write_all`/`flush`
+/// op *already in flight* is bounded ONLY by the socket's `SO_SNDTIMEO` (and the read by `SO_RCVTIMEO`) —
+/// so 5b-2b-ii's wrapper MUST set BOTH (+ a connect timeout) for the per-attempt wall-clock to actually
+/// hold against a black-holing relay; the in-fn checks bound only *initiating* a write/flush, not a stalled
+/// in-kernel one. `request_frame` is ALREADY a complete `0x41` frame — written verbatim, never re-framed.
+/// Returns the raw response bytes for the driver to verify (never parsed here).
+/// Write `bytes` then flush `stream`, checking `deadline` before **both** the `write_all` AND the `flush`
+/// — each is potentially-blocking I/O, so a budget that lapsed during the write must not even initiate the
+/// flush. `what` localizes which leg tripped. The single shared writer used by both relay cores, so the
+/// "guard before every potentially-blocking write op" contract can't drift between them. (A blocking op
+/// already in flight is still bounded only by the socket `SO_SNDTIMEO` — a 5b-2b-ii obligation; this just
+/// avoids *initiating* a doomed write/flush.)
+fn deadline_guarded_write<W: std::io::Write>(
+    stream: &mut W,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+    what: &'static str,
+) -> Result<(), ProtocolError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(ProtocolError::WireProtocol(what));
+    }
+    stream.write_all(bytes).map_err(ProtocolError::from)?;
+    if std::time::Instant::now() >= deadline {
+        return Err(ProtocolError::WireProtocol(what));
+    }
+    stream.flush().map_err(ProtocolError::from)
+}
+
 pub(crate) fn relay_round_trip_over_stream<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     request_frame: &[u8],
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>, ProtocolError> {
-    if std::time::Instant::now() >= deadline {
-        return Err(ProtocolError::WireProtocol("anchor relay: deadline before write"));
-    }
-    stream.write_all(request_frame).map_err(ProtocolError::from)?;
-    stream.flush().map_err(ProtocolError::from)?;
+    deadline_guarded_write(stream, request_frame, deadline, "anchor relay: deadline before write")?;
     read_bounded_anchor_response(stream, deadline)
 }
 
@@ -356,22 +375,13 @@ where
 {
     let frame = crate::read_framed_message_with_idle_deadline(enclave, Some(deadline))?;
     let _ = decode_anchor_boot_request(&frame)?; // reject malformed BEFORE an anchor round-trip
-    // Pre-write deadline check on BOTH write legs (matches `relay_round_trip_over_stream`): if the budget
-    // lapsed during the enclave read / anchor read, don't even START another write — fail closed so the
-    // daemon turns it into a retryable close. The blocking `write_all` itself is still bounded only by the
-    // socket `SO_SNDTIMEO` (a 5b-2b-ii obligation); this in-fn check just avoids initiating a doomed write.
-    if std::time::Instant::now() >= deadline {
-        return Err(ProtocolError::WireProtocol("anchor relay: deadline before anchor write"));
-    }
-    anchor.write_all(&frame).map_err(ProtocolError::from)?;
-    anchor.flush().map_err(ProtocolError::from)?;
+    // Both write legs go through `deadline_guarded_write` (checks the budget before the write AND the
+    // flush) — same contract as `relay_round_trip_over_stream`: a budget that lapsed during the enclave
+    // read / anchor read never initiates another write, so the daemon turns it into a retryable close.
+    deadline_guarded_write(anchor, &frame, deadline, "anchor relay: deadline before anchor write")?;
     let response = read_bounded_anchor_response(anchor, deadline)?;
     let wire = frame_anchor_response(&response)?;
-    if std::time::Instant::now() >= deadline {
-        return Err(ProtocolError::WireProtocol("anchor relay: deadline before enclave write"));
-    }
-    enclave.write_all(&wire).map_err(ProtocolError::from)?;
-    enclave.flush().map_err(ProtocolError::from)
+    deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
 }
 
 /// The production [`BootQuoteProducer`]: fetch the SNP quote via configfs-tsm, honoring the deadline
@@ -923,6 +933,46 @@ mod tests {
         let r = relay_round_trip_over_stream(&mut stream, &[0xaa], near_past());
         assert!(r.is_err());
         assert!(stream.written.is_empty(), "nothing written when the deadline is already past");
+    }
+
+    /// A stream whose `write` SLEEPS past `cross_at` (so the deadline lapses *during* the write), and whose
+    /// `flush` records whether it was called — to prove the pre-flush deadline guard skips a doomed flush.
+    struct FlushGuardStream {
+        cross_at: std::time::Instant,
+        wrote: usize,
+        flush_called: bool,
+    }
+    impl std::io::Read for FlushGuardStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            // Unreachable in this test: the pre-flush guard returns Err before any response read.
+            Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "unreached"))
+        }
+    }
+    impl std::io::Write for FlushGuardStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let now = std::time::Instant::now();
+            if now < self.cross_at {
+                std::thread::sleep(self.cross_at - now); // cross the deadline DURING the write
+            }
+            self.wrote += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_called = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_round_trip_flush_skipped_when_deadline_lapses_during_write() {
+        // pre-write guard passes (deadline still future); the write crosses the deadline; the pre-flush
+        // guard then fires — the flush must NOT be initiated after the budget is gone.
+        let dl = std::time::Instant::now() + Duration::from_millis(50);
+        let mut s = FlushGuardStream { cross_at: dl, wrote: 0, flush_called: false };
+        let r = relay_round_trip_over_stream(&mut s, &[0xaa; 8], dl);
+        assert!(r.is_err(), "lapsed-during-write must error");
+        assert!(s.wrote > 0, "the write itself ran");
+        assert!(!s.flush_called, "flush must be skipped once the deadline lapsed during the write");
     }
 
     #[test]

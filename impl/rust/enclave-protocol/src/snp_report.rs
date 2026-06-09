@@ -122,7 +122,7 @@ impl TsmFs for RealTsmFs {
     }
     fn read_outblob(&self, entry: &str) -> Result<Vec<u8>, ProtocolError> {
         use std::io::Read;
-        let mut file = std::fs::File::open(format!("{entry}/outblob"))
+        let file = std::fs::File::open(format!("{entry}/outblob"))
             .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot open outblob"))?;
         // Cap-before-alloc (configfs is in the TCB, but match the module's bounded-read discipline so a
         // buggy/wedged provider can't force an unbounded heap alloc in the memory-constrained TEE): read at
@@ -146,7 +146,7 @@ impl TsmFs for RealTsmFs {
         // most +1 to detect oversize) so an implausibly large auxblob can't force an unbounded alloc, nor
         // push the GET_MEASUREMENT response frame past `MAX_MESSAGE_SIZE` (nor the boot-relay request frame
         // past its own bound, which reuses this same constant).
-        let mut file = match std::fs::File::open(format!("{entry}/auxblob")) {
+        let file = match std::fs::File::open(format!("{entry}/auxblob")) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
         };
@@ -238,7 +238,17 @@ pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<(Vec<u8>, Vec
 
 /// Like [`fetch_report`] but bounded by a caller-supplied absolute `deadline` — the entrypoint the agent
 /// boot-relay quote producer (TASK-7.7 5b-2) calls so the seam's deadline contract is honored.
-pub fn fetch_report_deadline(
+///
+/// **`pub(crate)` + `agent-gateway`-gated deliberately** (its only caller is
+/// `agent_boot_relay::SnpQuoteProducer::fetch`, itself `agent-gateway`-only): the deadline here is
+/// best-effort/cooperative — it does NOT hard-bound a wedged in-kernel `read(outblob)` until 5b-2b-ii lands
+/// a cancellable boundary — so this MUST NOT be wired into a live serve/boot path from outside the crate.
+/// Crate-private visibility *type-enforces* that obligation (the doc'd "must not wire externally" is now a
+/// compile error, not just prose); the feature gate keeps it from being dead code in the non-agent builds.
+/// The unbounded producer [`fetch_report`] stays `pub` — the legitimate GET_MEASUREMENT path with no
+/// wall-clock contract to violate.
+#[cfg(feature = "agent-gateway")]
+pub(crate) fn fetch_report_deadline(
     report_data: &[u8; REPORT_DATA_LEN],
     deadline: std::time::Instant,
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
