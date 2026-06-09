@@ -451,6 +451,23 @@ enforced afterward by `check_strict_keys` + the typed accessors in each module. 
 decoder's `MAX_STR_LEN` ≥ the largest per-field byte cap (today 64 B) so no schema-valid field is
 rejected at decode.
 
+**Freshness-challenge (nonce) state machine — slice 2 (`agent_challenge.rs`).** The enclave's half of
+the freshness handshake: `issue_challenge(chain_id, env)` draws a fresh CSPRNG nonce and installs it as
+the **single outstanding challenge** in a volatile process-global (`Mutex<Option<Challenge>>`, mirrors
+`INSTALLED_KEYSTORE`/`PLATFORM_PROVISIONING_ROOT`); `Challenge::report_data()` binds that *same* draw
+into the SNP `report_data`; `consume_outstanding_challenge() -> Option<Challenge>` is the **single-use**
+retire (a `take()` returning the taken challenge). Decisions: **overwrite-on-reissue** (a re-issuable
+per-restart token, not an install-once secret — a failed handshake rotates to a fresh nonce, never
+retries the same), **poison-recover** (a non-secret slot must not brick the agent), and a structural
+**volatile-only anti-invariant** — `Challenge` is deliberately **non-`Serialize`/`Deserialize`** so the
+nonce can never enter sealed/host-relayed state; a restart MUST lose it and force a fresh draw
+(otherwise a host that rolls back sealed state could replay a captured `(nonce, response)`). **Boot-slice
+obligations (deferred):** `issue_challenge` runs **after** unseal (scope comes from the sealed config),
+once per (re)start; the boot caller routes **every** verify outcome through `consume_outstanding_challenge`
+and asserts the returned nonce equals the one it verified against (fail-closed backstop for the
+peek→verify→take sequence); a retry re-issues, never re-uses a peeked nonce. Per-instance only — no
+clone fencing (design §3 Option A residual).
+
 **Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
 the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, wiring
 verify+reconcile (via `verify_anchor_response_bytes`) into boot/install, per-op `epoch` bump +

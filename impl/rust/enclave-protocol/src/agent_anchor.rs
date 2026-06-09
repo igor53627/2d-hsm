@@ -40,8 +40,9 @@ const ANCHOR_RESPONSE_VERSION: u64 = 1;
 /// Domain for the SNP `report_data` the enclave puts in its handshake attestation (the anchor verifies
 /// the enclave's side; that verification is anchor-side, this is just the binding the enclave commits).
 const HANDSHAKE_REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-agent-anchor-handshake-v1";
-/// 32-byte fixed-length fields (marks digest, nonce, block hash).
-const DIGEST_LEN: usize = 32;
+/// 32-byte fixed-length fields (marks digest, nonce, block hash). `pub(crate)` so the freshness-
+/// challenge module ([`crate::agent_challenge`]) keeps the nonce width in lockstep with verify/report_data.
+pub(crate) const DIGEST_LEN: usize = 32;
 
 /// Why a freshness response was rejected. The handshake is a boot-time ceremony (not a per-request,
 /// host-probeable surface), so these are coarse fail-closed reasons rather than an anti-oracle band.
