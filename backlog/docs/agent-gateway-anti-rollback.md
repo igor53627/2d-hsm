@@ -626,22 +626,33 @@ request carries a multi-KiB cert chain (the request is not signature-bound, so b
 not load-bearing). The response framing has a single shared writer (`frame_anchor_response`) so the host
 relay and the reader can't drift.
 
-**Still 5b-2b (aya/SNP) — only OS-coupled leaves:** (a) the concrete `VsockBootRelayChannel`
-(`VsockStream::connect` to host CID 2, fresh-per-call, `SO_*TIMEO` + the deadline) + `SnpQuoteProducer`
-(delegates to `snp_report::fetch_report`), gated `vsock-transport`; (b) the agent-gateway **bin** +
-in-crate boot module (set platform root → unseal the agent keystore → `install_agent_keystore` →
-`RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` → `decide_serve(outcome,
-cfg!(release_build))?` → serve); (c) the sealed-blob source + unseal sequencing; (d) the `AdoptForward`
-signed raw-marks channel + seed + re-seal; plus the host-side relay daemon (uses
-`decode_anchor_boot_request`). **Enclave-initiated outbound vsock is feasible** (the `vsock` crate's
-`VsockStream::connect` to CID 2, separate from the serve-loop listener — spike confirmed via
-`vsock_listen.rs`), but the live exchange + timeouts are validated on aya. **Each of (a)–(d) is its own
-ordered, independently-gated review slice** (transport+quote leaf → bin/boot-sequencing → sealed-blob
-source/unseal → AdoptForward), NOT one mega-PR — (d) **AdoptForward stays last and separate** because it
-changes the fail-closed behavior (flips `AdoptForwardUnsupported` from terminal to executable) and adds
-an authenticated raw-marks channel + re-seal/persistence; (a)'s `SnpQuoteProducer::fetch` and
-`VsockBootRelayChannel` must each carry an aya acceptance test for their wall-clock bound (connect/write/
-read timeouts + non-hanging quote fetch + fresh-connection late-reply isolation). Still **UNWIRED**
+**Wire-spec registry (synced in 5b-2a):** `MessageType::AgentBootRelay = 0x41` is now registered in the
+source-of-truth `vsock-api-wire-format-spec-draft.md` §10.1 (allocated in the `0x40..0x4F` agent band;
+enclave-initiated; NOT serve-dispatchable; unknown-frame coverage moved to `0x42`). **Canonicality
+contract:** the enclave encoder MUST emit canonical CBOR (it does, via the `put_*` helpers); the host-relay
+*decoder* MAY be lenient after semantic validation (the request is not signature-bound). A canonical
+request golden vector is a 5b-2b test-vector item.
+
+**Still 5b-2 platform/host, split into ordered independently-gated slices (aya/SNP):**
+- **5b-2b — transport + quote leaf** (gated `vsock-transport`): the concrete `VsockBootRelayChannel`
+  (`VsockStream::connect` to host CID 2, fresh-per-call, `SO_*TIMEO` + the shared deadline) +
+  `SnpQuoteProducer` (delegates to `snp_report::fetch_report`, deadline-honoring). **Endpoint contract
+  (define here):** host CID `2`; the relay **port** = a new `TWOD_HSM_ANCHOR_RELAY_PORT` env (with a
+  documented default const), distinct from the serve `TWOD_HSM_VSOCK_PORT`; the host-side relay daemon
+  binds that port and uses `decode_anchor_boot_request`. Each of the channel + quote must carry an aya
+  acceptance test for its wall-clock bound (connect/write/read timeouts + non-hanging quote fetch +
+  fresh-connection late-reply isolation).
+- **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →
+  `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
+  `decide_serve(outcome, cfg!(release_build))?` → serve.
+- **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
+- **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
+  `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
+  `hash(adopted)==marks_digest` seed + re-seal/persistence.
+
+**Enclave-initiated outbound vsock is feasible** (the `vsock` crate's `VsockStream::connect` to CID 2,
+separate from the serve-loop listener — spike confirmed via `vsock_listen.rs`), but the live exchange +
+timeouts are validated on aya. Still **UNWIRED**
 (dead-code) until 5b-2b adds the bin caller; **5b-2 MUST land before any release build claims anti-rollback
 support** (else 5a/5b-1/5b-2a ship dead). 5b-2a is the LAST pure layer — its tests already drive the full
 verify+driver+transport composition end-to-end (including the response wire framing via
