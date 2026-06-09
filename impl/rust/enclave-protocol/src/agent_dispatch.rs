@@ -620,7 +620,7 @@ pub fn install_anti_rollback_binding(binding: AntiRollbackBinding) -> bool {
 /// Whether a boot-resolved anti-rollback binding is installed AND reports the instance live/active
 /// (poison-recovers). Checks `active` (not just presence) so a binding installed with `active == false`
 /// — e.g. the anchor reported the instance stale/not-live — fails closed rather than passing the gate.
-pub fn is_anti_rollback_configured() -> bool {
+pub(crate) fn is_anti_rollback_configured() -> bool {
     ANTI_ROLLBACK_BINDING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1664,10 +1664,12 @@ mod tests {
         let _g = gate_unconfigured();
         let (body, key_ref) = body_with_key();
         // PUBLIC_IDENTITY(2) is not rollback-sensitive → allowed with no anti-rollback binding.
+        // (PROVE_IDENTITY(3)'s gate-pass when unconfigured is covered by prove_identity_signs_and_recovers
+        // under agent-prove-identity-preview, and op3==false is locked by the exhaustive classification.)
         let env = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
         assert!(
             dispatch_agent(Profile::AgentGateway, &env, &body).is_ok(),
-            "read opcodes are not gated by anti-rollback"
+            "PUBLIC_IDENTITY is not gated by anti-rollback"
         );
     }
 
