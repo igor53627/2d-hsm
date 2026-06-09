@@ -636,9 +636,12 @@ request golden vector is a 5b-2b test-vector item.
 
 **Still 5b-2 platform/host, split into ordered independently-gated slices (aya/SNP):**
 - **5b-2b — transport + quote leaf**, split into a CI-testable core (5b-2b-i) and the OS-syscall leaf
-  (5b-2b-ii) because **CI never compiles `vsock-transport`** — so all framing/deadline/cleanup logic lives
-  OUTSIDE that gate to stay tested:
-  - **5b-2b-i IN REVIEW — PR #53 (this slice; CI-tested in the default + `agent-gateway` builds, NOT behind `vsock-transport`):**
+  (5b-2b-ii) because **CI's default test matrix never RUNS `vsock-transport`** (no live vsock env; the
+  framing/deadline/cleanup logic therefore lives OUTSIDE that gate so it is exercised by ordinary
+  `cargo test`). As of 5b-2b-ii(c), CI does **compile** the gate (`cargo test --no-run --features
+  vsock-transport,agent-gateway` on the Linux runner) so the leaf can't bit-rot — but it still never *runs*
+  the `#[ignore]` vsock tests (those run on aya):
+  - **5b-2b-i DONE — MERGED PR #53 (CI-tested in the default + `agent-gateway` builds, NOT behind `vsock-transport`):**
     `snp_report` deadline-aware quote fetch via a `TsmFs` fs-seam — `fetch_report_with(fs, report_data,
     deadline: Option<Instant>)` (`Some` ⇒ fast-path past-deadline → no fs + per-step `check_deadline`;
     `None` ⇒ unbounded; **unconditional entry cleanup on every path incl. mid-sequence timeout** so no
@@ -665,20 +668,40 @@ request golden vector is a 5b-2b test-vector item.
     over in-memory duplexes incl. pre-write-deadline guards on both cores, oversize/malformed-pinned
     rejection, cap-before-alloc outblob/auxblob reads, fast-path quote no-hang, `validate_relay_port` +
     `validate_vsock_listen_addr`.
-  - **5b-2b-ii (aya leaf, deferred)** — independently-reviewable sub-items (split so a single PR doesn't
-    mix vsock integration, daemon fault semantics, and acceptance infra; review each obligation on its own):
-    - **(0) canonical golden vector (BLOCKS (a)+(b)):** commit the `AgentBootRelay` canonical-request byte
-      vector to `testvectors/agent-gateway/` FIRST, so the channel + daemon (and any external relay
-      reimplementation) are built against frozen bytes, not prose. **Ordering inversion (intentional,
+  - **5b-2b-ii (aya leaf)** — independently-reviewable sub-items (split so a single PR doesn't mix vsock
+    integration, daemon fault semantics, and acceptance infra; review each obligation on its own). The
+    rule's load-bearing intent is **keep (b) daemon fault-semantics out of the vsock-integration PR** —
+    preserved: (b) is still open. PR #54 co-landed (0)+(a)+(c) because (0) is a test-only frozen vector and
+    (c) is a one-line CI guard for (a) — neither is a separate review surface from the channel; (b) was NOT
+    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') tracked; (b), (d) open.**
+    - **(0) canonical golden vector — DONE PR #54 (BLOCKS (a)+(b)):** committed
+      `testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin` (+ `.json` manifest with a
+      hand-auditable byte breakdown); the agent-gateway CI test asserts byte-exact `encode==golden` AND
+      `decode(golden)==inputs` AND canonical layout. **Ordering inversion (intentional,
       annotated):** the decode-leniency-relevant code (`relay_forward_once` + `decode_anchor_boot_request`)
       already landed in 5b-2b-i, asserted against frames from the *canonical encoder*
       (`encode_anchor_boot_request` — the vector's source of truth), so the in-crate production path is
       correct NOW; the frozen-bytes regression anchor for external/separate-service reimplementation is
       added in (0). So: invariant *asserted via the in-crate encoder in 5b-2b-i; frozen-bytes anchor added
       in 5b-2b-ii(0)* — (0) precedes the channel/daemon, not the already-merged 5b-2b-i core.
-    - **(a) channel socket wrapper:** the concrete `VsockBootRelayChannel` (`VsockStream::connect` to
-      `VMADDR_CID_HOST`, fresh-per-call, `SO_RCVTIMEO`/`SO_SNDTIMEO`+connect-timeout, delegates to the
-      CI-proven `relay_round_trip_over_stream`).
+    - **(a) channel socket wrapper — DONE PR #54** ((c) is a SEPARATE obligation that landed in the same PR,
+      tracked below — not "part of" (a)): the concrete
+      `VsockBootRelayChannel` (fresh `VsockStream::connect_with_cid_port(VMADDR_CID_HOST, port)` per call,
+      RAII-dropped) → a `DeadlineSocket` wrapper that **reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the budget
+      remaining to the deadline before EVERY read/write** (tight per-syscall bound — satisfies the
+      "Exact-bound caveat" below: no once-set socket timeout, so a late syscall can't overrun the leg) →
+      `relay_round_trip_over_stream`; blanket-maps all `ProtocolError`→retryable. Compile- AND runtime-
+      validated on aya (real vsock loopback: happy round-trip, prompt connect-failure, stalled-peer
+      read-timeout — all `#[ignore]`). **Connect bound is a watchdog-thread soft bound** (vsock 0.5 has no
+      `connect_with_timeout`; poll/libc is off-limits under `forbid(unsafe_code)`): bounded by the deadline
+      via `recv_timeout`, but a truly-wedged connect leaks one thread+fd per attempt (bounded by
+      `max_attempts` — so the worst-case simultaneous leaked thread+fd count on the guest is `max_attempts`,
+      relevant for fd-budget sizing; OS-reaped). **TRACKED OBLIGATION (a'): cancellable hard connect bound**
+      — a nonblocking-connect+poll or a vsock crate exposing connect-with-timeout, eliminating the leak; its
+      OWN item, NOT collapsed into the quote (d) bound. **HARD PRECONDITION for a live 5b-2c serve (a checked
+      task item, mirroring (d)):** 5b-2c MUST either (i) land (a'), or (ii) record an EXPLICIT operational
+      risk-acceptance of the bounded leak with concrete retry/thread/fd bounds — it may NOT silently rely on
+      the connect path under a black-holing host. (Not merely "should".)
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
       LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
       because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
@@ -694,30 +717,45 @@ request golden vector is a 5b-2b test-vector item.
       under the serial loop a slow/wedged pump delays every queued boot by ≤ (per-pump deadline + socket +
       connect timeouts); those bounds are what keep it tolerable — concurrency (and accept-backlog limits)
       is the named follow-up trigger if many enclaves boot at once.
-    - **(c) feature-build CI:** a new `cargo build --features vsock-transport,agent-gateway` step **on a
-      Linux runner** (the `vsock` crate is Linux-only + all socket code is `#[cfg(target_os = "linux")]`, so
-      a non-Linux runner would compile only the stub and not actually guard the leaf from bit-rot — NOTE:
-      NOT `staging-vsock,agent-gateway`, which fails the `ml-dsa-65 ⊕ agent-gateway` role-isolation
-      `compile_error!` since `staging-vsock` pulls `staging-host`→`ml-dsa-65`).
+    - **(c) feature-build CI — DONE PR #54:** `cargo test --no-run --features vsock-transport,agent-gateway`
+      on the ubuntu (Linux) `rust-test` job — compiles the channel + the `#[ignore]` aya tests (more than a
+      bare `cargo build`) so the leaf can't bit-rot; the only place `vsock-transport` compilation is
+      validated in CI. NOT `staging-vsock,agent-gateway`, which fails the `ml-dsa-65 ⊕ agent-gateway`
+      role-isolation `compile_error!` since `staging-vsock` pulls `staging-host`→`ml-dsa-65`.
     - **(d) aya/live-platform tests:** `#[ignore]` acceptance tests (real `fetch_report_deadline` against
-      live configfs incl. no-stale-entry-after-timeout; `SO_*TIMEO` getsockopt readback; connect to CID 2)
-      + the hard wall-clock bound for a wedged in-kernel read (a CANCELLABLE boundary — killable
+      live configfs incl. no-stale-entry-after-timeout; connect to CID 2) verifying socket-timeout
+      enforcement **BEHAVIORALLY** (stalled-peer read times out within budget; prompt connect-failure) —
+      NOT via `SO_*TIMEO` getsockopt readback, which would need `unsafe`/`libc` (off-limits under
+      `#![forbid(unsafe_code)]`) and is therefore NOT a (d) requirement unless a safe readback path appears.
+      Plus the hard wall-clock bound for a wedged in-kernel read (a CANCELLABLE boundary — killable
       subprocess / kernel timeout / unique-per-attempt entries, NOT a plain worker thread; see the deadline
       requirement below). **(d) is the critical-path blocker for a live 5b-2c serve** (a/b/c are
-      necessary-but-insufficient) — do NOT deprioritize it as "last".
+      necessary-but-insufficient) — do NOT deprioritize it as "last". (Note: the channel half of these
+      behavioral tests already landed in 5b-2b-ii(a) — `vsock_channel_*` aya tests — leaving (d) the configfs
+      + hard-bound items.)
 - **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →
   `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
   `decide_serve(outcome, cfg!(release_build))?` → serve. Like the daemon (b), 5b-2c needs a **`pub`
   library boot-sequencing entrypoint** (e.g. `run_agent_gateway_boot(...)`) — the `RelayAnchorTransport` /
   `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
   `[[bin]]`. **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
-  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d)** — the
-  hard quote bound. **Hard precondition — make it an ENFORCEABLE artifact, not just a checklist line:** the
-  5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline` into a *serving* path until
-  (d) exists. Prefer a structural gate over prose, e.g.: have (d) introduce a `HardBoundedQuoteProducer`
-  type that the live boot-sequencing wrapper requires by signature, so a build lacking (d) **cannot
-  construct** the serving path (compile error) — rather than a runtime/`cfg` check that can be omitted.
-  Wiring it sooner reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
+  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on BOTH 5b-2b-ii(d) AND
+  (a')** — (d) = the hard quote bound; (a') = the cancellable hard CONNECT bound (or an explicit operational
+  risk-acceptance of the watchdog thread/fd leak). **Two hard preconditions for a live 5b-2c serve (make
+  them ENFORCEABLE artifacts, not just checklist lines):**
+  1. **(d) quote bound** — the 5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
+     into a *serving* path until (d) exists; prefer a structural gate (have (d) introduce a
+     `HardBoundedQuoteProducer` type the wrapper requires by signature, so a build lacking (d) **cannot
+     construct** the serving path — a compile error, not an omittable runtime/`cfg` check). Wiring it sooner
+     reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
+  2. **(a') connect bound** — 5b-2c MUST NOT ship a live serve over the watchdog soft-bound connect under a
+     black-holing host without EITHER (a') (cancellable connect) OR a recorded operational risk-acceptance
+     stating the leak bound (see below). Same enforceable-artifact preference.
+  **Leak-bound scope (define for the (a') risk-acceptance):** the thread/fd leak is **per wedged connect
+  ATTEMPT**, so within ONE boot the worst case is `max_attempts` simultaneous leaked thread+fd (the driver's
+  `max_attempts`, ceiling 64) until kernel-reaped. Across repeated boot invocations in one process (restart
+  loops) it is bounded by `max_attempts` per invocation × the restart count, so 5b-2c MUST either land (a')
+  or impose a boot-attempt backoff/cap so a sustained black-hole can't exhaust the guest fd table.
 - **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
@@ -772,14 +810,30 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `quote_timeout`/`relay_timeout` is **deferred to 5b-2c** (the bin that constructs the transport and owns
   operator config) — NOT 5b-2b-i/ii, which keep the single-budget model. 5b-2c, if it splits them, MUST
   restate the resulting total-boot bound as a success criterion so "timeout" is never ambiguous between
-  total-attempt and per-leg. **Exact-bound caveat (5b-2b-ii):** the `≤ 2·timeout` bound only holds if the
-  socket `SO_*TIMEO`/connect timeouts are derived from the *remaining* per-leg budget, NOT set equal to the
-  full leg `timeout` — otherwise a single blocked in-flight syscall can overrun a leg by up to one socket
-  timeout (the in-fn checks only bound *initiating* I/O). 5b-2b-ii MUST either use remaining-deadline-based
-  socket timeouts or state the looser real bound (`leg + SO_*TIMEO + connect`) as the success criterion.
-- **Socket-timeout precondition.** `read_bounded_anchor_response`'s deadline is only enforceable if the
-  stream has `SO_RCVTIMEO`/non-blocking set. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` +
-  `SO_SNDTIMEO` + a **connect** timeout (so connect can't hang either); the aya test verifies all three.
+  total-attempt and per-leg. **Exact-bound caveat — SATISFIED in 5b-2b-ii(a):** the `≤ 2·timeout` bound only
+  holds if the socket `SO_*TIMEO` are derived from the *remaining* per-leg budget, NOT set equal to the full
+  leg `timeout` — otherwise a single blocked in-flight syscall could overrun a leg by up to one socket
+  timeout. `VsockBootRelayChannel` achieves this via `DeadlineSocket`, which reapplies the timeout =
+  remaining-budget before EVERY read/write (not once), so the channel-I/O leg is tightly bounded by the
+  deadline. (Connect is the watchdog soft-bound (a'); see above.) **Per-leg sizing floor (5b-2c):** the
+  per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
+  both (a connect that nearly exhausts it yields a retryable lapse before I/O — a wasted attempt), AND MUST
+  satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
+  retry loop can't blow the operator's total boot deadline. **Term definitions (single source — 5b-2c wires
+  both into one check):** `max_attempts` = the value 5b-2c passes to
+  `run_boot_anti_rollback_handshake(..., max_attempts)` (driver-clamped to `MAX_BOOT_ATTEMPTS_CEILING = 64`);
+  `timeout` = the per-leg `Duration` 5b-2c gives `RelayAnchorTransport::new`; `overall_boot_budget` = a NEW
+  5b-2c operator config (the total wall-clock the platform allows for boot before fail-closed). 5b-2c MUST
+  pick `max_attempts`/`timeout` so the product respects its own `overall_boot_budget`.
+- **Socket-timeout precondition — DONE in (a) for read/write; connect via (a').** `read_bounded_anchor_response`'s
+  deadline is only enforceable if the stream has `SO_RCVTIMEO`/non-blocking set. `VsockBootRelayChannel`
+  sets `SO_RCVTIMEO` + `SO_SNDTIMEO` (per-syscall via `DeadlineSocket`); the **connect** bound is the
+  watchdog soft-bound, with the cancellable hard bound deferred to **(a')**. **What the aya tests actually
+  verify (behavioral, not getsockopt):** `SO_RCVTIMEO` via a stalled-peer read that times out within budget;
+  the connect bound via a prompt connect-failure. `SO_SNDTIMEO` is set but NOT behaviorally exercised (a
+  small request frame never fills the send buffer, so `write_all` doesn't block); a getsockopt readback of
+  the option *values* would need `unsafe`/`libc`, off-limits under `#![forbid(unsafe_code)]` — so it is not
+  asserted. (The daemon (b) anchor-facing socket has the same obligations.)
   The connect/socket timeout **budget is derived from the per-leg `Duration`** (a fraction of it), NOT a
   separate operator knob, so channel (a) and daemon (b) coordinate on the same source and the total-boot
   bound stays verifiable.
