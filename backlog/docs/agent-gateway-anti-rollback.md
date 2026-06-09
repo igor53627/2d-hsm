@@ -454,19 +454,26 @@ rejected at decode.
 **Freshness-challenge (nonce) state machine — slice 2 (`agent_challenge.rs`).** The enclave's half of
 the freshness handshake: `issue_challenge(chain_id, env)` draws a fresh CSPRNG nonce and installs it as
 the **single outstanding challenge** in a volatile process-global (`Mutex<Option<Challenge>>`, mirrors
-`INSTALLED_KEYSTORE`/`PLATFORM_PROVISIONING_ROOT`); `Challenge::report_data()` binds that *same* draw
-into the SNP `report_data`; `consume_outstanding_challenge() -> Option<Challenge>` is the **single-use**
-retire (a `take()` returning the taken challenge). Decisions: **overwrite-on-reissue** (a re-issuable
-per-restart token, not an install-once secret — a failed handshake rotates to a fresh nonce, never
-retries the same), **poison-recover** (a non-secret slot must not brick the agent), and a structural
-**volatile-only anti-invariant** — `Challenge` is deliberately **non-`Serialize`/`Deserialize`** so the
-nonce can never enter sealed/host-relayed state; a restart MUST lose it and force a fresh draw
+`INSTALLED_KEYSTORE`/`PLATFORM_PROVISIONING_ROOT`); `Challenge::report_data()` **computes** the
+`report_data` the SNP quote will commit to from that *same* draw (nothing is attested until the
+deferred quote fetch). `verify_outstanding_response(response, config)` is the **safe verification
+primitive** — it `take()`s the challenge **before** verifying against its nonce, so single-use is
+*structural* (the challenge is retired on **every** outcome: success, anchor error, or no-challenge) and
+there is **no non-consuming peek** to misuse; `consume_outstanding_challenge() -> Option<Challenge>` is
+the explicit retire for the no-response (timeout) path. Decisions: **overwrite-on-reissue** (a
+re-issuable per-restart token, not an install-once secret — a failed handshake rotates to a fresh nonce,
+never retries the same), **poison-recover** uniformly (a non-secret slot must not brick the agent), and a
+structural **volatile-only anti-invariant** — `Challenge` is deliberately **non-`Serialize`/`Deserialize`**
+so the nonce can never enter sealed/host-relayed state; a restart MUST lose it and force a fresh draw
 (otherwise a host that rolls back sealed state could replay a captured `(nonce, response)`). **Boot-slice
-obligations (deferred):** `issue_challenge` runs **after** unseal (scope comes from the sealed config),
-once per (re)start; the boot caller routes **every** verify outcome through `consume_outstanding_challenge`
-and asserts the returned nonce equals the one it verified against (fail-closed backstop for the
-peek→verify→take sequence); a retry re-issues, never re-uses a peeked nonce. Per-instance only — no
-clone fencing (design §3 Option A residual).
+obligations (deferred):** `issue_challenge` runs **after** unseal, once per (re)start; the `(chain_id,
+environment_identifier)` passed to `issue_challenge` MUST equal the sealed config the response is later
+verified against (verify binds scope to the config, not to the challenge — naming this cross-check as an
+explicit boot invariant); the boot caller verifies via `verify_outstanding_response` (which retires
+atomically) and a retry re-issues, never re-uses a nonce. **Single-slot is intentionally boot-only:** a
+future *per-op* freshness scheme would need a keyed/multi-slot redesign + a concurrency guard, not an
+extension of this single-outstanding slot. Per-instance only — no clone fencing (design §3 Option A
+residual).
 
 **Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
 the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, wiring
