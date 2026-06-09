@@ -190,8 +190,14 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
 /// Read the anchor response off a stream: a single 4-byte BE length prefix then exactly that many raw
 /// anchor-signed bytes (no version/type framing — the relay forwards exactly what the anchor signed).
 /// The length is checked against [`MAX_ANCHOR_RESPONSE_LEN`] **before** allocating, so a hostile relay
-/// cannot force a large alloc. Deadline-bounded (covers both reads). Returns the raw bytes verbatim for
-/// the driver to verify — this helper never parses anchor internals.
+/// cannot force a large alloc. Returns the raw bytes verbatim for the driver to verify — this helper
+/// never parses anchor internals.
+///
+/// **Deadline precondition (5b-2b):** the `deadline` is only enforceable if `reader`'s underlying socket
+/// is configured with a read timeout (`SO_RCVTIMEO`) or non-blocking mode — the deadline is re-checked
+/// between/around `read` syscalls, but a fully-blocking `read` that never returns is not interruptible
+/// here. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` (+ `SO_SNDTIMEO` + a connect timeout) so a
+/// black-holing relay cannot stall boot; its aya acceptance test MUST verify those socket options.
 pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
     reader: &mut R,
     deadline: std::time::Instant,
@@ -255,6 +261,11 @@ pub(crate) trait BootQuoteProducer {
 /// The concrete [`AnchorBootTransport`] for the 5b-1 driver: compose quote-fetch → request-encode →
 /// channel round-trip, returning the anchor's response bytes verbatim. Monomorphized over the two seams
 /// (no `dyn`); 5b-2b instantiates it with `Q = SnpQuoteProducer`, `C = VsockBootRelayChannel`.
+///
+/// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
+/// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2 * timeout` wall-clock (the
+/// driver's `max_attempts` count bound caps total boot at `max_attempts * 2 * timeout`). 5b-2b MAY split
+/// this into separate `quote_timeout` / `relay_timeout` if the two legs want different budgets.
 pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel> {
     quote: Q,
     channel: C,

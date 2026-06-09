@@ -660,3 +660,36 @@ timeouts are validated on aya. Still **UNWIRED**
 support** (else 5a/5b-1/5b-2a ship dead). 5b-2a is the LAST pure layer — its tests already drive the full
 verify+driver+transport composition end-to-end (including the response wire framing via
 `driver_ready_through_real_response_framing`), so the accumulation bottoms out here.
+
+**5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
+MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
+- **Deadline-aware quote fetch (load-bearing).** `BootQuoteProducer::fetch(report_data, deadline)`'s
+  contract requires honoring `deadline`, but `snp_report::fetch_report` today has no deadline and does
+  blocking configfs file I/O. 5b-2b MUST make the quote fetch deadline-aware — either change
+  `fetch_report` to accept/enforce a deadline, or wrap it in a bounded worker — **with defined cleanup of
+  the stale configfs-tsm entry on timeout/abandon** (the entry dir is fixed `twod-hsm`; a left-behind
+  entry must be removed so the next attempt's `fetch_report` `remove_dir`+`create_dir` still works), and
+  an aya acceptance test that a wedged provider fails the attempt promptly rather than hanging boot.
+- **Timeout semantics + total bound.** 5b-2a's single `timeout` is **per-leg** (quote and channel each
+  get `timeout`; one attempt ≤ `2·timeout`; total boot ≤ `max_attempts · 2 · timeout`). 5b-2b SHOULD
+  expose distinct `quote_timeout` / `relay_timeout` (or derive sub-deadlines from one `attempt_timeout`)
+  and state the resulting total-boot bound as a success criterion, so "timeout" is never ambiguous
+  between total-attempt and per-leg.
+- **Socket-timeout precondition.** `read_bounded_anchor_response`'s deadline is only enforceable if the
+  stream has `SO_RCVTIMEO`/non-blocking set. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` +
+  `SO_SNDTIMEO` + a **connect** timeout (so connect can't hang either); the aya test verifies all three.
+- **Host-relay daemon (its own 5b-2b sub-checklist).** Define: daemon location + feature gate; the
+  upstream enclave→anchor request/response schema; the **error→framing mapping** — a relay/anchor error
+  (unavailable, timeout, upstream 5xx) MUST be surfaced to the enclave as a *retryable transport close*
+  (so the driver retries), NEVER as malformed bytes (which the driver would turn into a TERMINAL
+  `VerifyMalformed`, burning the attempt budget on a transient); retry/concurrency model; and tests for
+  anchor-unavailable, timeout, malformed-anchor-response, and oversized-response cases.
+- **Canonical request golden vector** — add an `AgentBootRelay` canonical-request test vector to
+  `testvectors/agent-gateway/` **before** any host-daemon/channel implementation, so external/later relay
+  work implements against bytes, not prose (the encoder is canonical; the decoder is lenient).
+- **Observability** — the boot log MUST distinguish quote-timeout / relay-timeout / anchor-unavailable /
+  oversized-response / malformed-response / verify-failure for operator triage, WITHOUT leaking
+  oracle-grade detail over the serve APIs (boot-time, operator-facing only).
+- **Profile uniformity** — the relay CID/port (`DEFAULT_ANCHOR_RELAY_PORT=5001` / `TWOD_HSM_ANCHOR_RELAY_PORT`)
+  applies uniformly across lab/staging/production; a misconfiguration or collision with the serve port
+  surfaces as a clear fail-closed boot error, never a silent wrong-endpoint connect.
