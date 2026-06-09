@@ -89,12 +89,19 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
     }
 }
 
-/// True iff `revents` is a CLEAN readiness for `want` (the requested event set AND no error condition).
-/// The reusable form of the `Ok(revents)` contract above: `revents` containing `want` is NOT enough —
-/// `POLLERR`/`POLLHUP`/`POLLNVAL` (reported regardless of `want`) mean the fd is broken/closed. Extracted
-/// for (a') connect (`want = POLLOUT`), its only live caller today; the future (d) quote-pipe (`want =
-/// POLLIN`) will reuse it so the success predicate can't drift between the two poll consumers. (The unit
-/// test already exercises both flag sets, so the POLLIN contract is covered before (d) lands.)
+/// True iff `revents` is a CLEAN readiness for `want` (the requested event set AND no hangup/error
+/// condition). The reusable form of the `Ok(revents)` contract above: `revents` containing `want` is NOT
+/// enough — `POLLERR`/`POLLHUP`/`POLLNVAL` (reported regardless of `want`) mean the fd is broken/closed.
+///
+/// **Scope: CONNECT / stream-write readiness only** (the (a') `want = POLLOUT` case — a failed non-blocking
+/// connect surfaces `POLLOUT|POLLERR|POLLHUP`, so vetoing the hangup/error flags is exactly right). It is the
+/// only live caller today.
+///
+/// **Do NOT reuse this verbatim for a pipe READ (e.g. the future (d) quote-subprocess `POLLIN`).** On a pipe,
+/// `POLLHUP` is a *normal EOF* (the writer closed) and can arrive **together with final readable data**
+/// (`POLLIN|POLLHUP`); vetoing `POLLHUP` here would make (d) treat a completed quote read as a failure and
+/// drop the last bytes. (d) must use its own EOF-aware read-readiness check — `poll_with_deadline` stays
+/// shared (it returns raw `revents`; the caller decides), but this success predicate does not.
 pub(crate) fn poll_ready_for(revents: nix::poll::PollFlags, want: nix::poll::PollFlags) -> bool {
     use nix::poll::PollFlags;
     revents.contains(want)

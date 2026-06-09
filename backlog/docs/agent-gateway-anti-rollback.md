@@ -707,12 +707,17 @@ request golden vector is a 5b-2b test-vector item.
       `poll_with_deadline(&fd, POLLOUT, deadline)`; (4)
       **connect-success check = `poll_ready_for(revents, POLLOUT)` (= `revents.contains(POLLOUT) &&
       !revents.intersects(POLLERR|POLLHUP|POLLNVAL)`) AND `getsockopt(SocketError)==0`** (a bare `Ok(_)` is NOT
-      success — see the primitive's contract; **BOTH checks are required, not redundant**: `POLLOUT` can fire
-      on a *failed* non-blocking connect, and `SO_ERROR` is the authoritative result — neither alone is
-      sufficient, so a future "simplify away the SO_ERROR check" would be a correctness regression); the shared
-      `poll_ready_for` helper lives in `cancellable_boundary` (extracted here for (a'); it is the success
-      predicate the future (d) quote pipe will reuse with `want = POLLIN`, so the two paths can't drift —
-      today (a')/POLLOUT is its only live caller, with the unit test exercising both flag sets); (5) promote the
+      success — see the primitive's contract; **keep BOTH checks**: on Linux a failed non-blocking connect
+      surfaces `POLLOUT|POLLERR|POLLHUP` so `poll_ready_for` alone already vetoes it, but `SO_ERROR` is the
+      *authoritative, portable* connect result — the poll flags alone are not guaranteed across stacks to flag
+      every failure with an error bit (Stevens UNP: a clean `POLLOUT` with `SO_ERROR != 0`), so the `SO_ERROR`
+      read is the robust belt-and-suspenders, not dead code to "simplify away"); the
+      `poll_ready_for` helper lives in `cancellable_boundary` (extracted here for (a'), its only live caller).
+      **`poll_ready_for` is CONNECT/stream-write-readiness ONLY** — it vetoes `POLLHUP`, which is correct for a
+      failed connect but WRONG for a pipe read: the future (d) quote-subprocess `POLLIN` path must NOT reuse it,
+      because a pipe's `POLLHUP` is a *normal EOF* that can carry final data (`POLLIN|POLLHUP`); (d) needs its
+      own EOF-aware read-readiness check. (`poll_with_deadline` itself stays shared — it returns raw `revents`
+      and the caller decides — only the success *predicate* is connect-specific.); (5) promote the
       `OwnedFd` to `VsockStream` via `From<OwnedFd>`, then `set_nonblocking(false)` so `DeadlineSocket`'s
       `SO_*TIMEO` take effect; RAII fd drop on every path — no thread, no leak. Needs the nix `socket` feature
       alongside `poll` (both added). aya acceptance (MET — re-run on the rewritten `poll(POLLOUT)`
@@ -843,12 +848,18 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
   both (a connect that nearly exhausts it yields a retryable lapse before I/O — a wasted attempt), AND MUST
   satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
-  retry loop can't blow the operator's total boot deadline. **Invariant precondition (verify when 5b-2c
-  wires it):** `connect_bounded`'s `deadline` arg MUST be the **per-leg channel deadline** (`round_trip_inner`
-  passes the *same* `deadline` to `connect_bounded` and to the channel-I/O `DeadlineSocket`, so connect + I/O
-  share ONE channel-leg `timeout` — the `2·` in the invariant counts the *quote* leg + the *channel* leg, NOT
-  connect-vs-I/O). If `connect_bounded` were ever handed the *overall* boot deadline instead, a single wedged
-  connect could consume the whole boot budget and the `2·timeout` accounting would break. **Term definitions (single source — 5b-2c wires
+  retry loop can't blow the operator's total boot deadline. **Invariant (ALREADY structurally enforced in
+  5b-2b, not a 5b-2c obligation):** `connect_bounded`'s `deadline` arg is the **per-leg channel deadline** —
+  `round_trip_inner` passes the *same* `deadline` to `connect_bounded` and to the channel-I/O `DeadlineSocket`,
+  so connect + I/O share ONE channel-leg `timeout` (the `2·` in the invariant counts the *quote* leg + the
+  *channel* leg, NOT connect-vs-I/O). 5b-2c does NOT thread this deadline (it only constructs the channel and
+  supplies `max_attempts`/`timeout`), so the surviving 5b-2c obligation is purely the budget sizing
+  (`max_attempts · 2 · timeout ≤ overall_boot_budget`); the per-leg-deadline guarantee is owned by 5b-2b's
+  `round_trip_inner` and would only break if that wiring were later changed to hand `connect_bounded` the
+  *overall* boot deadline. **Post-(a') threat model:** with the fd/thread leak gone, a black-holing host no
+  longer exhausts the guest fd table — it instead produces `max_attempts` *prompt* per-leg-timeout lapses, so
+  the **time** invariant above is now the *only* thing bounding a sustained black-hole (the failure mode
+  shifted from fd-exhaustion to budget-consumption). **Term definitions (single source — 5b-2c wires
   both into one check):** `max_attempts` = the value 5b-2c passes to
   `run_boot_anti_rollback_handshake(..., max_attempts)` (driver-clamped to `MAX_BOOT_ATTEMPTS_CEILING = 64`);
   `timeout` = the per-leg `Duration` 5b-2c gives `RelayAnchorTransport::new`; `overall_boot_budget` = a NEW
