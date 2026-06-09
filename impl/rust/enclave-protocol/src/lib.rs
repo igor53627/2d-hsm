@@ -140,6 +140,11 @@ mod agent_cbor;
 // single-use lifecycle + handshake report_data binding. Crate-private; dead-code until boot wiring.
 #[cfg(feature = "agent-gateway")]
 mod agent_challenge;
+// Agent Gateway anti-rollback boot reconcile orchestration (TASK-7.7, slice 5a). Pure glue:
+// verify_outstanding_response -> compute_local_marks_digest -> reconcile -> install the runtime binding
+// ONLY on the Fresh arm. Crate-private; UNWIRED (dead-code) until the slice-5b boot caller lands.
+#[cfg(feature = "agent-gateway")]
+mod agent_boot;
 mod wire;
 
 use serde::{Deserialize, Serialize};

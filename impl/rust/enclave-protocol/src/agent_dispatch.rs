@@ -635,6 +635,29 @@ pub fn reset_anti_rollback_binding_for_tests() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
+/// Test-only: the SINGLE guard serializing EVERY test across the crate that touches an agent
+/// process-global. Private — all callers go through [`lock_and_reset_agent_process_globals`] so the
+/// "lock + reset the FULL set of agent globals" invariant lives in exactly one place.
+#[cfg(test)]
+static AGENT_PROCESS_GLOBAL_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+/// Test-only: lock the crate-wide agent-process-global guard AND reset EVERY agent process-global to
+/// its pristine state, returning the held guard (hold it for the whole test body). The crate's tests
+/// run in one binary in parallel and `crate::agent_boot` drives BOTH `ANTI_ROLLBACK_BINDING` (this
+/// module) and `OUTSTANDING_CHALLENGE` (`crate::agent_challenge`); the original per-module guards each
+/// reset only "their" global, so once tests across modules shared one guard, stale state could leak
+/// (a dispatch test inheriting a challenge a prior boot test left, etc.). This is the ONE place that
+/// knows the full set: every global-touching test — here, in `agent_challenge`, and in `agent_boot` —
+/// serializes + resets via this helper, and a NEW agent process-global adds its reset HERE so all
+/// three modules stay symmetric by construction rather than by convention.
+#[cfg(test)]
+pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'static, ()> {
+    let g = AGENT_PROCESS_GLOBAL_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    reset_anti_rollback_binding_for_tests();
+    crate::agent_challenge::reset_outstanding_challenge_for_tests();
+    g
+}
+
 /// AC#5 gate predicate: a rollback-sensitive op may proceed iff the anti-rollback mechanism is
 /// configured for this boot OR the measured/sealed AC#10 opt-out is acknowledged in the sealed config.
 fn anti_rollback_satisfied(keystore: &KeystoreBody) -> bool {
@@ -859,22 +882,19 @@ mod tests {
         enc(Value::Map(m))
     }
 
-    /// Serialize tests that drive a rollback-sensitive opcode (they share the `ANTI_ROLLBACK_BINDING`
-    /// process-global via the AC#5 gate; cargo runs tests in parallel). Hold the returned guard for the
-    /// test body. `gate_configured` installs a test binding so the gated op proceeds to its real
-    /// outcome; `gate_unconfigured` leaves the slot `None` so the gate fires. Read-only opcodes don't
-    /// touch the global (the gate short-circuits) and need no guard.
-    static GATE_GUARD: Mutex<()> = Mutex::new(());
+    /// Lock the crate-wide agent-process-global guard (via `lock_and_reset_agent_process_globals`,
+    /// which resets ALL agent globals) and hold it for the test body. The SAME guard serializes the
+    /// `agent_challenge` and `agent_boot` tests, so this is NOT scoped to this module's binding global —
+    /// do not reintroduce a module-local mutex. `gate_configured` then installs a test binding so the
+    /// gated op proceeds to its real outcome; `gate_unconfigured` leaves the slot `None` so the gate
+    /// fires. Read-only opcodes short-circuit the gate and need no guard.
     fn gate_configured() -> std::sync::MutexGuard<'static, ()> {
-        let g = GATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        reset_anti_rollback_binding_for_tests();
+        let g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         let _ = install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: true });
         g
     }
     fn gate_unconfigured() -> std::sync::MutexGuard<'static, ()> {
-        let g = GATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        reset_anti_rollback_binding_for_tests();
-        g
+        crate::agent_dispatch::lock_and_reset_agent_process_globals()
     }
 
     #[test]

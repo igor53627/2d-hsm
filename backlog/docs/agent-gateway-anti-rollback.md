@@ -480,8 +480,28 @@ future *per-op* freshness scheme would need a keyed/multi-slot redesign + a conc
 extension of this single-outstanding slot. Per-instance only — no clone fencing (design §3 Option A
 residual).
 
-**Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
-the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, wiring
-verify+reconcile (via `verify_anchor_response_bytes`) into boot/install, per-op `epoch` bump +
-seal-before-emit, and seeding the body's counter/spend from the anchor's authoritative marks (asserting
-adopted marks ≥ local). The live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.
+**Boot reconcile orchestration — slice 5a (`agent_boot.rs`).** The pure, platform-free *glue* that
+sequences the three primitives above into the one canonical boot ceremony, decomposed out of the
+platform-coupled boot wiring (5b) so it is unit-testable now. `boot_reconcile_anti_rollback(response_bytes,
+body)` runs: (1) `verify_outstanding_response` (retire-then-verify against the sealed `anchor_root` +
+scope + issued nonce), (2) `compute_local_marks_digest` over the sealed counters/spend, (3) `reconcile`
+the local `(freshness_epoch, structural_version, marks)` vs the verified `AnchorState` — and collapses the
+result into a single `BootAntiRollbackOutcome { Ready(state) | AdoptForwardRequired(state) |
+FailClosed(reason) }`. Two wildcard-free mappers flatten the verify-stage (`AnchorError`) and
+reconcile-stage (`FailReason`) errors into the boot-time `BootFailReason` enum (a new upstream variant is
+a compile error here, not a silent fall-through). **The live Layer-2b binding
+(`install_anti_rollback_binding`) is installed ONLY on the `Fresh` arm** — `AdoptForward` returns
+`AdoptForwardRequired` *without* installing (5b owns the seed-from-marks + re-seal-forward + retry), and
+every fail path installs nothing. Four independent properties enforce never-install-off-`Fresh`:
+binding-literal-constructed-in-arm-only, exhaustive wildcard-free `match`, const-init `None` fail-closed
+default, and the callee's install-once + reject-inactive. Still **UNWIRED** (dead-code-gated): 5b adds the
+only caller. 13 unit tests cover every arm + the no-install sweep, driving the real challenge/binding
+process-globals (all crate tests touching either global now serialize on one shared
+`AGENT_PROCESS_GLOBAL_TEST_GUARD` since `agent_boot` exercises both).
+
+**Out of this slice (next, platform/host plumbing — slice 5b/6):** the actual SNP-quote fetch (the
+enclave half of the *mutual* auth — slice 2 only fixes the value the quote commits to), the vsock host
+relay that delivers `response_bytes`, the at-boot call sequencing (`issue_challenge` after unseal → relay
+→ `boot_reconcile_anti_rollback` → act on the outcome), the `AdoptForward` seed-from-marks + re-seal
+forward (asserting adopted marks ≥ local), and per-op `epoch` bump + seal-before-emit atomic with the
+structural bump. The live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.
