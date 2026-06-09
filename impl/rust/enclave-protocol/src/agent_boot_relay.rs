@@ -298,6 +298,80 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
     }
 }
 
+/// The channel **framing core** (TASK-7.7 5b-2b): write the already-framed `request_frame` to a duplex
+/// `stream`, then bounded-read the anchor response. Generic over `Read + Write` so it is CI-tested over an
+/// in-memory duplex — the real `VsockBootRelayChannel` (5b-2b-ii, `vsock-transport`) is a thin wrapper
+/// that connects a `VsockStream`, sets the socket timeouts, and calls this.
+///
+/// **Deadline coverage:** this fn checks the deadline before the write, and the bounded read enforces it
+/// across reads. The blocking `write_all`/`flush` itself is bounded ONLY by the socket's `SO_SNDTIMEO`
+/// (and the read by `SO_RCVTIMEO`) — so 5b-2b-ii's wrapper MUST set BOTH (+ a connect timeout) for the
+/// per-attempt wall-clock to actually hold against a black-holing relay; the in-fn check alone does not
+/// bound a stalled in-kernel write. `request_frame` is ALREADY a complete `0x41` frame — written verbatim,
+/// never re-framed. Returns the raw response bytes for the driver to verify (never parsed here).
+pub(crate) fn relay_round_trip_over_stream<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    request_frame: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, ProtocolError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(ProtocolError::WireProtocol("anchor relay: deadline before write"));
+    }
+    stream.write_all(request_frame).map_err(ProtocolError::from)?;
+    stream.flush().map_err(ProtocolError::from)?;
+    read_bounded_anchor_response(stream, deadline)
+}
+
+/// The host-relay **forward core** (TASK-7.7 5b-2b): the one enclave↔anchor pump the host relay daemon
+/// loops on. Generic over both stream sides so it is CI-tested over in-memory duplexes; the daemon bin
+/// (5b-2b-ii) supplies the real vsock (enclave) + upstream-anchor (TCP/UDS) streams. Reads the `0x41`
+/// request frame from the enclave, **rejects a malformed request before spending an anchor round-trip**
+/// (defense-in-depth — the relay is untrusted but a malformed forward would just burn the enclave's
+/// attempt budget on a terminal verify failure), forwards the frame verbatim to the anchor, reads the
+/// raw signed response (bounded), and writes it back to the enclave via the shared
+/// [`frame_anchor_response`] writer (so the two sides can't drift on the response framing). The relay
+/// never parses/trusts the anchor response — verification is entirely in the enclave.
+///
+/// This is **HOST-side, untrusted** code — NOT an enclave trust boundary; the enclave's own per-leg
+/// channel deadline + downstream verification are what protect custody. The single `deadline` here spans
+/// the WHOLE pump (enclave read + anchor write + anchor read), so the daemon (5b-2b-ii) must size it for
+/// the full round-trip (not one leg) AND set `SO_RCVTIMEO`/`SO_SNDTIMEO` on BOTH the enclave-facing and
+/// anchor-facing sockets — `write_all` to either side is bounded only by `SO_SNDTIMEO`, not by an in-fn
+/// check, so a black-holing peer on the write leg would otherwise stall the pump.
+pub(crate) fn relay_forward_once<E, A>(
+    enclave: &mut E,
+    anchor: &mut A,
+    deadline: std::time::Instant,
+) -> Result<(), ProtocolError>
+where
+    E: std::io::Read + std::io::Write,
+    A: std::io::Read + std::io::Write,
+{
+    let frame = crate::read_framed_message_with_idle_deadline(enclave, Some(deadline))?;
+    let _ = decode_anchor_boot_request(&frame)?; // reject malformed BEFORE an anchor round-trip
+    anchor.write_all(&frame).map_err(ProtocolError::from)?;
+    anchor.flush().map_err(ProtocolError::from)?;
+    let response = read_bounded_anchor_response(anchor, deadline)?;
+    let wire = frame_anchor_response(&response)?;
+    enclave.write_all(&wire).map_err(ProtocolError::from)?;
+    enclave.flush().map_err(ProtocolError::from)
+}
+
+/// The production [`BootQuoteProducer`]: fetch the SNP quote via configfs-tsm, honoring the deadline. Pure
+/// delegation to [`crate::snp_report::fetch_report_deadline`] — the deadline contract is satisfied
+/// structurally. The real configfs read runs only inside the SNP guest (aya); off-configfs it returns a
+/// prompt interface-absent / deadline error (never a hang), so even the CI fast-path test is safe.
+pub(crate) struct SnpQuoteProducer;
+impl BootQuoteProducer for SnpQuoteProducer {
+    fn fetch(
+        &self,
+        report_data: &[u8; 64],
+        deadline: std::time::Instant,
+    ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+        crate::snp_report::fetch_report_deadline(report_data, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +721,11 @@ mod tests {
     fn far_deadline() -> std::time::Instant {
         std::time::Instant::now() + Duration::from_secs(60)
     }
+    fn near_past() -> std::time::Instant {
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now)
+    }
 
     // ---- transport composition (direct) ----
 
@@ -779,6 +858,111 @@ mod tests {
             other => panic!("expected VerifyNonceMismatch, got {other:?}"),
         }
         assert_eq!(t.channel.connects, 1, "a wrong-nonce reply is terminal, not a grind lever");
+    }
+
+    // ---- framing core / forward core / quote producer (5b-2b-i, all CI) ----
+
+    /// In-memory duplex: writes append to `written`; reads pull from `to_read`.
+    struct TestStream {
+        written: Vec<u8>,
+        to_read: std::io::Cursor<Vec<u8>>,
+    }
+    impl TestStream {
+        fn new(to_read: Vec<u8>) -> Self {
+            Self { written: Vec::new(), to_read: std::io::Cursor::new(to_read) }
+        }
+    }
+    impl std::io::Read for TestStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.to_read, buf)
+        }
+    }
+    impl std::io::Write for TestStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_round_trip_over_stream_writes_request_reads_response() {
+        let signed = vec![0xab; 200];
+        let mut stream = TestStream::new(frame_anchor_response(&signed).unwrap());
+        let req = vec![0x01, 0x02, 0x03];
+        let got = relay_round_trip_over_stream(&mut stream, &req, far_deadline()).unwrap();
+        assert_eq!(got, signed, "response returned verbatim");
+        assert_eq!(stream.written, req, "request frame written verbatim, not re-framed");
+    }
+
+    #[test]
+    fn relay_round_trip_past_deadline_errors_before_write() {
+        let mut stream = TestStream::new(vec![]);
+        let r = relay_round_trip_over_stream(&mut stream, &[0xaa], near_past());
+        assert!(r.is_err());
+        assert!(stream.written.is_empty(), "nothing written when the deadline is already past");
+    }
+
+    #[test]
+    fn relay_round_trip_truncated_response_errors() {
+        // length prefix says 300 but only 4 body bytes -> bounded reader errors.
+        let mut wire = (300u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[0u8; 4]);
+        let mut stream = TestStream::new(wire);
+        assert!(relay_round_trip_over_stream(&mut stream, &[0xaa], far_deadline()).is_err());
+    }
+
+    #[test]
+    fn snp_quote_producer_fast_path_errors_no_hang() {
+        // Zero budget (or off-configfs in CI) -> prompt Err, never a hang/panic.
+        let r = SnpQuoteProducer.fetch(&[0u8; 64], near_past());
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn relay_forward_once_pipes_request_and_frames_response() {
+        let (nonce, rd) = request_for([0x33; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let req_frame = encode_anchor_boot_request(&[0xa5; 100], &[0xc7; 8], &req).unwrap();
+        let anchor_resp = vec![0xab; 200];
+        let mut enclave = TestStream::new(req_frame.clone());
+        let mut anchor = TestStream::new(frame_anchor_response(&anchor_resp).unwrap());
+        relay_forward_once(&mut enclave, &mut anchor, far_deadline()).unwrap();
+        assert_eq!(anchor.written, req_frame, "request forwarded byte-identical");
+        assert_eq!(enclave.written, frame_anchor_response(&anchor_resp).unwrap(), "enclave gets the framed response");
+    }
+
+    #[test]
+    fn relay_forward_once_rejects_malformed_request_before_anchor() {
+        // A 0x41 frame whose payload isn't a valid boot request (garbage CBOR).
+        let bad = crate::encode_message(crate::MessageType::AgentBootRelay, &[0xff, 0xff]).unwrap();
+        let mut enclave = TestStream::new(bad);
+        let mut anchor = TestStream::new(vec![]);
+        // Pin that the rejection is the decode gate (a "boot request: ..." WireProtocol), not some other
+        // early error — proving the malformed request is rejected BEFORE any anchor write.
+        match relay_forward_once(&mut enclave, &mut anchor, far_deadline()) {
+            Err(crate::ProtocolError::WireProtocol(m)) => {
+                assert!(m.contains("boot request"), "expected a decode rejection, got: {m}")
+            }
+            other => panic!("expected WireProtocol decode rejection, got {other:?}"),
+        }
+        assert!(anchor.written.is_empty(), "anchor never written on a malformed request");
+    }
+
+    #[test]
+    fn relay_forward_once_oversize_anchor_response_rejected() {
+        let (nonce, rd) = request_for([0x44; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let req_frame = encode_anchor_boot_request(&[0xa5; 8], &[], &req).unwrap();
+        let mut enclave = TestStream::new(req_frame);
+        // anchor returns an oversize length prefix.
+        let mut over = ((MAX_ANCHOR_RESPONSE_LEN + 1) as u32).to_be_bytes().to_vec();
+        over.extend_from_slice(&vec![0u8; MAX_ANCHOR_RESPONSE_LEN + 1]);
+        let mut anchor = TestStream::new(over);
+        assert!(relay_forward_once(&mut enclave, &mut anchor, far_deadline()).is_err());
+        assert!(enclave.written.is_empty(), "no response framed back when the anchor reply is oversize");
     }
 
     #[test]

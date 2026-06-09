@@ -635,16 +635,33 @@ contract:** the enclave encoder MUST emit canonical CBOR (it does, via the `put_
 request golden vector is a 5b-2b test-vector item.
 
 **Still 5b-2 platform/host, split into ordered independently-gated slices (aya/SNP):**
-- **5b-2b — transport + quote leaf** (gated `vsock-transport`): the concrete `VsockBootRelayChannel`
-  (`VsockStream::connect` to host CID 2, fresh-per-call, `SO_*TIMEO` + the shared deadline) +
-  `SnpQuoteProducer` (delegates to `snp_report::fetch_report`, deadline-honoring). **Endpoint contract
-  (define here):** host CID `2` (`VMADDR_CID_HOST`); the relay **port** = `TWOD_HSM_ANCHOR_RELAY_PORT`
-  env, default **`5001`** (a `DEFAULT_ANCHOR_RELAY_PORT: u32 = 5001` const, one greater than the serve
-  `DEFAULT_VSOCK_PORT = 5000` so the two surfaces never collide); both the enclave channel and the
-  host-side relay daemon read the SAME const/env, and the daemon binds that port and uses
-  `decode_anchor_boot_request`. Each of the channel + quote must carry an aya
-  acceptance test for its wall-clock bound (connect/write/read timeouts + non-hanging quote fetch +
-  fresh-connection late-reply isolation).
+- **5b-2b — transport + quote leaf**, split into a CI-testable core (5b-2b-i) and the OS-syscall leaf
+  (5b-2b-ii) because **CI never compiles `vsock-transport`** — so all framing/deadline/cleanup logic lives
+  OUTSIDE that gate to stay tested:
+  - **5b-2b-i DONE — MERGED PR #__ (this slice; ungated/`agent-gateway`, 100% CI-tested):**
+    `snp_report` deadline-aware quote fetch via a `TsmFs` fs-seam — `fetch_report_with(fs, report_data,
+    deadline: Option<Instant>)` (`Some` ⇒ fast-path past-deadline → no fs + per-step `check_deadline`;
+    `None` ⇒ unbounded; **unconditional entry cleanup on every path incl. mid-sequence timeout** so no
+    stale `twod-hsm` configfs entry leaks). `fetch_report` is a refactor-only wrapper that stays
+    **UNBOUNDED** (`None`) — the producer GET_MEASUREMENT path keeps its historical no-timeout contract,
+    so this slice does NOT silently impose a wall-clock bound on the unrelated producer measurement; only
+    `fetch_report_deadline` (the agent boot-relay entrypoint) is bounded. `agent_boot_relay` framing core
+    `relay_round_trip_over_stream<S: Read+Write>` + host-relay forward core `relay_forward_once<E,A>`
+    (reject-malformed-before-anchor-round-trip; shared `frame_anchor_response` writer; deadline guards the
+    reads + the pre-write check — the blocking `write_all` itself needs the socket's `SO_SNDTIMEO`, a
+    5b-2b-ii obligation) + `SnpQuoteProducer` (delegates to `fetch_report_deadline`). `vsock_listen`
+    `DEFAULT_ANCHOR_RELAY_PORT=5001` (`VMADDR_CID_HOST=2`) + `anchor_relay_port_from_env()` over the shared
+    `serve_vsock_port_from_env` + pure `validate_relay_port` (rejects 0 + same-as-serve-port). 16 CI tests
+    (seam full-sequence cleanup-on-timeout/fast-path/unbounded-None, framing/forward round-trips over
+    in-memory duplexes, oversize/malformed-pinned rejection, fast-path quote no-hang, validate_relay_port).
+  - **5b-2b-ii (aya leaf, deferred):** the concrete `VsockBootRelayChannel` (`VsockStream::connect` to
+    `VMADDR_CID_HOST`, fresh-per-call, `SO_RCVTIMEO`/`SO_SNDTIMEO`+connect-timeout, delegates to the
+    CI-proven `relay_round_trip_over_stream`) + the `host_anchor_relay` daemon bin (loops `relay_forward_once`)
+    + a new `cargo build --features vsock-transport,agent-gateway` CI step (so the `vsock-transport` leaf
+    can't bit-rot — NOTE: NOT `staging-vsock,agent-gateway`, which fails the `ml-dsa-65 ⊕ agent-gateway`
+    role-isolation `compile_error!` since `staging-vsock` pulls `staging-host`→`ml-dsa-65`) + the
+    `#[ignore]` aya acceptance tests (real `fetch_report_deadline` against live configfs incl.
+    no-stale-entry-after-timeout; `SO_*TIMEO` getsockopt readback; connect to CID 2).
 - **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →
   `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
   `decide_serve(outcome, cfg!(release_build))?` → serve.
