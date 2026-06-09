@@ -250,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn verify_outstanding_success_returns_state_and_consumes() {
+        use ed25519_dalek::SigningKey;
+        let _g = test_lock();
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let mut cfg = test_config();
+        cfg.anchor_root = key.verifying_key().to_bytes();
+        let c = issue_challenge(CHAIN, ENV).unwrap();
+        let nonce = *c.nonce();
+        // A valid anchor response echoing the issued nonce → Ok(AnchorState) AND the challenge is
+        // retired (the same take()-before-verify path as the failure case).
+        let resp =
+            crate::agent_anchor::test_signed_response_bytes(&key, CHAIN, ENV, 7, 2, [0xab; 32], nonce);
+        let st = verify_outstanding_response(&resp, &cfg).expect("a valid signed response verifies");
+        assert_eq!(st.epoch, 7);
+        assert!(!has_outstanding_challenge(), "challenge consumed on success");
+        // a replay of the (now-retired) valid response finds no outstanding challenge
+        assert_eq!(
+            verify_outstanding_response(&resp, &cfg),
+            Err(ChallengeVerifyError::NoOutstandingChallenge)
+        );
+    }
+
+    #[test]
     fn verify_outstanding_consumes_even_on_failure() {
         let _g = test_lock();
         let cfg = test_config();
