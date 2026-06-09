@@ -201,11 +201,13 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
 /// here. `VsockBootRelayChannel` satisfies this via `DeadlineSocket` (both Linux/vsock-gated), which
 /// reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the remaining budget before every read/write (connect is a
 /// separate hard, cancellable bound — obligation (a'), DONE: non-blocking connect + `poll(POLLOUT)` to the
-/// deadline, see [`connect_bounded`]). Its `#[ignore]` aya tests verify the bound **behaviorally** —
-/// `SO_RCVTIMEO` via a stalled-peer read that times out within budget, the connect bound via a prompt
-/// connect-failure. (`SO_SNDTIMEO` is set but not behaviorally exercised: a small request frame never fills
-/// the send buffer, so `write_all` doesn't block; a getsockopt readback of the option values would need
-/// `unsafe`/`libc`, off-limits under `#![forbid(unsafe_code)]`.)
+/// deadline, see `connect_bounded` — not intra-doc-linked: that item is vsock-gated narrower than this one).
+/// Its `#[ignore]` aya tests verify the bound **behaviorally** — `SO_RCVTIMEO` via a stalled-peer read that
+/// times out within budget, the connect bound via a prompt connect-failure — and **directly**: the
+/// blocking-mode + readback aya test asserts `O_NONBLOCK` is cleared after connect and reads the armed
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` values back via SAFE `nix` getsockopt (`sockopt::ReceiveTimeout`/
+/// `SendTimeout`, enabled by the same `socket` feature the connect bound uses — the old "readback would
+/// need `unsafe`/`libc`" limitation is gone).
 pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
     reader: &mut R,
     deadline: std::time::Instant,
@@ -438,14 +440,13 @@ impl BootQuoteProducer for SnpQuoteProducer {
 /// nearly the whole budget yields a retryable deadline-lapse before I/O — safe, but a wasted attempt).
 ///
 /// ## Connect-timeout (hard, cancellable — 5b-2b-ii(a') DONE)
-/// vsock 0.5 has **no** `connect_with_timeout`, so [`connect_bounded`] creates a non-blocking vsock
-/// `SOCK_STREAM` fd directly (`nix::sys::socket`) and waits for the connect via
-/// `cancellable_boundary::poll_with_deadline(POLLOUT, deadline)` — a TRUE cancellable bound: on a deadline
-/// lapse the `poll` returns and the `OwnedFd` drops, closing the fd and aborting the connect, with **no
-/// watchdog thread and no leaked fd** (this replaced the earlier watchdog-thread soft-bound). Success
-/// requires `POLLOUT` AND no `POLLERR`/`POLLHUP`/`POLLNVAL` AND `getsockopt(SO_ERROR) == 0`; the fd is then
-/// returned to blocking mode so the [`DeadlineSocket`] socket timeouts apply. All `nix`/vsock calls are
-/// SAFE wrappers (no `unsafe`). The quote-fetch hard bound (§8 5b-2b-ii(d)) remains the separate open item.
+/// The connect leg is bounded by [`connect_bounded`] (the single source for the mechanism — non-blocking
+/// connect + `poll_with_deadline(POLLOUT)` to the deadline, no watchdog thread, no leaked fd; see its doc).
+/// **Timing note for budget sizing:** the kernel ALSO arms its own per-socket connect timer for
+/// non-blocking AF_VSOCK connects (`VSOCK_DEFAULT_CONNECT_TIMEOUT` ≈ 2s; `connect_bounded` does not raise
+/// `SO_VM_SOCKETS_CONNECT_TIMEOUT`), which fails a black-holed in-flight connect with `ETIMEDOUT` at ~2s —
+/// so a wedged connect leg costs ~`min(deadline, ~2s)`, and the caller's `deadline` is the binding connect
+/// bound only when it is shorter. The quote-fetch hard bound (§8 5b-2b-ii(d)) remains the separate open item.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub(crate) struct VsockBootRelayChannel {
     host_cid: u32,
@@ -461,13 +462,23 @@ use crate::cancellable_boundary::remaining_or_lapsed;
 /// a non-blocking `connect` + [`crate::cancellable_boundary::poll_with_deadline`] on `POLLOUT`. On a
 /// deadline lapse the `poll` returns and the `OwnedFd` drops in-scope (closing the fd, aborting the
 /// connect) — **no watchdog thread, no leaked fd**. Returns a retryable `ProtocolError` on lapse/failure.
-/// (The no-leak guarantee relies on the kernel tearing down the in-flight connect when the last reference to
-/// the socket fd is closed — true for AF_VSOCK, as for TCP: `close()` aborts an unfinished connect.)
+/// (The no-leak guarantee relies on the kernel tearing down the in-flight connect when the fd is closed —
+/// verified against af_vsock.c: `__vsock_release` forces immediate teardown for a non-established socket
+/// and sets `sk_shutdown = SHUTDOWN_MASK`, which neutralizes the pending connect timer; a kernel-internal
+/// sock ref may linger ≤ ~2s, but no fd/thread leaks to userspace.)
+///
+/// **Kernel connect-timer interplay:** for a non-blocking AF_VSOCK connect the kernel arms its own
+/// per-socket timer (`vsk->connect_timeout`, default `VSOCK_DEFAULT_CONNECT_TIMEOUT` ≈ 2s; we do not set
+/// `SO_VM_SOCKETS_CONNECT_TIMEOUT`). A black-holed in-flight connect therefore fails at ~2s with
+/// `sk_err = ETIMEDOUT` → the poll wakes `POLLERR|POLLOUT` → the [`connect_poll_succeeded`] veto fires —
+/// BEFORE our `deadline` whenever `deadline > ~2s`. The `poll_with_deadline` lapse arm is the binding bound
+/// only for deadlines shorter than the kernel timer (which is also what a real-vsock lapse test must use).
 ///
 /// The fd is created `SOCK_NONBLOCK` so the connect can be polled; **after** the connect completes it is
 /// returned to BLOCKING mode (`set_nonblocking(false)`) so the caller's [`DeadlineSocket`]
-/// `SO_RCVTIMEO`/`SO_SNDTIMEO` actually take effect (a non-blocking socket ignores `SO_*TIMEO`). All nix
-/// calls (`socket`/`connect`/`getsockopt`) and vsock's `set_nonblocking` are SAFE wrappers — no `unsafe`.
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` actually take effect (a non-blocking socket ignores `SO_*TIMEO`) — asserted
+/// directly by the blocking-mode/readback aya test. All nix calls (`socket`/`connect`/`getsockopt`) and
+/// vsock's `set_nonblocking` are SAFE wrappers — no `unsafe`.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 fn connect_bounded(
     host_cid: u32,
@@ -483,8 +494,10 @@ fn connect_bounded(
     // Upfront deadline check: an already-lapsed deadline at entry is a clean retryable error BEFORE we
     // allocate an fd. Without this, a synchronous `connect` success (`Ok(())`, e.g. vsock loopback) would
     // hand back a live stream whose lapse is only caught later in `DeadlineSocket::arm_*` — restoring the
-    // contract that a lapsed deadline at entry fails fast (and avoiding a wasted socket).
-    remaining_or_lapsed(deadline)?;
+    // contract that a lapsed deadline at entry fails fast (and avoiding a wasted socket). The connect-leg
+    // relabel keeps lapse triage attributable (the shared helper's string is deliberately subsystem-neutral).
+    remaining_or_lapsed(deadline)
+        .map_err(|_| ProtocolError::WireProtocol("anchor relay: vsock connect deadline lapsed"))?;
 
     // Fresh non-blocking vsock SOCK_STREAM fd. NOT vsock 0.5's `VsockSocket` (that is SOCK_DGRAM).
     let fd = socket(
@@ -498,24 +511,34 @@ fn connect_bounded(
     let addr = VsockAddr::new(host_cid, port);
     match connect(fd.as_raw_fd(), &addr) {
         Ok(()) => {} // connected synchronously (uncommon for a non-blocking connect)
-        // EINPROGRESS = connect in flight → poll POLLOUT for completion. EINTR is handled DEFENSIVELY: a
-        // SOCK_NONBLOCK connect returns immediately (nothing blocks for a signal to interrupt), so EINTR is
-        // not actually expected here — but if it ever surfaces, connect(2) says the attempt was initiated and
-        // "will complete asynchronously", so polling POLLOUT is the correct recovery rather than a spurious
-        // failure. Harmless and future-proof.
-        Err(nix::errno::Errno::EINPROGRESS) | Err(nix::errno::Errno::EINTR) => {
+        // EINPROGRESS = connect in flight → poll POLLOUT for completion.
+        Err(nix::errno::Errno::EINPROGRESS) => {
             // Wait (cancellably) for completion. `poll_with_deadline` returns `Ok(revents)` even for
-            // error-readiness (POLLERR/HUP/NVAL), so a bare `Ok(_)` is NOT success — `poll_ready_for`
-            // requires POLLOUT AND no error flag. On lapse it returns Err and `fd` drops below.
-            let revents = crate::cancellable_boundary::poll_with_deadline(&fd, PollFlags::POLLOUT, deadline)?;
-            if !crate::cancellable_boundary::poll_ready_for(revents, PollFlags::POLLOUT) {
+            // error-readiness (POLLERR/HUP/NVAL), so a bare `Ok(_)` is NOT success —
+            // `connect_poll_succeeded` requires POLLOUT AND no error flag. On a deadline lapse it returns
+            // Err (relabelled below to keep the connect leg attributable) and `fd` drops below. NB the
+            // kernel's own ~2s connect timer usually preempts the lapse for longer deadlines (see fn doc).
+            let revents =
+                crate::cancellable_boundary::poll_with_deadline(&fd, PollFlags::POLLOUT, deadline)
+                    .map_err(|e| match e {
+                        // Keep non-lapse poll failures distinct ("poll: syscall error" etc.).
+                        ProtocolError::WireProtocol("deadline lapsed") => ProtocolError::WireProtocol(
+                            "anchor relay: vsock connect deadline lapsed",
+                        ),
+                        other => other,
+                    })?;
+            if !crate::cancellable_boundary::connect_poll_succeeded(revents) {
                 return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed (poll)"));
             }
         }
-        // Any other errno fails immediately (intentional): for a non-blocking AF_VSOCK SOCK_STREAM connect
-        // the only "in flight" return is EINPROGRESS (EINTR handled above defensively). Errors like
-        // ECONNRESET/ENODEV/EAGAIN are genuine connect failures, not a not-yet-complete state, so there is
-        // nothing to poll for — fail fast and let the driver retry.
+        // Any other errno — INCLUDING EINTR — fails immediately (intentional). For a non-blocking AF_VSOCK
+        // SOCK_STREAM connect the only "in flight" return is EINPROGRESS. EINTR must NOT be routed to the
+        // poll path: af_vsock's signal path CANCELS the attempt (sk_state → TCP_CLOSE, transport cancel_pkt,
+        // sk_err left 0), and vsock_poll's "simulate INET" branch reports a cancelled socket as bare clean
+        // POLLOUT — so polling after EINTR would pass connect_poll_succeeded AND SO_ERROR==0 and hand back a
+        // NEVER-CONNECTED stream as success. (Unreachable today anyway: the O_NONBLOCK path returns before
+        // any interruptible wait.) Errors like ECONNRESET/ENODEV are genuine connect failures, not a
+        // not-yet-complete state — fail fast and let the driver retry.
         Err(_) => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
     }
 
@@ -1438,8 +1461,10 @@ mod tests {
 
 /// 5b-2b-ii(a) acceptance tests for [`VsockBootRelayChannel`] over a REAL `VsockStream`. Gated
 /// `all(test, target_os = "linux", feature = "vsock-transport")` (so they compile only where the channel
-/// does) and `#[ignore]` (they need a live vsock environment — they are NOT run by ordinary CI). Compiled
-/// by the CI build-check `cargo test --no-run --features vsock-transport,agent-gateway`; RUN on aya:
+/// does) and `#[ignore]` (they need a live vsock environment, so THESE tests are skipped by ordinary CI —
+/// but CI does compile AND RUN the deviceless suite under the same features, `cargo test --features
+/// vsock-transport,agent-gateway` in nix-hsm.yml, which executes the `cancellable_boundary` unit tests this
+/// module's coverage notes lean on). RUN on aya:
 ///   cargo test --features vsock-transport,agent-gateway -- --ignored --nocapture
 /// The loopback test needs the `vsock_loopback` kernel module (or run inside the SNP guest).
 #[cfg(all(test, target_os = "linux", feature = "vsock-transport"))]
@@ -1497,13 +1522,18 @@ mod vsock_aya_tests {
     }
 
     /// Connect to a no-listener endpoint under a short deadline: must fail (retryable) PROMPTLY, never hang.
-    /// What this PROVES: **prompt socket-level connect refusal + retryable folding** — a no-listener vsock
-    /// `connect` fast-fails (ECONNRESET/refused) either synchronously (`Err(_)` arm) or via an *immediate*
-    /// error-ready `poll` return; neither runs `poll(POLLOUT)` out to the deadline. It does NOT exercise the
-    /// genuine deadline-LAPSE path (a wedged in-flight connect on a black-holing host). That lapse path is
-    /// covered structurally by `cancellable_boundary::poll_times_out_when_not_ready` (poll returns at the
-    /// deadline) + RAII fd drop; a real-vsock black-hole-connect test is DEFERRED (see the design doc §8 —
-    /// staging a silently-black-holing vsock peer is awkward; tracked, not silently claimed).
+    /// What this PROVES: **prompt socket-level connect refusal + retryable folding**. Kernel reality
+    /// (af_vsock): the non-blocking connect returns `EINPROGRESS` (the synchronous-`Ok`/`Err` arms are
+    /// structurally unreachable for a refusal — `vsock_connect` holds the sock lock and the REQUEST tx is
+    /// workqueued), the transport's RST then lands as `sk_err = ECONNRESET`, and the poll wakes *immediately*
+    /// with `POLLERR|POLLOUT` → the `connect_poll_succeeded` veto arm ("vsock connect failed (poll)").
+    /// The elapsed bound is BELOW the 500ms deadline, so this assert genuinely discriminates prompt refusal
+    /// from a deadline-lapse (a lapse would take the full 500ms and fail the bound). It does NOT exercise
+    /// the deadline-LAPSE path (a black-holed in-flight connect): that is covered structurally by
+    /// `cancellable_boundary::poll_times_out_when_not_ready` + RAII fd drop; a real-vsock lapse test is
+    /// DEFERRED and must use a deadline **shorter than the kernel's ~2s `VSOCK_DEFAULT_CONNECT_TIMEOUT`**
+    /// (or raise `SO_VM_SOCKETS_CONNECT_TIMEOUT`), else the kernel's `ETIMEDOUT` timer preempts the lapse
+    /// (see the design doc §8).
     #[test]
     #[ignore]
     fn vsock_channel_connect_failure_is_prompt_and_retryable() {
@@ -1512,9 +1542,53 @@ mod vsock_aya_tests {
         let r = ch.round_trip(&build_request_frame(), start + Duration::from_millis(500));
         assert!(r.is_err(), "connect to a dead endpoint must error, not hang");
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "must fail promptly (prompt refusal + retryable folding), not block on connect"
+            start.elapsed() < Duration::from_millis(400),
+            "refusal must arrive promptly (error-ready poll), NOT by running the 500ms deadline out — \
+             a lapse here means the prompt-refusal property regressed"
         );
+    }
+
+    /// Direct assertions for the two properties the behavioral tests cannot discriminate: (1) after
+    /// `connect_bounded` the fd is back in BLOCKING mode (`F_GETFL` has `O_NONBLOCK` cleared) — if a
+    /// regression left it non-blocking, `SO_*TIMEO` would be silently ignored and every channel read would
+    /// busy-spin WouldBlock until the deadline, passing the stalled-peer test on wall-clock alone; (2)
+    /// `DeadlineSocket::arm_read`/`arm_write` really arm `SO_RCVTIMEO`/`SO_SNDTIMEO` to ~the remaining
+    /// budget, read back via SAFE `nix` getsockopt (`sockopt::ReceiveTimeout`/`SendTimeout`) — the readback
+    /// the docs previously (wrongly, since the nix `socket` feature landed) claimed needed `unsafe`/`libc`.
+    #[test]
+    #[ignore]
+    fn vsock_connect_restores_blocking_and_arms_so_timeo() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use nix::sys::socket::{getsockopt, sockopt::ReceiveTimeout, sockopt::SendTimeout};
+        let port = 5996;
+        let listener =
+            crate::vsock_listen::bind_vsock_listener(LOOPBACK_CID, port).expect("bind loopback");
+        let server = std::thread::spawn(move || {
+            let (_s, _addr) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(300)); // keep the peer alive while we probe
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut stream = connect_bounded(LOOPBACK_CID, port, deadline).expect("connect_bounded");
+        // (1) Blocking-mode restored: O_NONBLOCK must be CLEARED (SOCK_NONBLOCK was set at creation).
+        let flags = OFlag::from_bits_retain(fcntl(&stream, FcntlArg::F_GETFL).expect("F_GETFL"));
+        assert!(
+            !flags.contains(OFlag::O_NONBLOCK),
+            "connect_bounded must hand back a BLOCKING fd (O_NONBLOCK cleared), got flags {flags:?}"
+        );
+        // (2) Arm via DeadlineSocket, then read the armed values back (safe nix getsockopt).
+        let sock = DeadlineSocket { inner: &mut stream, deadline };
+        sock.arm_read().expect("arm_read");
+        sock.arm_write().expect("arm_write");
+        let rcv = getsockopt(&*sock.inner, ReceiveTimeout).expect("getsockopt(SO_RCVTIMEO)");
+        let snd = getsockopt(&*sock.inner, SendTimeout).expect("getsockopt(SO_SNDTIMEO)");
+        for (name, tv) in [("SO_RCVTIMEO", rcv), ("SO_SNDTIMEO", snd)] {
+            let armed_ms = tv.tv_sec() * 1000 + i64::from(tv.tv_usec()) / 1000;
+            assert!(
+                armed_ms > 0 && armed_ms <= 3000,
+                "{name} must be armed to ~the remaining budget (0 < t <= 3000ms), got {armed_ms}ms"
+            );
+        }
+        server.join().unwrap();
     }
 
     /// A peer that CONNECTS then STALLS (never sends a response): the channel's read must time out within
