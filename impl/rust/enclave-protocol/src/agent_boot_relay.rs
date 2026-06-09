@@ -294,10 +294,14 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         &mut self,
         request: &AnchorBootRequest,
     ) -> Result<Vec<u8>, AnchorTransportError> {
-        // Each leg gets its OWN `timeout` budget (a fresh deadline computed just before it runs), so:
-        // (a) a hung quote fetch is bounded — it can't stall boot; AND (b) quote latency does NOT eat
-        // into the channel's budget (no false channel timeout). Per-attempt wall-clock is therefore
-        // ≤ 2×timeout; the driver bounds the attempt COUNT on top, so total boot stays bounded.
+        // Each leg gets its OWN `timeout` budget (a fresh deadline computed just before it runs), so quote
+        // latency does NOT eat into the channel's budget (no false channel timeout). The quote leg's bound
+        // is **cooperative/best-effort only**: `SnpQuoteProducer` → `fetch_report_deadline` checks the
+        // deadline between configfs steps but CANNOT interrupt a wedged in-kernel `read(outblob)` (the hard
+        // `2×timeout` per-attempt bound holds only once 5b-2b-ii(d)'s cancellable-boundary quote producer
+        // lands; until then a wedged provider can overrun — which is why a live 5b-2c serve is gated on (d)).
+        // The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver bounds the
+        // attempt COUNT on top.
         let (report, cert_chain) = self
             .quote
             .fetch(&request.report_data, std::time::Instant::now() + self.timeout)
