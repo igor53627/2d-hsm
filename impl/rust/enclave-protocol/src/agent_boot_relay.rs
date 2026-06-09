@@ -436,17 +436,15 @@ impl BootQuoteProducer for SnpQuoteProducer {
 /// size the per-leg timeout to comfortably cover BOTH a connect and a round-trip (a connect that consumes
 /// nearly the whole budget yields a retryable deadline-lapse before I/O — safe, but a wasted attempt).
 ///
-/// ## Connect-timeout (best-effort soft bound — load-bearing caveat)
-/// vsock 0.5 has **no** `connect_with_timeout` (only blocking `VsockStream::connect_with_cid_port`), and a
-/// `poll`-based nonblocking connect would need `libc`/`unsafe` or a new dep — both off-limits under
-/// `#![forbid(unsafe_code)]`. So [`connect_bounded`] bounds the connect *wait* with a watchdog thread +
-/// `recv_timeout` (no new dep, no unsafe): `round_trip` returns within the budget even if connect stalls.
-/// A truly-wedged connect **leaks one watchdog thread + its connecting fd PER wedged attempt** (bounded by
-/// the driver's `max_attempts`) until the kernel's vsock connect-timeout reaps each (the socket is local
-/// host↔guest, so connect fast-fails — `ECONNRESET` if no listener — in practice; a real hang is rare and
-/// OS-reaped, unlike the un-interruptible configfs read). A *cancellable* hard connect bound (nonblocking +
-/// poll, or a vsock crate exposing connect-with-timeout) is the same deferred follow-up class as the quote
-/// hard bound (§8 5b-2b-ii(d)) and MUST be tracked as its OWN obligation, not collapsed into the quote one.
+/// ## Connect-timeout (hard, cancellable — 5b-2b-ii(a') DONE)
+/// vsock 0.5 has **no** `connect_with_timeout`, so [`connect_bounded`] creates a non-blocking vsock
+/// `SOCK_STREAM` fd directly (`nix::sys::socket`) and waits for the connect via
+/// `cancellable_boundary::poll_with_deadline(POLLOUT, deadline)` — a TRUE cancellable bound: on a deadline
+/// lapse the `poll` returns and the `OwnedFd` drops, closing the fd and aborting the connect, with **no
+/// watchdog thread and no leaked fd** (this replaced the earlier watchdog-thread soft-bound). Success
+/// requires `POLLOUT` AND no `POLLERR`/`POLLHUP`/`POLLNVAL` AND `getsockopt(SO_ERROR) == 0`; the fd is then
+/// returned to blocking mode so the [`DeadlineSocket`] socket timeouts apply. All `nix`/vsock calls are
+/// SAFE wrappers (no `unsafe`). The quote-fetch hard bound (§8 5b-2b-ii(d)) remains the separate open item.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub(crate) struct VsockBootRelayChannel {
     host_cid: u32,
@@ -458,39 +456,65 @@ pub(crate) struct VsockBootRelayChannel {
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use crate::cancellable_boundary::remaining_or_lapsed;
 
-/// Open a fresh `VsockStream` to `(host_cid, port)`, bounding the connect *wait* by `deadline` via a
-/// watchdog thread + `recv_timeout` (see the [`VsockBootRelayChannel`] connect-timeout caveat). Returns a
-/// retryable `ProtocolError` on lapse/failure. `VsockStream` is `Send`, so the connected stream is moved
-/// back over the channel.
+/// Open a fresh `VsockStream` to `(host_cid, port)`, with a TRUE cancellable connect bound (5b-2b-ii(a')):
+/// a non-blocking `connect` + [`crate::cancellable_boundary::poll_with_deadline`] on `POLLOUT`. On a
+/// deadline lapse the `poll` returns and the `OwnedFd` drops in-scope (closing the fd, aborting the
+/// connect) — **no watchdog thread, no leaked fd**. Returns a retryable `ProtocolError` on lapse/failure.
+///
+/// The fd is created `SOCK_NONBLOCK` so the connect can be polled; **after** the connect completes it is
+/// returned to BLOCKING mode (`set_nonblocking(false)`) so the caller's [`DeadlineSocket`]
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` actually take effect (a non-blocking socket ignores `SO_*TIMEO`). All nix
+/// calls (`socket`/`connect`/`getsockopt`) and vsock's `set_nonblocking` are SAFE wrappers — no `unsafe`.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 fn connect_bounded(
     host_cid: u32,
     port: u32,
     deadline: std::time::Instant,
 ) -> Result<vsock::VsockStream, ProtocolError> {
-    let budget = remaining_or_lapsed(deadline)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("vsock-boot-connect".to_string())
-        .spawn(move || {
-            // tx send may fail if the receiver already timed out and dropped rx — that's fine, the
-            // stream is then dropped here, closing the fd.
-            let _ = tx.send(vsock::VsockStream::connect_with_cid_port(host_cid, port));
-        })
-        .map_err(|_| ProtocolError::WireProtocol("anchor relay: connect thread spawn failed"))?;
-    match rx.recv_timeout(budget) {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(_)) => Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
-        // Distinct messages aid triage (both fold to a retryable AnchorTransportError upstream): Timeout =
-        // connect out-raced the budget (watchdog leak); Disconnected = the connect thread died without
-        // sending (no panic path today, so effectively unreachable — but never silently relabel it).
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(ProtocolError::WireProtocol("anchor relay: vsock connect timed out"))
+    use nix::poll::PollFlags;
+    use nix::sys::socket::{
+        connect, getsockopt, socket, sockopt::SocketError, AddressFamily, SockFlag, SockType, VsockAddr,
+    };
+    use std::os::fd::AsRawFd;
+
+    // Fresh non-blocking vsock SOCK_STREAM fd. NOT vsock 0.5's `VsockSocket` (that is SOCK_DGRAM).
+    let fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .map_err(|_| ProtocolError::WireProtocol("anchor relay: vsock socket() failed"))?;
+
+    let addr = VsockAddr::new(host_cid, port);
+    match connect(fd.as_raw_fd(), &addr) {
+        Ok(()) => {} // connected synchronously (uncommon for a non-blocking connect)
+        Err(nix::errno::Errno::EINPROGRESS) => {
+            // Connect in flight — wait (cancellably) for it to complete. `poll_with_deadline` returns
+            // `Ok(revents)` even for error-readiness (POLLERR/HUP/NVAL), so a bare `Ok(_)` is NOT success:
+            // require POLLOUT AND no error flags. On lapse it returns Err and `fd` drops below.
+            let revents = crate::cancellable_boundary::poll_with_deadline(&fd, PollFlags::POLLOUT, deadline)?;
+            if !revents.contains(PollFlags::POLLOUT)
+                || revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+            {
+                return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed (poll)"));
+            }
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(ProtocolError::WireProtocol("anchor relay: vsock connect thread died"))
-        }
+        Err(_) => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
     }
+
+    // SO_ERROR carries the real non-blocking-connect result and must be 0 even once POLLOUT fired.
+    match getsockopt(&fd, SocketError) {
+        Ok(0) => {}
+        _ => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect SO_ERROR set")),
+    }
+
+    // Promote to VsockStream, then restore BLOCKING mode so DeadlineSocket's SO_*TIMEO take effect.
+    let stream = vsock::VsockStream::from(fd);
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| ProtocolError::WireProtocol("anchor relay: clear O_NONBLOCK failed"))?;
+    Ok(stream)
 }
 
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
