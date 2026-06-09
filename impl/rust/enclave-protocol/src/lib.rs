@@ -84,6 +84,9 @@ pub mod enclave_serve;
 #[cfg(feature = "ml-dsa-65")]
 pub mod platform_provisioning_boot;
 mod uds_listen;
+/// AF_VSOCK address/port resolution + validation (pure, gate-free so it is CI-tested without the
+/// Linux-only `vsock` crate). The socket-binding leaf is the gated [`vsock_listen`] module.
+pub mod vsock_addr;
 #[cfg(feature = "vsock-transport")]
 pub mod vsock_listen;
 #[cfg(any(

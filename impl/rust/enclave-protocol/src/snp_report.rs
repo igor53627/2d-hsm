@@ -117,8 +117,9 @@ impl TsmFs for RealTsmFs {
     }
     fn read_auxblob(&self, entry: &str) -> Vec<u8> {
         // VCEK→ASK→ARK cert chain. Best-effort: absent/unreadable/oversize → empty (the verifier can
-        // fetch the chain from AMD KDS by VCEK serial). Capped so an implausibly large auxblob can't push
-        // a downstream frame past its size bound.
+        // fetch the chain from AMD KDS by VCEK serial). Capped at `MAX_CERT_CHAIN_LEN` so an implausibly
+        // large auxblob can't push the GET_MEASUREMENT response frame past `MAX_MESSAGE_SIZE` (nor the
+        // boot-relay request frame past its own bound, which reuses this same constant).
         match std::fs::read(format!("{entry}/auxblob")) {
             Ok(c) if c.len() <= MAX_CERT_CHAIN_LEN => c,
             _ => Vec::new(),
@@ -150,6 +151,10 @@ pub(crate) fn fetch_report_with<F: TsmFs>(
     report_data: &[u8; REPORT_DATA_LEN],
     deadline: Option<std::time::Instant>,
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+    // Distinct from the per-step `check_deadline` in the inner fn: this outer guard fires BEFORE the
+    // stale-clear `remove_entry`, so an already-past deadline touches NO fs at all (the "fast path",
+    // pinned by `fetch_past_deadline_fast_path_touches_no_fs`). The inner checks then bound the gaps
+    // between ops. Different message ("already past" vs "exceeded") to localize which guard tripped.
     if let Some(d) = deadline {
         if std::time::Instant::now() >= d {
             return Err(ProtocolError::PqSigningUnavailable("SNP quote fetch deadline already past"));
@@ -379,6 +384,10 @@ mod tests {
         outblob_err: bool,
         outblob: Vec<u8>,
         auxblob: Vec<u8>,
+        /// If set, `create_entry` busy-waits until `now >= this` before returning — lets a test make the
+        /// deadline lapse *mid-sequence* (after create) deterministically, so the post-create
+        /// `check_deadline` fires and the unconditional cleanup is exercised on the timeout path.
+        create_spin_until: Option<Instant>,
         calls: RefCell<Vec<&'static str>>,
     }
     impl FakeTsmFs {
@@ -388,6 +397,7 @@ mod tests {
                 outblob_err: false,
                 outblob: vec![0xa5; MIN_REPORT_LEN],
                 auxblob: vec![0xc7; 16],
+                create_spin_until: None,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -398,6 +408,9 @@ mod tests {
         }
         fn create_entry(&self, _entry: &str) -> Result<(), ProtocolError> {
             self.calls.borrow_mut().push("create");
+            if let Some(t) = self.create_spin_until {
+                while Instant::now() < t {} // deterministic: cross the deadline during this op
+            }
             if self.create_ok {
                 Ok(())
             } else {
@@ -487,6 +500,20 @@ mod tests {
         let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future()));
         assert_eq!(err_msg(r), "SNP attestation: outblob shorter than ABI minimum");
         assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "outblob", "remove"]);
+    }
+
+    #[test]
+    fn fetch_cleans_up_on_mid_sequence_deadline_timeout() {
+        // Deadline is in the future at the outer fast-path check (so create runs), but `create_entry`
+        // busy-waits across it, so the post-create `check_deadline` fires: this exercises the cleanup on a
+        // deadline-lapse *between* fs ops (not just an op-error path). The trailing "remove" proves no
+        // stale entry leaks even when the timeout lands mid-sequence; write/outblob/aux never run.
+        let mut fs = FakeTsmFs::ok();
+        let dl = Instant::now() + Duration::from_millis(5);
+        fs.create_spin_until = Some(dl);
+        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(dl));
+        assert_eq!(err_msg(r), "SNP quote fetch deadline exceeded");
+        assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "remove"]);
     }
 
     #[test]

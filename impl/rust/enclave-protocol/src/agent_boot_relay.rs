@@ -34,7 +34,8 @@
 //! composition (this transport + the 5b-1 driver + 5a verify) end-to-end with a mock channel + fake
 //! quote producer. The remaining aya/SNP work is split into ordered slices (see §8): **5b-2b** the real
 //! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded) +
-//! `SnpQuoteProducer` (delegates to `snp_report::fetch_report`), gated `vsock-transport`, plus the
+//! `SnpQuoteProducer` (delegates to the deadline-bounded `snp_report::fetch_report_deadline`, NOT the
+//! unbounded producer `fetch_report`), gated `vsock-transport`, plus the
 //! host-side relay daemon (which uses [`decode_anchor_boot_request`]); **5b-2c** the agent-gateway bin +
 //! boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -246,10 +247,15 @@ pub(crate) trait BootRelayChannel {
 /// records the `report_data` it was handed (proving the quote↔nonce binding).
 ///
 /// **`deadline` bounds the quote fetch's own wall-clock** (`RelayAnchorTransport` gives this leg its own
-/// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't hang boot
-/// AND quote latency can't starve the channel's budget). `fetch` MUST honor it: bound its I/O by
-/// `deadline` and return [`ProtocolError`] (→ retryable `AnchorTransportError`) rather than block past it.
-/// A wedged provider is a platform fault, but it must still fail promptly, not hang.
+/// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't starve
+/// the channel's budget). `fetch` MUST honor it COOPERATIVELY: check `deadline` around its I/O steps and
+/// return [`ProtocolError`] (→ retryable `AnchorTransportError`) rather than block past it.
+///
+/// **Best-effort caveat (load-bearing):** under `#![forbid(unsafe_code)]` a single in-kernel blocking
+/// syscall (e.g. configfs `read(outblob)`) cannot be interrupted, so this is a *between-steps* bound, NOT
+/// a hard wall-clock guarantee against a wedged kernel. A true hard bound needs a worker-thread/process
+/// timeout — a tracked deferred follow-up (see §8). Callers (the boot serve-gate) MUST size their own
+/// timeouts treating the quote-fetch deadline as best-effort, not as a guaranteed ceiling.
 pub(crate) trait BootQuoteProducer {
     fn fetch(
         &self,
@@ -357,10 +363,13 @@ where
     enclave.flush().map_err(ProtocolError::from)
 }
 
-/// The production [`BootQuoteProducer`]: fetch the SNP quote via configfs-tsm, honoring the deadline. Pure
-/// delegation to [`crate::snp_report::fetch_report_deadline`] — the deadline contract is satisfied
-/// structurally. The real configfs read runs only inside the SNP guest (aya); off-configfs it returns a
-/// prompt interface-absent / deadline error (never a hang), so even the CI fast-path test is safe.
+/// The production [`BootQuoteProducer`]: fetch the SNP quote via configfs-tsm, honoring the deadline
+/// **cooperatively** (between-steps). Pure delegation to [`crate::snp_report::fetch_report_deadline`],
+/// which checks the deadline around each configfs op — so the *gaps* are bounded, but a single wedged
+/// in-kernel `read(outblob)` is bounded only by the deferred worker-thread hard-bound (see the trait's
+/// best-effort caveat and §8), NOT by this deadline. The real configfs read runs only inside the SNP
+/// guest (aya); off-configfs it returns a prompt interface-absent / deadline error (never a hang in CI),
+/// so even the CI fast-path test is safe.
 pub(crate) struct SnpQuoteProducer;
 impl BootQuoteProducer for SnpQuoteProducer {
     fn fetch(
