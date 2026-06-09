@@ -192,7 +192,8 @@ impl StrictParser<'_> {
                 Ok(Value::Array(out))
             }
             5 => {
-                if arg > MAX_MAP_ENTRIES || arg as usize > self.remaining() {
+                // Each entry is a (key, value) = at least 2 bytes; bound by 2×arg before allocating.
+                if arg > MAX_MAP_ENTRIES || 2 * (arg as usize) > self.remaining() {
                     return Err(());
                 }
                 let mut out: Vec<(Value, Value)> = Vec::with_capacity(arg as usize);
