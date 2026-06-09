@@ -107,7 +107,7 @@ pub(crate) struct VerifiedCapability {
     pub key_purpose: u8,
 }
 
-use crate::agent_cbor::{as_bytes, as_u64, check_strict_keys, map_get};
+use crate::agent_cbor::{as_bytes, as_bytes32, as_bytes_n, as_u64, check_strict_keys, map_get};
 
 /// Strict structural decode of the capability map → typed [`Capability`]. Any shape/type/range
 /// violation ⇒ [`AgentError::Malformed`] (`0x40`, syntax only).
@@ -181,18 +181,14 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
         Some(b) if b.len() <= MAX_CAP_REQUEST_ID_LEN => b.to_vec(),
         _ => return Err(AgentError::Malformed),
     };
-    let payload_binding: [u8; 32] = match map_get(map, 11).and_then(as_bytes) {
-        Some(b) => b.try_into().map_err(|_| AgentError::Malformed)?,
-        None => return Err(AgentError::Malformed),
-    };
+    let payload_binding: [u8; 32] =
+        map_get(map, 11).and_then(as_bytes32).ok_or(AgentError::Malformed)?;
     let is_recovery = match map_get(map, 12) {
         Some(Value::Bool(b)) => *b,
         _ => return Err(AgentError::Malformed),
     };
-    let signature: [u8; 64] = match map_get(map, 13).and_then(as_bytes) {
-        Some(b) => b.try_into().map_err(|_| AgentError::Malformed)?,
-        None => return Err(AgentError::Malformed),
-    };
+    let signature: [u8; 64] =
+        map_get(map, 13).and_then(as_bytes_n::<64>).ok_or(AgentError::Malformed)?;
 
     Ok(Capability {
         cap_format_version,
