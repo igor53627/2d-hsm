@@ -1336,6 +1336,42 @@ mod tests {
     }
 
     #[test]
+    fn marks_payload_is_decodable_canonical_cbor() {
+        // The payload must be a genuinely decodable CBOR document (the seeding slice reconstructs rows
+        // from it) — not just a hash preimage. Parse it back with ciborium and check the structure.
+        let mut b = marks_body();
+        b.counters = vec![ctr(1, 0, b"x", 5), ctr(2, 7, b"yy", 9)];
+        b.faucet.cumulative_native_spend = {
+            let mut a = [0u8; 32];
+            a[31] = 3;
+            a
+        };
+        b.strict_recovery_counter = 4;
+        let payload = b.encode_marks_payload();
+        let v: ciborium::value::Value = ciborium::de::from_reader(&payload[..]).unwrap();
+        let ciborium::value::Value::Map(m) = v else {
+            panic!("marks_payload must decode as a CBOR map");
+        };
+        assert_eq!(m.len(), 4, "exactly 4 keys (no spilled row items)");
+        let mut key1 = None;
+        for (k, val) in &m {
+            if matches!(k, ciborium::value::Value::Integer(i) if u64::try_from(*i).ok() == Some(1)) {
+                key1 = Some(val);
+            }
+        }
+        let ciborium::value::Value::Array(rows) = key1.expect("key 1 present") else {
+            panic!("key 1 must be an array of rows");
+        };
+        assert_eq!(rows.len(), 2, "two counter rows");
+        for row in rows {
+            let ciborium::value::Value::Array(fields) = row else {
+                panic!("each row must be a CBOR array(4)");
+            };
+            assert_eq!(fields.len(), 4, "row = [authority, scope_class, scope_target, counter]");
+        }
+    }
+
+    #[test]
     fn advance_counter_does_not_change_structural_version() {
         // A counter advance is an adoptable (anchor-reconstructable) gap — it MUST NOT bump
         // structural_version (else a benign spend would masquerade as a structural mutation).
