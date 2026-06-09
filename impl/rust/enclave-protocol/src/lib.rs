@@ -136,6 +136,10 @@ pub mod agent_anchor;
 // canonical decode). Crate-private; consumed by agent_capability/agent_dispatch/agent_anchor.
 #[cfg(feature = "agent-gateway")]
 mod agent_cbor;
+// Agent Gateway anti-rollback freshness-challenge (nonce) state machine (TASK-7.7). CSPRNG issue +
+// single-use lifecycle + handshake report_data binding. Crate-private; dead-code until boot wiring.
+#[cfg(feature = "agent-gateway")]
+mod agent_challenge;
 mod wire;
 
 use serde::{Deserialize, Serialize};

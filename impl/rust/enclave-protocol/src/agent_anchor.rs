@@ -40,8 +40,9 @@ const ANCHOR_RESPONSE_VERSION: u64 = 1;
 /// Domain for the SNP `report_data` the enclave puts in its handshake attestation (the anchor verifies
 /// the enclave's side; that verification is anchor-side, this is just the binding the enclave commits).
 const HANDSHAKE_REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-agent-anchor-handshake-v1";
-/// 32-byte fixed-length fields (marks digest, nonce, block hash).
-const DIGEST_LEN: usize = 32;
+/// 32-byte fixed-length fields (marks digest, nonce, block hash). `pub(crate)` so the freshness-
+/// challenge module ([`crate::agent_challenge`]) keeps the nonce width in lockstep with verify/report_data.
+pub(crate) const DIGEST_LEN: usize = 32;
 
 /// Why a freshness response was rejected. The handshake is a boot-time ceremony (not a per-request,
 /// host-probeable surface), so these are coarse fail-closed reasons rather than an anti-oracle band.
@@ -330,6 +331,48 @@ pub(crate) fn anchor_handshake_report_data(
     h.update(environment_identifier.as_bytes());
     h.update(nonce);
     h.finalize().into()
+}
+
+/// Test-only: build the canonically-encoded, validly-signed (non-chain-bound) anchor freshness
+/// response bytes a conformant anchor would send for `signing_key` + these fields. `pub(crate)` so the
+/// freshness-challenge slice's tests can drive `verify_outstanding_response` end-to-end.
+#[cfg(test)]
+pub(crate) fn test_signed_response_bytes(
+    signing_key: &ed25519_dalek::SigningKey,
+    chain_id: u64,
+    environment_identifier: &str,
+    epoch: u64,
+    structural_version: u64,
+    marks_digest: [u8; DIGEST_LEN],
+    nonce: [u8; DIGEST_LEN],
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let mut r = AnchorResponse {
+        version: ANCHOR_RESPONSE_VERSION,
+        chain_id,
+        environment_identifier: environment_identifier.to_string(),
+        epoch,
+        structural_version,
+        marks_digest,
+        nonce,
+        chain_height: None,
+        chain_block_hash: None,
+        signature: [0u8; 64],
+    };
+    r.signature = signing_key.sign(&signed_preimage(&r)).to_bytes();
+    let map: Vec<(Value, Value)> = vec![
+        (Value::Integer(1.into()), Value::Integer(r.version.into())),
+        (Value::Integer(2.into()), Value::Integer(r.chain_id.into())),
+        (Value::Integer(3.into()), Value::Text(r.environment_identifier.clone())),
+        (Value::Integer(4.into()), Value::Integer(r.epoch.into())),
+        (Value::Integer(5.into()), Value::Integer(r.structural_version.into())),
+        (Value::Integer(6.into()), Value::Bytes(r.marks_digest.to_vec())),
+        (Value::Integer(7.into()), Value::Bytes(r.nonce.to_vec())),
+        (Value::Integer(13.into()), Value::Bytes(r.signature.to_vec())),
+    ];
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
+    out
 }
 
 #[cfg(test)]
