@@ -424,29 +424,28 @@ impl BootQuoteProducer for SnpQuoteProducer {
 /// `(VMADDR_CID_HOST, port)`, set deadline-derived socket timeouts, run the round-trip, and drop the
 /// connection on return. Every failure folds to the always-retryable [`AnchorTransportError`].
 ///
+/// ## Budget model
+/// The single per-leg `deadline` covers connect AND the round-trip I/O **sequentially** (connect first,
+/// then the framed exchange share the remaining budget). So a slow-but-successful connect shrinks the I/O
+/// budget; for a local host↔guest vsock connect (fast) the I/O leg gets ~the whole budget, but 5b-2c MUST
+/// size the per-leg timeout to comfortably cover BOTH a connect and a round-trip (a connect that consumes
+/// nearly the whole budget yields a retryable deadline-lapse before I/O — safe, but a wasted attempt).
+///
 /// ## Connect-timeout (best-effort soft bound — load-bearing caveat)
 /// vsock 0.5 has **no** `connect_with_timeout` (only blocking `VsockStream::connect_with_cid_port`), and a
 /// `poll`-based nonblocking connect would need `libc`/`unsafe` or a new dep — both off-limits under
 /// `#![forbid(unsafe_code)]`. So [`connect_bounded`] bounds the connect *wait* with a watchdog thread +
 /// `recv_timeout` (no new dep, no unsafe): `round_trip` returns within the budget even if connect stalls.
-/// A truly-wedged connect **leaks that one thread** until the kernel's vsock connect-timeout reaps it
-/// (the socket is local host↔guest, so connect fast-fails — `ECONNRESET` if no listener — in practice; a
-/// real hang is rare and OS-reaped, unlike the un-interruptible configfs read). A *cancellable* hard
-/// connect bound (nonblocking + poll, or a vsock crate exposing connect-with-timeout) is the same deferred
-/// follow-up class as the quote hard bound (§8 5b-2b-ii(d)).
+/// A truly-wedged connect **leaks one watchdog thread + its connecting fd PER wedged attempt** (bounded by
+/// the driver's `max_attempts`) until the kernel's vsock connect-timeout reaps each (the socket is local
+/// host↔guest, so connect fast-fails — `ECONNRESET` if no listener — in practice; a real hang is rare and
+/// OS-reaped, unlike the un-interruptible configfs read). A *cancellable* hard connect bound (nonblocking +
+/// poll, or a vsock crate exposing connect-with-timeout) is the same deferred follow-up class as the quote
+/// hard bound (§8 5b-2b-ii(d)) and MUST be tracked as its OWN obligation, not collapsed into the quote one.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub(crate) struct VsockBootRelayChannel {
     host_cid: u32,
     port: u32,
-}
-
-#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
-impl VsockBootRelayChannel {
-    /// Dial `(host_cid, port)`. 5b-2c wires `host_cid = vsock_addr::VMADDR_CID_HOST` and
-    /// `port = vsock_addr::anchor_relay_port_from_env()?`.
-    pub(crate) fn new(host_cid: u32, port: u32) -> Self {
-        Self { host_cid, port }
-    }
 }
 
 /// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed. Avoids the vsock-0.5 trap
@@ -486,12 +485,26 @@ fn connect_bounded(
     match rx.recv_timeout(budget) {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(_)) => Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
-        Err(_) => Err(ProtocolError::WireProtocol("anchor relay: vsock connect timed out")),
+        // Distinct messages aid triage (both fold to a retryable AnchorTransportError upstream): Timeout =
+        // connect out-raced the budget (watchdog leak); Disconnected = the connect thread died without
+        // sending (no panic path today, so effectively unreachable — but never silently relabel it).
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(ProtocolError::WireProtocol("anchor relay: vsock connect timed out"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ProtocolError::WireProtocol("anchor relay: vsock connect thread died"))
+        }
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 impl VsockBootRelayChannel {
+    /// Dial `(host_cid, port)`. 5b-2c wires `host_cid = vsock_addr::VMADDR_CID_HOST` and
+    /// `port = vsock_addr::anchor_relay_port_from_env()?`.
+    pub(crate) fn new(host_cid: u32, port: u32) -> Self {
+        Self { host_cid, port }
+    }
+
     /// Fresh connect → deadline-derived `SO_RCVTIMEO`/`SO_SNDTIMEO` → [`relay_round_trip_over_stream`] →
     /// drop the stream on return (RAII; the stream is a function-local, never stored in `self` — stale-reply
     /// isolation). Returns the raw `ProtocolError`; [`BootRelayChannel::round_trip`] folds it to retryable.
