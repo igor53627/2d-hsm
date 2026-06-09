@@ -480,8 +480,58 @@ future *per-op* freshness scheme would need a keyed/multi-slot redesign + a conc
 extension of this single-outstanding slot. Per-instance only — no clone fencing (design §3 Option A
 residual).
 
-**Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
-the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, wiring
-verify+reconcile (via `verify_anchor_response_bytes`) into boot/install, per-op `epoch` bump +
-seal-before-emit, and seeding the body's counter/spend from the anchor's authoritative marks (asserting
-adopted marks ≥ local). The live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.
+**Boot reconcile orchestration — slice 5a (`agent_boot.rs`).** The pure, platform-free *glue* that
+sequences the three primitives above into the one canonical boot ceremony, decomposed out of the
+platform-coupled boot wiring (5b) so it is unit-testable now. `boot_reconcile_anti_rollback(response_bytes,
+body)` runs: (1) `verify_outstanding_response` (retire-then-verify against the sealed `anchor_root` +
+scope + issued nonce), (2) `compute_local_marks_digest` over the sealed counters/spend, (3) `reconcile`
+the local `(freshness_epoch, structural_version, marks)` vs the verified `AnchorState` — and collapses the
+result into a single `BootAntiRollbackOutcome { Ready(state) | AdoptForwardRequired(state) |
+FailClosed(reason) }`. Two wildcard-free mappers flatten the verify-stage (`AnchorError`) and
+reconcile-stage (`FailReason`) errors into the boot-time `BootFailReason` enum (a new upstream variant is
+a compile error here, not a silent fall-through). **The live Layer-2b binding
+(`install_anti_rollback_binding`) is installed ONLY on the `Fresh` arm** — `AdoptForward` returns
+`AdoptForwardRequired` *without* installing (5b owns the seed-from-marks + re-seal-forward + retry), and
+every fail path installs nothing. Four independent properties enforce never-install-off-`Fresh`:
+binding-literal-constructed-in-arm-only, exhaustive wildcard-free `match`, const-init `None` fail-closed
+default, and the callee's install-once + reject-inactive. Still **UNWIRED** (dead-code-gated): 5b adds the
+only caller. 13 unit tests cover every arm + the no-install sweep, driving the real challenge/binding
+process-globals (all crate tests touching either global now serialize on one shared
+`AGENT_PROCESS_GLOBAL_TEST_GUARD` since `agent_boot` exercises both).
+
+**Out of this slice (next, platform/host plumbing — slice 5b/6):** the actual SNP-quote fetch (the
+enclave half of the *mutual* auth — slice 2 only fixes the value the quote commits to), the vsock host
+relay that delivers `response_bytes`, the at-boot call sequencing (`issue_challenge` after unseal → relay
+→ `boot_reconcile_anti_rollback` → act on the outcome), the `AdoptForward` seed-from-marks + re-seal
+forward, and per-op `epoch` bump + seal-before-emit atomic with the structural bump. The
+live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.
+
+**Slice 5b contract — load-bearing obligations (pinned here after the 5a Full Matrix review):**
+- **AdoptForward marks authentication (security-critical).** The `marks_digest` in the verified
+  `AnchorState` is a SHA3 hash — non-invertible — so the *raw* counter/spend marks 5b seeds the body
+  from must arrive over a **separate authenticated channel** (a second `anchor_root`-signed query, or
+  extra signed fields, bound to the same scope + freshness nonce — to the same rigor as the freshness
+  response). Before re-sealing, 5b MUST assert **`hash(adopted_marks) == state.marks_digest`** (NOT only
+  the weaker `adopted ≥ local`): without the hash-equality check a malicious host could supply forged
+  marks (arbitrarily large but `≥ local`) to inflate spend limits, bypassing the anchor entirely. **Until
+  that signed raw-marks channel is specified and implemented, `AdoptForward` MUST be treated as
+  fail-closed (operator intervention), not auto-adopted.**
+- **Retry re-runs the FULL sequence, bounded.** `verify_outstanding_response` consumes the challenge on
+  every outcome, so recovering from `AdoptForwardRequired` (or any transient) is NOT a same-bytes
+  re-call: 5b must `issue_challenge` afresh → new SNP quote → new anchor round-trip → new
+  `response_bytes` → `boot_reconcile_anti_rollback`. The retry loop MUST be **bounded** (fail closed
+  after N attempts) so a continuously-advancing anchor cannot cause an infinite boot loop.
+- **Non-`Ready` handling.** On any non-`Ready` outcome 5b MUST NOT begin serving rollback-sensitive
+  frames. `FailClosed(BindingInstall)` specifically signals an enclave-internal sequencing defect (the
+  ceremony ran twice) — treat it as **fatal/abort**, not operator-recoverable; note that the pre-existing
+  (first, valid `Fresh`) binding legitimately stays configured, so the fault is "ran twice", not "gate
+  left open by a failure".
+- **`active` semantics.** The Fresh-arm binding sets `active: true` to mean "a `Fresh` reconcile
+  occurred this boot"; there is no anchor-reported per-instance liveness field in `AnchorState` yet
+  (design §3 Option A has no clone fencing), so `active` is not yet a liveness signal — a future Option-B
+  upgrade that fences concurrent attestations would supply it.
+- **Challenge↔config scope cross-check.** `boot_reconcile_anti_rollback` binds the *response* scope to
+  `body.config` and the nonce to the challenge, but the challenge's own `(chain_id, environment_identifier)`
+  (which fed the SNP `report_data`) is the boot caller's to match against `body.config` — 5b MUST issue
+  the challenge with exactly the sealed config's scope so the quote and the verified response commit to
+  the same `(chain_id, env)`.

@@ -178,14 +178,12 @@ mod tests {
     const CHAIN: u64 = 11565;
 
     /// Serialize the tests that touch the `OUTSTANDING_CHALLENGE` process-global (cargo runs tests in
-    /// parallel) and reset the slot. Hold the returned guard for the test body's duration. Mirrors the
-    /// crate's "consolidate global-state tests to avoid cross-test interference" convention, but as a
-    /// reusable lock so each behavior stays its own test.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    /// parallel) and reset the slot. Hold the returned guard for the test body's duration. Delegates to
+    /// the crate-wide [`crate::agent_dispatch::lock_and_reset_agent_process_globals`] (not a module-local
+    /// mutex): `agent_boot` drives this global AND `ANTI_ROLLBACK_BINDING` together, so all touchers of
+    /// either global serialize on one mutex (and reset the full global set) or they race.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        let g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        reset_outstanding_challenge_for_tests();
-        g
+        crate::agent_dispatch::lock_and_reset_agent_process_globals()
     }
 
     fn test_config() -> KeystoreConfig {

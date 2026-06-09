@@ -279,8 +279,12 @@ pub(crate) fn verify_anchor_response_bytes(
 /// `marks_digest` is a hash, so this decides only the *action* (Fresh / AdoptForward / FailClosed)
 /// from the epoch + structural_version ordering; it cannot compare mark *magnitudes*. The safety of
 /// `AdoptForward` rests on the trusted anchor recording a **monotone** counter/spend high-water
-/// (design §3). The boot-wiring slice that actually SEEDS the body from the anchor's marks MUST assert
-/// the adopted marks are ≥ the local marks (never seed a regression) before re-sealing.
+/// (design §3). The boot-wiring slice that actually SEEDS the body from the anchor's marks MUST obtain
+/// those raw marks over a separate `anchor_root`-signed channel and assert **`hash(adopted_marks) ==
+/// state.marks_digest`** (digest equality — authenticates the host-relayed raw marks against this
+/// verified digest; the weaker `adopted ≥ local` alone lets a host forge large-but-`≥-local` marks)
+/// before re-sealing. Until that signed raw-marks channel exists, `AdoptForward` is treated as
+/// fail-closed (slice-5b contract, `agent-gateway-anti-rollback.md` §8).
 pub(crate) fn reconcile(
     local_epoch: u64,
     local_structural_version: u64,

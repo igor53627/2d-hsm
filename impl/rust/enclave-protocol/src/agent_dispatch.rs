@@ -578,14 +578,21 @@ pub fn reset_agent_keystore_for_tests() {
 
 /// The boot-resolved anti-rollback binding (TASK-7.7 AC#5). Opaque presence marker — the funding gate
 /// only needs to know a successful anchor handshake + reconcile happened this (re)start, not the full
-/// (v1-PROVISIONAL) `ReconcileDecision`. The boot-wiring slice installs this AFTER `reconcile` returns
-/// `Fresh`/`AdoptForward`.
+/// (v1-PROVISIONAL) `ReconcileDecision`. Installed by `agent_boot::boot_reconcile_anti_rollback` **only
+/// on the `Fresh` arm** — NEVER directly on `AdoptForward` (that path must first seed the body from the
+/// anchor's authenticated marks + re-seal forward, then re-run the full ceremony so the now-current
+/// state reconciles `Fresh`). Do not install this from any other site: a binding installed on a stale
+/// (un-re-sealed) `AdoptForward` body would unblock fund custody on rolled-back counters/spend.
 #[derive(Debug, Clone, Copy)]
 pub struct AntiRollbackBinding {
     /// The reconciled freshness epoch the instance is operating under (for observability/audit).
     pub epoch: u64,
-    /// Whether the anchor reported the instance live/active. **Load-bearing:** the funding gate treats
-    /// a binding with `active == false` as unconfigured (fail-closed) — not mere observability.
+    /// **Load-bearing:** the funding gate treats a binding with `active == false` as unconfigured
+    /// (fail-closed) — not mere observability. Currently this means "a `Fresh` reconcile occurred this
+    /// boot" (`boot_reconcile_anti_rollback` sets it `true` only on the `Fresh` arm); there is no
+    /// anchor-reported per-instance liveness field in `AnchorState` yet (design §3 Option A has no clone
+    /// fencing), so `active` is NOT yet a true liveness/fencing signal — a future Option-B upgrade that
+    /// fences concurrent attestations would supply that and could set this `false`.
     pub active: bool,
 }
 
@@ -617,9 +624,11 @@ pub fn install_anti_rollback_binding(binding: AntiRollbackBinding) -> bool {
     true
 }
 
-/// Whether a boot-resolved anti-rollback binding is installed AND reports the instance live/active
-/// (poison-recovers). Checks `active` (not just presence) so a binding installed with `active == false`
-/// — e.g. the anchor reported the instance stale/not-live — fails closed rather than passing the gate.
+/// Whether a boot-resolved anti-rollback binding is installed AND `active` (poison-recovers). Checks
+/// `active` (not just presence) so a non-`active` binding fails closed rather than passing the gate.
+/// Today `active` means "a `Fresh` reconcile occurred this boot" (set `true` only on the `Fresh` arm of
+/// `boot_reconcile_anti_rollback`); a future Option-B clone-fencing upgrade is what would supply true
+/// anchor-reported liveness and could set it `false` (see [`AntiRollbackBinding::active`]).
 pub(crate) fn is_anti_rollback_configured() -> bool {
     ANTI_ROLLBACK_BINDING
         .lock()
@@ -633,6 +642,33 @@ pub fn reset_anti_rollback_binding_for_tests() {
     *ANTI_ROLLBACK_BINDING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Test-only: the SINGLE guard serializing EVERY test across the crate that touches an agent
+/// process-global. Private — all callers go through [`lock_and_reset_agent_process_globals`] so the
+/// "lock + reset the FULL set of agent globals" invariant lives in exactly one place.
+#[cfg(test)]
+static AGENT_PROCESS_GLOBAL_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+/// Test-only: lock the crate-wide agent-process-global guard AND reset EVERY agent process-global to
+/// its pristine state, returning the held guard (hold it for the whole test body). The crate's tests
+/// run in one binary in parallel and `crate::agent_boot` drives BOTH `ANTI_ROLLBACK_BINDING` (this
+/// module) and `OUTSTANDING_CHALLENGE` (`crate::agent_challenge`); the original per-module guards each
+/// reset only "their" global, so once tests across modules shared one guard, stale state could leak
+/// (a dispatch test inheriting a challenge a prior boot test left, etc.). This is the ONE place that
+/// knows the full set: every global-touching test — here, in `agent_challenge`, and in `agent_boot` —
+/// serializes + resets via this helper, and a NEW agent process-global adds its reset HERE so all
+/// three modules stay symmetric by construction rather than by convention.
+#[cfg(test)]
+pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'static, ()> {
+    let g = AGENT_PROCESS_GLOBAL_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    // The FULL set: the installed keystore slot too (frame-path tests install into it), not just the
+    // anti-rollback binding + freshness challenge — so the helper's "pristine state" claim actually holds
+    // and no test inherits a keystore a prior frame test left installed.
+    reset_agent_keystore_for_tests();
+    reset_anti_rollback_binding_for_tests();
+    crate::agent_challenge::reset_outstanding_challenge_for_tests();
+    g
 }
 
 /// AC#5 gate predicate: a rollback-sensitive op may proceed iff the anti-rollback mechanism is
@@ -859,22 +895,19 @@ mod tests {
         enc(Value::Map(m))
     }
 
-    /// Serialize tests that drive a rollback-sensitive opcode (they share the `ANTI_ROLLBACK_BINDING`
-    /// process-global via the AC#5 gate; cargo runs tests in parallel). Hold the returned guard for the
-    /// test body. `gate_configured` installs a test binding so the gated op proceeds to its real
-    /// outcome; `gate_unconfigured` leaves the slot `None` so the gate fires. Read-only opcodes don't
-    /// touch the global (the gate short-circuits) and need no guard.
-    static GATE_GUARD: Mutex<()> = Mutex::new(());
+    /// Lock the crate-wide agent-process-global guard (via `lock_and_reset_agent_process_globals`,
+    /// which resets ALL agent globals) and hold it for the test body. The SAME guard serializes the
+    /// `agent_challenge` and `agent_boot` tests, so this is NOT scoped to this module's binding global —
+    /// do not reintroduce a module-local mutex. `gate_configured` then installs a test binding so the
+    /// gated op proceeds to its real outcome; `gate_unconfigured` leaves the slot `None` so the gate
+    /// fires. Read-only opcodes short-circuit the gate and need no guard.
     fn gate_configured() -> std::sync::MutexGuard<'static, ()> {
-        let g = GATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        reset_anti_rollback_binding_for_tests();
+        let g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         let _ = install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: true });
         g
     }
     fn gate_unconfigured() -> std::sync::MutexGuard<'static, ()> {
-        let g = GATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        reset_anti_rollback_binding_for_tests();
-        g
+        crate::agent_dispatch::lock_and_reset_agent_process_globals()
     }
 
     #[test]
