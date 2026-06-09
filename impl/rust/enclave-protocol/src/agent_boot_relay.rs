@@ -32,9 +32,10 @@
 //! ## UNWIRED — slice 5b-2b adds the platform leaves
 //! Like 5a/5b-1, the module is dead-code in the non-test lib build; the test build drives the FULL
 //! composition (this transport + the 5b-1 driver + 5a verify) end-to-end with a mock channel + fake
-//! quote producer. The remaining aya/SNP work is split into ordered slices (see §8): **5b-2b-ii** the real
-//! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded) + the
-//! host-side relay daemon (which uses [`decode_anchor_boot_request`]) — those are the `vsock-transport`-gated
+//! quote producer. The aya/SNP work is split into ordered slices (see §8): **5b-2b-ii** — the real
+//! `VsockBootRelayChannel` (fresh per call, hard-cancellable `connect_bounded` to host CID 2 — LANDED, (a)
+//! PR #54 + (a') PR #56) and the still-open host-side relay daemon (b) (which uses
+//! [`decode_anchor_boot_request`]) — the `vsock-transport`-gated
 //! leaf. (`SnpQuoteProducer` already landed HERE in 5b-2b-i — `agent-gateway`-gated + CI-tested, dead-code
 //! until 5b-2c wires it; it delegates to the deadline-bounded `snp_report::fetch_report_deadline`, NOT the
 //! unbounded producer `fetch_report`. It is NOT behind `vsock-transport`.) Then **5b-2c** the agent-gateway
@@ -436,8 +437,10 @@ impl BootQuoteProducer for SnpQuoteProducer {
 /// The single per-leg `deadline` covers connect AND the round-trip I/O **sequentially** (connect first,
 /// then the framed exchange share the remaining budget). So a slow-but-successful connect shrinks the I/O
 /// budget; for a local host↔guest vsock connect (fast) the I/O leg gets ~the whole budget, but 5b-2c MUST
-/// size the per-leg timeout to comfortably cover BOTH a connect and a round-trip (a connect that consumes
-/// nearly the whole budget yields a retryable deadline-lapse before I/O — safe, but a wasted attempt).
+/// size the per-leg timeout to comfortably cover BOTH a connect and a round-trip. (A connect can consume
+/// "nearly the whole budget" — yielding a retryable lapse before I/O, safe but a wasted attempt — only when
+/// the per-leg budget is ≲ the kernel's ~2s connect timer below; for longer budgets a wedged connect is
+/// kernel-capped at ~2s, so the I/O leg keeps the rest.)
 ///
 /// ## Connect-timeout (hard, cancellable — 5b-2b-ii(a') DONE)
 /// The connect leg is bounded by [`connect_bounded`] (the single source for the mechanism — non-blocking
@@ -445,8 +448,9 @@ impl BootQuoteProducer for SnpQuoteProducer {
 /// **Timing note for budget sizing:** the kernel ALSO arms its own per-socket connect timer for
 /// non-blocking AF_VSOCK connects (`VSOCK_DEFAULT_CONNECT_TIMEOUT` ≈ 2s; `connect_bounded` does not raise
 /// `SO_VM_SOCKETS_CONNECT_TIMEOUT`), which fails a black-holed in-flight connect with `ETIMEDOUT` at ~2s —
-/// so a wedged connect leg costs ~`min(deadline, ~2s)`, and the caller's `deadline` is the binding connect
-/// bound only when it is shorter. The quote-fetch hard bound (§8 5b-2b-ii(d)) remains the separate open item.
+/// so a wedged connect leg costs ~`min(per-leg budget, ~2s)`, and the caller's `deadline` is the binding
+/// connect bound only when its remaining budget is shorter than the kernel timer. The quote-fetch hard
+/// bound (§8 5b-2b-ii(d)) remains the separate open item.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub(crate) struct VsockBootRelayChannel {
     host_cid: u32,
@@ -470,8 +474,9 @@ use crate::cancellable_boundary::remaining_or_lapsed;
 /// **Kernel connect-timer interplay:** for a non-blocking AF_VSOCK connect the kernel arms its own
 /// per-socket timer (`vsk->connect_timeout`, default `VSOCK_DEFAULT_CONNECT_TIMEOUT` ≈ 2s; we do not set
 /// `SO_VM_SOCKETS_CONNECT_TIMEOUT`). A black-holed in-flight connect therefore fails at ~2s with
-/// `sk_err = ETIMEDOUT` → the poll wakes `POLLERR|POLLOUT` → the [`connect_poll_succeeded`] veto fires —
-/// BEFORE our `deadline` whenever `deadline > ~2s`. The `poll_with_deadline` lapse arm is the binding bound
+/// `sk_err = ETIMEDOUT` → the poll wakes `POLLERR|POLLOUT` → the
+/// [`crate::cancellable_boundary::connect_poll_succeeded`] veto fires — BEFORE our `deadline` whenever
+/// `deadline > ~2s`. The `poll_with_deadline` lapse arm is the binding bound
 /// only for deadlines shorter than the kernel timer (which is also what a real-vsock lapse test must use).
 ///
 /// The fd is created `SOCK_NONBLOCK` so the connect can be polled; **after** the connect completes it is
@@ -521,10 +526,12 @@ fn connect_bounded(
             let revents =
                 crate::cancellable_boundary::poll_with_deadline(&fd, PollFlags::POLLOUT, deadline)
                     .map_err(|e| match e {
-                        // Keep non-lapse poll failures distinct ("poll: syscall error" etc.).
-                        ProtocolError::WireProtocol("deadline lapsed") => ProtocolError::WireProtocol(
-                            "anchor relay: vsock connect deadline lapsed",
-                        ),
+                        // Keep non-lapse poll failures distinct ("poll: syscall error" etc.). The lapse
+                        // string is matched via the shared const so a reword in the helper can't silently
+                        // turn this arm into dead code (also pinned by the deviceless entry-lapse test).
+                        ProtocolError::WireProtocol(crate::cancellable_boundary::DEADLINE_LAPSED_MSG) => {
+                            ProtocolError::WireProtocol("anchor relay: vsock connect deadline lapsed")
+                        }
                         other => other,
                     })?;
             if !crate::cancellable_boundary::connect_poll_succeeded(revents) {
@@ -1527,8 +1534,8 @@ mod vsock_aya_tests {
     /// structurally unreachable for a refusal — `vsock_connect` holds the sock lock and the REQUEST tx is
     /// workqueued), the transport's RST then lands as `sk_err = ECONNRESET`, and the poll wakes *immediately*
     /// with `POLLERR|POLLOUT` → the `connect_poll_succeeded` veto arm ("vsock connect failed (poll)").
-    /// The elapsed bound is BELOW the 500ms deadline, so this assert genuinely discriminates prompt refusal
-    /// from a deadline-lapse (a lapse would take the full 500ms and fail the bound). It does NOT exercise
+    /// The elapsed bound is BELOW the deadline, so this assert genuinely discriminates prompt refusal
+    /// from a deadline-lapse (a lapse would run the full deadline out and fail the bound). It does NOT exercise
     /// the deadline-LAPSE path (a black-holed in-flight connect): that is covered structurally by
     /// `cancellable_boundary::poll_times_out_when_not_ready` + RAII fd drop; a real-vsock lapse test is
     /// DEFERRED and must use a deadline **shorter than the kernel's ~2s `VSOCK_DEFAULT_CONNECT_TIMEOUT`**
@@ -1537,15 +1544,40 @@ mod vsock_aya_tests {
     #[test]
     #[ignore]
     fn vsock_channel_connect_failure_is_prompt_and_retryable() {
+        // 1s deadline / 800ms bound: a real refusal is microsecond-scale, a lapse takes the full 1s, so
+        // the 800ms bound discriminates with ~200ms of scheduler-jitter margin (both well under the
+        // kernel's ~2s connect timer, which never engages for a refusal). Triage note: a deterministic
+        // FAILURE here can also mean a stray process is LISTENING on vsock port 5998 (connect then
+        // succeeds and the read runs the deadline out) — check `ss --vsock` before chasing the connect path.
         let mut ch = VsockBootRelayChannel::new(crate::vsock_addr::VMADDR_CID_HOST, 5998);
         let start = Instant::now();
-        let r = ch.round_trip(&build_request_frame(), start + Duration::from_millis(500));
+        let r = ch.round_trip(&build_request_frame(), start + Duration::from_millis(1000));
         assert!(r.is_err(), "connect to a dead endpoint must error, not hang");
         assert!(
-            start.elapsed() < Duration::from_millis(400),
-            "refusal must arrive promptly (error-ready poll), NOT by running the 500ms deadline out — \
-             a lapse here means the prompt-refusal property regressed"
+            start.elapsed() < Duration::from_millis(800),
+            "refusal must arrive promptly (error-ready poll), NOT by running the 1s deadline out — \
+             a lapse here means the prompt-refusal property regressed (or port 5998 has a stray listener)"
         );
+    }
+
+    /// Deviceless (NOT `#[ignore]` — runs in ordinary Linux CI): pins the connect-leg lapse RELABEL and,
+    /// through the shared `DEADLINE_LAPSED_MSG` const, the cross-module string coupling — if the helper's
+    /// lapse message and the relabel match-arm ever drift apart, this fails before any triage degrades.
+    /// Uses the entry-check path (a past deadline fails BEFORE any socket is created), so no vsock device
+    /// is needed.
+    #[test]
+    fn connect_bounded_entry_lapse_is_relabelled_deviceless() {
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        match connect_bounded(LOOPBACK_CID, 5995, past) {
+            Err(ProtocolError::WireProtocol(msg)) => assert_eq!(
+                msg, "anchor relay: vsock connect deadline lapsed",
+                "entry lapse must carry the connect-leg triage label"
+            ),
+            Err(other) => panic!("expected relabelled entry-lapse error, got {other:?}"),
+            Ok(_) => panic!("a past deadline must fail at entry, not connect"),
+        }
     }
 
     /// Direct assertions for the two properties the behavioral tests cannot discriminate: (1) after
@@ -1583,9 +1615,14 @@ mod vsock_aya_tests {
         let snd = getsockopt(&*sock.inner, SendTimeout).expect("getsockopt(SO_SNDTIMEO)");
         for (name, tv) in [("SO_RCVTIMEO", rcv), ("SO_SNDTIMEO", snd)] {
             let armed_ms = tv.tv_sec() * 1000 + i64::from(tv.tv_usec()) / 1000;
+            // Tight LOWER bound: the remaining budget at arm time is ~2990ms (connect + F_GETFL take
+            // milliseconds), so anything below 2000ms means arm_* did NOT derive the timeout from the
+            // remaining budget (e.g. a regression arming a hardcoded 1s would otherwise pass both this
+            // and the stalled-peer behavioral test). Upper bound: armed value is strictly < 3000ms and
+            // kernel jiffy round-UP can reach exactly 3000ms, never exceed it.
             assert!(
-                armed_ms > 0 && armed_ms <= 3000,
-                "{name} must be armed to ~the remaining budget (0 < t <= 3000ms), got {armed_ms}ms"
+                (2000..=3000).contains(&armed_ms),
+                "{name} must be armed to ~the remaining budget (2000 <= t <= 3000ms), got {armed_ms}ms"
             );
         }
         server.join().unwrap();

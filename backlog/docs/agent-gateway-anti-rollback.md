@@ -726,12 +726,12 @@ request golden vector is a 5b-2b test-vector item.
       it returns raw `revents`, the caller decides); (5) promote the
       `OwnedFd` to `VsockStream` via `From<OwnedFd>`, then `set_nonblocking(false)` so `DeadlineSocket`'s
       `SO_*TIMEO` take effect; RAII fd drop on every path — no thread, no leak. Needs the nix `socket` feature
-      alongside `poll` (both added; plus `fcntl` for the readback test below). aya acceptance (re-run on the
+      alongside `poll` (both added; plus `fs` — the nix feature gating `fcntl()`/`OFlag` — for the readback test below). aya acceptance (re-run on the
       rewritten `poll(POLLOUT)` `connect_bounded`, not inherited from the deleted watchdog path) — **be
       precise about WHICH failure mode each test proves**: (i) connect-to-a-no-listener-endpoint fails
       **promptly** and folds to a retryable error — kernel reality: the refusal lands as `sk_err=ECONNRESET`
       → an *immediate* error-ready poll wake (`POLLERR|POLLOUT`) → the **`connect_poll_succeeded` veto arm**
-      (error string `"vsock connect failed (poll)"`; the synchronous and `SO_ERROR` arms are structurally
+      (error string `"anchor relay: vsock connect failed (poll)"`; the synchronous and `SO_ERROR` arms are structurally
       unreachable for a refusal — `vsock_connect` holds the sock lock and the REQUEST tx is workqueued), and
       the test's elapsed bound is BELOW the deadline so it genuinely discriminates prompt-refusal from a
       lapse; (ii) a loopback connect round-trips; (iii) stalled-peer **read** times out within budget
@@ -885,7 +885,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   deadline. (Connect is the cancellable hard bound (a') — DONE PR #56: non-blocking connect + `poll(POLLOUT)`
   to the deadline; see above.) **Per-leg sizing floor (5b-2c):** the
   per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
-  both (a connect that nearly exhausts it yields a retryable lapse before I/O — a wasted attempt), AND MUST
+  both (NB per the kernel-timer note below, a connect can only consume "nearly the whole leg" when the per-leg `timeout` is ≲ the ~2s kernel connect timer — for longer legs a wedged connect is kernel-capped at ~2s and the I/O budget keeps the rest), AND MUST
   satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
   retry loop can't blow the operator's total boot deadline. **Invariant (wiring-enforced in 5b-2b — a single
   local variable, NOT a structural gate; re-verify on any refactor of `round_trip_inner`):** `connect_bounded`'s
@@ -937,7 +937,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   [`connect_bounded`], `set_nonblocking(false)` afterwards so `SO_*TIMEO` apply to I/O). **What the aya tests
   actually verify:** behaviorally — `SO_RCVTIMEO` via a stalled-peer read that times out within budget; the
   connect bound via a prompt connect-failure (which lands via the `connect_poll_succeeded` veto arm, error
-  string `"vsock connect failed (poll)"` — see the (a') AC for the kernel arm-attribution detail). Directly —
+  string `"anchor relay: vsock connect failed (poll)"` — see the (a') AC for the kernel arm-attribution detail). Directly —
   the `vsock_connect_restores_blocking_and_arms_so_timeo` test asserts `O_NONBLOCK` is cleared post-connect
   (`F_GETFL`) and reads BOTH armed `SO_RCVTIMEO`/`SO_SNDTIMEO` values back via SAFE nix getsockopt
   (`sockopt::ReceiveTimeout`/`SendTimeout` — the former "readback needs `unsafe`/`libc`" limitation is gone

@@ -5,15 +5,15 @@
 //! - **(a')** the cancellable CONNECT bound — `poll(POLLOUT)` on a non-blocking vsock connect fd.
 //! - **(d)** the cancellable QUOTE bound — `poll(POLLIN)` on a killable-subprocess pipe-read fd.
 //!
-//! [`poll_with_deadline`] is that shared core. It is backed by `nix::poll` — whose `poll` wrapper is SAFE
+//! `poll_with_deadline` (below) is that shared core. It is backed by `nix::poll` — whose `poll` wrapper is SAFE
 //! (the `unsafe` `libc::poll` lives inside `nix`), so this stays within the crate's `forbid(unsafe_code)`
 //! boundary — and `nix` is a direct, target-gated (`cfg(target_os = "linux")`), optional dep folded into
-//! `vsock-transport`, declaring `poll`/`socket`/`fcntl` explicitly (vsock's transitive nix dep enables only
-//! `ioctl`/`socket` — see Cargo.toml for why we don't rely on it). Linux + vsock-transport gated, mirroring
-//! the channel it serves.
+//! `vsock-transport`, declaring `poll`/`socket`/`fs` explicitly (vsock's transitive nix dep enables only
+//! `ioctl`/`socket` — see Cargo.toml for why we don't rely on it and what each feature is for). Linux +
+//! vsock-transport gated, mirroring the channel it serves.
 //!
 //! The (a') consumer is LIVE: `agent_boot_relay::connect_bounded` calls `poll_with_deadline` +
-//! [`connect_poll_succeeded`]. The module-wide `allow(dead_code)` below is NOT transitional leftovers — it
+//! `connect_poll_succeeded`. The module-wide `allow(dead_code)` below is NOT transitional leftovers — it
 //! is held for the **consumer-free feature combos**: the only consumer (`agent_boot_relay`) is gated on
 //! `agent-gateway`, while this module compiles under plain `vsock-transport`; the `production-vsock` /
 //! `staging-vsock` profiles (which can never enable `agent-gateway` — the `ml-dsa-65 ⊕ agent-gateway`
@@ -33,6 +33,13 @@ use std::time::{Duration, Instant};
 /// return-immediately; only (b) binds there.)
 pub(crate) const MIN_BOUNDARY_BUDGET: Duration = Duration::from_millis(1);
 
+/// The subsystem-neutral lapse message produced by [`remaining_or_lapsed`] (and therefore by
+/// `poll_with_deadline`). A named const — not an inline literal — because callers that RELABEL a lapse for
+/// triage (e.g. `connect_bounded`'s connect-leg attribution) pattern-match this exact string; a reworded
+/// literal would silently turn their match arms into dead code, so the coupling is pinned here (and by the
+/// deviceless entry-lapse test in `agent_boot_relay`).
+pub(crate) const DEADLINE_LAPSED_MSG: &str = "deadline lapsed";
+
 /// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed / below [`MIN_BOUNDARY_BUDGET`].
 /// Single `now` sample; `checked_duration_since` is `None` when `deadline < now`. Anything below the floor
 /// folds to the retryable lapse error, so no caller ever arms a zero/sub-ms socket/poll timeout. The error
@@ -41,7 +48,7 @@ pub(crate) const MIN_BOUNDARY_BUDGET: Duration = Duration::from_millis(1);
 pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, ProtocolError> {
     match deadline.checked_duration_since(Instant::now()) {
         Some(d) if d >= MIN_BOUNDARY_BUDGET => Ok(d),
-        _ => Err(ProtocolError::WireProtocol("deadline lapsed")),
+        _ => Err(ProtocolError::WireProtocol(DEADLINE_LAPSED_MSG)),
     }
 }
 

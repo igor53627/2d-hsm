@@ -29,11 +29,12 @@ sha2 = { version = "0.10", optional = true }
 vsock = { version = "0.5", optional = true }
 # `poll` for the cancellable-boundary primitive (deadline-bounded fd wait), `socket` for the (a') hard
 # connect bound (non-blocking vsock SOCK_STREAM via socket/connect/getsockopt(SO_ERROR)/VsockAddr), and
-# `fs` for `fcntl::OFlag` (nix's `fcntl()` itself is ungated; OFlag is behind `fs`), used by the aya
-# acceptance test that asserts the connect fd is restored to BLOCKING mode (F_GETFL/O_NONBLOCK readback)
-# alongside the SO_*TIMEO values via safe getsockopt — all SAFE nix wrappers (under
-# #![forbid(unsafe_code)]). We declare the features directly rather than relying on vsock's transitive nix
-# enablement: vsock does not enable `poll`/`fs` at all, and even where it may pull `socket` we pin it
+# `fs` for `nix::fcntl` (BOTH `fcntl()`/`FcntlArg` and `OFlag` live inside nix's `feature!{fs}` block —
+# fcntl.rs:726 — so the whole F_GETFL readback needs `fs`), used by the aya acceptance test that asserts
+# the connect fd is restored to BLOCKING mode (F_GETFL/O_NONBLOCK readback) alongside the SO_*TIMEO values
+# via safe getsockopt — all SAFE nix wrappers (under #![forbid(unsafe_code)]). We declare the features
+# directly rather than relying on vsock's transitive nix enablement: vsock does not enable `poll`/`fs` at
+# all, and even where it may pull `socket` we pin it
 # explicitly so a future vsock bump that drops/changes its nix features can't silently break our build
 # (don't "clean up" as redundant). Direct dep is target-gated + optional. Version matches the
 # already-locked nix 0.31.3.
