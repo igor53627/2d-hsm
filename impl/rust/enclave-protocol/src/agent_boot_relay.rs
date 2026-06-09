@@ -448,16 +448,23 @@ pub(crate) struct VsockBootRelayChannel {
     port: u32,
 }
 
-/// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed. Avoids the vsock-0.5 trap
-/// where `set_read_timeout(Some(Duration::ZERO))` is an *error*, not "no timeout" — a lapsed budget must
-/// short-circuit, never reach the setter with a zero/negative value.
+/// Minimum socket-timeout we will arm: a budget below this is treated as lapsed (retryable). vsock 0.5.4
+/// already floors a non-zero sub-µs `Duration` to `tv_usec = 1` (so it never becomes a 0 = infinite
+/// timeout), but this floor (a) decouples us from that internal conversion detail across crate versions and
+/// (b) reflects that a sub-millisecond residual cannot complete a real round-trip — failing fast as a
+/// retryable lapse is correct, not a spurious failure.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+const MIN_SOCKET_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Remaining budget until `deadline`, or `Err` (retryable) if lapsed / below [`MIN_SOCKET_BUDGET`]. Avoids
+/// the vsock-0.5 trap where `set_read_timeout(Some(Duration::ZERO))` is an *error* (not "no timeout") and
+/// the theoretical sub-µs→0 timeval rounding (a 0 `SO_*TIMEO` = block forever).
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 fn remaining_or_lapsed(deadline: std::time::Instant) -> Result<std::time::Duration, ProtocolError> {
-    // Single `now` sample; `checked_duration_since` is None when `deadline < now` (lapsed) and
-    // `Some(ZERO)` when `deadline == now` — both fold to the retryable lapse error, never to a zero/neg
-    // value reaching `set_read_timeout` (which rejects `Some(ZERO)`).
+    // Single `now` sample; `checked_duration_since` is None when `deadline < now` (lapsed). Anything below
+    // MIN_SOCKET_BUDGET folds to the retryable lapse error, so the setter never gets a zero/sub-ms value.
     match deadline.checked_duration_since(std::time::Instant::now()) {
-        Some(d) if !d.is_zero() => Ok(d),
+        Some(d) if d >= MIN_SOCKET_BUDGET => Ok(d),
         _ => Err(ProtocolError::WireProtocol("anchor relay: deadline lapsed")),
     }
 }
