@@ -22,6 +22,11 @@ pub const LEGACY_HSM_VSOCK_CID: &str = "2D_HSM_VSOCK_CID";
 pub const TWOD_HSM_VSOCK_PORT: &str = "TWOD_HSM_VSOCK_PORT";
 pub const LEGACY_HSM_VSOCK_PORT: &str = "2D_HSM_VSOCK_PORT";
 
+// TASK-7.7 5b-2: the enclave-initiated anti-rollback boot-relay endpoint port (distinct from the serve
+// port above; the enclave dials host CID 2 on this to reach the anchor relay). Default 5001.
+pub const TWOD_HSM_ANCHOR_RELAY_PORT: &str = "TWOD_HSM_ANCHOR_RELAY_PORT";
+pub const LEGACY_HSM_ANCHOR_RELAY_PORT: &str = "2D_HSM_ANCHOR_RELAY_PORT";
+
 pub const TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str = "TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
 pub const LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str = "2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
 

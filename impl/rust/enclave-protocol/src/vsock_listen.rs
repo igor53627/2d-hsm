@@ -1,54 +1,17 @@
-//! AF_VSOCK listener (Linux / Nitro / SEV-SNP reference transport).
+//! AF_VSOCK listener **socket leaf** (Linux / Nitro / SEV-SNP reference transport).
+//!
+//! Only the socket-touching code lives here — it is gated `vsock-transport` (lib.rs) because it pulls the
+//! Linux-only `vsock` crate. The pure address/port *resolution + validation* lives in the gate-free
+//! [`crate::vsock_addr`] module so it is CI-tested in the default/`agent-gateway` builds (TASK-7.7 5b-2).
 
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use std::io;
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use vsock::{VsockAddr, VsockListener};
 
-use crate::env_config::{
-    var_twod, LEGACY_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_PORT, TWOD_HSM_VSOCK_CID, TWOD_HSM_VSOCK_PORT,
-};
-
-/// Default bind CID: `VMADDR_CID_ANY` (guest accepts connections on any assigned guest CID).
-pub const DEFAULT_VSOCK_CID: u32 = 4_294_967_295;
-/// Loopback-friendly CID (`VMADDR_CID_LOCAL`) for `vsock_loopback` on dev Linux.
-pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
-/// Default vsock service port (override via `TWOD_HSM_VSOCK_PORT`).
-pub const DEFAULT_VSOCK_PORT: u32 = 5000;
-
-fn env_u32_twod(primary: &str, legacy: &str, default: u32) -> Result<u32, String> {
-    match var_twod(primary, legacy) {
-        Ok(s) if s.is_empty() => Ok(default),
-        Ok(s) => s
-            .parse::<u32>()
-            .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u32")),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(e) => Err(format!("{primary} (or legacy {legacy}): {e}")),
-    }
-}
-
-fn validate_vsock_listen_addr(cid: u32, port: u32) -> Result<(u32, u32), String> {
-    if cid == 0 {
-        return Err(format!(
-            "{TWOD_HSM_VSOCK_CID} must not be 0 (hypervisor reserved); set an explicit guest CID"
-        ));
-    }
-    if port == 0 {
-        return Err(format!(
-            "{TWOD_HSM_VSOCK_PORT} must not be 0; set an explicit service port"
-        ));
-    }
-    Ok((cid, port))
-}
-
-/// Resolve `(cid, port)` from env or defaults.
-///
-/// Canonical: `TWOD_HSM_VSOCK_CID` / `TWOD_HSM_VSOCK_PORT`. Legacy `2D_HSM_VSOCK_*` still accepted.
-pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
-    let cid = env_u32_twod(TWOD_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_CID, DEFAULT_VSOCK_CID)?;
-    let port = env_u32_twod(TWOD_HSM_VSOCK_PORT, LEGACY_HSM_VSOCK_PORT, DEFAULT_VSOCK_PORT)?;
-    validate_vsock_listen_addr(cid, port)
-}
+// Re-export so the staging/production bins keep importing the resolver via this module
+// (`use ...vsock_listen::{..., vsock_listen_addr_from_env}`); canonical home is `crate::vsock_addr`.
+pub use crate::vsock_addr::vsock_listen_addr_from_env;
 
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 pub fn bind_vsock_listener(cid: u32, port: u32) -> Result<VsockListener, io::Error> {
