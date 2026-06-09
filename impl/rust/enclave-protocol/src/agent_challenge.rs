@@ -69,7 +69,7 @@ pub(crate) enum ChallengeVerifyError {
 }
 
 /// One outstanding freshness challenge. **Volatile process state only** — deliberately NOT
-/// `Serialize`/`Deserialize` (so it can't enter sealed/host-relayed state, see the module invariants)
+/// `Serialize`/`Deserialize` (so it can't enter sealed/persisted state — the volatile-only invariant)
 /// and NOT `Zeroizing` (the nonce is public: it is sent to the anchor and echoed back).
 #[derive(Debug, Clone)]
 pub(crate) struct Challenge {

@@ -464,7 +464,8 @@ the explicit retire for the no-response (timeout) path. Decisions: **overwrite-o
 re-issuable per-restart token, not an install-once secret — a failed handshake rotates to a fresh nonce,
 never retries the same), **poison-recover** uniformly (a non-secret slot must not brick the agent), and a
 structural **volatile-only anti-invariant** — `Challenge` is deliberately **non-`Serialize`/`Deserialize`**
-so the nonce can never enter sealed/host-relayed state; a restart MUST lose it and force a fresh draw
+so the nonce can never enter sealed/persisted/cached state (the public nonce *does* transit the host
+transiently to reach the anchor, but is never stored, sealed, or reused); a restart MUST lose it and force a fresh draw
 (otherwise a host that rolls back sealed state could replay a captured `(nonce, response)`). **Boot-slice
 obligations (deferred):** `issue_challenge` runs **after** unseal, once per (re)start; the `(chain_id,
 environment_identifier)` passed to `issue_challenge` MUST equal the sealed config the response is later
