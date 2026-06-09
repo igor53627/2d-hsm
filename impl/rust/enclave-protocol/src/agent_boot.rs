@@ -56,12 +56,15 @@ pub(crate) enum BootAntiRollbackOutcome {
     /// Fund custody is unblocked for this boot.
     Ready(crate::agent_anchor::AnchorState),
     /// Anchor is ahead by a counter/spend-only gap (`reconcile` ⇒ `AdoptForward`). **No binding
-    /// installed** — 5b must seed the body from the anchor's marks (asserting adopted ≥ local), re-seal
-    /// forward to `state.epoch`, then re-run the ceremony so the now-current state reconciles `Fresh`.
-    /// The carried `AnchorState` gives 5b the authoritative `epoch` + `structural_version` to re-seal to;
-    /// its `marks_digest` is a hash (decides the reconcile, not invertible), so the *actual* counter/
-    /// spend marks to seed come from the boot-wiring channel that delivers them (per `agent_anchor`'s
-    /// data model), NOT from this outcome.
+    /// installed, and 5b must NOT install directly on this arm.** 5b must obtain the anchor's raw marks
+    /// over a separate `anchor_root`-signed channel, assert **`hash(adopted_marks) == state.marks_digest`**
+    /// (digest equality authenticates the host-relayed raw marks — the weaker `adopted ≥ local` alone
+    /// lets a host forge large-but-`≥-local` marks), re-seal forward to `state.epoch`, then re-run the
+    /// FULL ceremony (fresh challenge + response) so the now-current state reconciles `Fresh` — the only
+    /// arm that installs. The carried `AnchorState` gives 5b the authoritative `epoch` +
+    /// `structural_version` to re-seal to; its `marks_digest` is a non-invertible hash (it decides the
+    /// reconcile and authenticates the raw marks), so the *actual* marks to seed come from that signed
+    /// channel, NOT from this outcome. Until that channel exists, `AdoptForward` is fail-closed (§8).
     AdoptForwardRequired(crate::agent_anchor::AnchorState),
     /// This invocation did not newly configure custody — the caller MUST NOT proceed (abort / don't
     /// serve). No `FailClosed` arm constructs or installs a NEW binding. On a clean boot the gate
