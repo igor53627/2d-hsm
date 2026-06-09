@@ -490,8 +490,11 @@ fn connect_bounded(
     let addr = VsockAddr::new(host_cid, port);
     match connect(fd.as_raw_fd(), &addr) {
         Ok(()) => {} // connected synchronously (uncommon for a non-blocking connect)
-        // EINPROGRESS = connect in flight; EINTR = interrupted but the attempt WAS initiated (connect(2):
-        // "completed asynchronously") — both recover by polling POLLOUT.
+        // EINPROGRESS = connect in flight → poll POLLOUT for completion. EINTR is handled DEFENSIVELY: a
+        // SOCK_NONBLOCK connect returns immediately (nothing blocks for a signal to interrupt), so EINTR is
+        // not actually expected here — but if it ever surfaces, connect(2) says the attempt was initiated and
+        // "will complete asynchronously", so polling POLLOUT is the correct recovery rather than a spurious
+        // failure. Harmless and future-proof.
         Err(nix::errno::Errno::EINPROGRESS) | Err(nix::errno::Errno::EINTR) => {
             // Wait (cancellably) for completion. `poll_with_deadline` returns `Ok(revents)` even for
             // error-readiness (POLLERR/HUP/NVAL), so a bare `Ok(_)` is NOT success — `poll_ready_for`

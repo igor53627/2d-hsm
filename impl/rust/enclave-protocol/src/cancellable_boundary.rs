@@ -91,9 +91,10 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
 
 /// True iff `revents` is a CLEAN readiness for `want` (the requested event set AND no error condition).
 /// The reusable form of the `Ok(revents)` contract above: `revents` containing `want` is NOT enough —
-/// `POLLERR`/`POLLHUP`/`POLLNVAL` (reported regardless of `want`) mean the fd is broken/closed. Both
-/// poll consumers use this — (a') connect with `want = POLLOUT`, (d) quote-pipe with `want = POLLIN` — so
-/// the success predicate can't drift between them.
+/// `POLLERR`/`POLLHUP`/`POLLNVAL` (reported regardless of `want`) mean the fd is broken/closed. Extracted
+/// for (a') connect (`want = POLLOUT`), its only live caller today; the future (d) quote-pipe (`want =
+/// POLLIN`) will reuse it so the success predicate can't drift between the two poll consumers. (The unit
+/// test already exercises both flag sets, so the POLLIN contract is covered before (d) lands.)
 pub(crate) fn poll_ready_for(revents: nix::poll::PollFlags, want: nix::poll::PollFlags) -> bool {
     use nix::poll::PollFlags;
     revents.contains(want)
