@@ -175,8 +175,9 @@ fn check_deadline(deadline: Option<std::time::Instant>) -> Result<(), ProtocolEr
 /// GET_MEASUREMENT). On **every** path it **unconditionally cleans up** the entry — the cleanup is the
 /// last statement, so an error or mid-sequence timeout still leaves no stale `twod-hsm` entry. Per-step
 /// checks bound the *gaps* between fs ops; a single in-kernel `read(outblob)` that blocks forever is not
-/// interruptible under `#![forbid(unsafe_code)]` (a worker-thread hard-bound is a deferred follow-up —
-/// the stale-clear covers the leak meanwhile).
+/// interruptible under `#![forbid(unsafe_code)]` (a hard bound needs a *cancellable boundary* — killable
+/// subprocess / kernel timeout, NOT a plain worker thread which can only abandon a stuck reader — a
+/// deferred follow-up; the stale-clear covers the leak meanwhile).
 pub(crate) fn fetch_report_with<F: TsmFs>(
     fs: &F,
     report_data: &[u8; REPORT_DATA_LEN],

@@ -652,7 +652,7 @@ request golden vector is a 5b-2b test-vector item.
     never initiates a write; the blocking `write_all` already in flight still needs the socket's
     `SO_SNDTIMEO`, a 5b-2b-ii obligation) + `SnpQuoteProducer` (delegates to `fetch_report_deadline`, honoring the deadline
     **cooperatively/between-steps only** — a single wedged in-kernel read is bounded by the deferred
-    worker-thread hard-bound, NOT this deadline; see the deadline bullet below). The pure relay/serve
+    cancellable-boundary hard-bound, NOT this deadline; see the deadline bullet below). The pure relay/serve
     port resolution lives in the **gate-free `vsock_addr` module** (NOT `vsock_listen`, which is gated
     `vsock-transport` and now holds only the socket-binding leaf + a re-export of `vsock_listen_addr_from_env`
     for the bins): `DEFAULT_ANCHOR_RELAY_PORT=5001` (`VMADDR_CID_HOST=2`) + `anchor_relay_port_from_env()`

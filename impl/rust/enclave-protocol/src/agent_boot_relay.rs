@@ -254,9 +254,11 @@ pub(crate) trait BootRelayChannel {
 ///
 /// **Best-effort caveat (load-bearing):** under `#![forbid(unsafe_code)]` a single in-kernel blocking
 /// syscall (e.g. configfs `read(outblob)`) cannot be interrupted, so this is a *between-steps* bound, NOT
-/// a hard wall-clock guarantee against a wedged kernel. A true hard bound needs a worker-thread/process
-/// timeout — a tracked deferred follow-up (see §8). Callers (the boot serve-gate) MUST size their own
-/// timeouts treating the quote-fetch deadline as best-effort, not as a guaranteed ceiling.
+/// a hard wall-clock guarantee against a wedged kernel. A true hard bound needs a *cancellable boundary*
+/// (killable subprocess / kernel-supported timeout / unique-per-attempt entries — NOT a plain worker
+/// thread, which can only abandon a stuck reader) — a tracked deferred follow-up (see §8). Callers (the
+/// boot serve-gate) MUST size their own timeouts treating the quote-fetch deadline as best-effort, not as
+/// a guaranteed ceiling.
 pub(crate) trait BootQuoteProducer {
     fn fetch(
         &self,
@@ -306,18 +308,6 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
     }
 }
 
-/// The channel **framing core** (TASK-7.7 5b-2b): write the already-framed `request_frame` to a duplex
-/// `stream`, then bounded-read the anchor response. Generic over `Read + Write` so it is CI-tested over an
-/// in-memory duplex — the real `VsockBootRelayChannel` (5b-2b-ii, `vsock-transport`) is a thin wrapper
-/// that connects a `VsockStream`, sets the socket timeouts, and calls this.
-///
-/// **Deadline coverage:** via [`deadline_guarded_write`] this fn checks the deadline before the write AND
-/// before the flush, and the bounded read enforces it across reads. The blocking `write_all`/`flush`
-/// op *already in flight* is bounded ONLY by the socket's `SO_SNDTIMEO` (and the read by `SO_RCVTIMEO`) —
-/// so 5b-2b-ii's wrapper MUST set BOTH (+ a connect timeout) for the per-attempt wall-clock to actually
-/// hold against a black-holing relay; the in-fn checks bound only *initiating* a write/flush, not a stalled
-/// in-kernel one. `request_frame` is ALREADY a complete `0x41` frame — written verbatim, never re-framed.
-/// Returns the raw response bytes for the driver to verify (never parsed here).
 /// Write `bytes` then flush `stream`, checking `deadline` before **both** the `write_all` AND the `flush`
 /// — each is potentially-blocking I/O, so a budget that lapsed during the write must not even initiate the
 /// flush. `what` localizes which leg tripped. The single shared writer used by both relay cores, so the
@@ -340,6 +330,18 @@ fn deadline_guarded_write<W: std::io::Write>(
     stream.flush().map_err(ProtocolError::from)
 }
 
+/// The channel **framing core** (TASK-7.7 5b-2b): write the already-framed `request_frame` to a duplex
+/// `stream`, then bounded-read the anchor response. Generic over `Read + Write` so it is CI-tested over an
+/// in-memory duplex — the real `VsockBootRelayChannel` (5b-2b-ii, `vsock-transport`) is a thin wrapper
+/// that connects a `VsockStream`, sets the socket timeouts, and calls this.
+///
+/// **Deadline coverage:** via [`deadline_guarded_write`] this fn checks the deadline before the write AND
+/// before the flush, and the bounded read enforces it across reads. The blocking `write_all`/`flush`
+/// op *already in flight* is bounded ONLY by the socket's `SO_SNDTIMEO` (and the read by `SO_RCVTIMEO`) —
+/// so 5b-2b-ii's wrapper MUST set BOTH (+ a connect timeout) for the per-attempt wall-clock to actually
+/// hold against a black-holing relay; the in-fn checks bound only *initiating* a write/flush, not a stalled
+/// in-kernel one. `request_frame` is ALREADY a complete `0x41` frame — written verbatim, never re-framed.
+/// Returns the raw response bytes for the driver to verify (never parsed here).
 pub(crate) fn relay_round_trip_over_stream<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     request_frame: &[u8],
@@ -389,8 +391,8 @@ where
 /// The production [`BootQuoteProducer`]: fetch the SNP quote via configfs-tsm, honoring the deadline
 /// **cooperatively** (between-steps). Pure delegation to [`crate::snp_report::fetch_report_deadline`],
 /// which checks the deadline around each configfs op — so the *gaps* are bounded, but a single wedged
-/// in-kernel `read(outblob)` is bounded only by the deferred worker-thread hard-bound (see the trait's
-/// best-effort caveat and §8), NOT by this deadline. The real configfs read runs only inside the SNP
+/// in-kernel `read(outblob)` is bounded only by the deferred cancellable-boundary hard-bound (see the
+/// trait's best-effort caveat and §8), NOT by this deadline. The real configfs read runs only inside the SNP
 /// guest (aya); off-configfs it returns a prompt interface-absent / deadline error (never a hang in CI),
 /// so even the CI fast-path test is safe.
 pub(crate) struct SnpQuoteProducer;
