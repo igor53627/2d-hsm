@@ -89,6 +89,9 @@ pub enum KeystoreError {
     /// `environment_identifier` failed the TASK-7.1 §10.6 rules (1..=64, `[a-z0-9-]`, no
     /// leading/trailing/double hyphen).
     InvalidEnvironmentId,
+    /// `structural_version` violated the frozen v2 invariant: it must be `>= 1` (init 1, never 0 —
+    /// a 0 would fail the same-epoch `reconcile` Fresh-equality vs a forged 0-anchor).
+    InvalidStructuralVersion,
     /// Key-entry count over `MAX_TOTAL_KEY_ENTRIES`, or counter table over `MAX_COUNTER_ENTRIES`
     /// (AC#5 capacity guard).
     CapacityExceeded,
@@ -595,6 +598,11 @@ impl KeystoreBody {
     /// Structural validation enforced on both seal (before commit) and unseal (after decrypt):
     /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
     pub fn validate(&self) -> Result<(), KeystoreError> {
+        // Frozen v2 invariant: structural_version is init 1 and never 0 (enforced, not just documented),
+        // so a 0 fails closed on both seal and unseal rather than silently producing a forge-equal mark.
+        if self.structural_version == 0 {
+            return Err(KeystoreError::InvalidStructuralVersion);
+        }
         validate_environment_identifier(&self.config.environment_identifier)?;
         // The DR-backup wrapping key must be a well-formed ML-KEM-1024 encapsulation key.
         if self.config.backup_recovery_wrapping_pubkey.len() != ML_KEM_1024_ENCAPS_KEY_LEN {
@@ -1369,6 +1377,16 @@ mod tests {
             };
             assert_eq!(fields.len(), 4, "row = [authority, scope_class, scope_target, counter]");
         }
+    }
+
+    #[test]
+    fn structural_version_zero_fails_validation() {
+        let mut b = sample_body();
+        b.structural_version = 0;
+        assert_eq!(b.validate(), Err(KeystoreError::InvalidStructuralVersion));
+        // and it fails closed through the seal/unseal path too (validate is called on both).
+        b.structural_version = 1;
+        assert!(b.validate().is_ok());
     }
 
     #[test]
