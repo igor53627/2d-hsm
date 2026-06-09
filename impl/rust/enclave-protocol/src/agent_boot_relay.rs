@@ -198,8 +198,13 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
 /// **Deadline precondition (5b-2b):** the `deadline` is only enforceable if `reader`'s underlying socket
 /// is configured with a read timeout (`SO_RCVTIMEO`) or non-blocking mode — the deadline is re-checked
 /// between/around `read` syscalls, but a fully-blocking `read` that never returns is not interruptible
-/// here. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` (+ `SO_SNDTIMEO` + a connect timeout) so a
-/// black-holing relay cannot stall boot; its aya acceptance test MUST verify those socket options.
+/// here. `VsockBootRelayChannel` satisfies this via `DeadlineSocket` (both Linux/vsock-gated), which
+/// reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the remaining budget before every read/write (connect is the watchdog
+/// soft-bound, obligation (a')). Its `#[ignore]` aya tests verify the bound **behaviorally** —
+/// `SO_RCVTIMEO` via a stalled-peer read that times out within budget, the connect bound via a prompt
+/// connect-failure. (`SO_SNDTIMEO` is set but not behaviorally exercised: a small request frame never fills
+/// the send buffer, so `write_all` doesn't block; a getsockopt readback of the option values would need
+/// `unsafe`/`libc`, off-limits under `#![forbid(unsafe_code)]`.)
 pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
     reader: &mut R,
     deadline: std::time::Instant,

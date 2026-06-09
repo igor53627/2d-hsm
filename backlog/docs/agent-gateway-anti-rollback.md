@@ -802,9 +802,15 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   both (a connect that nearly exhausts it yields a retryable lapse before I/O — a wasted attempt), AND MUST
   satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
   retry loop can't blow the operator's total boot deadline.
-- **Socket-timeout precondition.** `read_bounded_anchor_response`'s deadline is only enforceable if the
-  stream has `SO_RCVTIMEO`/non-blocking set. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` +
-  `SO_SNDTIMEO` + a **connect** timeout (so connect can't hang either); the aya test verifies all three.
+- **Socket-timeout precondition — DONE in (a) for read/write; connect via (a').** `read_bounded_anchor_response`'s
+  deadline is only enforceable if the stream has `SO_RCVTIMEO`/non-blocking set. `VsockBootRelayChannel`
+  sets `SO_RCVTIMEO` + `SO_SNDTIMEO` (per-syscall via `DeadlineSocket`); the **connect** bound is the
+  watchdog soft-bound, with the cancellable hard bound deferred to **(a')**. **What the aya tests actually
+  verify (behavioral, not getsockopt):** `SO_RCVTIMEO` via a stalled-peer read that times out within budget;
+  the connect bound via a prompt connect-failure. `SO_SNDTIMEO` is set but NOT behaviorally exercised (a
+  small request frame never fills the send buffer, so `write_all` doesn't block); a getsockopt readback of
+  the option *values* would need `unsafe`/`libc`, off-limits under `#![forbid(unsafe_code)]` — so it is not
+  asserted. (The daemon (b) anchor-facing socket has the same obligations.)
   The connect/socket timeout **budget is derived from the per-leg `Duration`** (a fraction of it), NOT a
   separate operator knob, so channel (a) and daemon (b) coordinate on the same source and the total-boot
   bound stays verifiable.
