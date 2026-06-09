@@ -587,8 +587,12 @@ pub fn reset_agent_keystore_for_tests() {
 pub struct AntiRollbackBinding {
     /// The reconciled freshness epoch the instance is operating under (for observability/audit).
     pub epoch: u64,
-    /// Whether the anchor reported the instance live/active. **Load-bearing:** the funding gate treats
-    /// a binding with `active == false` as unconfigured (fail-closed) — not mere observability.
+    /// **Load-bearing:** the funding gate treats a binding with `active == false` as unconfigured
+    /// (fail-closed) — not mere observability. Currently this means "a `Fresh` reconcile occurred this
+    /// boot" (`boot_reconcile_anti_rollback` sets it `true` only on the `Fresh` arm); there is no
+    /// anchor-reported per-instance liveness field in `AnchorState` yet (design §3 Option A has no clone
+    /// fencing), so `active` is NOT yet a true liveness/fencing signal — a future Option-B upgrade that
+    /// fences concurrent attestations would supply that and could set this `false`.
     pub active: bool,
 }
 

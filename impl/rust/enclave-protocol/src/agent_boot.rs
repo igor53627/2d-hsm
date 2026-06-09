@@ -55,7 +55,13 @@ pub(crate) enum BootAntiRollbackOutcome {
     /// spend marks to seed come from the boot-wiring channel that delivers them (per `agent_anchor`'s
     /// data model), NOT from this outcome.
     AdoptForwardRequired(crate::agent_anchor::AnchorState),
-    /// Operator intervention required; **no binding installed**, fund custody stays blocked.
+    /// This invocation did not newly configure custody — the caller MUST NOT proceed (abort / don't
+    /// serve). No `FailClosed` arm constructs or installs a NEW binding. On a clean boot the gate
+    /// therefore stays blocked (const-init `None`). **One nuance:** `BindingInstall` means a *prior*
+    /// `Fresh` ceremony already (validly) installed the binding **this same process**, so
+    /// `is_anti_rollback_configured()` may legitimately still read configured off that earlier, valid
+    /// install — that is an internal sequencing defect (the ceremony ran twice), NOT this invocation
+    /// leaving the gate open by a failure. Treat it as fatal/abort regardless (see `BindingInstall`).
     FailClosed(BootFailReason),
 }
 
@@ -100,9 +106,13 @@ pub(crate) enum BootFailReason {
 /// reconcile is `Fresh` — install the runtime Layer-2b [`crate::agent_dispatch::AntiRollbackBinding`]
 /// that unblocks fund custody for this boot.
 ///
-/// Returns [`BootAntiRollbackOutcome`]. The caller (slice 5b) MUST treat every variant other than
-/// `Ready` as "fund custody stays blocked": `AdoptForwardRequired` needs a seed/re-seal pass before a
-/// retry, and `FailClosed` needs operator intervention.
+/// Returns [`BootAntiRollbackOutcome`]. The caller (slice 5b) MUST NOT proceed (abort / don't serve
+/// rollback-sensitive frames) on any variant other than `Ready`: `AdoptForwardRequired` needs a
+/// seed/re-seal pass before a fresh-challenge retry, host/anchor `FailClosed` reasons need operator
+/// intervention, and `FailClosed(BindingInstall)` is a fatal internal sequencing defect (the ceremony
+/// ran twice). Note "don't proceed" is the caller's obligation, not a guarantee the gate slot reads
+/// unconfigured — on the `BindingInstall` path a prior valid `Fresh` install legitimately remains (see
+/// the `FailClosed` variant doc).
 ///
 /// # Preconditions (owned by the boot-wiring caller, slice 5b)
 /// - A challenge MUST have been issued this (re)start via [`crate::agent_challenge::issue_challenge`]
