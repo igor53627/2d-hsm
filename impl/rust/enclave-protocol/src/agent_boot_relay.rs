@@ -417,6 +417,120 @@ impl BootQuoteProducer for SnpQuoteProducer {
     }
 }
 
+/// The production [`BootRelayChannel`] over AF_VSOCK (TASK-7.7 5b-2b-ii(a)). Gated
+/// `all(target_os = "linux", feature = "vsock-transport")` because it pulls the Linux-only `vsock` crate;
+/// dead-code until the 5b-2c bin constructs it. It is the thin platform leaf over the CI-proven
+/// [`relay_round_trip_over_stream`]: open a **fresh** `VsockStream` to the host relay endpoint
+/// `(VMADDR_CID_HOST, port)`, set deadline-derived socket timeouts, run the round-trip, and drop the
+/// connection on return. Every failure folds to the always-retryable [`AnchorTransportError`].
+///
+/// ## Connect-timeout (best-effort soft bound — load-bearing caveat)
+/// vsock 0.5 has **no** `connect_with_timeout` (only blocking `VsockStream::connect_with_cid_port`), and a
+/// `poll`-based nonblocking connect would need `libc`/`unsafe` or a new dep — both off-limits under
+/// `#![forbid(unsafe_code)]`. So [`connect_bounded`] bounds the connect *wait* with a watchdog thread +
+/// `recv_timeout` (no new dep, no unsafe): `round_trip` returns within the budget even if connect stalls.
+/// A truly-wedged connect **leaks that one thread** until the kernel's vsock connect-timeout reaps it
+/// (the socket is local host↔guest, so connect fast-fails — `ECONNRESET` if no listener — in practice; a
+/// real hang is rare and OS-reaped, unlike the un-interruptible configfs read). A *cancellable* hard
+/// connect bound (nonblocking + poll, or a vsock crate exposing connect-with-timeout) is the same deferred
+/// follow-up class as the quote hard bound (§8 5b-2b-ii(d)).
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+pub(crate) struct VsockBootRelayChannel {
+    host_cid: u32,
+    port: u32,
+}
+
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+impl VsockBootRelayChannel {
+    /// Dial `(host_cid, port)`. 5b-2c wires `host_cid = vsock_addr::VMADDR_CID_HOST` and
+    /// `port = vsock_addr::anchor_relay_port_from_env()?`.
+    pub(crate) fn new(host_cid: u32, port: u32) -> Self {
+        Self { host_cid, port }
+    }
+}
+
+/// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed. Avoids the vsock-0.5 trap
+/// where `set_read_timeout(Some(Duration::ZERO))` is an *error*, not "no timeout" — a lapsed budget must
+/// short-circuit, never reach the setter with a zero/negative value.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+fn remaining_or_lapsed(deadline: std::time::Instant) -> Result<std::time::Duration, ProtocolError> {
+    // Single `now` sample; `checked_duration_since` is None when `deadline < now` (lapsed) and
+    // `Some(ZERO)` when `deadline == now` — both fold to the retryable lapse error, never to a zero/neg
+    // value reaching `set_read_timeout` (which rejects `Some(ZERO)`).
+    match deadline.checked_duration_since(std::time::Instant::now()) {
+        Some(d) if !d.is_zero() => Ok(d),
+        _ => Err(ProtocolError::WireProtocol("anchor relay: deadline lapsed")),
+    }
+}
+
+/// Open a fresh `VsockStream` to `(host_cid, port)`, bounding the connect *wait* by `deadline` via a
+/// watchdog thread + `recv_timeout` (see the [`VsockBootRelayChannel`] connect-timeout caveat). Returns a
+/// retryable `ProtocolError` on lapse/failure. `VsockStream` is `Send`, so the connected stream is moved
+/// back over the channel.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+fn connect_bounded(
+    host_cid: u32,
+    port: u32,
+    deadline: std::time::Instant,
+) -> Result<vsock::VsockStream, ProtocolError> {
+    let budget = remaining_or_lapsed(deadline)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("vsock-boot-connect".to_string())
+        .spawn(move || {
+            // tx send may fail if the receiver already timed out and dropped rx — that's fine, the
+            // stream is then dropped here, closing the fd.
+            let _ = tx.send(vsock::VsockStream::connect_with_cid_port(host_cid, port));
+        })
+        .map_err(|_| ProtocolError::WireProtocol("anchor relay: connect thread spawn failed"))?;
+    match rx.recv_timeout(budget) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(_)) => Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
+        Err(_) => Err(ProtocolError::WireProtocol("anchor relay: vsock connect timed out")),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+impl VsockBootRelayChannel {
+    /// Fresh connect → deadline-derived `SO_RCVTIMEO`/`SO_SNDTIMEO` → [`relay_round_trip_over_stream`] →
+    /// drop the stream on return (RAII; the stream is a function-local, never stored in `self` — stale-reply
+    /// isolation). Returns the raw `ProtocolError`; [`BootRelayChannel::round_trip`] folds it to retryable.
+    fn round_trip_inner(
+        &self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let mut stream = connect_bounded(self.host_cid, self.port, deadline)?;
+        // Per-syscall socket timeouts derived from the REMAINING budget (not the fixed serve READ/WRITE
+        // timeouts), so a single blocked in-flight read/write can't overrun the per-leg deadline. The
+        // in-fn deadline re-checks in relay_round_trip_over_stream remain the real bound; these are the
+        // backstop for a stalled in-kernel syscall.
+        let budget = remaining_or_lapsed(deadline)?;
+        stream
+            .set_read_timeout(Some(budget))
+            .map_err(|_| ProtocolError::WireProtocol("anchor relay: set_read_timeout failed"))?;
+        stream
+            .set_write_timeout(Some(budget))
+            .map_err(|_| ProtocolError::WireProtocol("anchor relay: set_write_timeout failed"))?;
+        relay_round_trip_over_stream(&mut stream, request_frame, deadline)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+impl BootRelayChannel for VsockBootRelayChannel {
+    fn round_trip(
+        &mut self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, AnchorTransportError> {
+        // Blanket map: EVERY ProtocolError (incl. a deadline-lapse WireProtocol, which reads as
+        // "malformed" but is a timeout) folds to the always-retryable AnchorTransportError. Do NOT key
+        // terminal-vs-retryable off the variant (see deadline_guarded_write's variant caveat).
+        self.round_trip_inner(request_frame, deadline)
+            .map_err(|_| AnchorTransportError("anchor relay: vsock channel round-trip failed"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +731,86 @@ mod tests {
         assert_eq!(d.report_data, rd);
         assert_eq!(d.quote_report, vec![0xa5; 100]);
         assert_eq!(d.cert_chain, vec![0xc7; 8]);
+    }
+
+    // ---- 5b-2b-ii(0): canonical AgentBootRelay request golden vector ----
+
+    // Fixed, fully-documented inputs (see boot_relay_anchor_handshake_v1.json). report_data is DERIVED
+    // (anchor_handshake_report_data), so the only free inputs are these. quote_report/cert_chain are opaque
+    // frame-format filler (NOT a valid attestation — the quote does not embed this report_data).
+    const GOLDEN_NONCE: [u8; 32] = [0x33; 32];
+    fn golden_quote() -> Vec<u8> {
+        vec![0xa5; 100]
+    }
+    fn golden_cert() -> Vec<u8> {
+        vec![0xc7; 8]
+    }
+    fn golden_request_frame() -> Vec<u8> {
+        let rd = anchor_handshake_report_data(CHAIN, ENV, &GOLDEN_NONCE);
+        let req = AnchorBootRequest {
+            chain_id: CHAIN,
+            environment_identifier: ENV,
+            nonce: GOLDEN_NONCE,
+            report_data: rd,
+        };
+        encode_anchor_boot_request(&golden_quote(), &golden_cert(), &req).unwrap()
+    }
+
+    const BOOT_RELAY_GOLDEN: &[u8] =
+        include_bytes!("../testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin");
+
+    /// REGEN (manual): `cargo test --features agent-gateway regen_boot_relay_golden_vector -- --ignored
+    /// --nocapture`, then commit the .bin. This is the documented regeneration mechanism: the Elixir
+    /// `gen_agent_vectors.exs` cannot emit CBOR/SHA3-512 frames, so `encode_anchor_boot_request` is the
+    /// canonical source. The byte-exact + canonical-layout assertions in
+    /// `boot_relay_golden_vector_is_byte_exact_and_round_trips` independently pin the wire format.
+    #[test]
+    #[ignore]
+    fn regen_boot_relay_golden_vector() {
+        let frame = golden_request_frame();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin"
+        );
+        std::fs::write(path, &frame).expect("write golden frame");
+        eprintln!("wrote {} bytes -> {path}", frame.len());
+    }
+
+    #[test]
+    fn boot_relay_golden_vector_is_byte_exact_and_round_trips() {
+        let frame = golden_request_frame();
+        // (1) BYTE-EXACT freeze vs the committed golden — catches ANY encoder drift (key order, non-shortest
+        // integers, length-prefix changes) that the lenient decoder would silently round-trip through.
+        assert_eq!(
+            frame.as_slice(),
+            BOOT_RELAY_GOLDEN,
+            "AgentBootRelay frame must be byte-exact vs the golden vector; if the wire format changed \
+             intentionally, regen via `regen_boot_relay_golden_vector` and bump the doc/json"
+        );
+        // (2) decode(golden) yields exactly the inputs.
+        let d = decode_anchor_boot_request(BOOT_RELAY_GOLDEN).unwrap();
+        assert_eq!(d.chain_id, CHAIN);
+        assert_eq!(d.environment_identifier, ENV);
+        assert_eq!(d.nonce, GOLDEN_NONCE);
+        assert_eq!(d.report_data, anchor_handshake_report_data(CHAIN, ENV, &GOLDEN_NONCE));
+        assert_eq!(d.quote_report, golden_quote());
+        assert_eq!(d.cert_chain, golden_cert());
+        // (3) canonical-layout assertions on the GOLDEN bytes directly (the lenient decoder enforces NONE
+        // of these — key order, shortest-form ints, bstr length prefixes). This pins the format by
+        // hand-audit, not just "encode matches a possibly-buggy-encoder-emitted golden". Payload (after the
+        // 4-byte BE len + version + type frame header) is the integer-keyed CBOR map:
+        let framed = crate::decode_message(BOOT_RELAY_GOLDEN).unwrap();
+        assert_eq!(framed.msg_type, crate::MessageType::AgentBootRelay);
+        let p = framed.payload.as_slice();
+        // map(7), key1=ver shortest uint 1, key2, chain_id 11565 canonical 2-byte (0x19 0x2D 0x2D), key3:
+        assert_eq!(&p[0..8], &[0xA7, 0x01, 0x01, 0x02, 0x19, 0x2D, 0x2D, 0x03], "map header + canonical ver/chain_id + key order");
+        // key3 text(7) "testnet":
+        assert_eq!(p[8], 0x67, "env = CBOR text(7)");
+        assert_eq!(&p[9..16], b"testnet");
+        // key4 + nonce bstr(32) prefix:
+        assert_eq!(&p[16..19], &[0x04, 0x58, 0x20], "key4 + 32-byte nonce bstr prefix");
+        // key5 (offset 16 + 1 + 2 + 32 = 51) + report_data bstr(64) prefix:
+        assert_eq!(&p[51..54], &[0x05, 0x58, 0x40], "key5 + 64-byte report_data bstr prefix");
     }
 
     #[test]
@@ -1133,5 +1327,78 @@ mod tests {
             other => panic!("expected VerifyMalformed, got {other:?}"),
         }
         assert_eq!(t.channel.connects, 1);
+    }
+}
+
+/// 5b-2b-ii(a) acceptance tests for [`VsockBootRelayChannel`] over a REAL `VsockStream`. Gated
+/// `all(test, target_os = "linux", feature = "vsock-transport")` (so they compile only where the channel
+/// does) and `#[ignore]` (they need a live vsock environment — they are NOT run by ordinary CI). Compiled
+/// by the CI build-check `cargo test --no-run --features vsock-transport,agent-gateway`; RUN on aya:
+///   cargo test --features vsock-transport,agent-gateway -- --ignored --nocapture
+/// The loopback test needs the `vsock_loopback` kernel module (or run inside the SNP guest).
+#[cfg(all(test, target_os = "linux", feature = "vsock-transport"))]
+mod vsock_aya_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// `VMADDR_CID_LOCAL` — vsock loopback CID (requires the `vsock_loopback` module).
+    const LOOPBACK_CID: u32 = 1;
+
+    fn build_request_frame() -> Vec<u8> {
+        let nonce = [0x44u8; 32];
+        let rd = crate::agent_anchor::anchor_handshake_report_data(11565, "testnet", &nonce);
+        let req = AnchorBootRequest {
+            chain_id: 11565,
+            environment_identifier: "testnet",
+            nonce,
+            report_data: rd,
+        };
+        encode_anchor_boot_request(&[0xa5; 64], &[0xc7; 8], &req).unwrap()
+    }
+
+    /// Full round-trip over a real loopback `VsockStream`: a listener echoes a framed anchor response;
+    /// the channel connects fresh, sets deadline-derived timeouts, forwards the request, and returns the
+    /// response verbatim. Exercises connect + `set_read/write_timeout` + `relay_round_trip_over_stream`.
+    #[test]
+    #[ignore]
+    fn vsock_channel_loopback_round_trip() {
+        let port = 5999;
+        let listener =
+            crate::vsock_listen::bind_vsock_listener(LOOPBACK_CID, port).expect("bind loopback");
+        let signed = vec![0xab; 200];
+        let wire = frame_anchor_response(&signed).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _addr) = listener.accept().expect("accept");
+            let req = crate::read_framed_message_with_idle_deadline(
+                &mut s,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .expect("server reads the request frame");
+            assert!(decode_anchor_boot_request(&req).is_ok(), "server got a valid boot-relay request");
+            s.write_all(&wire).expect("server writes response");
+            s.flush().expect("server flush");
+        });
+        let mut ch = VsockBootRelayChannel::new(LOOPBACK_CID, port);
+        let got = ch
+            .round_trip(&build_request_frame(), Instant::now() + Duration::from_secs(5))
+            .expect("channel round trip");
+        assert_eq!(got, signed, "anchor response returned verbatim over real vsock");
+        server.join().unwrap();
+    }
+
+    /// Connect to an endpoint with no listener under a short deadline: must fail (retryable) PROMPTLY,
+    /// never hang — proves the watchdog-thread connect bound + that all failures fold to a retryable error.
+    #[test]
+    #[ignore]
+    fn vsock_channel_connect_failure_is_prompt_and_retryable() {
+        let mut ch = VsockBootRelayChannel::new(crate::vsock_addr::VMADDR_CID_HOST, 5998);
+        let start = Instant::now();
+        let r = ch.round_trip(&build_request_frame(), start + Duration::from_millis(500));
+        assert!(r.is_err(), "connect to a dead endpoint must error, not hang");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must fail within ~the budget (watchdog bound), not block on connect"
+        );
     }
 }

@@ -1,0 +1,34 @@
+{
+  "_comment": "TASK-7.7 5b-2b-ii(0): canonical AgentBootRelay (0x41) boot-relay REQUEST frame golden vector. Freezes the enclave->host-relay->anchor wire format so the host relay daemon (5b-2b-ii(b)) and any external/anchor reimplementation match it byte-for-byte. The companion .frame.bin holds the full encoded frame; the Rust test boot_relay_golden_vector_is_byte_exact_and_round_trips asserts encode==.frame.bin AND decode(.frame.bin)==these inputs AND the canonical byte layout below.",
+  "provenance": {
+    "canonical_source": "encode_anchor_boot_request (impl/rust/enclave-protocol/src/agent_boot_relay.rs)",
+    "note": "This is a RUST-ENCODER-EMITTED golden: the directory's Elixir generator gen_agent_vectors.exs emits only RLP/protobuf/EIP-191 and has no CBOR or SHA3-512, so it cannot produce this frame. The byte-exact assert is therefore against the encoder that produced it; the value of the vector is (a) freezing against future encoder drift and (b) the independent canonical-layout assertions + this hand-auditable breakdown, which let an external reimplementer reproduce the bytes WITHOUT running the Rust encoder.",
+    "regen": "cargo test --features agent-gateway regen_boot_relay_golden_vector -- --ignored --nocapture"
+  },
+  "inputs": {
+    "chain_id": 11565,
+    "environment_identifier": "testnet",
+    "nonce_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "quote_report": "opaque frame-format filler: 100 bytes of 0xA5 (NOT a valid SNP attestation; the quote does NOT embed report_data — this vector pins the FRAME only, never feed it to an SNP verifier)",
+    "cert_chain": "opaque frame-format filler: 8 bytes of 0xC7"
+  },
+  "derived": {
+    "report_data_hex": "0d5d1746ba2c870fb7c954028260e3c377966e22a1b3e5d0226695c0ab244c6eb53c8d2fc2328ac22b4a1c1843ed6c60cb97fd5e2780bdddceaa1ded796d28aa",
+    "report_data_construction": "SHA3-512( b\"2d-hsm-agent-anchor-handshake-v1\" || chain_id.to_be_bytes()[8] || (env.len() as u32).to_be_bytes()[4] || env.as_bytes() || nonce[32] )"
+  },
+  "frame_layout": {
+    "header": "[4-byte BE total-payload length][1-byte PROTOCOL_VERSION = 0x01][1-byte MessageType::AgentBootRelay = 0x41]",
+    "body": "canonical integer-keyed CBOR map of 7 pairs (RFC 8949 shortest-form, ascending integer keys); decoder is lenient on key ORDER but the encoder + this vector are canonical",
+    "keys": {
+      "1": "uint version = 1",
+      "2": "uint chain_id (11565 -> 0x19 0x2D 0x2D)",
+      "3": "text environment_identifier (\"testnet\" -> 0x67 + 7 bytes)",
+      "4": "bytes nonce, len 32 (0x58 0x20 + 32)",
+      "5": "bytes report_data, len 64 (0x58 0x40 + 64)",
+      "6": "bytes quote_report (SNP ATTESTATION_REPORT, opaque)",
+      "7": "bytes cert_chain (VCEK->ASK->ARK, opaque; may be empty)"
+    },
+    "payload_prefix_hex": "a701010219 2d2d 0367 74657374 6e6574 0458 20"
+  },
+  "frame_len_bytes": 237
+}
