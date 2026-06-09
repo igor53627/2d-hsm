@@ -149,16 +149,19 @@ mod tests {
     }
 
     #[test]
-    fn poll_returns_hup_when_peer_closed() {
-        // Error-readiness pass-through: dropping the peer makes `a` poll-ready with POLLHUP (EOF), even
-        // polling POLLIN. poll_with_deadline returns Ok(revents-with-HUP) — it does NOT error — so the
-        // caller (not the primitive) decides; this pins the documented contract.
+    fn poll_returns_ok_not_err_on_closed_peer() {
+        // The pinned contract is Ok-PASS-THROUGH: a closed/error-readiness comes back as Ok(revents), NOT
+        // converted to a poll-level Err — so the CALLER (not the primitive) inspects and decides.
+        // poll_with_deadline returns `revents` verbatim (it never filters flags), so it cannot "drop" a
+        // flag. Dropping the write end makes `a` poll-ready; the exact flag(s) vary by kernel/socket-type
+        // (POLLHUP and/or POLLIN-for-EOF), so we assert Ok + a closed/readable signal, not one specific flag.
         let (a, b) = UnixStream::pair().unwrap();
         drop(b);
-        let rv = poll_with_deadline(&a, PollFlags::POLLIN, future()).expect("ready (hup)");
+        let rv = poll_with_deadline(&a, PollFlags::POLLIN, future())
+            .expect("closed peer must be Ok readiness, not an Err");
         assert!(
             rv.intersects(PollFlags::POLLHUP | PollFlags::POLLIN),
-            "expected POLLHUP/POLLIN on closed peer, got {rv:?}"
+            "expected a closed/readable signal (POLLHUP and/or POLLIN), got {rv:?}"
         );
     }
 }

@@ -697,11 +697,21 @@ request golden vector is a 5b-2b test-vector item.
       via `recv_timeout`, but a truly-wedged connect leaks one thread+fd per attempt (bounded by
       `max_attempts` — so the worst-case simultaneous leaked thread+fd count on the guest is `max_attempts`,
       relevant for fd-budget sizing; OS-reaped). **TRACKED OBLIGATION (a'): cancellable hard connect bound**
-      — a nonblocking-connect+poll or a vsock crate exposing connect-with-timeout, eliminating the leak; its
-      OWN item, NOT collapsed into the quote (d) bound. **HARD PRECONDITION for a live 5b-2c serve (a checked
-      task item, mirroring (d)):** 5b-2c MUST either (i) land (a'), or (ii) record an EXPLICIT operational
-      risk-acceptance of the bounded leak with concrete retry/thread/fd bounds — it may NOT silently rely on
-      the connect path under a black-holing host. (Not merely "should".)
+      — a nonblocking-connect+poll (the `cancellable_boundary::poll_with_deadline` primitive landed in PR-A
+      exists for exactly this), eliminating the leak; its OWN item, NOT collapsed into the quote (d) bound.
+      **Acceptance criteria (pinned now PR-A's primitive exists, so (a') just consumes it):** (1) create a
+      NON-blocking vsock `SOCK_STREAM` fd directly via `nix::sys::socket::socket(AddressFamily::Vsock,
+      SockType::Stream, SOCK_NONBLOCK|SOCK_CLOEXEC, None)` — NOT vsock 0.5's `VsockSocket` (that is
+      `SOCK_DGRAM`); (2) `connect` (expect `EINPROGRESS`); (3) `poll_with_deadline(&fd, POLLOUT, deadline)`;
+      (4) **connect-success check = `revents.contains(POLLOUT) && !revents.intersects(POLLERR|POLLHUP|POLLNVAL)
+      && getsockopt(SocketError)==0`** (a bare `Ok(_)` is NOT success — see the primitive's contract); a
+      small `connect_succeeded(revents, fd)` helper is worth extracting; (5) promote the `OwnedFd` to
+      `VsockStream` via `From<OwnedFd>`; RAII fd drop on every path — no thread, no leak. Needs the nix
+      `socket` feature added alongside `poll`. aya acceptance: connect-to-dead-endpoint fails promptly via
+      the poll timeout (no thread leak); a loopback connect round-trips. **HARD PRECONDITION for a live 5b-2c
+      serve (a checked task item, mirroring (d)):** 5b-2c MUST either (i) land (a'), or (ii) record an
+      EXPLICIT operational risk-acceptance of the bounded leak with concrete retry/thread/fd bounds — it may
+      NOT silently rely on the watchdog connect path under a black-holing host. (Not merely "should".)
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
       LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
       because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
