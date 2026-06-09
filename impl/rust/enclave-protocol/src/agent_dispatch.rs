@@ -578,8 +578,11 @@ pub fn reset_agent_keystore_for_tests() {
 
 /// The boot-resolved anti-rollback binding (TASK-7.7 AC#5). Opaque presence marker — the funding gate
 /// only needs to know a successful anchor handshake + reconcile happened this (re)start, not the full
-/// (v1-PROVISIONAL) `ReconcileDecision`. The boot-wiring slice installs this AFTER `reconcile` returns
-/// `Fresh`/`AdoptForward`.
+/// (v1-PROVISIONAL) `ReconcileDecision`. Installed by `agent_boot::boot_reconcile_anti_rollback` **only
+/// on the `Fresh` arm** — NEVER directly on `AdoptForward` (that path must first seed the body from the
+/// anchor's authenticated marks + re-seal forward, then re-run the full ceremony so the now-current
+/// state reconciles `Fresh`). Do not install this from any other site: a binding installed on a stale
+/// (un-re-sealed) `AdoptForward` body would unblock fund custody on rolled-back counters/spend.
 #[derive(Debug, Clone, Copy)]
 pub struct AntiRollbackBinding {
     /// The reconciled freshness epoch the instance is operating under (for observability/audit).
