@@ -29,22 +29,26 @@
 //!   clone running its own fresh nonce — anti-clone rests on the anchor's per-scope counter churn
 //!   (design §3 Option A), an operator-procedural residual, not on this module.
 //!
-//! ## Boot-slice obligations (deferred; not satisfied by these primitives alone)
-//! - **Scope/ordering.** `chain_id`/`environment_identifier` come from the *unsealed* `KeystoreConfig`,
-//!   so [`issue_challenge`] runs **after** the keystore is unsealed (not before). Exact placement in
-//!   the boot ceremony is the boot-wiring slice's decision.
-//! - **Single handshake in flight.** `issue_challenge` is called once per (re)start and no second
-//!   issue overlaps an outstanding verify (the boot ceremony is single-threaded). The boot caller must
-//!   route **every** verify outcome (Ok, Err, and timeout/unavailable) through
-//!   [`consume_outstanding_challenge`] and, on success, assert the returned `Challenge.nonce()` equals
-//!   the nonce it verified against — the fail-closed backstop if the peek/verify/take sequence ever
-//!   races a reissue. A retry MUST `issue_challenge` afresh, never re-use a peeked nonce.
+//! ## Safe usage + boot-slice obligations
+//! The intended flow makes single-use structural: `let c = issue_challenge(chain_id, env)?;` → use
+//! `c.report_data()` to drive the SNP quote → relay the nonce and receive the anchor response →
+//! `verify_outstanding_response(&response, config)`. That primitive **takes the challenge before it
+//! verifies**, so the nonce is retired on every outcome and there is no non-consuming peek to misuse.
+//! - **Scope/ordering (deferred to boot).** `chain_id`/`environment_identifier` come from the
+//!   *unsealed* `KeystoreConfig`, so [`issue_challenge`] runs **after** the keystore is unsealed (not
+//!   before). Exact placement in the boot ceremony is the boot-wiring slice's decision.
+//! - **Single handshake in flight.** `issue_challenge` is called once per (re)start; on a timeout /
+//!   anchor-unavailable path with no response to verify, the boot caller retires the challenge via
+//!   [`consume_outstanding_challenge`] and re-issues. A retry MUST `issue_challenge` afresh.
 //!
 //! Like the rest of the anchor path this is dead-code-gated until boot wiring calls it.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::agent_anchor::{anchor_handshake_report_data, DIGEST_LEN};
+use crate::agent_anchor::{
+    anchor_handshake_report_data, verify_anchor_response_bytes, AnchorError, AnchorState, DIGEST_LEN,
+};
+use crate::agent_keystore::KeystoreConfig;
 use std::sync::Mutex;
 
 /// Why issuing a challenge failed. Coarse + fail-closed; the underlying `getrandom` detail is
@@ -53,6 +57,15 @@ use std::sync::Mutex;
 pub(crate) enum ChallengeError {
     /// The platform CSPRNG was unavailable when drawing the nonce.
     Csprng,
+}
+
+/// Why verifying a response against the outstanding challenge failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChallengeVerifyError {
+    /// No challenge was outstanding — never issued, or already consumed (a replay attempt).
+    NoOutstandingChallenge,
+    /// The anchor response failed verification against the challenge's nonce + the sealed config.
+    Anchor(AnchorError),
 }
 
 /// One outstanding freshness challenge. **Volatile process state only** — deliberately NOT
@@ -120,30 +133,40 @@ pub(crate) fn consume_outstanding_challenge() -> Option<Challenge> {
         .take()
 }
 
-/// Non-consuming peek at the outstanding nonce (copies the public nonce). The boot caller pulls this
-/// **once** to drive the `report_data` binding + verify's `expected_nonce`. MUST NOT be used to drive a
-/// retry of the same handshake — a retry MUST [`issue_challenge`] afresh.
-pub(crate) fn outstanding_nonce() -> Option<[u8; DIGEST_LEN]> {
-    OUTSTANDING_CHALLENGE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .map(|c| c.nonce)
+/// Atomically RETIRE the outstanding challenge and verify `response_bytes` against its nonce — the
+/// **safe verification primitive**. The challenge is consumed FIRST, so single-use is *structural*:
+/// it is taken on EVERY outcome (success, anchor error, or no-challenge), making "forget to consume"
+/// unrepresentable and a replayed `(nonce, response)` after a verify a `NoOutstandingChallenge`. There
+/// is deliberately **no non-consuming peek** of the nonce — the only way to check a response retires
+/// the challenge in the same step. On any failure the caller MUST [`issue_challenge`] afresh before
+/// retrying (never reuse a nonce). `report_data` for the SNP quote comes from the [`Challenge`] that
+/// [`issue_challenge`] returned, not from a peek.
+pub(crate) fn verify_outstanding_response(
+    response_bytes: &[u8],
+    config: &KeystoreConfig,
+) -> Result<AnchorState, ChallengeVerifyError> {
+    let challenge =
+        consume_outstanding_challenge().ok_or(ChallengeVerifyError::NoOutstandingChallenge)?;
+    verify_anchor_response_bytes(response_bytes, challenge.nonce(), config)
+        .map_err(ChallengeVerifyError::Anchor)
 }
 
-/// Whether a challenge is currently outstanding (presence-only).
+/// Whether a challenge is currently outstanding (presence-only; poison-recovers like the mutators so
+/// it can't disagree with `consume`/`issue` about lifecycle state on a poisoned lock).
 pub(crate) fn has_outstanding_challenge() -> bool {
     OUTSTANDING_CHALLENGE
         .lock()
-        .map(|g| g.is_some())
-        .unwrap_or(false)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
 }
 
 #[cfg(test)]
 pub(crate) fn reset_outstanding_challenge_for_tests() {
-    if let Ok(mut guard) = OUTSTANDING_CHALLENGE.lock() {
-        *guard = None;
-    }
+    // Poison-recover (not `if let Ok`) so a test that panicked while the slot was non-empty can't leak
+    // stale state into the next test via a poisoned lock.
+    *OUTSTANDING_CHALLENGE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 #[cfg(test)]
@@ -165,12 +188,25 @@ mod tests {
         g
     }
 
+    fn test_config() -> KeystoreConfig {
+        KeystoreConfig {
+            twod_chain_id: CHAIN,
+            environment_identifier: ENV.to_string(),
+            admin_authority_pk: [0xa1; 32],
+            recovery_authority_pk: [0xa2; 32],
+            backup_recovery_wrapping_pubkey: Vec::new(),
+            monotonic_treasury_config_version: 1,
+            authority_epoch: 0,
+            anchor_root: [0u8; 32],
+        }
+    }
+
     #[test]
     fn issue_returns_ok_and_stores() {
         let _g = test_lock();
         let c = issue_challenge(CHAIN, ENV).unwrap();
         assert!(has_outstanding_challenge());
-        assert_eq!(outstanding_nonce(), Some(*c.nonce()));
+        assert_eq!(consume_outstanding_challenge().unwrap().nonce(), c.nonce());
     }
 
     #[test]
@@ -200,7 +236,34 @@ mod tests {
         let n1 = *issue_challenge(CHAIN, ENV).unwrap().nonce();
         let n2 = *issue_challenge(CHAIN, ENV).unwrap().nonce();
         assert_ne!(n1, n2);
-        assert_eq!(outstanding_nonce(), Some(n2), "reissue overwrites with the newest nonce");
+        assert!(has_outstanding_challenge());
+    }
+
+    #[test]
+    fn verify_outstanding_with_no_challenge_errs() {
+        let _g = test_lock();
+        let cfg = test_config();
+        assert_eq!(
+            verify_outstanding_response(&[0xa1, 0x01, 0x00], &cfg),
+            Err(ChallengeVerifyError::NoOutstandingChallenge)
+        );
+    }
+
+    #[test]
+    fn verify_outstanding_consumes_even_on_failure() {
+        let _g = test_lock();
+        let cfg = test_config();
+        issue_challenge(CHAIN, ENV).unwrap();
+        // Garbage bytes → anchor verify fails, BUT the challenge is taken first, so it is retired
+        // regardless of the verify result (structural single-use).
+        let r = verify_outstanding_response(&[0xff, 0xff, 0xff], &cfg);
+        assert!(matches!(r, Err(ChallengeVerifyError::Anchor(_))));
+        assert!(!has_outstanding_challenge(), "challenge consumed even on verify failure");
+        // a replay now finds no outstanding challenge
+        assert_eq!(
+            verify_outstanding_response(&[0xff, 0xff, 0xff], &cfg),
+            Err(ChallengeVerifyError::NoOutstandingChallenge)
+        );
     }
 
     #[test]
