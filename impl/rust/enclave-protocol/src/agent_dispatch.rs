@@ -584,8 +584,8 @@ pub fn reset_agent_keystore_for_tests() {
 pub struct AntiRollbackBinding {
     /// The reconciled freshness epoch the instance is operating under (for observability/audit).
     pub epoch: u64,
-    /// Whether the anchor reported the instance live/active (always true for an installed binding;
-    /// kept explicit so the marker can't be a zero-value default).
+    /// Whether the anchor reported the instance live/active. **Load-bearing:** the funding gate treats
+    /// a binding with `active == false` as unconfigured (fail-closed) — not mere observability.
     pub active: bool,
 }
 
@@ -611,12 +611,15 @@ pub fn install_anti_rollback_binding(binding: AntiRollbackBinding) -> bool {
     true
 }
 
-/// Whether a boot-resolved anti-rollback binding is installed (presence-only; poison-recovers).
+/// Whether a boot-resolved anti-rollback binding is installed AND reports the instance live/active
+/// (poison-recovers). Checks `active` (not just presence) so a binding installed with `active == false`
+/// — e.g. the anchor reported the instance stale/not-live — fails closed rather than passing the gate.
 pub fn is_anti_rollback_configured() -> bool {
     ANTI_ROLLBACK_BINDING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_some()
+        .as_ref()
+        .is_some_and(|b| b.active)
 }
 
 #[cfg(test)]
@@ -993,6 +996,7 @@ mod tests {
     #[test]
     fn noncanonical_nested_capability_is_malformed_before_verify() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured(); // op 7 is rollback-sensitive — serialize + bind (Malformed wins at decode)
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1356,6 +1360,7 @@ mod tests {
 
     #[test]
     fn runtime_signing_opcodes_not_configured() {
+        let _g = gate_unconfigured(); // op 5 is rollback-sensitive — serialize the binding global
         let (body, _) = body_with_key();
         for op in [4u8, 5u8] {
             assert_eq!(
@@ -1563,6 +1568,13 @@ mod tests {
         // All CONFIGURE_TREASURY sub-ops {0..=3} are fund-custody, so the whole opcode is gated with no
         // sub-op decode needed.
         assert!(AgentOpcode::ConfigureTreasury.is_rollback_sensitive());
+    }
+
+    #[test]
+    fn optout_stub_is_off() {
+        // The AC#10 measured/sealed opt-out is DEFERRED; the stub MUST stay `false` so the gate
+        // hard-blocks when unconfigured (the safe default). A premature `true` would open the gate.
+        assert!(!sealed_optout_acknowledged(&base_body()));
     }
 
     #[test]
