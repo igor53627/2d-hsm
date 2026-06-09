@@ -208,8 +208,12 @@ the AgentGateway (0x40) handler, if the boot-resolved anti-rollback binding is a
 `AGENT_K1_GENERATE_KEYS`, `AGENT_K1_SIGN_FAUCET_DISPENSE`, `AGENT_K1_CONFIGURE_TREASURY` fund-custody
 sub-ops (`set_limits` / `refill_budget` / `raise_lifetime_breaker` / `reset_lifetime_breaker`),
 `AGENT_KEYSTORE_EXPORT_BACKUP` (advances the export capability counter), and
-`AGENT_KEYSTORE_RESTORE_BACKUP` (advances the strict recovery counter) — with an AgentGateway error
-*"anti-rollback mechanism not configured (TASK-7.7)"*; read-only/status/attestation stay allowed.
+`AGENT_KEYSTORE_RESTORE_BACKUP` (advances the strict recovery counter) — with a fail-closed
+AgentGateway error. **Wire form (impl):** the reject reuses the generic `NotConfigured` (`0x45`)
+§10.9 band code (no distinct wire string — a distinct code/string would be an anti-oracle and would
+break the band/variant-equality contracts); the anti-rollback-specific phrasing *"anti-rollback
+mechanism not configured (TASK-7.7)"* lives in the code/diagnostics, not on the wire. AC#5 requires a
+fail-closed reject, which `0x45` is. Read-only/status/attestation stay allowed.
 **`AGENT_K1_SIGN_TRANSFER` is deliberately NOT in this runtime list** — it carries no rollback-
 sensitive sealed state (no spend/cap/counter; bounded only by key-purpose + canonical EIP-155 +
 sealed chain_id per 7.4/7.5), so gating it on anti-rollback would protect nothing it touches. AC#5's

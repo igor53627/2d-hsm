@@ -601,6 +601,12 @@ static ANTI_ROLLBACK_BINDING: Mutex<Option<AntiRollbackBinding>> = Mutex::new(No
 /// — it is not a host-settable input.
 #[must_use]
 pub fn install_anti_rollback_binding(binding: AntiRollbackBinding) -> bool {
+    // Refuse to install an inactive binding: a binding is only ever installed after a SUCCESSFUL
+    // reconcile (⇒ active), so `!active` is a caller bug — reject it rather than store a marker the
+    // gate would treat as unconfigured anyway (defense-in-depth on top of the `active` gate check).
+    if !binding.active {
+        return false;
+    }
     let mut guard = ANTI_ROLLBACK_BINDING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1575,6 +1581,20 @@ mod tests {
         // The AC#10 measured/sealed opt-out is DEFERRED; the stub MUST stay `false` so the gate
         // hard-blocks when unconfigured (the safe default). A premature `true` would open the gate.
         assert!(!sealed_optout_acknowledged(&base_body()));
+    }
+
+    #[test]
+    fn install_binding_is_install_once_and_rejects_inactive() {
+        let _g = gate_unconfigured(); // resets the slot to None + serializes
+        // An inactive binding is refused (only a successful reconcile installs ⇒ active).
+        assert!(!install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: false }));
+        assert!(!is_anti_rollback_configured());
+        // First active install wins.
+        assert!(install_anti_rollback_binding(AntiRollbackBinding { epoch: 5, active: true }));
+        assert!(is_anti_rollback_configured());
+        // Second install is refused (no overwrite) — a security-relevant property: a later call can't
+        // swap in a different epoch over a live binding.
+        assert!(!install_anti_rollback_binding(AntiRollbackBinding { epoch: 9, active: true }));
     }
 
     #[test]
