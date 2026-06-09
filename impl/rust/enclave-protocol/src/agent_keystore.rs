@@ -227,7 +227,7 @@ pub fn unseal_keystore(
 // high-water table, faucet state, audit ring.) All structs are `deny_unknown_fields` so an
 // unexpected field fails closed rather than being silently dropped on a forward-migration read.
 //
-// Encoding note (format_version 1): this uses **deterministic** CBOR — serde emits struct fields
+// Encoding note (sealed-body format, current format_version 2): this uses **deterministic** CBOR — serde emits struct fields
 // in declaration order and every collection is a `Vec` (no map/HashMap), so a given body always
 // encodes to the same bytes (the golden vector locks this). It is NOT RFC 8949 *canonical* CBOR,
 // and byte fields (`[u8; N]`, `Vec<u8>`) serialize as CBOR integer-arrays, not byte strings.
@@ -460,14 +460,28 @@ impl KeystoreBody {
     // is decode-only today, so reuse agent_capability's encoders in place until they move there.
     fn encode_marks_payload(&self) -> Vec<u8> {
         use crate::agent_capability::{put_bytes, put_uint};
+        // The digest's determinism + injectivity rest on every row's environment_identifier equalling
+        // config.environment_identifier (validate() enforces this at every seal/unseal boundary), which
+        // is why env is folded out of the encoding. Self-document + catch a future mutator that lands a
+        // differing-env row without re-validating.
+        debug_assert!(
+            self.counters
+                .iter()
+                .all(|r| r.environment_identifier == self.config.environment_identifier),
+            "marks env-fold precondition: every counter row's environment_identifier must equal config",
+        );
         // Counters are stored in arrival order (see advance_counter); sort references for a canonical,
-        // enclave-independent digest. The (authority, scope_class, scope_target) key is unique per row.
+        // enclave-independent digest. The encoded sort key is (authority, scope_class, scope_target);
+        // environment_identifier is appended as a final tiebreaker so the order stays TOTAL (and the
+        // digest reproducible) even if the env-fold precondition above is ever violated — for a valid
+        // body (env constant) it never changes the order, so the frozen vectors are unaffected.
         let mut rows: Vec<&CounterEntry> = self.counters.iter().collect();
         rows.sort_by(|a, b| {
             a.authority
                 .cmp(&b.authority)
                 .then(a.scope_class.cmp(&b.scope_class))
                 .then(a.scope_target.as_slice().cmp(b.scope_target.as_slice()))
+                .then(a.environment_identifier.cmp(&b.environment_identifier))
         });
         let mut out = Vec::new();
         put_uint(&mut out, 5, 4); // map header: 4 pairs
@@ -1175,6 +1189,9 @@ mod tests {
         let mut cbor = Zeroizing::new(Vec::new());
         ciborium::ser::into_writer(&body, &mut *cbor).unwrap();
         let blob = seal_keystore_with_nonce(&cbor, &GOLDEN_ROOT, GOLDEN_MEAS, &GOLDEN_NONCE).unwrap();
+        // Independently pin the on-wire format-version byte to the literal 2 (not just the const), so a
+        // stealth const edit can't pass on the hash alone.
+        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), 2, "sealed format_version must be 2");
 
         let digest: [u8; 32] = {
             let mut h = Sha3_256::new();
@@ -1206,9 +1223,12 @@ mod tests {
         }
     }
 
-    /// A body reset to marks-genesis (empty counters, zero spends, zero recovery counter).
+    /// A body reset to marks-genesis (empty counters, zero spends, zero recovery counter). Config env
+    /// is pinned to "testnet" to match [`ctr`] so the env-fold precondition (row env == config env)
+    /// holds for the rows the tests add.
     fn marks_body() -> KeystoreBody {
         let mut b = golden_body();
+        b.config.environment_identifier = "testnet".to_string();
         b.counters.clear();
         b.faucet.cumulative_native_spend = [0; 32];
         b.faucet.lifetime_spend = [0; 32];
@@ -1287,14 +1307,21 @@ mod tests {
 
     #[test]
     fn marks_environment_identifier_is_folded_out() {
-        let mut a = marks_body();
-        a.counters = vec![ctr(1, 0, b"x", 5)];
-        let mut b = marks_body();
-        let mut e = ctr(1, 0, b"x", 5);
-        e.environment_identifier = "other-env".to_string();
-        b.counters = vec![e];
-        // env is not encoded (it equals config per row) → same digest.
-        assert_eq!(a.compute_local_marks_digest(), b.compute_local_marks_digest());
+        // Two bodies that differ ONLY in their (internally-consistent) environment — each body's row
+        // env equals its own config env, satisfying the fold precondition. Since env is not encoded,
+        // the digests are equal.
+        let body_for = |env: &str| {
+            let mut b = marks_body();
+            b.config.environment_identifier = env.to_string();
+            let mut row = ctr(1, 0, b"x", 5);
+            row.environment_identifier = env.to_string();
+            b.counters = vec![row];
+            b
+        };
+        assert_eq!(
+            body_for("env-aaa").compute_local_marks_digest(),
+            body_for("env-bbb").compute_local_marks_digest()
+        );
     }
 
     #[test]
@@ -1335,7 +1362,7 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&body, &mut buf).unwrap();
         let val: ciborium::value::Value = ciborium::de::from_reader(&buf[..]).unwrap();
-        let ciborium::value::Value::Map(mut entries) = val else {
+        let ciborium::value::Value::Map(entries) = val else {
             panic!("KeystoreBody should serialize as a CBOR map");
         };
         for field in ["structural_version", "strict_recovery_counter"] {
@@ -1351,7 +1378,5 @@ mod tests {
             let res: Result<KeystoreBody, _> = ciborium::de::from_reader(&shortened[..]);
             assert!(res.is_err(), "v2 body missing {field} must fail closed, not default");
         }
-        // keep `entries` used (silence unused-mut on some toolchains)
-        entries.clear();
     }
 }
