@@ -512,6 +512,10 @@ fn connect_bounded(
                 return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed (poll)"));
             }
         }
+        // Any other errno fails immediately (intentional): for a non-blocking AF_VSOCK SOCK_STREAM connect
+        // the only "in flight" return is EINPROGRESS (EINTR handled above defensively). Errors like
+        // ECONNRESET/ENODEV/EAGAIN are genuine connect failures, not a not-yet-complete state, so there is
+        // nothing to poll for — fail fast and let the driver retry.
         Err(_) => return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed")),
     }
 
@@ -1492,9 +1496,14 @@ mod vsock_aya_tests {
         server.join().unwrap();
     }
 
-    /// Connect to an endpoint with no listener under a short deadline: must fail (retryable) PROMPTLY,
-    /// never hang — proves the (a') cancellable connect bound (non-blocking connect + `poll(POLLOUT)` to the
-    /// deadline) + that all failures fold to a retryable error.
+    /// Connect to a no-listener endpoint under a short deadline: must fail (retryable) PROMPTLY, never hang.
+    /// What this PROVES: **prompt socket-level connect refusal + retryable folding** — a no-listener vsock
+    /// `connect` fast-fails (ECONNRESET/refused) either synchronously (`Err(_)` arm) or via an *immediate*
+    /// error-ready `poll` return; neither runs `poll(POLLOUT)` out to the deadline. It does NOT exercise the
+    /// genuine deadline-LAPSE path (a wedged in-flight connect on a black-holing host). That lapse path is
+    /// covered structurally by `cancellable_boundary::poll_times_out_when_not_ready` (poll returns at the
+    /// deadline) + RAII fd drop; a real-vsock black-hole-connect test is DEFERRED (see the design doc §8 —
+    /// staging a silently-black-holing vsock peer is awkward; tracked, not silently claimed).
     #[test]
     #[ignore]
     fn vsock_channel_connect_failure_is_prompt_and_retryable() {
@@ -1504,7 +1513,7 @@ mod vsock_aya_tests {
         assert!(r.is_err(), "connect to a dead endpoint must error, not hang");
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "must fail within ~the budget ((a') poll(POLLOUT) bound), not block on connect"
+            "must fail promptly (prompt refusal + retryable folding), not block on connect"
         );
     }
 

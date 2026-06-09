@@ -876,13 +876,22 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   is precisely the case where the connect does NOT fail fast: `poll_with_deadline(POLLOUT)` waits out the
   **full per-leg `timeout`** before lapsing, so each wedged connect leg consumes up to `timeout` and the
   worst-case connect-only cost is **`max_attempts · timeout`** (only the no-listener/reset case is *prompt*).
-  The failure mode thus shifted from fd-exhaustion to *budget-consumption*, which makes the **time** invariant
-  `max_attempts · 2 · timeout ≤ overall_boot_budget` the *only* thing now bounding a sustained black-hole.
-  **Enforce it as an artifact, not a prose `MUST` (mirroring the (d) treatment):** because this invariant is
-  now load-bearing as the sole bound, 5b-2c SHOULD enforce it structurally — e.g. a constructor that takes
-  `overall_boot_budget` and returns an error / `debug_assert`s when `max_attempts · 2 · timeout` exceeds it —
-  rather than leaving it an omittable checklist line (the same enforceable-artifact standard the doc applies
-  to (d)). **Term definitions (single source — 5b-2c wires
+  Note budget-consumption is NOT a *new* exposure introduced by (a'): the old watchdog path also blocked the
+  caller (`recv_timeout(budget)`) ~`max_attempts · timeout` of wall-clock under a black-hole — (a') removed
+  the fd/thread *leak*, not the time cost. So post-(a'): with the leak gone, *budget-consumption is the ONLY
+  REMAINING* failure mode, which makes the **time** invariant `max_attempts · 2 · timeout ≤ overall_boot_budget`
+  the *only* thing now bounding a sustained black-hole. **5b-2c MUST enforce it as a structural artifact (NOT
+  a prose checklist line) — same MUST/enforceable standard the doc applies to (d):** because this invariant is
+  now load-bearing as the sole availability bound, 5b-2c MUST validate it where the transport/driver is
+  constructed — a constructor/config check that **returns an error** (fail-closed, not merely a
+  `debug_assert`, since the bound must hold in release) when `max_attempts · 2 · timeout > overall_boot_budget`.
+  This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **Generalized form (the `2·`
+  assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if 5b-2c
+  exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
+  **`max_attempts · (quote_timeout + channel_timeout) ≤ overall_boot_budget`** — 5b-2c MUST restate and
+  enforce whichever form it ships. **Deferred verification artifact (do not lose behind "DONE PR #56"):** a
+  real-vsock test of the in-flight-connect black-hole *deadline lapse* (currently unit-level-only via
+  `poll_times_out_when_not_ready`) remains a tracked 5b-2b-ii/TASK-7.7 residual. **Term definitions (single source — 5b-2c wires
   both into one check):** `max_attempts` = the value 5b-2c passes to
   `run_boot_anti_rollback_handshake(..., max_attempts)` (driver-clamped to `MAX_BOOT_ATTEMPTS_CEILING = 64`);
   `timeout` = the per-leg `Duration` 5b-2c gives `RelayAnchorTransport::new`; `overall_boot_budget` = a NEW
