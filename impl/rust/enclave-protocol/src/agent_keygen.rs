@@ -186,6 +186,8 @@ mod tests {
             },
             audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch: 1,
+            structural_version: 1,
+            strict_recovery_counter: 0,
         }
     }
 

@@ -33,14 +33,22 @@ use zeroize::{Zeroize as _, Zeroizing};
 /// `b"2DAGTKS\0"` — distinct from the producer `b"2DHSMV1\0"` so the two blob families can never
 /// be cross-parsed (format-level role separation, AC#2).
 pub const KEYSTORE_MAGIC: &[u8; 8] = b"2DAGTKS\0";
-/// Current sealed-keystore format version (`u16`, big-endian on the wire). `1` denotes the
-/// XChaCha20Poly1305 envelope + deterministic-CBOR body defined here; an incompatible on-disk
-/// layout/encoding change (e.g. byte-string field encoding, a different AEAD) bumps this and gains
-/// a fail-closed old-version rejection or explicit migration.
-pub const KEYSTORE_FORMAT_VERSION: u16 = 1;
+/// Current sealed-keystore format version (`u16`, big-endian on the wire). `2` denotes the
+/// XChaCha20Poly1305 envelope + deterministic-CBOR body defined here **with the TASK-7.7
+/// anti-rollback body fields** `structural_version` + `strict_recovery_counter` (added in v2). `1`
+/// (the same envelope without those fields) **never shipped a real blob** — the only seal site is the
+/// `agent-keygen-exec-preview`-gated GENERATE_KEYS path — so v2 is a hard bump with **no v1 reader**:
+/// the pre-decrypt `UnsupportedVersion` rejection (version is AAD-bound) is the entire migration. Any
+/// further incompatible on-disk layout/encoding change bumps this again. Note: the `KeystoreBody`
+/// fields are feature-invariant (never `#[cfg]`-gated) so the sealed layout/golden is single-valued
+/// across all feature combinations.
+pub const KEYSTORE_FORMAT_VERSION: u16 = 2;
 
 const MEAS_DIGEST_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-meas";
 const AEAD_KEY_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-key";
+/// Domain prefix for the TASK-7.7 anti-rollback marks digest (anchor response key 6). Trailing NUL is
+/// part of the label. `marks_digest = SHA3-256(MARKS_DOMAIN ‖ canonical-CBOR(marks_payload))`.
+pub(crate) const MARKS_DOMAIN: &[u8] = b"2d-hsm/agent-anchor-marks/v1\0";
 
 const MEAS_DIGEST_LEN: usize = 32;
 /// 24-byte (192-bit) XChaCha20Poly1305 nonce. Unlike the producer's one-shot `pq-seal-v1` blob,
@@ -418,6 +426,78 @@ pub struct KeystoreBody {
     /// ahead of the anchor, a structural key/config gap the anchor never held, or an
     /// unavailable/unresolvable anchor.
     pub freshness_epoch: u64,
+    /// Anti-rollback **structural version** (TASK-7.7, anchor response key 5). **Required** (no
+    /// `serde(default)` — a v2 body missing it fails closed as a CBOR decode error, never a silent 0).
+    /// Init **1**, never 0 (a 0 would fail the same-epoch `reconcile` Fresh-equality vs a forged
+    /// 0-anchor). Forward-only, never reset. Bumped by **exactly**: each committed GENERATE_KEYS, and
+    /// each key/config-changing CONFIGURE_TREASURY sub-op (that handler is deferred). MUST NOT bump on
+    /// counter/spend advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change,
+    /// and MUST NOT be aliased onto [`KeystoreConfig::monotonic_treasury_config_version`]. Overflow:
+    /// `checked_add` → fail closed (never wrap). The GENERATE_KEYS bump is **LOCAL-ONLY and currently
+    /// INERT**: advancing `freshness_epoch` + the anchor ack atomically with this bump (seal-before-emit)
+    /// and the boot `reconcile` that reads this field are the deferred co-slice — nothing reads
+    /// `structural_version` at boot yet.
+    pub structural_version: u64,
+    /// Strict recovery counter (TASK-7.7 §1 item 5, anchor marks key 4). **Required** (no
+    /// `serde(default)`). Init **0** (genuine genesis: zero recoveries performed; anchor baseline 0).
+    /// Forward-only `u64`, encoded as a CBOR major-0 unsigned int at marks key 4. Advanced (never
+    /// decreased) by RESTORE_BACKUP + `reset_lifetime_breaker` — those **mutators are deferred**; the
+    /// field + its marks encoding are frozen now so `marks_digest` is complete and stable.
+    pub strict_recovery_counter: u64,
+}
+
+impl KeystoreBody {
+    /// Canonical-CBOR encoding of the authoritative counter/spend high-water **marks** — the preimage
+    /// (after [`MARKS_DOMAIN`]) of the anchor response key-6 digest. FROZEN v1 grammar (design doc §8):
+    /// a 4-key map `{1: [rows…], 2: cumulative_native_spend(32B), 3: lifetime_spend(32B),
+    /// 4: strict_recovery_counter(uint)}`, keys ascending, shortest-form. Counter rows are **sorted**
+    /// byte-lex by `(authority, scope_class, scope_target)` — `environment_identifier` is folded out
+    /// (it equals `config.environment_identifier` for every row, `validate()`-enforced) — each row a
+    /// self-delimiting concat `authority(32B bstr) ‖ scope_class(CBOR uint) ‖ scope_target(bstr) ‖
+    /// highest_accepted_counter(CBOR uint)`. Built with the shared canonical encoders, **not** serde
+    /// (the sealed body serializes `[u8;N]` as CBOR int-arrays, which must not be reused here).
+    // TODO(agent_cbor): the canonical ENCODER has 3 consumers now (capability/anchor/here); agent_cbor
+    // is decode-only today, so reuse agent_capability's encoders in place until they move there.
+    fn encode_marks_payload(&self) -> Vec<u8> {
+        use crate::agent_capability::{put_bytes, put_uint};
+        // Counters are stored in arrival order (see advance_counter); sort references for a canonical,
+        // enclave-independent digest. The (authority, scope_class, scope_target) key is unique per row.
+        let mut rows: Vec<&CounterEntry> = self.counters.iter().collect();
+        rows.sort_by(|a, b| {
+            a.authority
+                .cmp(&b.authority)
+                .then(a.scope_class.cmp(&b.scope_class))
+                .then(a.scope_target.as_slice().cmp(b.scope_target.as_slice()))
+        });
+        let mut out = Vec::new();
+        put_uint(&mut out, 5, 4); // map header: 4 pairs
+        put_uint(&mut out, 0, 1); // key 1 -> counter rows
+        put_uint(&mut out, 4, rows.len() as u64); // array header
+        for r in &rows {
+            put_bytes(&mut out, &r.authority);
+            put_uint(&mut out, 0, u64::from(r.scope_class));
+            put_bytes(&mut out, &r.scope_target);
+            put_uint(&mut out, 0, r.highest_accepted_counter);
+        }
+        put_uint(&mut out, 0, 2); // key 2 -> cumulative_native_spend (32B u256-BE byte string)
+        put_bytes(&mut out, &self.faucet.cumulative_native_spend);
+        put_uint(&mut out, 0, 3); // key 3 -> lifetime_spend
+        put_bytes(&mut out, &self.faucet.lifetime_spend);
+        put_uint(&mut out, 0, 4); // key 4 -> strict_recovery_counter (CBOR uint)
+        put_uint(&mut out, 0, self.strict_recovery_counter);
+        out
+    }
+
+    /// `marks_digest = SHA3-256(MARKS_DOMAIN ‖ encode_marks_payload())` — the local high-water digest
+    /// the boot `reconcile` compares against the anchor's authoritative key-6 (design doc §8). Pure,
+    /// total, panic-free over `&self`. (Dead-code-allowed until boot wiring calls it.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compute_local_marks_digest(&self) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(MARKS_DOMAIN);
+        h.update(self.encode_marks_payload());
+        h.finalize().into()
+    }
 }
 
 /// `environment_identifier` rules (TASK-7.1 §10.6): UTF-8, length `1..=64`, `[a-z0-9-]`, no
@@ -643,9 +723,20 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails_closed_before_decrypt() {
+        // An unknown FUTURE version (3) is rejected pre-decrypt (version is AAD-bound).
         let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         blob[8] = 0x00;
-        blob[9] = 0x02; // version 2 (unknown)
+        blob[9] = 0x03;
+        assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::UnsupportedVersion));
+    }
+
+    #[test]
+    fn legacy_v1_version_rejected_after_bump() {
+        // The pre-bump format_version 1 (never shipped a real blob) is now rejected: v2 is a hard bump
+        // with no v1 reader, so a v1-stamped blob fails closed before decrypt.
+        let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
+        blob[8] = 0x00;
+        blob[9] = 0x01;
         assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::UnsupportedVersion));
     }
 
@@ -771,6 +862,8 @@ mod tests {
             },
             audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch: 1,
+            structural_version: 2,
+            strict_recovery_counter: 0,
         }
     }
 
@@ -1066,6 +1159,8 @@ mod tests {
             },
             audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch: 1,
+            structural_version: 1,
+            strict_recovery_counter: 0,
         }
     }
 
@@ -1086,14 +1181,177 @@ mod tests {
             h.update(&blob);
             h.finalize().into()
         };
+        // format_version 2 (adds structural_version + strict_recovery_counter); supersedes the v1
+        // vector 4233 / c55edc09… (v1 never shipped a real blob — see KEYSTORE_FORMAT_VERSION).
         assert_eq!(
             (blob.len(), hex::encode(digest)),
-            (4233usize, "c55edc09ac4eeb1349887e64a175838045f5a4c704637fc994f8628adc3ec4df".to_string()),
+            (4278usize, "0e8e0df50b19ecb34faf0d09a51d5224e3c044ad3e07ef961814f4dfd1382edc".to_string()),
             "keystore golden blob changed — if intentional, bump format_version + update this vector"
         );
 
         // Round-trip from the frozen inputs.
         let out = unseal_body(&blob, &GOLDEN_ROOT, GOLDEN_MEAS).unwrap();
         assert_eq!(out, body);
+    }
+
+    // ---- TASK-7.7 marks_digest (anchor key 6) frozen-grammar tests ----
+
+    fn ctr(authority: u8, scope_class: u8, scope_target: &[u8], counter: u64) -> CounterEntry {
+        CounterEntry {
+            authority: [authority; 32],
+            environment_identifier: "testnet".to_string(),
+            scope_class,
+            scope_target: scope_target.to_vec(),
+            highest_accepted_counter: counter,
+        }
+    }
+
+    /// A body reset to marks-genesis (empty counters, zero spends, zero recovery counter).
+    fn marks_body() -> KeystoreBody {
+        let mut b = golden_body();
+        b.counters.clear();
+        b.faucet.cumulative_native_spend = [0; 32];
+        b.faucet.lifetime_spend = [0; 32];
+        b.strict_recovery_counter = 0;
+        b
+    }
+
+    #[test]
+    fn marks_payload_genesis_is_hand_derived() {
+        // FROZEN grammar, hand-derived (anti-self-certification): map(4)
+        //   A4 | k1 01 array(0) 80 | k2 02 bstr32 5820 00*32 | k3 03 bstr32 5820 00*32 | k4 04 uint 00
+        let mut expected = vec![0xA4, 0x01, 0x80, 0x02, 0x58, 0x20];
+        expected.extend([0u8; 32]);
+        expected.extend([0x03, 0x58, 0x20]);
+        expected.extend([0u8; 32]);
+        expected.extend([0x04, 0x00]);
+        assert_eq!(marks_body().encode_marks_payload(), expected);
+    }
+
+    #[test]
+    fn marks_digest_is_sha3_of_domain_then_payload() {
+        // Pin the digest = SHA3-256(MARKS_DOMAIN ‖ payload) relationship (payload hand-verified above),
+        // so no captured hex is needed.
+        let b = marks_body();
+        let mut h = Sha3_256::new();
+        h.update(MARKS_DOMAIN);
+        h.update(b.encode_marks_payload());
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(b.compute_local_marks_digest(), expected);
+    }
+
+    #[test]
+    fn marks_digest_is_sort_invariant() {
+        let mut a = marks_body();
+        a.counters = vec![ctr(1, 0, b"x", 5), ctr(2, 0, b"y", 7)];
+        let mut b = marks_body();
+        b.counters = vec![ctr(2, 0, b"y", 7), ctr(1, 0, b"x", 5)]; // reversed arrival order
+        assert_eq!(a.compute_local_marks_digest(), b.compute_local_marks_digest());
+    }
+
+    #[test]
+    fn marks_scope_class_encoded_as_cbor_uint_not_raw_byte() {
+        let mut b = marks_body();
+        b.counters = vec![ctr(1, 200, b"x", 5)];
+        // 200 must appear as the CBOR major-0 1-byte head `0x18 0xC8`, NOT a raw 0xC8.
+        let payload = b.encode_marks_payload();
+        assert!(payload.windows(2).any(|w| w == [0x18, 0xC8]));
+        let mut b0 = marks_body();
+        b0.counters = vec![ctr(1, 0, b"x", 5)];
+        assert_ne!(b.compute_local_marks_digest(), b0.compute_local_marks_digest());
+    }
+
+    #[test]
+    fn marks_spend_is_fixed_width_bytes_distinct_from_recovery_uint() {
+        let mut spend = marks_body();
+        spend.faucet.cumulative_native_spend = {
+            let mut a = [0u8; 32];
+            a[31] = 1;
+            a
+        };
+        let mut rec = marks_body();
+        rec.strict_recovery_counter = 1;
+        // spend=1 (a 32-byte string) and strict_recovery_counter=1 (a uint) are different contributions.
+        assert_ne!(spend.compute_local_marks_digest(), rec.compute_local_marks_digest());
+    }
+
+    #[test]
+    fn marks_scope_target_length_framing_is_injective() {
+        // prefix-distinct scope_targets must not collide (length-prefixed byte strings).
+        let mut a = marks_body();
+        a.counters = vec![ctr(1, 0, &[0x10], 5)];
+        let mut b = marks_body();
+        b.counters = vec![ctr(1, 0, &[0x10, 0x00], 5)];
+        assert_ne!(a.compute_local_marks_digest(), b.compute_local_marks_digest());
+    }
+
+    #[test]
+    fn marks_environment_identifier_is_folded_out() {
+        let mut a = marks_body();
+        a.counters = vec![ctr(1, 0, b"x", 5)];
+        let mut b = marks_body();
+        let mut e = ctr(1, 0, b"x", 5);
+        e.environment_identifier = "other-env".to_string();
+        b.counters = vec![e];
+        // env is not encoded (it equals config per row) → same digest.
+        assert_eq!(a.compute_local_marks_digest(), b.compute_local_marks_digest());
+    }
+
+    #[test]
+    fn marks_digest_is_deterministic() {
+        let b = marks_body();
+        assert_eq!(b.compute_local_marks_digest(), b.compute_local_marks_digest());
+    }
+
+    #[test]
+    fn advance_counter_does_not_change_structural_version() {
+        // A counter advance is an adoptable (anchor-reconstructable) gap — it MUST NOT bump
+        // structural_version (else a benign spend would masquerade as a structural mutation).
+        let mut b = sample_body();
+        let sv = b.structural_version;
+        b.advance_counter(&[9u8; 32], 0, b"scope-x", 1).unwrap();
+        assert_eq!(b.structural_version, sv);
+    }
+
+    #[test]
+    fn body_differing_only_in_structural_version_serializes_differently() {
+        let mut a = sample_body();
+        let mut b = sample_body();
+        a.structural_version = 5;
+        b.structural_version = 6;
+        let enc = |body: &KeystoreBody| {
+            let mut v = Vec::new();
+            ciborium::ser::into_writer(body, &mut v).unwrap();
+            v
+        };
+        assert_ne!(enc(&a), enc(&b), "structural_version is actually encoded in the sealed body");
+    }
+
+    #[test]
+    fn v2_body_missing_required_field_fails_closed() {
+        // Removing a required v2 field from the body CBOR must FAIL to decode (no serde(default)
+        // silent-zero of a security counter). Guards against a future `#[serde(default)]`.
+        let body = sample_body();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&body, &mut buf).unwrap();
+        let val: ciborium::value::Value = ciborium::de::from_reader(&buf[..]).unwrap();
+        let ciborium::value::Value::Map(mut entries) = val else {
+            panic!("KeystoreBody should serialize as a CBOR map");
+        };
+        for field in ["structural_version", "strict_recovery_counter"] {
+            let mut shortened_entries = entries.clone();
+            let before = shortened_entries.len();
+            shortened_entries.retain(
+                |(k, _)| !matches!(k, ciborium::value::Value::Text(s) if s == field),
+            );
+            assert_eq!(shortened_entries.len(), before - 1, "removed {field}");
+            let mut shortened = Vec::new();
+            ciborium::ser::into_writer(&ciborium::value::Value::Map(shortened_entries), &mut shortened)
+                .unwrap();
+            let res: Result<KeystoreBody, _> = ciborium::de::from_reader(&shortened[..]);
+            assert!(res.is_err(), "v2 body missing {field} must fail closed, not default");
+        }
+        // keep `entries` used (silence unused-mut on some toolchains)
+        entries.clear();
     }
 }

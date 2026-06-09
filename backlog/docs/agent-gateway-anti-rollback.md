@@ -308,12 +308,14 @@ later direct merkle-read path) can back it **without a wire change**. It is **no
 **Domains.** Response signing preimage prefix `ANCHOR_DOMAIN = "2d-hsm/agent-anchor/v1\0"` (trailing
 NUL part of the label); handshake `report_data` domain `"2d-hsm-agent-anchor-handshake-v1"` (§3).
 
-**Anchor freshness response (canonical-CBOR int-key map) — v1 PROVISIONAL.** This wire format is
-**draft, not frozen.** The verify code implements the shape below, but two signed/compared fields it
-already consumes — `structural_version` (key 5) and `marks_digest` (key 6) — depend on a concrete
-construction that is finalized by the seeding + boot-wiring slices (see the blocking ACs in the task).
-Until then the response format MUST be treated as provisional and may take a wire-format bump; nothing
-is wired to it yet, so this carries no compatibility cost. Keys `1..=7` are **always** signed, plus
+**Anchor freshness response (canonical-CBOR int-key map).** The overall response wire format stays
+**v1-PROVISIONAL** for the not-yet-exercised parts (chain-binding 8/9, the epoch handshake), but the
+two signed/compared fields `reconcile` already consumes are now pinned: **`structural_version` (key 5)
+is FROZEN v1** (sealed-body `u64`, see below) and **`marks_digest` (key 6) has a FROZEN v1 enclave
+encoder** (the byte grammar below) whose **cross-component contract stays PINNED-BEFORE-ANCHOR-CO-SIGN**
+until the anchor team commits in writing to the same per-row data model. Nothing is wired to the
+response at boot yet, so a future bump of the still-provisional parts carries no compatibility cost.
+Keys `1..=7` are **always** signed, plus
 optional `8/9` **only when chain-bound** (both-or-neither); key `13` (the signature) is excluded from
 the preimage. The signed preimage is `ANCHOR_DOMAIN ‖ canonical-CBOR({signed keys})` built with the
 **same** RFC 8949 §4.2.1 shortest-form encoders the capability verifier uses, so a conformant anchor
@@ -326,38 +328,65 @@ signer matches byte-for-byte. Signature = Ed25519 (64B), verified `verify_strict
 | 2 | `chain_id` | uint | == sealed `twod_chain_id` (scope) |
 | 3 | `environment_identifier` | text | == sealed `environment_identifier` (scope) |
 | 4 | `epoch` | uint | authoritative freshness epoch |
-| 5 | `structural_version` | uint | bumped by key/config mutations the anchor cannot reconstruct (**construction PINNED-BEFORE-USE — see below**) |
-| 6 | `marks_digest` | bytes(32) | digest of authoritative counter/spend high-water (**construction PINNED-BEFORE-USE — see below**) |
+| 5 | `structural_version` | uint | bumped by key/config mutations the anchor cannot reconstruct (**FROZEN v1 — see below**) |
+| 6 | `marks_digest` | bytes(32) | digest of authoritative counter/spend high-water (**enclave encoder FROZEN v1; cross-component PINNED-BEFORE-ANCHOR-CO-SIGN — see below**) |
 | 7 | `nonce` | bytes(32) | must echo the enclave's fresh per-(re)start challenge |
 | 8 | `chain_height` | uint | **optional**, chain-backed anchor only |
 | 9 | `chain_block_hash` | bytes(32) | **optional**, chain-backed anchor only |
 | 13 | `signature` | bytes(64) | Ed25519 over the preimage above |
 
-**`marks_digest` (key 6) — construction (intended shape; PINNED-BEFORE-USE).** Key 6 is a **signed**
-field that the same-epoch `Fresh` compare (`anchor.marks_digest == local_marks_digest`) already
-consumes, so the anchor signer and enclave MUST derive identical bytes or every reboot fails closed
-(`Inconsistent` — a hard liveness break). The **intended** construction is
-`marks_digest = SHA3-256("2d-hsm/agent-anchor-marks/v1\0" ‖ canonical-CBOR(marks_payload))`, with
-`marks_payload` an RFC 8949 §4.2.1 canonical int-keyed encoding of the authoritative high-water state
-— the capability counter high-water table (per `(authority, scope_class, scope_target)` tuple,
-ascending), the faucet `cumulative_spend`/`lifetime_spend`, and the strict recovery counter. **This is
-provisional:** the exact `marks_payload` map keys, tuple encoding, sort order, integer units, and test
-vectors are pinned by the **seeding slice** (blocking AC) before anything computes or compares a real
-digest. **Adopt-forward delivery:** the digest is the signed *commitment*; the actual `marks_payload`
-is delivered to the enclave alongside the response (a separate payload, since it can be large) and the
-seeding slice MUST recompute its SHA3-256 and check it equals the signed key 6 **before** adopting — so
-a digest-only freshness response already authenticates the later-delivered marks (no unauthenticated
-side channel).
+**`marks_digest` (key 6) — FROZEN v1 enclave grammar** (impl `KeystoreBody::encode_marks_payload` /
+`compute_local_marks_digest`). Key 6 is a **signed** field the same-epoch `Fresh` compare consumes, so
+both sides MUST derive identical bytes or every reboot fails closed (`Inconsistent` — a hard liveness
+break). `marks_digest = SHA3-256("2d-hsm/agent-anchor-marks/v1\0" ‖ marks_payload)` where `marks_payload`
+is hand-built **canonical CBOR** (RFC 8949 §4.2.1 — shortest-form heads, definite length, **not** the
+serde body encoding which renders `[u8;N]` as int-arrays), a 4-key map:
+- **key 1** → array of counter rows, each row the concat `authority (32-byte bstr) ‖ scope_class
+  (CBOR major-0 uint — NOT a raw byte) ‖ scope_target (bstr, length-prefixed) ‖
+  highest_accepted_counter (CBOR uint)`. Rows **sorted ascending** byte-lex on
+  `(authority, scope_class, scope_target)`; `environment_identifier` is **folded out** (it equals
+  `config.environment_identifier` for every row, `validate()`-enforced). The `(authority, scope_class,
+  scope_target)` triple is the unique row key, so the sort is total.
+- **key 2** → `cumulative_native_spend` as a fixed 32-byte bstr (u256-BE), **never** a CBOR uint.
+- **key 3** → `lifetime_spend` as a fixed 32-byte bstr.
+- **key 4** → `strict_recovery_counter` as a CBOR uint.
 
-**`structural_version` (key 5) — definition (PINNED-BEFORE-USE).** `reconcile` already compares the
-local `structural_version` to the anchor's, but the sealed body today carries only `freshness_epoch`.
-The **intended** definition: a `u64` in the `pq-agent-keystore-v1` encrypted body, init `1`, bumped by
-**exactly one** event set — each committed structural mutation that the anchor cannot reconstruct
-(GENERATE_KEYS, and the key/config-changing CONFIGURE_TREASURY sub-ops). **Provisional:** the exact
-sealed field, initial value, the precise bump-event list, the migration rule for existing blobs, and
-test vectors are pinned by the **boot-wiring slice** (blocking AC) before `reconcile` is wired into
-boot. Until then `structural_version` is a design placeholder the verify logic is written against; do
-**not** map it onto `monotonic_treasury_config_version` or any existing field without that decision.
+`monotonic_treasury_config_version` is **excluded** from marks (it is anchor-non-reconstructable
+structural state → it drives `structural_version`; putting it in marks would let a config rollback
+masquerade as an adoptable counter gap). **Genesis golden:** the empty-state `marks_payload` is the
+hand-derived `A4 01 80 02 5820 00*32 03 5820 00*32 04 00` (pinned in a unit test before hashing — no
+self-certifying capture). **Adopt-forward delivery:** the digest is the signed *commitment*; the actual
+`marks_payload` is delivered alongside the response (separate payload — it can be large) and the seeding
+slice MUST recompute SHA3-256 and check equality with the signed key 6 **before** adopting (so a
+digest-only response already authenticates the later-delivered marks). **Anchor data-model requirement
+(to fully FREEZE key 6):** the anchor's authoritative marks model MUST be exactly this row set
+(env folded), identical sort + framing + units, at same-epoch granularity. Key 6 is promoted from
+PINNED-BEFORE-ANCHOR-CO-SIGN to fully FROZEN only on the anchor team's written data-model commitment;
+the enclave encoder is frozen now regardless.
+
+**`structural_version` (key 5) — FROZEN v1.** A `u64` in the `pq-agent-keystore-v1` encrypted body,
+init **1** (never 0 — same-epoch Fresh equality vs a forged 0-anchor; anchor baseline 1 is normative),
+forward-only/never-reset, bumped by **exactly**: each committed GENERATE_KEYS and each key/config-changing
+CONFIGURE_TREASURY sub-op (that handler is deferred; its sub-op classifier MUST be an exhaustive `match`
+with no wildcard so a new sub-op can't default into the wrong class). MUST NOT bump on counter/spend
+advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT be aliased
+onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
+**ATOMICITY/INERT invariant:** the GENERATE_KEYS bump is **LOCAL-ONLY and currently INERT** — it MUST
+advance atomically with `freshness_epoch` + the anchor ack in the deferred seal-before-emit co-slice;
+`reconcile` is unwired at boot, so nothing reads `structural_version` yet (an inert write cannot trigger
+`Inconsistent`).
+
+**`strict_recovery_counter` (marks key 4) — FROZEN v1.** A `u64` in the sealed body, init **0** (genuine
+genesis; anchor baseline 0 normative), forward-only, encoded as a CBOR major-0 uint at marks key 4. Its
+mutators (RESTORE_BACKUP + `reset_lifetime_breaker`) are **deferred**; the field + encoding are frozen
+now so `marks_digest` is complete (this is `agent_capability`'s "independent strict recovery counter").
+
+**Format bump.** Adding `structural_version` + `strict_recovery_counter` to the sealed body is
+`KEYSTORE_FORMAT_VERSION 1 → 2`. v1 **never shipped a real blob** (the only seal site is the
+`agent-keygen-exec-preview`-gated GENERATE_KEYS path), so v2 is a **hard bump with no v1 reader**: the
+pre-decrypt `UnsupportedVersion` rejection (version is AAD-bound) is the entire migration. The frozen
+golden vector was regenerated. `KeystoreBody` fields are feature-invariant (never `#[cfg]`-gated) so the
+golden is single-valued across feature combos.
 
 Strict decode (else `Malformed`): keys ⊆ `{1..=9, 13}`, no duplicates, all required present, fixed
 byte-lengths exact, and keys 8/9 **both-or-neither** (a chain attestation binds to a finalized block).
