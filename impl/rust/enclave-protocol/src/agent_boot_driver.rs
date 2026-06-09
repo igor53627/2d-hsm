@@ -59,7 +59,7 @@
 //! driver with a mock channel + fake quote). The remaining aya/SNP work is split into ordered,
 //! independently-gated slices (see `agent-gateway-anti-rollback.md` §8): **5b-2b** transport+quote leaf
 //! (`VsockBootRelayChannel` fresh-connection-per-call/deadline-bounded + `SnpQuoteProducer` =
-//! `snp_report::fetch_report`, gated `vsock-transport`); **5b-2c** the agent-gateway bin + boot
+//! `snp_report::fetch_report_deadline`, gated `vsock-transport`); **5b-2c** the agent-gateway bin + boot
 //! sequencing (set platform root → unseal the agent keystore → `install_agent_keystore` →
 //! `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve);
 //! **5b-2d** the sealed-blob source + unseal sequencing; **5b-2e** the `AdoptForward` signed raw-marks

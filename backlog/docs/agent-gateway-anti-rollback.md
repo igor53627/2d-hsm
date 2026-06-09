@@ -694,22 +694,27 @@ request golden vector is a 5b-2b test-vector item.
       under the serial loop a slow/wedged pump delays every queued boot by ≤ (per-pump deadline + socket +
       connect timeouts); those bounds are what keep it tolerable — concurrency (and accept-backlog limits)
       is the named follow-up trigger if many enclaves boot at once.
-    - **(c) feature-build CI:** a new `cargo build --features vsock-transport,agent-gateway` step (so the
-      `vsock-transport` leaf can't bit-rot — NOTE: NOT `staging-vsock,agent-gateway`, which fails the
-      `ml-dsa-65 ⊕ agent-gateway` role-isolation `compile_error!` since `staging-vsock` pulls
-      `staging-host`→`ml-dsa-65`).
+    - **(c) feature-build CI:** a new `cargo build --features vsock-transport,agent-gateway` step **on a
+      Linux runner** (the `vsock` crate is Linux-only + all socket code is `#[cfg(target_os = "linux")]`, so
+      a non-Linux runner would compile only the stub and not actually guard the leaf from bit-rot — NOTE:
+      NOT `staging-vsock,agent-gateway`, which fails the `ml-dsa-65 ⊕ agent-gateway` role-isolation
+      `compile_error!` since `staging-vsock` pulls `staging-host`→`ml-dsa-65`).
     - **(d) aya/live-platform tests:** `#[ignore]` acceptance tests (real `fetch_report_deadline` against
       live configfs incl. no-stale-entry-after-timeout; `SO_*TIMEO` getsockopt readback; connect to CID 2)
-      + the hard wall-clock bound for a wedged in-kernel read (worker-thread/process timeout; see the
-      deadline requirement below).
+      + the hard wall-clock bound for a wedged in-kernel read (a CANCELLABLE boundary — killable
+      subprocess / kernel timeout / unique-per-attempt entries, NOT a plain worker thread; see the deadline
+      requirement below). **(d) is the critical-path blocker for a live 5b-2c serve** (a/b/c are
+      necessary-but-insufficient) — do NOT deprioritize it as "last".
 - **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →
   `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
-  `decide_serve(outcome, cfg!(release_build))?` → serve. **Blocked on 5b-2b-ii**, not merely 5b-2b-i:
-  `RelayAnchorTransport::new` needs a concrete `BootRelayChannel` (= `VsockBootRelayChannel`), which
-  5b-2b-ii supplies — so 5b-2c cannot be wired even though 5b-2b-i is done. **Hard precondition (must be a
-  checked task item, not just prose):** 5b-2c MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
-  into the live serve path until 5b-2b-ii(d)'s hard wall-clock quote bound exists — wiring it sooner
-  reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
+  `decide_serve(outcome, cfg!(release_build))?` → serve. Like the daemon (b), 5b-2c needs a **`pub`
+  library boot-sequencing entrypoint** (e.g. `run_agent_gateway_boot(...)`) — the `RelayAnchorTransport` /
+  `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
+  `[[bin]]`. **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
+  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d)** — the
+  hard quote bound. **Hard precondition (a checked task item, not just prose):** the 5b-2c `pub` wrapper
+  MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline` into a *serving* path until (d) exists — wiring
+  it sooner reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
 - **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
@@ -725,11 +730,12 @@ verify+driver+transport composition end-to-end (including the response wire fram
 5b-2b-i is merged but 5b-2b-ii is not, NO production boot path can hang on a wedged quote fetch — because
 there is no current caller**: the quote producer + relay transport are `#[cfg_attr(not(test),
 allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). The best-effort-deadline
-`fetch_report_deadline` is now **`pub(crate)`**, so the "MUST NOT be wired into a live serve/boot path
-before 5b-2b-ii's hard wall-clock bound lands" obligation is **type-enforced against any out-of-crate
-caller** (a compile error, not just prose); the only in-crate caller is `SnpQuoteProducer::fetch`, itself
-dead-code until 5b-2c. (The unbounded producer `fetch_report` stays `pub` — it has no wall-clock contract
-to violate.)
+`fetch_report_deadline` is `pub(crate)` (+ `agent-gateway`-gated), which **prevents any out-of-crate caller
+from reaching it at all** (a compile error). This is a *coarser* guarantee than the (d)-gate, NOT a
+substitute for it: it does NOT type-enforce "no live wire until (d)" — an in-crate 5b-2c wrapper could
+still call it. So the (d)-precondition on that wrapper (below) remains a **checklist obligation**, not a
+compile error. (The unbounded producer `fetch_report` stays `pub` — it has no wall-clock contract to
+violate.)
 
 **5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
 MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
@@ -747,13 +753,15 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   attempt's `create_dir` collides). 5b-2b-ii MUST therefore use one of: (i) a **killable subprocess**
   helper (SIGKILL on timeout), (ii) a kernel-supported read timeout if one exists, or (iii) **unique
   per-attempt configfs entry names** + an explicit abort/leak policy (bounded stuck-reader budget; refuse
-  boot past a threshold). Acceptance criteria: **"no stuck worker/process accumulation across repeated
-  timeouts"** and **"a subsequent attempt is well-defined (no entry collision) after a timeout"**, plus the
-  aya test that a wedged provider fails the attempt promptly rather than hanging boot. This matters in the
-  **partial-landing window** where 5b-2b-ii(a)/(b) (channel + daemon) have landed — so 5b-2c is no longer
-  blocked and a live boot path can exist — but (d)'s hard bound has not: in that window the boot serve-gate
-  (5b-2c) MUST treat the quote-fetch deadline as best-effort (and per the 5b-2c precondition, not wire it
-  live at all until (d) lands).
+  boot past a threshold) — NOTE option (iii) is incompatible with the current fixed-`twod-hsm` start-of-
+  attempt stale-clear (a wedged reader's unique entry is not reclaimed by it), so (iii) MUST add orphan-
+  entry GC; (i)/(ii) keep the fixed-name clear valid and are preferred. Acceptance criteria: **"no stuck
+  process accumulation across repeated timeouts"** and **"a subsequent attempt is well-defined (no entry
+  collision) after a timeout"**, plus the aya test that a wedged provider fails the attempt promptly rather
+  than hanging boot. **This is the live-serve blocker:** 5b-2b-ii(a)/(b) only unblock 5b-2c
+  *construction/compilation* (the concrete channel exists); a **live anti-rollback serve path requires (d)**.
+  There is no "wire it live but best-effort" window — the cooperative deadline is best-effort *within* the
+  attempt, but a live serving 5b-2c MUST wait for (d) (the wedged-read hang is otherwise reachable).
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
   is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout`; total boot ≤
   `max_attempts · 2 · timeout`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own

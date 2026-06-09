@@ -243,8 +243,9 @@ pub(crate) trait BootRelayChannel {
 }
 
 /// The SNP-quote seam: fetch a quote committing to `report_data`, returning `(report, cert_chain)`. The
-/// real (5b-2b) impl delegates to `snp_report::fetch_report` (local configfs-tsm file I/O); the test fake
-/// records the `report_data` it was handed (proving the quote↔nonce binding).
+/// real impl ([`SnpQuoteProducer`]) delegates to the deadline-bounded `snp_report::fetch_report_deadline`
+/// (local configfs-tsm file I/O), NOT the unbounded producer `fetch_report`; the test fake records the
+/// `report_data` it was handed (proving the quote↔nonce binding).
 ///
 /// **`deadline` bounds the quote fetch's own wall-clock** (`RelayAnchorTransport` gives this leg its own
 /// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't starve
@@ -270,8 +271,9 @@ pub(crate) trait BootQuoteProducer {
 ///
 /// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
 /// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2 * timeout` wall-clock (the
-/// driver's `max_attempts` count bound caps total boot at `max_attempts * 2 * timeout`). 5b-2b MAY split
-/// this into separate `quote_timeout` / `relay_timeout` if the two legs want different budgets.
+/// driver's `max_attempts` count bound caps total boot at `max_attempts * 2 * timeout`). The single-budget
+/// model is final for 5b-2b; splitting into distinct `quote_timeout` / `relay_timeout` is deferred to
+/// 5b-2c (see §8) — and is best-effort regardless until 5b-2b-ii's hard quote bound lands.
 pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel> {
     quote: Q,
     channel: C,
