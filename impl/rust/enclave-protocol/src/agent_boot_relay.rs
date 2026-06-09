@@ -199,8 +199,9 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
 /// is configured with a read timeout (`SO_RCVTIMEO`) or non-blocking mode — the deadline is re-checked
 /// between/around `read` syscalls, but a fully-blocking `read` that never returns is not interruptible
 /// here. `VsockBootRelayChannel` satisfies this via `DeadlineSocket` (both Linux/vsock-gated), which
-/// reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the remaining budget before every read/write (connect is the watchdog
-/// soft-bound, obligation (a')). Its `#[ignore]` aya tests verify the bound **behaviorally** —
+/// reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the remaining budget before every read/write (connect is a
+/// separate hard, cancellable bound — obligation (a'), DONE: non-blocking connect + `poll(POLLOUT)` to the
+/// deadline, see [`connect_bounded`]). Its `#[ignore]` aya tests verify the bound **behaviorally** —
 /// `SO_RCVTIMEO` via a stalled-peer read that times out within budget, the connect bound via a prompt
 /// connect-failure. (`SO_SNDTIMEO` is set but not behaviorally exercised: a small request frame never fills
 /// the send buffer, so `write_all` doesn't block; a getsockopt readback of the option values would need
@@ -489,14 +490,14 @@ fn connect_bounded(
     let addr = VsockAddr::new(host_cid, port);
     match connect(fd.as_raw_fd(), &addr) {
         Ok(()) => {} // connected synchronously (uncommon for a non-blocking connect)
-        Err(nix::errno::Errno::EINPROGRESS) => {
-            // Connect in flight — wait (cancellably) for it to complete. `poll_with_deadline` returns
-            // `Ok(revents)` even for error-readiness (POLLERR/HUP/NVAL), so a bare `Ok(_)` is NOT success:
-            // require POLLOUT AND no error flags. On lapse it returns Err and `fd` drops below.
+        // EINPROGRESS = connect in flight; EINTR = interrupted but the attempt WAS initiated (connect(2):
+        // "completed asynchronously") — both recover by polling POLLOUT.
+        Err(nix::errno::Errno::EINPROGRESS) | Err(nix::errno::Errno::EINTR) => {
+            // Wait (cancellably) for completion. `poll_with_deadline` returns `Ok(revents)` even for
+            // error-readiness (POLLERR/HUP/NVAL), so a bare `Ok(_)` is NOT success — `poll_ready_for`
+            // requires POLLOUT AND no error flag. On lapse it returns Err and `fd` drops below.
             let revents = crate::cancellable_boundary::poll_with_deadline(&fd, PollFlags::POLLOUT, deadline)?;
-            if !revents.contains(PollFlags::POLLOUT)
-                || revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-            {
+            if !crate::cancellable_boundary::poll_ready_for(revents, PollFlags::POLLOUT) {
                 return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed (poll)"));
             }
         }
@@ -1472,7 +1473,8 @@ mod vsock_aya_tests {
     }
 
     /// Connect to an endpoint with no listener under a short deadline: must fail (retryable) PROMPTLY,
-    /// never hang — proves the watchdog-thread connect bound + that all failures fold to a retryable error.
+    /// never hang — proves the (a') cancellable connect bound (non-blocking connect + `poll(POLLOUT)` to the
+    /// deadline) + that all failures fold to a retryable error.
     #[test]
     #[ignore]
     fn vsock_channel_connect_failure_is_prompt_and_retryable() {
@@ -1482,7 +1484,7 @@ mod vsock_aya_tests {
         assert!(r.is_err(), "connect to a dead endpoint must error, not hang");
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "must fail within ~the budget (watchdog bound), not block on connect"
+            "must fail within ~the budget ((a') poll(POLLOUT) bound), not block on connect"
         );
     }
 

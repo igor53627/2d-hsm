@@ -89,6 +89,17 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
     }
 }
 
+/// True iff `revents` is a CLEAN readiness for `want` (the requested event set AND no error condition).
+/// The reusable form of the `Ok(revents)` contract above: `revents` containing `want` is NOT enough —
+/// `POLLERR`/`POLLHUP`/`POLLNVAL` (reported regardless of `want`) mean the fd is broken/closed. Both
+/// poll consumers use this — (a') connect with `want = POLLOUT`, (d) quote-pipe with `want = POLLIN` — so
+/// the success predicate can't drift between them.
+pub(crate) fn poll_ready_for(revents: nix::poll::PollFlags, want: nix::poll::PollFlags) -> bool {
+    use nix::poll::PollFlags;
+    revents.contains(want)
+        && !revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +174,22 @@ mod tests {
             rv.intersects(PollFlags::POLLHUP | PollFlags::POLLIN),
             "expected a closed/readable signal (POLLHUP and/or POLLIN), got {rv:?}"
         );
+    }
+
+    #[test]
+    fn poll_ready_for_requires_want_and_rejects_error_flags() {
+        use PollFlags as P;
+        // Clean readiness for the requested event -> true.
+        assert!(poll_ready_for(P::POLLOUT, P::POLLOUT), "bare POLLOUT must be ready");
+        assert!(poll_ready_for(P::POLLIN, P::POLLIN), "bare POLLIN must be ready");
+        // want present but ALSO carries an error condition -> false (the (a') connect-failure case:
+        // a failed non-blocking connect can surface POLLOUT|POLLERR; treating it as ready would skip
+        // the SO_ERROR check). Cover each error flag.
+        assert!(!poll_ready_for(P::POLLOUT | P::POLLERR, P::POLLOUT), "POLLERR must veto readiness");
+        assert!(!poll_ready_for(P::POLLOUT | P::POLLHUP, P::POLLOUT), "POLLHUP must veto readiness");
+        assert!(!poll_ready_for(P::POLLOUT | P::POLLNVAL, P::POLLOUT), "POLLNVAL must veto readiness");
+        // want absent -> false even on an otherwise-clean revents (e.g. POLLIN when we asked POLLOUT).
+        assert!(!poll_ready_for(P::POLLIN, P::POLLOUT), "missing want must not be ready");
+        assert!(!poll_ready_for(P::empty(), P::POLLOUT), "empty revents must not be ready");
     }
 }

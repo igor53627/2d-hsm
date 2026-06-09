@@ -673,7 +673,7 @@ request golden vector is a 5b-2b test-vector item.
     rule's load-bearing intent is **keep (b) daemon fault-semantics out of the vsock-integration PR** —
     preserved: (b) is still open. PR #54 co-landed (0)+(a)+(c) because (0) is a test-only frozen vector and
     (c) is a one-line CI guard for (a) — neither is a separate review surface from the channel; (b) was NOT
-    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') tracked; (b), (d) open.**
+    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') DONE (PR #56); (b), (d) open.**
     - **(0) canonical golden vector — DONE PR #54 (BLOCKS (a)+(b)):** committed
       `testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin` (+ `.json` manifest with a
       hand-auditable byte breakdown); the agent-gateway CI test asserts byte-exact `encode==golden` AND
@@ -692,26 +692,29 @@ request golden vector is a 5b-2b test-vector item.
       "Exact-bound caveat" below: no once-set socket timeout, so a late syscall can't overrun the leg) →
       `relay_round_trip_over_stream`; blanket-maps all `ProtocolError`→retryable. Compile- AND runtime-
       validated on aya (real vsock loopback: happy round-trip, prompt connect-failure, stalled-peer
-      read-timeout — all `#[ignore]`). **Connect bound is a watchdog-thread soft bound** (vsock 0.5 has no
-      `connect_with_timeout`; poll/libc is off-limits under `forbid(unsafe_code)`): bounded by the deadline
-      via `recv_timeout`, but a truly-wedged connect leaks one thread+fd per attempt (bounded by
-      `max_attempts` — so the worst-case simultaneous leaked thread+fd count on the guest is `max_attempts`,
-      relevant for fd-budget sizing; OS-reaped). **TRACKED OBLIGATION (a'): cancellable hard connect bound**
-      — a nonblocking-connect+poll (the `cancellable_boundary::poll_with_deadline` primitive landed in PR-A
-      exists for exactly this), eliminating the leak; its OWN item, NOT collapsed into the quote (d) bound.
-      **Acceptance criteria (pinned now PR-A's primitive exists, so (a') just consumes it):** (1) create a
-      NON-blocking vsock `SOCK_STREAM` fd directly via `nix::sys::socket::socket(AddressFamily::Vsock,
-      SockType::Stream, SOCK_NONBLOCK|SOCK_CLOEXEC, None)` — NOT vsock 0.5's `VsockSocket` (that is
-      `SOCK_DGRAM`); (2) `connect` (expect `EINPROGRESS`); (3) `poll_with_deadline(&fd, POLLOUT, deadline)`;
-      (4) **connect-success check = `revents.contains(POLLOUT) && !revents.intersects(POLLERR|POLLHUP|POLLNVAL)
-      && getsockopt(SocketError)==0`** (a bare `Ok(_)` is NOT success — see the primitive's contract); a
-      small `connect_succeeded(revents, fd)` helper is worth extracting; (5) promote the `OwnedFd` to
-      `VsockStream` via `From<OwnedFd>`; RAII fd drop on every path — no thread, no leak. Needs the nix
-      `socket` feature added alongside `poll`. aya acceptance: connect-to-dead-endpoint fails promptly via
-      the poll timeout (no thread leak); a loopback connect round-trips. **HARD PRECONDITION for a live 5b-2c
-      serve (a checked task item, mirroring (d)):** 5b-2c MUST either (i) land (a'), or (ii) record an
-      EXPLICIT operational risk-acceptance of the bounded leak with concrete retry/thread/fd bounds — it may
-      NOT silently rely on the watchdog connect path under a black-holing host. (Not merely "should".)
+      read-timeout — all `#[ignore]`). **Connect bound: cancellable hard bound (a') — DONE PR #56** (the
+      original PR #54 connect used a watchdog-thread soft-bound; that is now SUPERSEDED — historical note
+      below). **(a') cancellable hard connect bound — DONE PR #56:** [`connect_bounded`] creates a NON-blocking
+      vsock `SOCK_STREAM` fd directly (`nix::sys::socket`) and waits via
+      `cancellable_boundary::poll_with_deadline(POLLOUT, deadline)`; on a deadline lapse the `poll` returns and
+      the `OwnedFd` drops in-scope (closing the fd, aborting the connect) — **no watchdog thread, no leaked
+      fd**, eliminating the earlier `max_attempts`-bounded thread+fd leak. Its OWN item, NOT collapsed into the
+      quote (d) bound. **Acceptance criteria (all MET):** (1) NON-blocking vsock `SOCK_STREAM` fd via
+      `nix::sys::socket::socket(AddressFamily::Vsock, SockType::Stream, SOCK_NONBLOCK|SOCK_CLOEXEC, None)` —
+      NOT vsock 0.5's `VsockSocket` (that is `SOCK_DGRAM`); (2) `connect` (expect `EINPROGRESS`; `EINTR` also
+      means the connect was initiated → poll); (3) `poll_with_deadline(&fd, POLLOUT, deadline)`; (4)
+      **connect-success check = `poll_ready_for(revents, POLLOUT)` (= `revents.contains(POLLOUT) &&
+      !revents.intersects(POLLERR|POLLHUP|POLLNVAL)`) AND `getsockopt(SocketError)==0`** (a bare `Ok(_)` is NOT
+      success — see the primitive's contract); the shared `poll_ready_for` helper lives in
+      `cancellable_boundary` (reused by the (d) quote pipe so the predicate can't drift); (5) promote the
+      `OwnedFd` to `VsockStream` via `From<OwnedFd>`, then `set_nonblocking(false)` so `DeadlineSocket`'s
+      `SO_*TIMEO` take effect; RAII fd drop on every path — no thread, no leak. Needs the nix `socket` feature
+      alongside `poll` (both added). aya acceptance (MET): connect-to-dead-endpoint fails promptly via the poll
+      timeout (no thread leak); a loopback connect round-trips. **HARD PRECONDITION for a live 5b-2c serve
+      (mirroring (d)) — SATISFIED:** (a') is landed, so 5b-2c no longer needs the risk-acceptance fallback for
+      the connect leg. *(Historical: the PR #54 watchdog soft-bound was bounded by the deadline via
+      `recv_timeout` but leaked one thread+fd per truly-wedged connect, bounded by `max_attempts`; that path is
+      now removed.)*
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
       LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
       because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
@@ -749,23 +752,23 @@ request golden vector is a 5b-2b test-vector item.
   library boot-sequencing entrypoint** (e.g. `run_agent_gateway_boot(...)`) — the `RelayAnchorTransport` /
   `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
   `[[bin]]`. **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
-  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on BOTH 5b-2b-ii(d) AND
-  (a')** — (d) = the hard quote bound; (a') = the cancellable hard CONNECT bound (or an explicit operational
-  risk-acceptance of the watchdog thread/fd leak). **Two hard preconditions for a live 5b-2c serve (make
-  them ENFORCEABLE artifacts, not just checklist lines):**
+  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d)** — (d) =
+  the hard quote bound. (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
+  no longer gates the live serve. **Hard precondition remaining for a live 5b-2c serve (make it an
+  ENFORCEABLE artifact, not just a checklist line):**
   1. **(d) quote bound** — the 5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
      into a *serving* path until (d) exists; prefer a structural gate (have (d) introduce a
      `HardBoundedQuoteProducer` type the wrapper requires by signature, so a build lacking (d) **cannot
      construct** the serving path — a compile error, not an omittable runtime/`cfg` check). Wiring it sooner
      reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
-  2. **(a') connect bound** — 5b-2c MUST NOT ship a live serve over the watchdog soft-bound connect under a
-     black-holing host without EITHER (a') (cancellable connect) OR a recorded operational risk-acceptance
-     stating the leak bound (see below). Same enforceable-artifact preference.
-  **Leak-bound scope (define for the (a') risk-acceptance):** the thread/fd leak is **per wedged connect
-  ATTEMPT**, so within ONE boot the worst case is `max_attempts` simultaneous leaked thread+fd (the driver's
-  `max_attempts`, ceiling 64) until kernel-reaped. Across repeated boot invocations in one process (restart
-  loops) it is bounded by `max_attempts` per invocation × the restart count, so 5b-2c MUST either land (a')
-  or impose a boot-attempt backoff/cap so a sustained black-hole can't exhaust the guest fd table.
+  2. **(a') connect bound — SATISFIED (PR #56).** [`connect_bounded`] is a non-blocking connect +
+     `poll_with_deadline(POLLOUT)` cancellable hard bound: deadline lapse drops the `OwnedFd`, no thread/fd
+     leak. The earlier requirement (land (a') OR record an operational risk-acceptance of the watchdog leak)
+     is met by landing (a'); the leak-bound risk-acceptance fallback is no longer needed.
+  *(Historical leak-bound scope — moot now (a') is landed: the PR #54 watchdog thread/fd leak was **per
+  wedged connect ATTEMPT**, worst case `max_attempts` simultaneous leaked thread+fd per boot (driver
+  `max_attempts`, ceiling 64) until kernel-reaped, × restart count across boots. (a') removes the leak
+  entirely, so no boot-attempt backoff/cap is needed on the connect leg for fd-table safety.)*
 - **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
@@ -825,7 +828,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   leg `timeout` — otherwise a single blocked in-flight syscall could overrun a leg by up to one socket
   timeout. `VsockBootRelayChannel` achieves this via `DeadlineSocket`, which reapplies the timeout =
   remaining-budget before EVERY read/write (not once), so the channel-I/O leg is tightly bounded by the
-  deadline. (Connect is the watchdog soft-bound (a'); see above.) **Per-leg sizing floor (5b-2c):** the
+  deadline. (Connect is the cancellable hard bound (a') — DONE PR #56: non-blocking connect + `poll(POLLOUT)`
+  to the deadline; see above.) **Per-leg sizing floor (5b-2c):** the
   per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
   both (a connect that nearly exhausts it yields a retryable lapse before I/O — a wasted attempt), AND MUST
   satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
@@ -835,10 +839,11 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `timeout` = the per-leg `Duration` 5b-2c gives `RelayAnchorTransport::new`; `overall_boot_budget` = a NEW
   5b-2c operator config (the total wall-clock the platform allows for boot before fail-closed). 5b-2c MUST
   pick `max_attempts`/`timeout` so the product respects its own `overall_boot_budget`.
-- **Socket-timeout precondition — DONE in (a) for read/write; connect via (a').** `read_bounded_anchor_response`'s
+- **Socket-timeout precondition — DONE in (a) for read/write; connect via (a') DONE PR #56.** `read_bounded_anchor_response`'s
   deadline is only enforceable if the stream has `SO_RCVTIMEO`/non-blocking set. `VsockBootRelayChannel`
   sets `SO_RCVTIMEO` + `SO_SNDTIMEO` (per-syscall via `DeadlineSocket`); the **connect** bound is the
-  watchdog soft-bound, with the cancellable hard bound deferred to **(a')**. **What the aya tests actually
+  cancellable hard bound **(a') — DONE PR #56** (non-blocking connect + `poll(POLLOUT)` to the deadline via
+  [`connect_bounded`], `set_nonblocking(false)` afterwards so `SO_*TIMEO` apply to I/O). **What the aya tests actually
   verify (behavioral, not getsockopt):** `SO_RCVTIMEO` via a stalled-peer read that times out within budget;
   the connect bound via a prompt connect-failure. `SO_SNDTIMEO` is set but NOT behaviorally exercised (a
   small request frame never fills the send buffer, so `write_all` doesn't block); a getsockopt readback of
