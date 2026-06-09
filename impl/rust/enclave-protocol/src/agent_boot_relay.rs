@@ -998,7 +998,12 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
             if self.reads >= 2 {
-                while std::time::Instant::now() < self.spin_until {} // cross the deadline during the body read
+                // Sleep (don't spin a core) until the deadline is crossed; the caller's generous margin
+                // makes the post-read pre-write guard fire deterministically even under CI scheduler jitter.
+                let now = std::time::Instant::now();
+                if now < self.spin_until {
+                    std::thread::sleep(self.spin_until - now);
+                }
             }
             std::io::Read::read(&mut self.to_read, buf)
         }
@@ -1020,7 +1025,7 @@ mod tests {
         let (nonce, rd) = request_for([0x52; 32]);
         let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
         let req_frame = encode_anchor_boot_request(&[0xa5; 8], &[], &req).unwrap();
-        let dl = std::time::Instant::now() + Duration::from_millis(5);
+        let dl = std::time::Instant::now() + Duration::from_millis(50);
         let mut enclave = DeadlineCrossingStream {
             to_read: std::io::Cursor::new(req_frame),
             written: Vec::new(),

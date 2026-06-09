@@ -38,6 +38,9 @@ pub(crate) const MAX_CERT_CHAIN_LEN: usize = 64 * 1024;
 /// (version 5); 8 KiB is ample headroom for future report versions and matches the relay-path quote bound
 /// (`agent_boot_relay::MAX_QUOTE_REPORT_LEN`). Enforced cap-before-alloc on the configfs read so a buggy/
 /// wedged provider cannot force an unbounded heap allocation in the memory-constrained TEE.
+///
+/// Independent of `agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN` (4 KiB): that bounds the *signed response*
+/// the relay returns, a different artifact on the other leg — the two caps need not track each other.
 pub(crate) const MAX_OUTBLOB_LEN: usize = 8192;
 
 /// Extract the 48-byte launch measurement from a raw SNP `ATTESTATION_REPORT`.
@@ -442,7 +445,14 @@ mod tests {
         fn create_entry(&self, _entry: &str) -> Result<(), ProtocolError> {
             self.calls.borrow_mut().push("create");
             if let Some(t) = self.create_spin_until {
-                while Instant::now() < t {} // deterministic: cross the deadline during this op
+                // Sleep (don't burn a core) until the deadline is crossed, so the post-create check trips
+                // deterministically. The caller's generous margin dwarfs any plausible scheduler preemption
+                // between computing the deadline and the outer fast-path check, so the mid-sequence path is
+                // hit reliably even on a loaded CI box.
+                let now = Instant::now();
+                if now < t {
+                    std::thread::sleep(t - now);
+                }
             }
             if self.create_ok {
                 Ok(())
@@ -557,7 +567,7 @@ mod tests {
         // deadline-lapse *between* fs ops (not just an op-error path). The trailing "remove" proves no
         // stale entry leaks even when the timeout lands mid-sequence; write/outblob/aux never run.
         let mut fs = FakeTsmFs::ok();
-        let dl = Instant::now() + Duration::from_millis(5);
+        let dl = Instant::now() + Duration::from_millis(50);
         fs.create_spin_until = Some(dl);
         let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(dl));
         assert_eq!(err_msg(r), "SNP quote fetch deadline exceeded");

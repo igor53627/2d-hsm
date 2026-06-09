@@ -667,12 +667,23 @@ request golden vector is a 5b-2b test-vector item.
     `validate_vsock_listen_addr`.
   - **5b-2b-ii (aya leaf, deferred)** — independently-reviewable sub-items (split so a single PR doesn't
     mix vsock integration, daemon fault semantics, and acceptance infra; review each obligation on its own):
+    - **(0) canonical golden vector (BLOCKS (a)+(b)):** commit the `AgentBootRelay` canonical-request byte
+      vector to `testvectors/agent-gateway/` FIRST, so the channel + daemon (and any external relay
+      reimplementation) are built against frozen bytes, not prose. NOTE: 5b-2b-i's `relay_forward_once`
+      tests assert against frames built by the *canonical encoder* (`encode_anchor_boot_request`) — which
+      IS the vector's source of truth, so the core is correct — but the frozen vector is what an external
+      relay/anchor must reimplement against, and it is the byte-level regression anchor for the
+      `relay ⊇ anchor` decode-leniency invariant; it was an implicit precondition not met by 5b-2b-i.
     - **(a) channel socket wrapper:** the concrete `VsockBootRelayChannel` (`VsockStream::connect` to
       `VMADDR_CID_HOST`, fresh-per-call, `SO_RCVTIMEO`/`SO_SNDTIMEO`+connect-timeout, delegates to the
       CI-proven `relay_round_trip_over_stream`).
-    - **(b) host relay daemon:** the `host_anchor_relay` bin looping `relay_forward_once`, owning the
-      Err→close mapping + the operator-triage logging (oversize/malformed/timeout) — see the host-relay
-      daemon requirement below.
+    - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
+      LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
+      because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
+      `relay_forward_once`/`frame_anchor_response` cores directly (it would otherwise duplicate the
+      framing/decoder and risk codec drift). The wrapper owns the Err→close mapping + operator-triage
+      logging (oversize/malformed/timeout) + a **serial accept loop** (one deadline-bounded pump at a time;
+      revisit only if concurrent enclave boots need it) — see the host-relay daemon requirement below.
     - **(c) feature-build CI:** a new `cargo build --features vsock-transport,agent-gateway` step (so the
       `vsock-transport` leaf can't bit-rot — NOTE: NOT `staging-vsock,agent-gateway`, which fails the
       `ml-dsa-65 ⊕ agent-gateway` role-isolation `compile_error!` since `staging-vsock` pulls
@@ -698,10 +709,13 @@ timeouts are validated on aya. Still **UNWIRED**
 support** (else 5a/5b-1/5b-2a ship dead). 5b-2a is the LAST pure layer — its tests already drive the full
 verify+driver+transport composition end-to-end (including the response wire framing via
 `driver_ready_through_real_response_framing`), so the accumulation bottoms out here. **In the window where
-5b-2b-i is merged but 5b-2b-ii is not, NO production boot path can hang on a wedged quote fetch**: the
-quote producer + relay transport are `#[cfg_attr(not(test), allow(dead_code))]` and reached only by the
-5b-2c bin (not yet built), so the best-effort-deadline caveat above has no live exposure until 5b-2c +
-5b-2b-ii land together.
+5b-2b-i is merged but 5b-2b-ii is not, NO production boot path can hang on a wedged quote fetch — because
+there is no current caller**: the quote producer + relay transport are `#[cfg_attr(not(test),
+allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). NOTE this is a
+call-graph guarantee, not a type-enforced one — `fetch_report_deadline` is `pub fn` (crate-public), so the
+obligation is explicit: **`fetch_report_deadline` MUST NOT be wired into any serve-gate / live boot path
+before 5b-2b-ii's hard wall-clock bound lands.** A future in-repo or out-of-tree caller that ignores this
+would silently reintroduce the hang risk.
 
 **5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
 MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
@@ -713,10 +727,16 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   works — pinned by `fetch_cleans_up_on_mid_sequence_deadline_timeout`). **Hard wall-clock bound — STILL
   DEFERRED (tracked here):** a single in-kernel blocking `read(outblob)` cannot be interrupted under
   `#![forbid(unsafe_code)]`, so the cooperative deadline is **best-effort, NOT a guaranteed ceiling against
-  a wedged kernel/configfs provider.** A true hard bound needs a worker-thread / process-isolation /
-  kernel-supported timeout — 5b-2b-ii MUST add it, plus an aya acceptance test that a wedged provider fails
-  the attempt promptly rather than hanging boot, and the boot serve-gate (5b-2c) MUST size its own timeouts
-  treating the quote-fetch deadline as best-effort until then.
+  a wedged kernel/configfs provider.** A true hard bound needs a **cancellable boundary** — and a plain
+  worker thread is NOT sufficient: it cannot cancel a wedged `read(outblob)`, it can only *abandon* a stuck
+  thread, which leaks the thread AND leaves the fixed `twod-hsm` configfs entry in use (so the next
+  attempt's `create_dir` collides). 5b-2b-ii MUST therefore use one of: (i) a **killable subprocess**
+  helper (SIGKILL on timeout), (ii) a kernel-supported read timeout if one exists, or (iii) **unique
+  per-attempt configfs entry names** + an explicit abort/leak policy (bounded stuck-reader budget; refuse
+  boot past a threshold). Acceptance criteria: **"no stuck worker/process accumulation across repeated
+  timeouts"** and **"a subsequent attempt is well-defined (no entry collision) after a timeout"**, plus the
+  aya test that a wedged provider fails the attempt promptly rather than hanging boot. Until it lands, the
+  boot serve-gate (5b-2c) MUST treat the quote-fetch deadline as best-effort.
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
   is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout`; total boot ≤
   `max_attempts · 2 · timeout`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
@@ -743,8 +763,11 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   invariant:** `relay_forward_once` rejects a malformed request via `decode_anchor_boot_request` *before*
   an anchor round-trip — this relay-side gate MUST stay **at least as lenient as the anchor's own
   acceptance**, else a request the anchor would have honored becomes a relay `Err` → retryable close that
-  silently burns the enclave's attempt budget toward a false terminal. Today both sides share the one
-  lenient decoder; any future anchor-side schema change MUST preserve `relay ⊇ anchor` leniency.
+  silently burns the enclave's attempt budget toward a false terminal. If the anchor is the SAME process
+  reusing `decode_anchor_boot_request`, `relay ⊇ anchor` holds trivially. If the anchor is a **separate
+  service** (the likely deployment), this is a **cross-component sync obligation, not a present fact**: the
+  5b-2b-ii(0) canonical golden vector is the contract that pins it — the anchor MUST accept every request
+  the relay's decoder accepts, regression-tested against that vector.
 - **Canonical request golden vector** — add an `AgentBootRelay` canonical-request test vector to
   `testvectors/agent-gateway/` **before** any host-daemon/channel implementation, so external/later relay
   work implements against bytes, not prose (the encoder is canonical; the decoder is lenient).
@@ -753,10 +776,13 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   oracle-grade detail over the serve APIs (boot-time, operator-facing only).
 - **Profile uniformity** — the relay CID/port (`DEFAULT_ANCHOR_RELAY_PORT=5001` / `TWOD_HSM_ANCHOR_RELAY_PORT`)
   applies uniformly across lab/staging/production; a misconfiguration surfaces as a clear fail-closed boot
-  error, never a silent wrong-endpoint connect. **Authoritative statement on the relay-vs-serve port
-  relationship (no "must differ" requirement):** the relay endpoint is `(VMADDR_CID_HOST=2, relay_port)`
-  while the serve listener binds the *guest* CID, so the two are **already distinct endpoints even at the
-  same port number — there is no CID-level bind collision, ever.** The `+1` default and
-  `validate_relay_port`'s reject-same-as-serve-port are therefore purely an **operator-ergonomics guard**
-  against confusing the two numbers; they are NOT a safety-critical invariant, and nothing downstream may
-  treat `relay_port != serve_port` as one.
+  error, never a silent wrong-endpoint connect. **Authoritative relay-vs-serve port policy (code + doc now
+  agree):** there is **no CID-level bind collision, ever** — the relay endpoint is
+  `(VMADDR_CID_HOST=2, relay_port)` while the serve listener binds the *guest* CID, so the two are already
+  distinct endpoints even at the same port *number*. Nonetheless `validate_relay_port` (called by
+  `anchor_relay_port_from_env`) **does fail-closed-reject `relay_port == serve_port`** as a deliberate
+  operator-ergonomics guard against confusing the two numbers. So the policy is: **distinct port numbers
+  ARE enforced (fail-closed) at the env-config layer** — code downstream of `anchor_relay_port_from_env`
+  may rely on `relay_port != serve_port` because the resolver guaranteed it — but this enforcement is an
+  ergonomics CHOICE, not a CID-collision safety necessity (equal numbers would be harmless; we forbid the
+  confusing config anyway). The `+1` default keeps the common case clear of the guard entirely.
