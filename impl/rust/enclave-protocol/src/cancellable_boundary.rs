@@ -27,16 +27,16 @@ use std::time::{Duration, Instant};
 /// 0.5 (not "no timeout") and a sub-µs `Duration` could round to a 0 = infinite `timeval` — the floor
 /// avoids both. ((a) is irrelevant to the `poll` consumer, where `PollTimeout::ZERO` is a valid
 /// return-immediately; only (b) binds there.)
-pub(crate) const MIN_SOCKET_BUDGET: Duration = Duration::from_millis(1);
+pub(crate) const MIN_BOUNDARY_BUDGET: Duration = Duration::from_millis(1);
 
-/// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed / below [`MIN_SOCKET_BUDGET`].
+/// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed / below [`MIN_BOUNDARY_BUDGET`].
 /// Single `now` sample; `checked_duration_since` is `None` when `deadline < now`. Anything below the floor
 /// folds to the retryable lapse error, so no caller ever arms a zero/sub-ms socket/poll timeout. The error
 /// string is subsystem-neutral because this helper is shared by the boot-relay channel AND the generic
 /// `poll_with_deadline` primitive (e.g. the 5b-2b-ii(d) quote-subprocess pipe).
 pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, ProtocolError> {
     match deadline.checked_duration_since(Instant::now()) {
-        Some(d) if d >= MIN_SOCKET_BUDGET => Ok(d),
+        Some(d) if d >= MIN_BOUNDARY_BUDGET => Ok(d),
         _ => Err(ProtocolError::WireProtocol("deadline lapsed")),
     }
 }
@@ -102,7 +102,7 @@ mod tests {
     fn remaining_or_lapsed_past_future_subms() {
         assert!(remaining_or_lapsed(past()).is_err());
         assert!(remaining_or_lapsed(future()).is_ok());
-        // sub-MIN_SOCKET_BUDGET (~0.5ms) folds to lapsed.
+        // sub-MIN_BOUNDARY_BUDGET (~0.5ms) folds to lapsed.
         let near = Instant::now() + Duration::from_micros(500);
         assert!(remaining_or_lapsed(near).is_err(), "sub-1ms residual must be treated as lapsed");
     }

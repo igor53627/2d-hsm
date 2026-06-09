@@ -453,7 +453,7 @@ pub(crate) struct VsockBootRelayChannel {
     port: u32,
 }
 
-// `remaining_or_lapsed` (the deadline→remaining-budget helper, with the MIN_SOCKET_BUDGET floor) now lives
+// `remaining_or_lapsed` (the deadline→remaining-budget helper, with the MIN_BOUNDARY_BUDGET floor) now lives
 // in `crate::cancellable_boundary` so it is shared with the `poll_with_deadline` cancellable primitive.
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use crate::cancellable_boundary::remaining_or_lapsed;

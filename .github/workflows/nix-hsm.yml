@@ -58,6 +58,8 @@ jobs:
       # in-memory relay framing/forward cores — while still COMPILING the #[ignore] vsock tests so the leaf
       # can't bit-rot. This runs on ubuntu-latest (Linux). NOT `staging-vsock,agent-gateway` (that pulls
       # ml-dsa-65 and trips the `ml-dsa-65 ⊕ agent-gateway` role-isolation compile_error).
+      # INVARIANT: any test under `vsock-transport` that needs a live vsock DEVICE (connect/bind) MUST be
+      # `#[ignore]` (runs on aya only) — this runner has no vsock device, so a non-ignored device test fails.
       - name: Agent Gateway vsock boot-relay leaf (compile + run deviceless; #[ignore] aya skipped)
         run: cargo test --features vsock-transport,agent-gateway
 
