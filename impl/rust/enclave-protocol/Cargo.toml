@@ -27,6 +27,10 @@ sha2 = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vsock = { version = "0.5", optional = true }
+# `poll` for the cancellable-boundary primitive (deadline-bounded fd wait under #![forbid(unsafe_code)] —
+# nix's poll wrapper is safe). vsock pulls nix transitively but only its ioctl/socket features, NOT poll,
+# so this direct (target-gated, optional) dep is required. Version matches the already-locked nix 0.31.3.
+nix = { version = "0.31", default-features = false, features = ["poll"], optional = true }
 
 [dev-dependencies]
 hex = "0.4"
@@ -86,7 +90,7 @@ staging-host = [
 # Enables mock PQ signing in the ticket_signing_demo example only (pq_signing_ready stays false).
 demo-mock-sign = ["test-support"]
 # AF_VSOCK transport (Linux). Staging binary pairs with staging-host.
-vsock-transport = ["dep:vsock"]
+vsock-transport = ["dep:vsock", "dep:nix"]
 staging-vsock = ["staging-host", "vsock-transport"]
 # Production AF_VSOCK server (release only; no reference seal / staging keys).
 production-vsock = ["ml-dsa-65", "vsock-transport"]

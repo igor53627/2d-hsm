@@ -89,6 +89,10 @@ mod uds_listen;
 pub mod vsock_addr;
 #[cfg(feature = "vsock-transport")]
 pub mod vsock_listen;
+/// Shared cancellable-boundary primitives (deadline-bounded `poll`) for the agent boot-relay hard bounds
+/// (TASK-7.7 5b-2b-ii (a')/(d)). Linux + vsock-transport gated (backed by `nix::poll`).
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+mod cancellable_boundary;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",
