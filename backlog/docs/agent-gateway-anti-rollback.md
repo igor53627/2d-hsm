@@ -667,18 +667,31 @@ request golden vector is a 5b-2b test-vector item.
     `validate_vsock_listen_addr`.
   - **5b-2b-ii (aya leaf, deferred)** — independently-reviewable sub-items (split so a single PR doesn't
     mix vsock integration, daemon fault semantics, and acceptance infra; review each obligation on its own):
-    - **(0) canonical golden vector (BLOCKS (a)+(b)):** commit the `AgentBootRelay` canonical-request byte
-      vector to `testvectors/agent-gateway/` FIRST, so the channel + daemon (and any external relay
-      reimplementation) are built against frozen bytes, not prose. **Ordering inversion (intentional,
+    - **(0) canonical golden vector — DONE PR #54 (BLOCKS (a)+(b)):** committed
+      `testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin` (+ `.json` manifest with a
+      hand-auditable byte breakdown); the agent-gateway CI test asserts byte-exact `encode==golden` AND
+      `decode(golden)==inputs` AND canonical layout. **Ordering inversion (intentional,
       annotated):** the decode-leniency-relevant code (`relay_forward_once` + `decode_anchor_boot_request`)
       already landed in 5b-2b-i, asserted against frames from the *canonical encoder*
       (`encode_anchor_boot_request` — the vector's source of truth), so the in-crate production path is
       correct NOW; the frozen-bytes regression anchor for external/separate-service reimplementation is
       added in (0). So: invariant *asserted via the in-crate encoder in 5b-2b-i; frozen-bytes anchor added
       in 5b-2b-ii(0)* — (0) precedes the channel/daemon, not the already-merged 5b-2b-i core.
-    - **(a) channel socket wrapper:** the concrete `VsockBootRelayChannel` (`VsockStream::connect` to
-      `VMADDR_CID_HOST`, fresh-per-call, `SO_RCVTIMEO`/`SO_SNDTIMEO`+connect-timeout, delegates to the
-      CI-proven `relay_round_trip_over_stream`).
+    - **(a) channel socket wrapper — DONE PR #54** (incl. **(c)** below, folded in): the concrete
+      `VsockBootRelayChannel` (fresh `VsockStream::connect_with_cid_port(VMADDR_CID_HOST, port)` per call,
+      RAII-dropped) → a `DeadlineSocket` wrapper that **reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the budget
+      remaining to the deadline before EVERY read/write** (tight per-syscall bound — satisfies the
+      "Exact-bound caveat" below: no once-set socket timeout, so a late syscall can't overrun the leg) →
+      `relay_round_trip_over_stream`; blanket-maps all `ProtocolError`→retryable. Compile- AND runtime-
+      validated on aya (real vsock loopback: happy round-trip, prompt connect-failure, stalled-peer
+      read-timeout — all `#[ignore]`). **Connect bound is a watchdog-thread soft bound** (vsock 0.5 has no
+      `connect_with_timeout`; poll/libc is off-limits under `forbid(unsafe_code)`): bounded by the deadline
+      via `recv_timeout`, but a truly-wedged connect leaks one thread+fd per attempt (bounded by
+      `max_attempts`, OS-reaped). **TRACKED OBLIGATION (a'): cancellable hard connect bound** — a
+      nonblocking-connect+poll or a vsock crate exposing connect-with-timeout, eliminating the leak; its OWN
+      item, NOT collapsed into the quote (d) bound. A live 5b-2c serve SHOULD land (a') (or accept the
+      bounded-leak with a documented operational decision) before relying on the connect path under a
+      black-holing host.
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
       LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
       because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
@@ -694,11 +707,11 @@ request golden vector is a 5b-2b test-vector item.
       under the serial loop a slow/wedged pump delays every queued boot by ≤ (per-pump deadline + socket +
       connect timeouts); those bounds are what keep it tolerable — concurrency (and accept-backlog limits)
       is the named follow-up trigger if many enclaves boot at once.
-    - **(c) feature-build CI:** a new `cargo build --features vsock-transport,agent-gateway` step **on a
-      Linux runner** (the `vsock` crate is Linux-only + all socket code is `#[cfg(target_os = "linux")]`, so
-      a non-Linux runner would compile only the stub and not actually guard the leaf from bit-rot — NOTE:
-      NOT `staging-vsock,agent-gateway`, which fails the `ml-dsa-65 ⊕ agent-gateway` role-isolation
-      `compile_error!` since `staging-vsock` pulls `staging-host`→`ml-dsa-65`).
+    - **(c) feature-build CI — DONE PR #54:** `cargo test --no-run --features vsock-transport,agent-gateway`
+      on the ubuntu (Linux) `rust-test` job — compiles the channel + the `#[ignore]` aya tests (more than a
+      bare `cargo build`) so the leaf can't bit-rot; the only place `vsock-transport` compilation is
+      validated in CI. NOT `staging-vsock,agent-gateway`, which fails the `ml-dsa-65 ⊕ agent-gateway`
+      role-isolation `compile_error!` since `staging-vsock` pulls `staging-host`→`ml-dsa-65`.
     - **(d) aya/live-platform tests:** `#[ignore]` acceptance tests (real `fetch_report_deadline` against
       live configfs incl. no-stale-entry-after-timeout; `SO_*TIMEO` getsockopt readback; connect to CID 2)
       + the hard wall-clock bound for a wedged in-kernel read (a CANCELLABLE boundary — killable

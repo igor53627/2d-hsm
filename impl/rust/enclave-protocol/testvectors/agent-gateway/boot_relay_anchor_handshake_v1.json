@@ -3,7 +3,8 @@
   "provenance": {
     "canonical_source": "encode_anchor_boot_request (impl/rust/enclave-protocol/src/agent_boot_relay.rs)",
     "note": "This is a RUST-ENCODER-EMITTED golden: the directory's Elixir generator gen_agent_vectors.exs emits only RLP/protobuf/EIP-191 and has no CBOR or SHA3-512, so it cannot produce this frame. The byte-exact assert is therefore against the encoder that produced it; the value of the vector is (a) freezing against future encoder drift and (b) the independent canonical-layout assertions + this hand-auditable breakdown, which let an external reimplementer reproduce the bytes WITHOUT running the Rust encoder.",
-    "regen": "cargo test --features agent-gateway regen_boot_relay_golden_vector -- --ignored --nocapture"
+    "regen": "cargo test --features agent-gateway regen_boot_relay_golden_vector -- --ignored --nocapture",
+    "versioning": "This freezes wire (body) version 1 (CBOR key 1 = 1). A future incompatible wire change bumps key-1 to 2 and adds a SEPARATE boot_relay_anchor_handshake_v2.* vector; this v1 file + its byte-exact test stay as the v1 regression anchor (regen-and-replace is ONLY for fixing a mis-generated v1, never for a format change)."
   },
   "inputs": {
     "chain_id": 11565,
@@ -17,7 +18,7 @@
     "report_data_construction": "SHA3-512( b\"2d-hsm-agent-anchor-handshake-v1\" || chain_id.to_be_bytes()[8] || (env.len() as u32).to_be_bytes()[4] || env.as_bytes() || nonce[32] )"
   },
   "frame_layout": {
-    "header": "[4-byte BE total-payload length][1-byte PROTOCOL_VERSION = 0x01][1-byte MessageType::AgentBootRelay = 0x41]",
+    "header": "[4-byte BE length of the frame BODY = version + type + CBOR map = 233 = 0x000000E9][1-byte PROTOCOL_VERSION = 0x01][1-byte MessageType::AgentBootRelay = 0x41]. NOTE the length counts the version+type bytes too, not just the CBOR payload (231).",
     "body": "canonical integer-keyed CBOR map of 7 pairs (RFC 8949 shortest-form, ascending integer keys); decoder is lenient on key ORDER but the encoder + this vector are canonical",
     "keys": {
       "1": "uint version = 1",

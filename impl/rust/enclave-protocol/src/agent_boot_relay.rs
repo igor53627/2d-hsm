@@ -505,27 +505,69 @@ impl VsockBootRelayChannel {
         Self { host_cid, port }
     }
 
-    /// Fresh connect → deadline-derived `SO_RCVTIMEO`/`SO_SNDTIMEO` → [`relay_round_trip_over_stream`] →
-    /// drop the stream on return (RAII; the stream is a function-local, never stored in `self` — stale-reply
-    /// isolation). Returns the raw `ProtocolError`; [`BootRelayChannel::round_trip`] folds it to retryable.
+    /// Fresh connect → wrap in a [`DeadlineSocket`] (per-syscall `SO_*TIMEO`) → [`relay_round_trip_over_stream`]
+    /// → drop the stream on return (RAII; the stream is a function-local, never stored in `self` —
+    /// stale-reply isolation). Returns the raw `ProtocolError`; [`BootRelayChannel::round_trip`] folds it to
+    /// retryable.
     fn round_trip_inner(
         &self,
         request_frame: &[u8],
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, ProtocolError> {
         let mut stream = connect_bounded(self.host_cid, self.port, deadline)?;
-        // Per-syscall socket timeouts derived from the REMAINING budget (not the fixed serve READ/WRITE
-        // timeouts), so a single blocked in-flight read/write can't overrun the per-leg deadline. The
-        // in-fn deadline re-checks in relay_round_trip_over_stream remain the real bound; these are the
-        // backstop for a stalled in-kernel syscall.
-        let budget = remaining_or_lapsed(deadline)?;
-        stream
-            .set_read_timeout(Some(budget))
-            .map_err(|_| ProtocolError::WireProtocol("anchor relay: set_read_timeout failed"))?;
-        stream
-            .set_write_timeout(Some(budget))
-            .map_err(|_| ProtocolError::WireProtocol("anchor relay: set_write_timeout failed"))?;
-        relay_round_trip_over_stream(&mut stream, request_frame, deadline)
+        // TIGHT per-syscall deadline: DeadlineSocket reapplies SO_RCVTIMEO/SO_SNDTIMEO = the budget
+        // REMAINING to `deadline` before EVERY read/write — so a syscall that begins late in the framed
+        // exchange cannot block past the absolute deadline (a once-set timeout could overrun by up to one
+        // socket-timeout; see §8 "Exact-bound caveat"). The in-fn deadline re-checks in
+        // relay_round_trip_over_stream still bound the loop; together the leg is bounded by ~`deadline`.
+        let mut socket = DeadlineSocket { inner: &mut stream, deadline };
+        relay_round_trip_over_stream(&mut socket, request_frame, deadline)
+    }
+}
+
+/// Wraps a connected [`vsock::VsockStream`] so EACH `read`/`write`/`flush` first reapplies the socket
+/// timeout to the budget remaining until `deadline` (not a value computed once before the exchange). This
+/// makes the per-leg deadline a tight bound: a syscall starting late in the round-trip gets a
+/// correspondingly-shrunk `SO_*TIMEO`, so it can't block past the absolute deadline. A lapsed budget yields
+/// a `TimedOut` io error (which `relay_round_trip_over_stream`/`read_exact_with_idle_deadline` fold to a
+/// clean error → retryable upstream). vsock's `flush` is a no-op, but the arm is kept for symmetry.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+struct DeadlineSocket<'a> {
+    inner: &'a mut vsock::VsockStream,
+    deadline: std::time::Instant,
+}
+
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+impl DeadlineSocket<'_> {
+    fn arm_read(&self) -> std::io::Result<()> {
+        let rem = remaining_or_lapsed(self.deadline)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "anchor relay: deadline lapsed"))?;
+        self.inner.set_read_timeout(Some(rem))
+    }
+    fn arm_write(&self) -> std::io::Result<()> {
+        let rem = remaining_or_lapsed(self.deadline)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "anchor relay: deadline lapsed"))?;
+        self.inner.set_write_timeout(Some(rem))
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+impl std::io::Read for DeadlineSocket<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm_read()?;
+        self.inner.read(buf)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+impl std::io::Write for DeadlineSocket<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.arm_write()?;
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.arm_write()?;
+        self.inner.flush()
     }
 }
 
@@ -1413,5 +1455,31 @@ mod vsock_aya_tests {
             start.elapsed() < Duration::from_secs(5),
             "must fail within ~the budget (watchdog bound), not block on connect"
         );
+    }
+
+    /// A peer that CONNECTS then STALLS (never sends a response): the channel's read must time out within
+    /// ~the deadline (DeadlineSocket SO_RCVTIMEO + the in-fn deadline re-check), NOT block for the peer's
+    /// full stall. This is the headline SO_RCVTIMEO-enforcement case the matrix flagged as untested.
+    #[test]
+    #[ignore]
+    fn vsock_channel_stalled_peer_read_times_out_within_budget() {
+        let port = 5997;
+        let listener =
+            crate::vsock_listen::bind_vsock_listener(LOOPBACK_CID, port).expect("bind loopback");
+        let server = std::thread::spawn(move || {
+            let (_s, _addr) = listener.accept().expect("accept");
+            // Accept, then STALL well past the client's deadline without sending a response.
+            std::thread::sleep(Duration::from_millis(1500));
+            // _s dropped here.
+        });
+        let mut ch = VsockBootRelayChannel::new(LOOPBACK_CID, port);
+        let start = Instant::now();
+        let r = ch.round_trip(&build_request_frame(), start + Duration::from_millis(500));
+        assert!(r.is_err(), "a stalled peer must make the read time out, not hang");
+        assert!(
+            start.elapsed() < Duration::from_millis(1300),
+            "must return on the client's own ~500ms read deadline, NOT wait out the peer's 1500ms stall"
+        );
+        server.join().unwrap();
     }
 }
