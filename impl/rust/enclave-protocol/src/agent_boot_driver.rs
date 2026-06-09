@@ -54,12 +54,14 @@
 //! ## UNWIRED — slice 5b-2 adds the only caller
 //! Like 5a, this whole module is dead-code in the non-test lib build (the inner attribute below); the
 //! test build type- and use-checks it against a mock transport. Slice 5b-2 (real SNP / aya) adds: the
-//! concrete `impl AnchorBootTransport` (quote fetch + vsock relay), the agent-gateway bin + its
-//! in-crate boot module (set platform root → unseal the agent keystore → `install_agent_keystore` →
-//! `run_boot_anti_rollback_handshake` → `agent_anti_rollback_serve_gate(cfg!(release_build),
-//! is_anti_rollback_configured())` → serve), the sealed-blob source + unseal sequencing, and the
-//! `AdoptForward` signed raw-marks channel (which would eventually reclassify `AdoptForwardUnsupported`
-//! from terminal to executable — only in 5b-2+).
+//! concrete `impl AnchorBootTransport` (quote fetch + enclave-initiated vsock relay — which MUST
+//! enforce a per-call timeout, correlate the reply to the current nonce, and cap the untrusted response
+//! length), the agent-gateway bin + its in-crate boot module (set platform root → unseal the agent
+//! keystore → `install_agent_keystore` → `run_boot_anti_rollback_handshake` →
+//! `decide_serve(outcome, cfg!(release_build))?` → serve), the sealed-blob source + unseal sequencing,
+//! and the `AdoptForward` signed raw-marks channel (which would eventually reclassify
+//! `AdoptForwardUnsupported` from terminal to executable — only in 5b-2+). The handshake is
+//! single-threaded over the challenge/binding process-globals — 5b-2 MUST NOT run it concurrently.
 #![cfg_attr(not(test), allow(dead_code))]
 
 /// The public per-attempt handshake values the driver hands the transport. All fields are PUBLIC: the
@@ -166,11 +168,14 @@ pub(crate) fn run_boot_anti_rollback_handshake(
     body: &crate::agent_keystore::KeystoreBody,
     max_attempts: u32,
 ) -> BootDriverOutcome {
-    if max_attempts == 0 || max_attempts > MAX_BOOT_ATTEMPTS_CEILING {
-        // Both a zero (never serve, never loop) and a pathological count (soft boot-DoS) are caller
-        // config errors — fail closed before issuing any challenge or touching the transport.
+    // Distinct messages per cause for operator triage (a misconfigured bound is not a runtime fault).
+    if max_attempts == 0 {
+        return BootDriverOutcome::FailClosed(BootDriverFail::Unstartable("max_attempts must be >= 1"));
+    }
+    if max_attempts > MAX_BOOT_ATTEMPTS_CEILING {
+        // A pathological count is a caller config error (soft boot-DoS) — reject, don't clamp.
         return BootDriverOutcome::FailClosed(BootDriverFail::Unstartable(
-            "max_attempts must be in 1..=MAX_BOOT_ATTEMPTS_CEILING",
+            "max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING",
         ));
     }
     let chain = body.config.twod_chain_id;
@@ -260,6 +265,39 @@ pub(crate) fn agent_anti_rollback_serve_gate(
         ));
     }
     Ok(())
+}
+
+/// Fuse the driver outcome with the serve-gate into ONE fail-closed serve decision, so the boot
+/// caller (5b-2) cannot get the ordering wrong. **This is the function 5b-2's bin calls** (not the gate
+/// directly) once the handshake returns:
+/// ```ignore
+/// let state = decide_serve(outcome, cfg!(release_build))?; // Ok ⇒ serve; Err ⇒ abort (do NOT serve)
+/// ```
+/// It encodes the load-bearing ordering structurally: **every `FailClosed` is rejected unconditionally**
+/// (in all builds — including `BindingInstall`, which can leave a *prior* valid binding configured so the
+/// gate alone would wrongly pass), and ONLY `Ready` proceeds to the second, independent
+/// [`agent_anti_rollback_serve_gate`] check (which reads the installed-binding flag, not this outcome, so
+/// even a driver bug returning `Ready` without an installed binding fails closed in production). The
+/// unsafe "handshake → gate → serve without an outcome branch" wiring is therefore unrepresentable.
+/// Returns the verified [`AnchorState`](crate::agent_anchor::AnchorState) on success (for the boot log /
+/// audit). (The standalone [`agent_anti_rollback_serve_gate`] remains for the deployment that never runs
+/// the handshake at all — anti-rollback not wired — where there is no `BootDriverOutcome` to branch on.)
+pub(crate) fn decide_serve(
+    outcome: BootDriverOutcome,
+    require_real: bool,
+) -> Result<crate::agent_anchor::AnchorState, crate::ProtocolError> {
+    match outcome {
+        BootDriverOutcome::Ready(state) => {
+            agent_anti_rollback_serve_gate(
+                require_real,
+                crate::agent_dispatch::is_anti_rollback_configured(),
+            )?;
+            Ok(state)
+        }
+        BootDriverOutcome::FailClosed(_) => Err(crate::ProtocolError::PqSigningUnavailable(
+            "agent gateway boot anti-rollback handshake did not reach Ready (refusing to serve)",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -781,5 +819,66 @@ mod tests {
             Err(crate::ProtocolError::PqSigningUnavailable(_)) => {}
             other => panic!("expected PqSigningUnavailable, got {other:?}"),
         }
+    }
+
+    // ---- fused serve decision (decide_serve) ----
+
+    fn an_state(epoch: u64) -> crate::agent_anchor::AnchorState {
+        crate::agent_anchor::AnchorState {
+            epoch,
+            structural_version: 2,
+            marks_digest: [0u8; 32],
+            chain_height: None,
+            chain_block_hash: None,
+        }
+    }
+
+    #[test]
+    fn decide_serve_ready_configured_serves() {
+        let _g = test_lock();
+        // Ready + an installed binding ⇒ serve (gate passes), returns the state.
+        assert!(install_anti_rollback_binding(AntiRollbackBinding { epoch: 7, active: true }));
+        let st = decide_serve(BootDriverOutcome::Ready(an_state(7)), true).expect("Ready+configured serves");
+        assert_eq!(st.epoch, 7);
+    }
+
+    #[test]
+    fn decide_serve_ready_unconfigured_prod_refuses_dev_serves() {
+        let _g = test_lock();
+        // Ready but NO installed binding (a driver-bug shape): prod refuses via the gate, dev serves
+        // degraded (runtime binding still blocks funds). Proves the gate reads the flag, not the outcome.
+        assert!(!is_anti_rollback_configured());
+        assert!(decide_serve(BootDriverOutcome::Ready(an_state(7)), true).is_err(), "prod refuses");
+        assert!(decide_serve(BootDriverOutcome::Ready(an_state(7)), false).is_ok(), "dev serves degraded");
+    }
+
+    #[test]
+    fn decide_serve_failclosed_always_aborts() {
+        let _g = test_lock();
+        // EVERY FailClosed aborts in BOTH builds — never reaches a serve.
+        let fails = [
+            BootDriverFail::Reconcile(BootFailReason::AnchorBehind),
+            BootDriverFail::Reconcile(BootFailReason::VerifySignatureInvalid),
+            BootDriverFail::AdoptForwardUnsupported(an_state(9)),
+            BootDriverFail::RetriesExhausted("flap"),
+            BootDriverFail::Unstartable("zero"),
+        ];
+        for f in fails {
+            assert!(decide_serve(BootDriverOutcome::FailClosed(f), true).is_err(), "{f:?} aborts in prod");
+            assert!(decide_serve(BootDriverOutcome::FailClosed(f), false).is_err(), "{f:?} aborts in dev");
+        }
+    }
+
+    #[test]
+    fn decide_serve_binding_install_with_prior_binding_still_aborts() {
+        let _g = test_lock();
+        // The exact codex case: a prior valid Fresh install left the binding configured, then a second
+        // ceremony returned FailClosed(BindingInstall). is_anti_rollback_configured() is TRUE, so the
+        // gate ALONE would pass — but decide_serve branches on the outcome FIRST and aborts.
+        assert!(install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: true }));
+        assert!(is_anti_rollback_configured(), "prior binding configured");
+        let outcome = BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::BindingInstall));
+        assert!(decide_serve(outcome, true).is_err(), "BindingInstall must abort despite a configured binding");
+        assert!(decide_serve(outcome, false).is_err(), "...in dev too");
     }
 }

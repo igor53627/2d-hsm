@@ -571,24 +571,40 @@ The driver **installs nothing** (reconcile installs on its `Fresh` arm) and **do
   makes the "infinite-loop impossible / soft-DoS bounded" property self-contained even if a caller passes
   a pathological count. **The transport impl (5b-2) MUST enforce a per-call timeout** — the driver bounds
   attempt COUNT, not wall-clock, so a hung relay would otherwise stall boot.
-- **Pure serve-gate + the 5b-2 outcome branch.** `agent_anti_rollback_serve_gate(require_real,
-  anti_rollback_configured) -> Result<(), ProtocolError>` follows the same fail-closed shape as
-  `snp_attestation_boot_gate` but has NO production transport-only allowance (anti-rollback is mandatory
-  in release): the ONLY fail-closed cell is `(require_real=true, configured=false)` → `PqSigningUnavailable`.
-  It reads the **installed-binding flag** (`is_anti_rollback_configured()`), NOT the driver's outcome — so
-  a driver bug that wrongly returned `Ready` can never open the gate (defense-in-depth). **The gate is the
-  SECOND layer; 5b-2 MUST branch on the driver outcome FIRST:** `match outcome { Ready(_) => { serve_gate(..)?;
-  serve } _ => abort }`. Only `Ready` proceeds to the gate; **every `FailClosed` (including
-  `BindingInstall`, which can leave a prior valid binding configured) aborts before the gate** in all
-  builds — this reconciles "non-`Ready` must abort" with the gate's dev allowance (the `(false,*)` ⇒ serve
-  cell is for the *anti-rollback-not-wired* deployment, NOT a path the driver's `FailClosed` may take).
-  Fund custody is independently blocked by the runtime Layer-2b binding regardless.
-- **§8 obligations now SATISFIED by 5b-1** (pure, 22 unit tests against a mock transport): bounded
+- **Fused serve decision `decide_serve` (the 5b-2 entry point).** Rather than leave the serve ordering to
+  5b-2 prose, 5b-1 exports `decide_serve(outcome: BootDriverOutcome, require_real) -> Result<AnchorState,
+  ProtocolError>`: **every `FailClosed` is rejected unconditionally** in all builds (including
+  `BindingInstall`, which can leave a *prior* valid binding configured so the gate alone would wrongly
+  pass), and ONLY `Ready` proceeds to the second, independent gate. 5b-2 calls `decide_serve(outcome,
+  cfg!(release_build))?` — the unsafe "handshake → gate → serve without an outcome branch" wiring is
+  **unrepresentable**, and the composition is **tested now** (the codex prior-binding case included). The
+  inner `agent_anti_rollback_serve_gate(require_real, anti_rollback_configured)` follows the same
+  fail-closed shape as `snp_attestation_boot_gate` but has NO production transport-only allowance
+  (anti-rollback is mandatory in release): the ONLY fail-closed cell is `(require_real=true,
+  configured=false)`. It reads the **installed-binding flag** (`is_anti_rollback_configured()`), NOT the
+  outcome, so even a driver bug returning `Ready` fails closed in production. (The standalone gate stays
+  exposed for the *anti-rollback-not-wired* deployment, which has no outcome to branch on.) **Scope:** in
+  release `decide_serve` is a **whole-service boot prerequisite** (don't begin serving at all without
+  `Ready`); the runtime per-opcode gate (`anti_rollback_satisfied`) is the independent second layer that
+  blocks rollback-sensitive opcodes regardless. **Precondition:** the boot ceremony is single-threaded
+  over the `OUTSTANDING_CHALLENGE`/`ANTI_ROLLBACK_BINDING` process-globals — 5b-2 MUST NOT run the
+  handshake concurrently with any other challenge consumer (the fresh-per-attempt + consume-on-exit
+  invariants assume it).
+- **`NoChallenge` is structurally unreachable in the driver** (terminal only as defense-in-depth): the
+  driver issues a fresh challenge immediately before each reconcile and the transport-error path
+  consumes-then-reissues, so on a single-threaded boot the reconcile path never sees an empty slot.
+- **§8 obligations now SATISFIED by 5b-1** (pure, 26 unit tests against a mock transport): bounded
   full-sequence retry, fresh challenge per attempt, scope-from-`body.config`, `AdoptForward` fail-closed,
-  non-`Ready` no-serve (via the gate), `BindingInstall` surfaced terminal. **Still 5b-2 (aya/SNP):** the
-  concrete `impl AnchorBootTransport` (`fetch_report` + enclave-initiated vsock relay), the agent-gateway
-  bin + its in-crate boot module (set platform root → unseal the agent keystore → `install_agent_keystore`
-  → `run_boot_anti_rollback_handshake` → `agent_anti_rollback_serve_gate(cfg!(release_build),
-  is_anti_rollback_configured())` → serve), the sealed-blob source + unseal sequencing, and the
-  `AdoptForward` signed raw-marks channel + seed + re-seal. Still **UNWIRED** (dead-code) until 5b-2 adds
-  the only caller.
+  non-`Ready` no-serve (via `decide_serve`, including the `BindingInstall`-with-prior-binding case),
+  serve-gate table. **Still 5b-2 (aya/SNP), split into reviewable sub-slices:** (a) the concrete `impl
+  AnchorBootTransport` — `fetch_report` for the quote + the enclave-initiated vsock relay, which MUST
+  enforce a per-call timeout, correlate the response to the current nonce (drain/discard a late/stale
+  reply from a timed-out prior attempt rather than returning it as a `VerifyNonceMismatch`), and cap the
+  untrusted response byte length before allocating; (b) the agent-gateway **bin** + in-crate boot module
+  (set platform root → unseal the agent keystore → `install_agent_keystore` →
+  `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve); (c) the
+  sealed-blob source + unseal sequencing; (d) the `AdoptForward` signed raw-marks channel + seed +
+  re-seal. **Enclave-initiated vsock pre-serve exchange is the largest 5b-2 feasibility unknown** (today's
+  transport is strictly host-initiated) — confirm it with a spike before (a). Still **UNWIRED**
+  (dead-code) until 5b-2 adds the only caller; **5b-2 MUST land before any release build claims
+  anti-rollback support** (else the slice ships dead).
