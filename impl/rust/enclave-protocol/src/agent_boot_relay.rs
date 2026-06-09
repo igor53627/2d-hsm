@@ -731,9 +731,9 @@ mod tests {
         std::time::Instant::now() + Duration::from_secs(60)
     }
     fn near_past() -> std::time::Instant {
-        std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now)
+        // Direct subtraction so it can never silently yield a non-past instant (see snp_report's `past`,
+        // greptile P2); real monotonic clocks are always far past the epoch, so this can't overflow.
+        std::time::Instant::now() - Duration::from_secs(1)
     }
 
     // ---- transport composition (direct) ----

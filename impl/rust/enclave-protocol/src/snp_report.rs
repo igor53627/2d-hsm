@@ -34,6 +34,12 @@ const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
 // against the single source of truth rather than re-declaring 64 KiB.
 pub(crate) const MAX_CERT_CHAIN_LEN: usize = 64 * 1024;
 
+/// Upper bound on the configfs-tsm `outblob` (the `ATTESTATION_REPORT`). A real report is ~1184 B
+/// (version 5); 8 KiB is ample headroom for future report versions and matches the relay-path quote bound
+/// (`agent_boot_relay::MAX_QUOTE_REPORT_LEN`). Enforced cap-before-alloc on the configfs read so a buggy/
+/// wedged provider cannot force an unbounded heap allocation in the memory-constrained TEE.
+pub(crate) const MAX_OUTBLOB_LEN: usize = 8192;
+
 /// Extract the 48-byte launch measurement from a raw SNP `ATTESTATION_REPORT`.
 pub fn measurement_from_report(report: &[u8]) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
     if report.len() < MIN_REPORT_LEN {
@@ -112,16 +118,38 @@ impl TsmFs for RealTsmFs {
         })
     }
     fn read_outblob(&self, entry: &str) -> Result<Vec<u8>, ProtocolError> {
-        std::fs::read(format!("{entry}/outblob"))
-            .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot read outblob"))
+        use std::io::Read;
+        let mut file = std::fs::File::open(format!("{entry}/outblob"))
+            .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot open outblob"))?;
+        // Cap-before-alloc (configfs is in the TCB, but match the module's bounded-read discipline so a
+        // buggy/wedged provider can't force an unbounded heap alloc in the memory-constrained TEE): read at
+        // most MAX_OUTBLOB_LEN+1, so an over-large stream is DETECTED (errored) — not silently truncated
+        // into a malformed report the relay would then sign over.
+        let mut buf = Vec::new();
+        file.take((MAX_OUTBLOB_LEN + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot read outblob"))?;
+        if buf.len() > MAX_OUTBLOB_LEN {
+            return Err(ProtocolError::PqSigningUnavailable(
+                "SNP attestation: outblob exceeds max size",
+            ));
+        }
+        Ok(buf)
     }
     fn read_auxblob(&self, entry: &str) -> Vec<u8> {
+        use std::io::Read;
         // VCEK→ASK→ARK cert chain. Best-effort: absent/unreadable/oversize → empty (the verifier can
-        // fetch the chain from AMD KDS by VCEK serial). Capped at `MAX_CERT_CHAIN_LEN` so an implausibly
-        // large auxblob can't push the GET_MEASUREMENT response frame past `MAX_MESSAGE_SIZE` (nor the
-        // boot-relay request frame past its own bound, which reuses this same constant).
-        match std::fs::read(format!("{entry}/auxblob")) {
-            Ok(c) if c.len() <= MAX_CERT_CHAIN_LEN => c,
+        // fetch the chain from AMD KDS by VCEK serial). Cap-before-alloc at `MAX_CERT_CHAIN_LEN` (read at
+        // most +1 to detect oversize) so an implausibly large auxblob can't force an unbounded alloc, nor
+        // push the GET_MEASUREMENT response frame past `MAX_MESSAGE_SIZE` (nor the boot-relay request frame
+        // past its own bound, which reuses this same constant).
+        let mut file = match std::fs::File::open(format!("{entry}/auxblob")) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut buf = Vec::new();
+        match file.take((MAX_CERT_CHAIN_LEN + 1) as u64).read_to_end(&mut buf) {
+            Ok(_) if buf.len() <= MAX_CERT_CHAIN_LEN => buf,
             _ => Vec::new(),
         }
     }
@@ -372,7 +400,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn past() -> Instant {
-        Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now)
+        // Direct subtraction: on any real monotonic clock `now()` is far past the `Instant` epoch, so this
+        // never overflows — and unlike `checked_sub(..).unwrap_or_else(Instant::now)` it can never silently
+        // yield a NON-past instant that turns a fast-path test into a fluke (greptile P2).
+        Instant::now() - Duration::from_secs(1)
     }
     fn future() -> Instant {
         Instant::now() + Duration::from_secs(60)
@@ -381,6 +412,7 @@ mod tests {
     /// Records the ordered sequence of seam calls and is configurable per step.
     struct FakeTsmFs {
         create_ok: bool,
+        write_err: bool,
         outblob_err: bool,
         outblob: Vec<u8>,
         auxblob: Vec<u8>,
@@ -394,6 +426,7 @@ mod tests {
         fn ok() -> Self {
             Self {
                 create_ok: true,
+                write_err: false,
                 outblob_err: false,
                 outblob: vec![0xa5; MIN_REPORT_LEN],
                 auxblob: vec![0xc7; 16],
@@ -419,7 +452,11 @@ mod tests {
         }
         fn write_inblob(&self, _entry: &str, _data: &[u8; REPORT_DATA_LEN]) -> Result<(), ProtocolError> {
             self.calls.borrow_mut().push("write");
-            Ok(())
+            if self.write_err {
+                Err(ProtocolError::PqSigningUnavailable("fake write fail"))
+            } else {
+                Ok(())
+            }
         }
         fn read_outblob(&self, _entry: &str) -> Result<Vec<u8>, ProtocolError> {
             self.calls.borrow_mut().push("outblob");
@@ -483,6 +520,17 @@ mod tests {
         assert!(fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future())).is_err());
         // create failed, but the unconditional cleanup still ran — exact sequence pins the path.
         assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "remove"]);
+    }
+
+    #[test]
+    fn fetch_cleans_up_on_write_failure() {
+        // write_inblob errors mid-sequence: the unconditional cleanup still runs (trailing "remove"), and
+        // outblob/aux are never reached. Pins the stale-entry-leak guard for the write leg too.
+        let mut fs = FakeTsmFs::ok();
+        fs.write_err = true;
+        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future()));
+        assert_eq!(err_msg(r), "fake write fail");
+        assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "remove"]);
     }
 
     #[test]
