@@ -145,6 +145,12 @@ mod agent_challenge;
 // ONLY on the Fresh arm. Crate-private; UNWIRED (dead-code) until the slice-5b boot caller lands.
 #[cfg(feature = "agent-gateway")]
 mod agent_boot;
+// Agent Gateway anti-rollback boot-handshake driver + serve-gate (TASK-7.7, slice 5b-1). Bounded retry
+// loop over the AnchorBootTransport seam around boot_reconcile_anti_rollback; only transport errors
+// retry, every reconcile verdict + AdoptForward is terminal (anti-grind). Crate-private; UNWIRED
+// (dead-code) until the slice-5b-2 agent bin + concrete transport land (aya/SNP validation).
+#[cfg(feature = "agent-gateway")]
+mod agent_boot_driver;
 mod wire;
 
 use serde::{Deserialize, Serialize};

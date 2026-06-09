@@ -535,3 +535,76 @@ live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.
   (which fed the SNP `report_data`) is the boot caller's to match against `body.config` — 5b MUST issue
   the challenge with exactly the sealed config's scope so the quote and the verified response commit to
   the same `(chain_id, env)`.
+
+**Boot-handshake driver — slice 5b-1 (`agent_boot_driver.rs`).** The bounded, retrying loop one layer
+above the single-shot `boot_reconcile_anti_rollback`, decomposed out of the platform-coupled 5b so it is
+unit-testable now. The **one platform dependency** is the `AnchorBootTransport` trait (single method
+`anchor_round_trip(request: &AnchorBootRequest) -> Result<Vec<u8>, AnchorTransportError>`): 5b-2's impl
+fetches an SNP quote committing to `request.report_data` (`snp_report::fetch_report`) then relays it +
+the public challenge to the anchor over the untrusted host and returns the signed response **bytes**
+(UNTRUSTED — handed straight to `boot_reconcile_anti_rollback` to strict-decode + Ed25519-verify). The
+seam carries the **public** `AnchorBootRequest { chain_id, environment_identifier, nonce, report_data }`
+— NOT `report_data` alone: `report_data` is a non-invertible SHA3-512 commitment, but the anchor must
+*echo* the cleartext nonce + scope in its signed response (`verify_anchor_response` checks them), so it
+needs them in cleartext (they transit the host to the anchor regardless). It is still *transport, never
+trust*: every field is public, the scope is the sealed config's (the anchor binds it via `report_data`,
+which the anchor recomputes and checks against the quote), it cannot choose the verify key, and a
+tampered response simply fails verification downstream. `run_boot_anti_rollback_handshake(transport,
+body, max_attempts)` loops `for _ in 1..=max_attempts`
+(structurally bounded — no `loop{}`): issue a fresh challenge (scope from `body.config`) → `anchor_round_trip`
+→ `boot_reconcile_anti_rollback` → classify into `BootDriverOutcome { Ready(state) | FailClosed(BootDriverFail) }`.
+The driver **installs nothing** (reconcile installs on its `Fresh` arm) and **does not serve**.
+- **Retry classification (anti-grind, load-bearing).** ONLY `AnchorTransportError` is retryable
+  (transient liveness). **EVERY** `BootFailReason` and `AdoptForward` are TERMINAL — in particular the
+  host-reachable verify verdicts (`VerifyMalformed`/`VerifyScopeMismatch`/`VerifyNonceMismatch`/
+  `VerifySignatureInvalid`) are NOT retried, denying a malicious/buggy host a grind lever to stall boot
+  or fish for a serve decision across the budget. `AnchorBehind`/`StructuralGap`/`Inconsistent`/
+  `BindingInstall`/`NoChallenge` are deterministic given this body. `AdoptForward` is returned
+  immediately as `AdoptForwardUnsupported(state)` (§8 fail-closed; never looped). Exhausting the bound on
+  transport flaps → `RetriesExhausted`; `max_attempts == 0` **or above the defensive module ceiling
+  `MAX_BOOT_ATTEMPTS_CEILING` (64)** or a CSPRNG failure → `Unstartable`. (5b-2 *may* reclassify ONLY
+  `AdoptForward` — once the signed raw-marks channel lands it becomes execute-then-re-run-to-`Fresh`;
+  `AnchorBehind` stays TERMINAL — a rolled-back/inconsistent anchor is an operator condition with no
+  authenticated recovery, not a retry/reclassify candidate.) Recommended operating bound:
+  `max_attempts = 5`, a bin-side const — never host/env-configurable; the module ceiling (64, a generous
+  backstop ≫ the operating 5 so it never interferes, while still capping a pathological `u32::MAX`)
+  makes the "infinite-loop impossible / soft-DoS bounded" property self-contained even if a caller passes
+  a pathological count. **The transport impl (5b-2) MUST enforce a per-call timeout** — the driver bounds
+  attempt COUNT, not wall-clock, so a hung relay would otherwise stall boot.
+- **Fused serve decision `decide_serve` (the 5b-2 entry point).** Rather than leave the serve ordering to
+  5b-2 prose, 5b-1 exports `decide_serve(outcome: BootDriverOutcome, require_real) -> Result<AnchorState,
+  ProtocolError>`: **every `FailClosed` is rejected unconditionally** in all builds (including
+  `BindingInstall`, which can leave a *prior* valid binding configured so the gate alone would wrongly
+  pass), and ONLY `Ready` proceeds to the second, independent gate. 5b-2 calls `decide_serve(outcome,
+  cfg!(release_build))?` — the unsafe "handshake → gate → serve without an outcome branch" wiring is
+  **unrepresentable**, and the composition is **tested now** (the codex prior-binding case included). The
+  inner `agent_anti_rollback_serve_gate(require_real, anti_rollback_configured)` follows the same
+  fail-closed shape as `snp_attestation_boot_gate` but has NO production transport-only allowance
+  (anti-rollback is mandatory in release): the ONLY fail-closed cell is `(require_real=true,
+  configured=false)`. It reads the **installed-binding flag** (`is_anti_rollback_configured()`), NOT the
+  outcome, so even a driver bug returning `Ready` fails closed in production. (The standalone gate stays
+  exposed for the *anti-rollback-not-wired* deployment, which has no outcome to branch on.) **Scope:** in
+  release `decide_serve` is a **whole-service boot prerequisite** (don't begin serving at all without
+  `Ready`); the runtime per-opcode gate (`anti_rollback_satisfied`) is the independent second layer that
+  blocks rollback-sensitive opcodes regardless. **Precondition:** the boot ceremony is single-threaded
+  over the `OUTSTANDING_CHALLENGE`/`ANTI_ROLLBACK_BINDING` process-globals — 5b-2 MUST NOT run the
+  handshake concurrently with any other challenge consumer (the fresh-per-attempt + consume-on-exit
+  invariants assume it).
+- **`NoChallenge` is structurally unreachable in the driver** (terminal only as defense-in-depth): the
+  driver issues a fresh challenge immediately before each reconcile and the transport-error path
+  consumes-then-reissues, so on a single-threaded boot the reconcile path never sees an empty slot.
+- **§8 obligations now SATISFIED by 5b-1** (pure, 26 unit tests against a mock transport): bounded
+  full-sequence retry, fresh challenge per attempt, scope-from-`body.config`, `AdoptForward` fail-closed,
+  non-`Ready` no-serve (via `decide_serve`, including the `BindingInstall`-with-prior-binding case),
+  serve-gate table. **Still 5b-2 (aya/SNP), split into reviewable sub-slices:** (a) the concrete `impl
+  AnchorBootTransport` — `fetch_report` for the quote + the enclave-initiated vsock relay, which MUST
+  enforce a per-call timeout, correlate the response to the current nonce (drain/discard a late/stale
+  reply from a timed-out prior attempt rather than returning it as a `VerifyNonceMismatch`), and cap the
+  untrusted response byte length before allocating; (b) the agent-gateway **bin** + in-crate boot module
+  (set platform root → unseal the agent keystore → `install_agent_keystore` →
+  `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve); (c) the
+  sealed-blob source + unseal sequencing; (d) the `AdoptForward` signed raw-marks channel + seed +
+  re-seal. **Enclave-initiated vsock pre-serve exchange is the largest 5b-2 feasibility unknown** (today's
+  transport is strictly host-initiated) — confirm it with a spike before (a). Still **UNWIRED**
+  (dead-code) until 5b-2 adds the only caller; **5b-2 MUST land before any release build claims
+  anti-rollback support** (else the slice ships dead).
