@@ -14,8 +14,13 @@
 //!
 //! — and turns the [`ReconcileDecision`] into a single [`BootAntiRollbackOutcome`] the boot-wiring slice
 //! (5b) acts on. **The live Layer-2b binding is installed ONLY on the `Fresh` arm.** `AdoptForward`
-//! returns `AdoptForwardRequired` *without* installing (5b must seed the body from the anchor's marks +
-//! re-seal forward, then install), and every fail path returns `FailClosed(..)` and installs nothing.
+//! returns `AdoptForwardRequired` *without* installing — and 5b must NOT install directly on it: it has
+//! to obtain the anchor's raw marks over a separate `anchor_root`-signed channel, assert
+//! `hash(adopted_marks) == state.marks_digest` (digest equality, NOT only `adopted ≥ local`), re-seal
+//! forward, then re-run the FULL ceremony (fresh challenge + response) so the now-current state
+//! reconciles `Fresh` — the only arm that installs. Until that signed raw-marks channel exists,
+//! `AdoptForward` is fail-closed (see the slice-5b contract in `agent-gateway-anti-rollback.md` §8).
+//! Every fail path returns `FailClosed(..)` and installs nothing.
 //!
 //! ## Why no binding install off the `Fresh` path (the load-bearing guarantee)
 //! Installing the runtime gate's binding is what *unblocks* fund custody for this boot. It must happen
