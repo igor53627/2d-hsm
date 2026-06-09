@@ -201,7 +201,7 @@ the opt-out is explicit in the formula, never an undocumented escape. A lab over
 endpoint counts as `none` (usesLab-style comparison) so the gate cannot be defeated by a no-op. This
 **fails the build**, exactly like the mainnet trust/seal gate.
 
-**Layer 2 — Rust dispatch gate.** (a) compile-time: in the `release_build` cfg family,
+**Layer 2 — Rust dispatch gate.** *(Layer-2b runtime block IMPLEMENTED — `agent_dispatch` `AgentOpcode::is_rollback_sensitive` + the gate after opcode-decode/before privilege-routing + the `ANTI_ROLLBACK_BINDING` boot-resolved global; fail-closed `NotConfigured`/0x45 when unconfigured. Layer-2a compile guard is forward-looking until a stub anti-rollback feature exists; the measured/sealed AC#10 opt-out is a deferred sub-slice — `sealed_optout_acknowledged` is a `false` stub so the gate hard-blocks meanwhile.)* (a) compile-time: in the `release_build` cfg family,
 `compile_error!` on any lab/stub anti-rollback feature in release. (b) runtime fail-closed: inside
 the AgentGateway (0x40) handler, if the boot-resolved anti-rollback binding is absent/unconfigured,
 **reject the rollback-sensitive commands** — those that advance/debit sealed counters or spend:

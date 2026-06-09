@@ -109,6 +109,29 @@ impl AgentOpcode {
             Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup | Self::RestoreBackup
         )
     }
+
+    /// **Rollback-sensitive** opcodes (TASK-7.7 AC#5 Layer-2b): those that advance/debit sealed
+    /// counters or spend, so they MUST be fail-closed-rejected when the anti-rollback mechanism is not
+    /// configured. This is the privileged set {GENERATE_KEYS, CONFIGURE_TREASURY, EXPORT_BACKUP,
+    /// RESTORE_BACKUP} PLUS the non-privileged SIGN_FAUCET_DISPENSE (which debits cumulative/lifetime
+    /// spend). CONFIGURE_TREASURY is gated whole-opcode — every one of its sub-ops {0 set_limits,
+    /// 1 refill_budget, 2 raise_lifetime_breaker, 3 reset_lifetime_breaker} is fund-custody, so no
+    /// sub-op decode is needed. Exhaustive match (no wildcard) so a new opcode forces a classification.
+    fn is_rollback_sensitive(self) -> bool {
+        match self {
+            Self::GenerateKeys
+            | Self::SignFaucetDispense
+            | Self::ConfigureTreasury
+            | Self::ExportBackup
+            | Self::RestoreBackup => true,
+            // SIGN_TRANSFER is intentionally NOT gated — it carries no rollback-sensitive sealed state
+            // (no spend/cap/counter; bounded by key-purpose + canonical EIP-155 + sealed chain_id per
+            // §5). If TASK-7.6.4 transfer signing ever gains sealed spend/counter state, move it to true.
+            Self::SignTransfer => false,
+            // Read/attestation opcodes touch no rollback-sensitive state.
+            Self::PublicIdentity | Self::ProveIdentity => false,
+        }
+    }
 }
 
 /// Which role this signer instance runs as (production role isolation, §10.2). A `Producer` signer
@@ -261,6 +284,16 @@ pub fn dispatch_agent(
         return Err(AgentError::Malformed);
     }
     let opcode = AgentOpcode::from_u8(env.opcode).ok_or(AgentError::Malformed)?;
+
+    // TASK-7.7 AC#5 Layer-2b — anti-rollback fund-custody gate. Rollback-sensitive opcodes are
+    // rejected fail-closed ("anti-rollback mechanism not configured (TASK-7.7)" → NotConfigured/0x45)
+    // when the boot-resolved anti-rollback binding is absent/unconfigured. Placed BEFORE privilege/cap
+    // routing so a gated op is rejected REGARDLESS of capability validity — no bypass via a crafted or
+    // valid cap, and no cap-state oracle for gated ops on an unconfigured instance. Covers both the
+    // privileged ops {1,6,7,8} and the non-privileged SIGN_FAUCET_DISPENSE(5) in one place.
+    if opcode.is_rollback_sensitive() && !anti_rollback_satisfied(keystore) {
+        return Err(AgentError::NotConfigured);
+    }
 
     // Privilege routing: privileged opcodes MUST carry a capability and go through the seam;
     // read/runtime opcodes MUST NOT carry one.
@@ -543,6 +576,72 @@ pub fn reset_agent_keystore_for_tests() {
     }
 }
 
+/// The boot-resolved anti-rollback binding (TASK-7.7 AC#5). Opaque presence marker — the funding gate
+/// only needs to know a successful anchor handshake + reconcile happened this (re)start, not the full
+/// (v1-PROVISIONAL) `ReconcileDecision`. The boot-wiring slice installs this AFTER `reconcile` returns
+/// `Fresh`/`AdoptForward`.
+#[derive(Debug, Clone, Copy)]
+pub struct AntiRollbackBinding {
+    /// The reconciled freshness epoch the instance is operating under (for observability/audit).
+    pub epoch: u64,
+    /// Whether the anchor reported the instance live/active (always true for an installed binding;
+    /// kept explicit so the marker can't be a zero-value default).
+    pub active: bool,
+}
+
+/// Process-global anti-rollback binding. Const-init `None` ⇒ **fail-closed by default**: a real boot
+/// where boot-wiring hasn't run, or a handshake that FAILED, leaves this `None` and the funding gate
+/// rejects rollback-sensitive ops. Volatile — lost on restart, so a restart MUST re-run the handshake
+/// (never trust a persisted "configured" flag, §3 threat model).
+static ANTI_ROLLBACK_BINDING: Mutex<Option<AntiRollbackBinding>> = Mutex::new(None);
+
+/// Install the boot-resolved anti-rollback binding (boot-wiring slice only, AFTER a successful
+/// `reconcile`). **Install-once**: returns `false` without overwriting if one is already installed.
+/// Like `install_agent_keystore`, production fail-closed rests on this being CALLED only post-reconcile
+/// — it is not a host-settable input.
+#[must_use]
+pub fn install_anti_rollback_binding(binding: AntiRollbackBinding) -> bool {
+    let mut guard = ANTI_ROLLBACK_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_some() {
+        return false;
+    }
+    *guard = Some(binding);
+    true
+}
+
+/// Whether a boot-resolved anti-rollback binding is installed (presence-only; poison-recovers).
+pub fn is_anti_rollback_configured() -> bool {
+    ANTI_ROLLBACK_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
+
+#[cfg(test)]
+pub fn reset_anti_rollback_binding_for_tests() {
+    *ANTI_ROLLBACK_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// AC#5 gate predicate: a rollback-sensitive op may proceed iff the anti-rollback mechanism is
+/// configured for this boot OR the measured/sealed AC#10 opt-out is acknowledged in the sealed config.
+fn anti_rollback_satisfied(keystore: &KeystoreBody) -> bool {
+    is_anti_rollback_configured() || sealed_optout_acknowledged(keystore)
+}
+
+/// The measured/sealed AC#10 residual-risk opt-out (§5). **DEFERRED** to its own sub-slice: it needs a
+/// sealed `KeystoreConfig` field carrying the verbatim TASK-7.2 AC#10 text + an operator (admin/
+/// recovery) Ed25519 signature, verified against the canonical text — a sealed-format change. Until
+/// then the gate hard-blocks when unconfigured (the design's safe default). **Contract for that slice:**
+/// this MUST read ONLY the sealed body and verify the operator signature + canonical text — never a
+/// host-supplied runtime input.
+fn sealed_optout_acknowledged(_keystore: &KeystoreBody) -> bool {
+    false
+}
+
 /// Frame-layer entry point: dispatch a `0x40` inner-envelope `payload` against the installed
 /// keystore and return the encoded response BODY — a per-opcode success map or a §10.9 error map.
 /// Always returns a body (never errors out of band), so the wire layer just frames it. Profile is
@@ -751,6 +850,24 @@ mod tests {
         enc(Value::Map(m))
     }
 
+    /// Serialize tests that drive a rollback-sensitive opcode (they share the `ANTI_ROLLBACK_BINDING`
+    /// process-global via the AC#5 gate; cargo runs tests in parallel). Hold the returned guard for the
+    /// test body. `gate_configured` installs a test binding so the gated op proceeds to its real
+    /// outcome; `gate_unconfigured` leaves the slot `None` so the gate fires. Read-only opcodes don't
+    /// touch the global (the gate short-circuits) and need no guard.
+    static GATE_GUARD: Mutex<()> = Mutex::new(());
+    fn gate_configured() -> std::sync::MutexGuard<'static, ()> {
+        let g = GATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        reset_anti_rollback_binding_for_tests();
+        let _ = install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: true });
+        g
+    }
+    fn gate_unconfigured() -> std::sync::MutexGuard<'static, ()> {
+        let g = GATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        reset_anti_rollback_binding_for_tests();
+        g
+    }
+
     #[test]
     fn producer_profile_rejects_all_agent_opcodes() {
         let (body, key_ref) = body_with_key();
@@ -843,6 +960,7 @@ mod tests {
 
     #[test]
     fn privileged_bogus_capability_is_malformed() {
+        let _g = gate_configured();
         let (body, _) = body_with_key();
         // GENERATE_KEYS(1) with a structurally-invalid (empty) capability map → MALFORMED (0x40):
         // the verifier now parses the cap and rejects missing required keys.
@@ -856,6 +974,7 @@ mod tests {
     #[test]
     fn deferred_privileged_op_valid_cap_reaches_not_configured() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -925,6 +1044,7 @@ mod tests {
     #[test]
     fn generate_keys_executes_and_advances_counter() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -957,6 +1077,7 @@ mod tests {
     #[test]
     fn generate_keys_bumps_structural_version_per_op_local_only() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -987,6 +1108,7 @@ mod tests {
     #[test]
     fn generate_keys_structural_overflow_fails_closed() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1009,6 +1131,7 @@ mod tests {
     #[test]
     fn generate_keys_payload_binding_mismatch_rejected() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1035,6 +1158,7 @@ mod tests {
     #[test]
     fn generate_keys_purpose_mismatch_is_key_purpose_mismatch() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1070,6 +1194,7 @@ mod tests {
     #[test]
     fn generate_keys_treasury_enclave_scoped_succeeds() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1096,6 +1221,7 @@ mod tests {
     #[test]
     fn generate_keys_fleet_scoped_treasury_rejected() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1130,6 +1256,7 @@ mod tests {
     #[test]
     fn generate_keys_request_id_mismatch_rejected() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1152,6 +1279,7 @@ mod tests {
     #[test]
     fn privileged_badly_signed_capability_rejected() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let wrong = SigningKey::from_bytes(&[8u8; 32]);
         let mut body = base_body();
@@ -1169,6 +1297,7 @@ mod tests {
 
     #[test]
     fn privileged_without_capability_rejected() {
+        let _g = gate_configured();
         let (body, _) = body_with_key();
         let payload = envelope(1, vec![]); // no capability key 5
         assert_eq!(
@@ -1294,6 +1423,7 @@ mod tests {
     #[test]
     fn frame_handler_via_installed_keystore_slot() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured(); // serialize + install the AC#5 binding (the frame drives a gated op)
         reset_agent_keystore_for_tests();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
@@ -1391,6 +1521,7 @@ mod tests {
     #[test]
     fn generate_keys_gated_off_reaches_not_configured() {
         use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
@@ -1407,5 +1538,141 @@ mod tests {
             dispatch_agent(Profile::AgentGateway, &env, &body).err(),
             Some(AgentError::NotConfigured)
         );
+    }
+
+    // ---- TASK-7.7 AC#5 Layer-2b funding-gate tests ----
+
+    #[test]
+    fn is_rollback_sensitive_exhaustive_classification() {
+        for (op, expected) in [
+            (AgentOpcode::GenerateKeys, true),
+            (AgentOpcode::PublicIdentity, false),
+            (AgentOpcode::ProveIdentity, false),
+            (AgentOpcode::SignTransfer, false),
+            (AgentOpcode::SignFaucetDispense, true),
+            (AgentOpcode::ConfigureTreasury, true),
+            (AgentOpcode::ExportBackup, true),
+            (AgentOpcode::RestoreBackup, true),
+        ] {
+            assert_eq!(op.is_rollback_sensitive(), expected);
+        }
+    }
+
+    #[test]
+    fn configure_treasury_whole_opcode_gated() {
+        // All CONFIGURE_TREASURY sub-ops {0..=3} are fund-custody, so the whole opcode is gated with no
+        // sub-op decode needed.
+        assert!(AgentOpcode::ConfigureTreasury.is_rollback_sensitive());
+    }
+
+    #[test]
+    fn fail_closed_default_no_binding() {
+        let _g = gate_unconfigured(); // resets the slot to None
+        assert!(!is_anti_rollback_configured(), "const-init None ⇒ fail-closed default");
+    }
+
+    #[test]
+    fn gate_blocks_generate_keys_when_unconfigured() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_unconfigured();
+        let body = base_body();
+        // A cap signed by a key that does NOT match the body's admin — would be CapabilityRejected if
+        // verified. With the gate unconfigured it returns NotConfigured instead, proving the gate
+        // short-circuits BEFORE verify_capability (no cap-state oracle). Removing the gate re-opens it.
+        let wrong = SigningKey::from_bytes(&[9u8; 32]);
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&wrong, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn gate_blocks_configure_treasury_export_restore_when_unconfigured() {
+        let _g = gate_unconfigured();
+        let body = base_body();
+        // The gate fires before privilege/cap routing, so no cap is needed to observe the block.
+        for op in [6u8, 7, 8] {
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &envelope(op, vec![]), &body).err(),
+                Some(AgentError::NotConfigured),
+                "opcode {op} must be gated when anti-rollback is unconfigured"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_transfer_not_gated_but_faucet_is() {
+        let _g = gate_unconfigured();
+        let body = base_body();
+        assert!(!AgentOpcode::SignTransfer.is_rollback_sensitive(), "transfer carries no rollback state");
+        assert!(AgentOpcode::SignFaucetDispense.is_rollback_sensitive(), "faucet dispense debits spend");
+        // Both currently return NotConfigured (op4 via the runtime arm even unconfigured; op5 via the
+        // gate when unconfigured); the classification above locks the 4/5 split against a refactor.
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &envelope(4, vec![]), &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &envelope(5, vec![]), &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn reads_allowed_when_unconfigured() {
+        let _g = gate_unconfigured();
+        let (body, key_ref) = body_with_key();
+        // PUBLIC_IDENTITY(2) is not rollback-sensitive → allowed with no anti-rollback binding.
+        let env = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
+        assert!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).is_ok(),
+            "read opcodes are not gated by anti-rollback"
+        );
+    }
+
+    #[test]
+    fn configured_lets_gated_op_reach_verify() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured(); // binding installed
+        let body = base_body();
+        // Same wrong-key cap as the block test, but the gate is now satisfied → the op proceeds to
+        // verify_capability, which rejects the wrong key (0x43). Proves the binding unblocks the gate.
+        let wrong = SigningKey::from_bytes(&[9u8; 32]);
+        let cap = crate::agent_capability::test_signed_capability(
+            &wrong, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+        );
+        let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::CapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn frame_gated_op_unconfigured_returns_0x45() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_unconfigured(); // serialize + leave the binding None
+        reset_agent_keystore_for_tests();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        assert!(install_agent_keystore(body, b"meas"));
+        // EXPORT_BACKUP(7) with a valid cap, through the REAL frame handler, no anti-rollback binding ⇒
+        // the gate fires ⇒ 0x45 (proves the gate is on the production frame path).
+        let cap = crate::agent_capability::test_signed_capability(
+            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+        );
+        let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&env)), Some(0x45));
+        reset_agent_keystore_for_tests();
     }
 }
