@@ -8,7 +8,8 @@ replaying spent capability counters and resetting faucet `cumulative_spend`. Thi
 mechanism that proves the sealed blob is the **latest**, and the production-funding **block** that
 fails closed until that mechanism is deployed.
 
-Design/contract only (implementation is TASK-7.6). 7.7 **adds** the freshness-binding mechanism +
+Design/contract document; the **anti-rollback anchor implementation is TASK-7.7's own** (slices in §8;
+TASK-7.6 owns the Agent Gateway secp256k1 signer backend it binds onto). 7.7 **adds** the freshness-binding mechanism +
 the AC#5 gate + restore high-water seeding source + the active-active rule, **plus a bounded
 `pq-agent-keystore-v1` format extension** — a `freshness_epoch` field and a pinned `anchor_root`
 identity/CA in the keystore plaintext config — which is a `format_version` bump with a reviewed,
@@ -381,17 +382,41 @@ closed.
 `report_data` the enclave's handshake attestation must commit to (the concrete `treasury_id` tuple of
 §3, length-prefixed env for unambiguous binding).
 
-**Decode contract (load-bearing).** `verify_anchor_response` takes an already-decoded CBOR map and
-checks the signature over the *re-encoded* canonical preimage of the parsed fields — it binds the
-field *values*, not the received wire bytes (same convention as the §10.5 capability verifier). The
-boot-wiring decode step that produces that map therefore **MUST** be a strict/canonical CBOR reader:
-reject non-shortest integers, indefinite-length items, duplicate keys, and trailing bytes. Otherwise a
-host could submit a non-canonical encoding of an otherwise-valid signed response and have it verify.
-This strict reader should be the **shared** helper that also serves the capability/dispatch decoders
-(see the map-accessor consolidation follow-up), not a third hand-rolled one.
+**Decode contract (load-bearing) — now satisfied by `agent_cbor::strict_decode_map`.** The signature
+checks bind the field *values* (the re-encoded canonical preimage), not the received wire bytes (same
+convention as the §10.5 capability verifier), so the decode that produces the map MUST be a strict
+canonical CBOR reader or a host could submit a non-canonical encoding of otherwise-valid signed values
+and have it verify. That shared reader now exists: `src/agent_cbor.rs` `strict_decode_map` (RFC 8949
+§4.2.1 — rejects non-shortest integers, indefinite-length items, duplicate **or out-of-order** keys at
+every nesting level, reserved/tag/float items, over-deep/over-large input, and trailing bytes;
+booleans are the only `major 7` value accepted, for the capability `is_recovery`). It is **wired into
+the dispatch path** (`decode_envelope` now decodes the envelope and its nested cap/payload submaps
+through it), closing the residual for the privileged-command path. For the anchor path,
+`verify_anchor_response_bytes(bytes, nonce, config)` is the strict-decode entrypoint the boot-wiring
+slice calls (dead-code-gated until then). `agent_cbor` also unifies the int-keyed map accessors that
+were duplicated across `agent_capability`/`agent_dispatch`/`agent_anchor`.
+
+**Safety carve-out:** the reader is for untrusted host wire maps only — the sealed `pq-agent-keystore-v1`
+body is serde-CBOR (a struct map, not a canonical int-keyed map) and must **NOT** be routed through it.
+
+**Host-encoder obligation (for the boot-relay / SDK slice).** Because the enclave now *enforces*
+canonical form, the legitimate host/SDK that produces these wire bytes MUST emit RFC 8949 §4.2.1
+canonical CBOR: integer map keys **ascending by encoded-key bytes**, shortest-form arguments,
+definite-length only. Note a plain Rust encoder (e.g. `ciborium::into_writer`) emits shortest-form +
+definite-length but does **not** auto-sort map keys — it preserves insertion/struct order — so the
+client must build maps in ascending-key order (for shortest-form unsigned int keys, ascending numeric
+== ascending encoded-byte order, so emitting keys in numeric order suffices). A non-canonical encoding
+of otherwise-valid signed values is rejected as `Malformed`. This tightening is **pre-launch** — the
+agent-gateway path is feature-gated and unwired, so no deployed client needs migration.
+
+**Decoder vs schema.** `strict_decode_map` is a *general* canonical reader (it accepts CBOR arrays and
+maps up to the caps); per-message admissibility — the exact allowed key set and field types — is
+enforced afterward by `check_strict_keys` + the typed accessors in each module. Invariant: keep the
+decoder's `MAX_STR_LEN` ≥ the largest per-field byte cap (today 64 B) so no schema-valid field is
+rejected at decode.
 
 **Out of this slice (next, platform/host plumbing):** the actual SNP-quote fetch (the enclave half of
-the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, the strict
-canonical wire decoder above, wiring verify+reconcile into boot/install, per-op `epoch` bump +
+the *mutual* auth — this slice only fixes the value the quote commits to), the host relay, wiring
+verify+reconcile (via `verify_anchor_response_bytes`) into boot/install, per-op `epoch` bump +
 seal-before-emit, and seeding the body's counter/spend from the anchor's authoritative marks (asserting
 adopted marks ≥ local). The live-GENERATE_KEYS un-gate (TASK-18) depends on that durable commit.

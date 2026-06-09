@@ -132,6 +132,10 @@ pub mod agent_capability;
 // verify against the sealed `anchor_root` + boot reconcile (Variant C: enclave is anchor-agnostic).
 #[cfg(feature = "agent-gateway")]
 pub mod agent_anchor;
+// Shared CBOR helpers for host-supplied agent-gateway wire maps (int-key accessors + strict
+// canonical decode). Crate-private; consumed by agent_capability/agent_dispatch/agent_anchor.
+#[cfg(feature = "agent-gateway")]
+mod agent_cbor;
 mod wire;
 
 use serde::{Deserialize, Serialize};
