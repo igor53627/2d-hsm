@@ -52,13 +52,14 @@ jobs:
       - name: Agent Gateway secp256k1 (agent-gateway, TASK-7.6) — PROVE_IDENTITY gated off
         run: cargo test --features agent-gateway
 
-      # TASK-7.7 5b-2b-ii: compile the Linux-only vsock boot-relay leaf (VsockBootRelayChannel + the
-      # #[ignore] aya acceptance tests) so it can't bit-rot. CI never RUNS vsock tests (no live vsock env)
-      # — this is the only place `vsock-transport` compilation is validated. `--no-run` builds the lib +
-      # the #[ignore] aya tests without executing them. NOT `staging-vsock,agent-gateway` (that pulls
+      # TASK-7.7 5b-2b-ii: compile + RUN the Linux-only vsock boot-relay leaf. The device-needing channel
+      # acceptance tests are #[ignore] (they run only on aya / a real vsock env), so this runner executes
+      # the deviceless logic — the `cancellable_boundary` poll primitive (UnixStream::pair) and the
+      # in-memory relay framing/forward cores — while still COMPILING the #[ignore] vsock tests so the leaf
+      # can't bit-rot. This runs on ubuntu-latest (Linux). NOT `staging-vsock,agent-gateway` (that pulls
       # ml-dsa-65 and trips the `ml-dsa-65 ⊕ agent-gateway` role-isolation compile_error).
-      - name: Agent Gateway vsock boot-relay leaf compiles (TASK-7.7 5b-2b-ii)
-        run: cargo test --no-run --features vsock-transport,agent-gateway
+      - name: Agent Gateway vsock boot-relay leaf (compile + run deviceless; #[ignore] aya skipped)
+        run: cargo test --features vsock-transport,agent-gateway
 
       - name: Agent Gateway incl. PROVE_IDENTITY preview (TASK-7.6.3)
         run: cargo test --features agent-prove-identity-preview

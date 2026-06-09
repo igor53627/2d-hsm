@@ -21,26 +21,36 @@ use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 /// Minimum socket/poll budget we will arm: a remaining budget below this is treated as a (retryable) lapse.
-/// (a) `set_read_timeout(Some(Duration::ZERO))` is an *error* on vsock 0.5, not "no timeout", and a sub-µs
-/// `Duration` could in theory round to a 0 = infinite `timeval`; (b) a sub-millisecond residual cannot
-/// complete a real connect/round-trip, so failing fast as retryable is correct, not a spurious failure.
+/// The binding reason for BOTH consumers is (b): a sub-millisecond residual cannot complete a real
+/// connect/round-trip, so failing fast as retryable is correct, not a spurious failure. Additionally, for
+/// the *socket-timeout* consumer only, (a) `set_read_timeout(Some(Duration::ZERO))` is an *error* on vsock
+/// 0.5 (not "no timeout") and a sub-µs `Duration` could round to a 0 = infinite `timeval` — the floor
+/// avoids both. ((a) is irrelevant to the `poll` consumer, where `PollTimeout::ZERO` is a valid
+/// return-immediately; only (b) binds there.)
 pub(crate) const MIN_SOCKET_BUDGET: Duration = Duration::from_millis(1);
 
 /// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed / below [`MIN_SOCKET_BUDGET`].
 /// Single `now` sample; `checked_duration_since` is `None` when `deadline < now`. Anything below the floor
-/// folds to the retryable lapse error, so no caller ever arms a zero/sub-ms socket timeout.
+/// folds to the retryable lapse error, so no caller ever arms a zero/sub-ms socket/poll timeout. The error
+/// string is subsystem-neutral because this helper is shared by the boot-relay channel AND the generic
+/// `poll_with_deadline` primitive (e.g. the 5b-2b-ii(d) quote-subprocess pipe).
 pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, ProtocolError> {
     match deadline.checked_duration_since(Instant::now()) {
         Some(d) if d >= MIN_SOCKET_BUDGET => Ok(d),
-        _ => Err(ProtocolError::WireProtocol("anchor relay: deadline lapsed")),
+        _ => Err(ProtocolError::WireProtocol("deadline lapsed")),
     }
 }
 
 /// Wait until `fd` is ready for `events` (e.g. `POLLIN`/`POLLOUT`) or the `deadline` elapses — a true
 /// CANCELLABLE bound (the `poll` simply returns at the deadline; nothing is left blocked, no thread/fd
-/// leaks). Returns the reported `revents` on readiness (the caller inspects — `POLLERR`/`POLLHUP` are
-/// reported regardless of `events`, e.g. a failed connect sets `POLLERR` so the caller then reads
-/// `SO_ERROR`). Returns a retryable [`ProtocolError`] on deadline-lapse or poll error.
+/// leaks). Returns a retryable [`ProtocolError`] on deadline-lapse or poll error.
+///
+/// **`Ok(revents)` does NOT imply the requested `events` are set** — the caller MUST inspect `revents`.
+/// `poll` reports `POLLERR`/`POLLHUP`/`POLLNVAL` regardless of `events`, so a readiness can be
+/// error-only: e.g. a failed non-blocking connect returns `Ok(POLLERR)` WITHOUT `POLLOUT` (the caller then
+/// reads `SO_ERROR`), and a closed peer returns `Ok(POLLHUP)` (possibly with `POLLIN`). A caller MUST do
+/// `if revents.contains(POLLOUT) && !revents.intersects(POLLERR|POLLHUP|POLLNVAL)` (or equivalent) — never
+/// treat a bare `Ok(_)` as "ready for I/O".
 ///
 /// The per-call timeout is re-derived from the budget *remaining to the absolute `deadline`* (via
 /// [`remaining_or_lapsed`]) and shrinks across `EINTR` retries, so the absolute deadline is the true bound
@@ -120,7 +130,30 @@ mod tests {
     #[test]
     fn poll_already_lapsed_is_immediate_err() {
         let (a, _b) = UnixStream::pair().unwrap();
-        // _b kept alive so a isn't HUP; past deadline -> remaining_or_lapsed errors before any poll.
+        // A past deadline short-circuits in remaining_or_lapsed BEFORE poll is ever called, so the fd's
+        // readiness/HUP state is irrelevant here — this only proves the pre-poll deadline check.
         assert!(poll_with_deadline(&a, PollFlags::POLLIN, past()).is_err());
+    }
+
+    #[test]
+    fn poll_returns_pollout_when_writable() {
+        // The (a') primary path: a fresh connected socket is immediately writable -> POLLOUT.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let rv = poll_with_deadline(&a, PollFlags::POLLOUT, future()).expect("writable");
+        assert!(rv.contains(PollFlags::POLLOUT), "expected POLLOUT, got {rv:?}");
+    }
+
+    #[test]
+    fn poll_returns_hup_when_peer_closed() {
+        // Error-readiness pass-through: dropping the peer makes `a` poll-ready with POLLHUP (EOF), even
+        // polling POLLIN. poll_with_deadline returns Ok(revents-with-HUP) — it does NOT error — so the
+        // caller (not the primitive) decides; this pins the documented contract.
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let rv = poll_with_deadline(&a, PollFlags::POLLIN, future()).expect("ready (hup)");
+        assert!(
+            rv.intersects(PollFlags::POLLHUP | PollFlags::POLLIN),
+            "expected POLLHUP/POLLIN on closed peer, got {rv:?}"
+        );
     }
 }
