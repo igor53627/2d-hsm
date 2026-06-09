@@ -665,8 +665,12 @@ request golden vector is a 5b-2b test-vector item.
     over in-memory duplexes incl. pre-write-deadline guards on both cores, oversize/malformed-pinned
     rejection, cap-before-alloc outblob/auxblob reads, fast-path quote no-hang, `validate_relay_port` +
     `validate_vsock_listen_addr`.
-  - **5b-2b-ii (aya leaf, deferred)** — independently-reviewable sub-items (split so a single PR doesn't
-    mix vsock integration, daemon fault semantics, and acceptance infra; review each obligation on its own):
+  - **5b-2b-ii (aya leaf)** — independently-reviewable sub-items (split so a single PR doesn't mix vsock
+    integration, daemon fault semantics, and acceptance infra; review each obligation on its own). The
+    rule's load-bearing intent is **keep (b) daemon fault-semantics out of the vsock-integration PR** —
+    preserved: (b) is still open. PR #54 co-landed (0)+(a)+(c) because (0) is a test-only frozen vector and
+    (c) is a one-line CI guard for (a) — neither is a separate review surface from the channel; (b) was NOT
+    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') tracked; (b), (d) open.**
     - **(0) canonical golden vector — DONE PR #54 (BLOCKS (a)+(b)):** committed
       `testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin` (+ `.json` manifest with a
       hand-auditable byte breakdown); the agent-gateway CI test asserts byte-exact `encode==golden` AND
@@ -677,7 +681,8 @@ request golden vector is a 5b-2b test-vector item.
       correct NOW; the frozen-bytes regression anchor for external/separate-service reimplementation is
       added in (0). So: invariant *asserted via the in-crate encoder in 5b-2b-i; frozen-bytes anchor added
       in 5b-2b-ii(0)* — (0) precedes the channel/daemon, not the already-merged 5b-2b-i core.
-    - **(a) channel socket wrapper — DONE PR #54** (incl. **(c)** below, folded in): the concrete
+    - **(a) channel socket wrapper — DONE PR #54** ((c) is a SEPARATE obligation that landed in the same PR,
+      tracked below — not "part of" (a)): the concrete
       `VsockBootRelayChannel` (fresh `VsockStream::connect_with_cid_port(VMADDR_CID_HOST, port)` per call,
       RAII-dropped) → a `DeadlineSocket` wrapper that **reapplies `SO_RCVTIMEO`/`SO_SNDTIMEO` = the budget
       remaining to the deadline before EVERY read/write** (tight per-syscall bound — satisfies the
@@ -687,11 +692,13 @@ request golden vector is a 5b-2b test-vector item.
       read-timeout — all `#[ignore]`). **Connect bound is a watchdog-thread soft bound** (vsock 0.5 has no
       `connect_with_timeout`; poll/libc is off-limits under `forbid(unsafe_code)`): bounded by the deadline
       via `recv_timeout`, but a truly-wedged connect leaks one thread+fd per attempt (bounded by
-      `max_attempts`, OS-reaped). **TRACKED OBLIGATION (a'): cancellable hard connect bound** — a
-      nonblocking-connect+poll or a vsock crate exposing connect-with-timeout, eliminating the leak; its OWN
-      item, NOT collapsed into the quote (d) bound. A live 5b-2c serve SHOULD land (a') (or accept the
-      bounded-leak with a documented operational decision) before relying on the connect path under a
-      black-holing host.
+      `max_attempts` — so the worst-case simultaneous leaked thread+fd count on the guest is `max_attempts`,
+      relevant for fd-budget sizing; OS-reaped). **TRACKED OBLIGATION (a'): cancellable hard connect bound**
+      — a nonblocking-connect+poll or a vsock crate exposing connect-with-timeout, eliminating the leak; its
+      OWN item, NOT collapsed into the quote (d) bound. **HARD PRECONDITION for a live 5b-2c serve (a checked
+      task item, mirroring (d)):** 5b-2c MUST either (i) land (a'), or (ii) record an EXPLICIT operational
+      risk-acceptance of the bounded leak with concrete retry/thread/fd bounds — it may NOT silently rely on
+      the connect path under a black-holing host. (Not merely "should".)
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
       LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
       because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
@@ -785,11 +792,16 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `quote_timeout`/`relay_timeout` is **deferred to 5b-2c** (the bin that constructs the transport and owns
   operator config) — NOT 5b-2b-i/ii, which keep the single-budget model. 5b-2c, if it splits them, MUST
   restate the resulting total-boot bound as a success criterion so "timeout" is never ambiguous between
-  total-attempt and per-leg. **Exact-bound caveat (5b-2b-ii):** the `≤ 2·timeout` bound only holds if the
-  socket `SO_*TIMEO`/connect timeouts are derived from the *remaining* per-leg budget, NOT set equal to the
-  full leg `timeout` — otherwise a single blocked in-flight syscall can overrun a leg by up to one socket
-  timeout (the in-fn checks only bound *initiating* I/O). 5b-2b-ii MUST either use remaining-deadline-based
-  socket timeouts or state the looser real bound (`leg + SO_*TIMEO + connect`) as the success criterion.
+  total-attempt and per-leg. **Exact-bound caveat — SATISFIED in 5b-2b-ii(a):** the `≤ 2·timeout` bound only
+  holds if the socket `SO_*TIMEO` are derived from the *remaining* per-leg budget, NOT set equal to the full
+  leg `timeout` — otherwise a single blocked in-flight syscall could overrun a leg by up to one socket
+  timeout. `VsockBootRelayChannel` achieves this via `DeadlineSocket`, which reapplies the timeout =
+  remaining-budget before EVERY read/write (not once), so the channel-I/O leg is tightly bounded by the
+  deadline. (Connect is the watchdog soft-bound (a'); see above.) **Per-leg sizing floor (5b-2c):** the
+  per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
+  both (a connect that nearly exhausts it yields a retryable lapse before I/O — a wasted attempt), AND MUST
+  satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
+  retry loop can't blow the operator's total boot deadline.
 - **Socket-timeout precondition.** `read_bounded_anchor_response`'s deadline is only enforceable if the
   stream has `SO_RCVTIMEO`/non-blocking set. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` +
   `SO_SNDTIMEO` + a **connect** timeout (so connect can't hang either); the aya test verifies all three.
