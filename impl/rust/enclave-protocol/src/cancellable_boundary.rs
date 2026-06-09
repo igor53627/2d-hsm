@@ -70,7 +70,12 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
         let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
         let mut fds = [PollFd::new(fd.as_fd(), events)];
         match poll(&mut fds, timeout) {
-            Ok(0) => return Err(ProtocolError::WireProtocol("poll: deadline elapsed before fd ready")),
+            // Timeout fired with no fd ready: LOOP, don't error — `remaining_or_lapsed` re-checks the
+            // ABSOLUTE deadline next iteration. For a normal deadline that returns the lapse error
+            // immediately (the armed timeout == the remaining budget); for a deadline beyond ~24 days
+            // (where the timeout was clamped to PollTimeout::MAX) the deadline is NOT yet up, so we re-arm.
+            // Not a busy loop: each Ok(0) means a full timeout interval elapsed.
+            Ok(0) => continue,
             Ok(_) => {
                 return fds[0]
                     .revents()
