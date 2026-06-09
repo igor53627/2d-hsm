@@ -280,9 +280,11 @@ pub(crate) fn agent_anti_rollback_serve_gate(
 /// Fuse the driver outcome with the serve-gate into ONE fail-closed serve decision, so the boot
 /// caller (5b-2) cannot get the ordering wrong. **This is the function 5b-2's bin calls** (not the gate
 /// directly) once the handshake returns:
-/// ```ignore
+/// ```text
 /// let state = decide_serve(outcome, cfg!(release_build))?; // Ok ⇒ serve; Err ⇒ abort (do NOT serve)
 /// ```
+/// (`text` fence, not `ignore`: it is a usage sketch with free variables — an `ignore` doctest still gets
+/// COMPILED by `cargo test -- --ignored`, which is exactly how the aya acceptance runs are invoked.)
 /// It encodes the load-bearing ordering structurally: **every `FailClosed` is rejected unconditionally**
 /// (in all builds — including `BindingInstall`, which can leave a *prior* valid binding configured so the
 /// gate alone would wrongly pass), and ONLY `Ready` proceeds to the second, independent

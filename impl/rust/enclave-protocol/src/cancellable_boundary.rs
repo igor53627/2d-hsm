@@ -5,15 +5,19 @@
 //! - **(a')** the cancellable CONNECT bound — `poll(POLLOUT)` on a non-blocking vsock connect fd.
 //! - **(d)** the cancellable QUOTE bound — `poll(POLLIN)` on a killable-subprocess pipe-read fd.
 //!
-//! [`poll_with_deadline`] is that shared core. It is backed by `nix::poll` — whose `poll` wrapper is SAFE
+//! `poll_with_deadline` (below) is that shared core. It is backed by `nix::poll` — whose `poll` wrapper is SAFE
 //! (the `unsafe` `libc::poll` lives inside `nix`), so this stays within the crate's `forbid(unsafe_code)`
 //! boundary — and `nix` is a direct, target-gated (`cfg(target_os = "linux")`), optional dep folded into
-//! `vsock-transport` (vsock pulls `nix` only for ioctl/socket, NOT `poll`). Linux + vsock-transport gated,
-//! mirroring the channel it serves.
+//! `vsock-transport`, declaring `poll`/`socket`/`fs` explicitly (vsock's transitive nix dep enables only
+//! `ioctl`/`socket` — see Cargo.toml for why we don't rely on it and what each feature is for). Linux +
+//! vsock-transport gated, mirroring the channel it serves.
 //!
-//! `poll_with_deadline` is dead-code in the non-test lib build until its consumers land (5b-2b-ii (a') wires
-//! POLLOUT on the connect fd; (d) wires POLLIN on the subprocess pipe) — allow it meanwhile (the tests
-//! exercise it now).
+//! The (a') consumer is LIVE: `agent_boot_relay::connect_bounded` calls `poll_with_deadline` +
+//! `connect_poll_succeeded`. The module-wide `allow(dead_code)` below is NOT transitional leftovers — it
+//! is held for the **consumer-free feature combos**: the only consumer (`agent_boot_relay`) is gated on
+//! `agent-gateway`, while this module compiles under plain `vsock-transport`; the `production-vsock` /
+//! `staging-vsock` profiles (which can never enable `agent-gateway` — the `ml-dsa-65 ⊕ agent-gateway`
+//! role-isolation compile_error forbids it) would otherwise emit dead_code warnings for the whole module.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::ProtocolError;
@@ -29,6 +33,13 @@ use std::time::{Duration, Instant};
 /// return-immediately; only (b) binds there.)
 pub(crate) const MIN_BOUNDARY_BUDGET: Duration = Duration::from_millis(1);
 
+/// The subsystem-neutral lapse message produced by [`remaining_or_lapsed`] (and therefore by
+/// `poll_with_deadline`). A named const — not an inline literal — because callers that RELABEL a lapse for
+/// triage (e.g. `connect_bounded`'s connect-leg attribution) pattern-match this exact string; a reworded
+/// literal would silently turn their match arms into dead code, so the coupling is pinned here (and by the
+/// deviceless entry-lapse test in `agent_boot_relay`).
+pub(crate) const DEADLINE_LAPSED_MSG: &str = "deadline lapsed";
+
 /// Remaining budget until `deadline`, or `Err` (retryable) if already lapsed / below [`MIN_BOUNDARY_BUDGET`].
 /// Single `now` sample; `checked_duration_since` is `None` when `deadline < now`. Anything below the floor
 /// folds to the retryable lapse error, so no caller ever arms a zero/sub-ms socket/poll timeout. The error
@@ -37,7 +48,7 @@ pub(crate) const MIN_BOUNDARY_BUDGET: Duration = Duration::from_millis(1);
 pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, ProtocolError> {
     match deadline.checked_duration_since(Instant::now()) {
         Some(d) if d >= MIN_BOUNDARY_BUDGET => Ok(d),
-        _ => Err(ProtocolError::WireProtocol("deadline lapsed")),
+        _ => Err(ProtocolError::WireProtocol(DEADLINE_LAPSED_MSG)),
     }
 }
 
@@ -46,11 +57,11 @@ pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, Protoco
 /// leaks). Returns a retryable [`ProtocolError`] on deadline-lapse or poll error.
 ///
 /// **`Ok(revents)` does NOT imply the requested `events` are set** — the caller MUST inspect `revents`.
-/// `poll` reports `POLLERR`/`POLLHUP`/`POLLNVAL` regardless of `events`, so a readiness can be
-/// error-only: e.g. a failed non-blocking connect returns `Ok(POLLERR)` WITHOUT `POLLOUT` (the caller then
-/// reads `SO_ERROR`), and a closed peer returns `Ok(POLLHUP)` (possibly with `POLLIN`). A caller MUST do
-/// `if revents.contains(POLLOUT) && !revents.intersects(POLLERR|POLLHUP|POLLNVAL)` (or equivalent) — never
-/// treat a bare `Ok(_)` as "ready for I/O".
+/// `poll` reports `POLLERR`/`POLLHUP`/`POLLNVAL` regardless of `events`, so a readiness can be error-only —
+/// never treat a bare `Ok(_)` as "ready for I/O". For the CONNECT/stream-write case use
+/// [`connect_poll_succeeded`] (clean `POLLOUT`, error flags veto) — do not hand-roll the flag check. A pipe
+/// READ caller (the future (d) quote pipe) must NOT use that predicate: on a pipe `POLLHUP` is a normal EOF
+/// that can arrive WITH final data (`POLLIN|POLLHUP`); (d) needs its own EOF-aware check.
 ///
 /// The per-call timeout is re-derived from the budget *remaining to the absolute `deadline`* (via
 /// [`remaining_or_lapsed`]) and shrinks across `EINTR` retries, so the absolute deadline is the true bound
@@ -89,6 +100,24 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
     }
 }
 
+/// True iff `revents` is a CLEAN connect/stream-write readiness: `POLLOUT` set AND no
+/// `POLLERR`/`POLLHUP`/`POLLNVAL` (reported regardless of the requested events — an error-only readiness
+/// must not pass). The concrete form of the `Ok(revents)` contract above for the (a') connect bound.
+///
+/// **Deliberately NOT parameterized over the wanted flag set** (the design doc's §8 (a') AC originally
+/// specced exactly this connect-scoped shape): the unconditional `POLLHUP` veto is *connect-specific*
+/// correctness — on AF_VSOCK a refused/timed-out connect surfaces `POLLERR|POLLOUT` (no `POLLHUP`; vsock
+/// gates `EPOLLHUP` on *local* shutdown, unlike inet) and the veto fires on `POLLERR`. On a **pipe READ**
+/// (the future (d) quote-subprocess fd) `POLLHUP` is instead a *normal EOF* that can arrive WITH final data
+/// (`POLLIN|POLLHUP`) — a predicate like this one would drop the last quote bytes, so (d) must build its own
+/// EOF-aware POLLIN check; hardcoding `POLLOUT` here makes that misuse impossible rather than
+/// comment-guarded.
+pub(crate) fn connect_poll_succeeded(revents: nix::poll::PollFlags) -> bool {
+    use nix::poll::PollFlags;
+    revents.contains(PollFlags::POLLOUT)
+        && !revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,7 +126,10 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     fn past() -> Instant {
-        Instant::now() - Duration::from_secs(1)
+        // checked_sub: a bare `Instant::now()` is itself "lapsed" under the MIN_BOUNDARY_BUDGET floor, so
+        // the fallback keeps the helper's meaning even if the monotonic clock reads < 1s (freshly-booted
+        // microVM running tests as near-init) — where the naked `-` operator would panic.
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now)
     }
     fn future() -> Instant {
         Instant::now() + Duration::from_secs(30)
@@ -162,6 +194,30 @@ mod tests {
         assert!(
             rv.intersects(PollFlags::POLLHUP | PollFlags::POLLIN),
             "expected a closed/readable signal (POLLHUP and/or POLLIN), got {rv:?}"
+        );
+    }
+
+    #[test]
+    fn connect_poll_succeeded_requires_clean_pollout() {
+        use PollFlags as P;
+        // Primary use: a freshly-writable connect fd -> POLLOUT clean -> success.
+        assert!(connect_poll_succeeded(P::POLLOUT), "bare POLLOUT must be success");
+        // POLLOUT present but ALSO an error condition -> false. On AF_VSOCK the real refused/timed-out
+        // connect shape is POLLERR|POLLOUT (kernel sets sk_err then wakes the poller; no POLLHUP — vsock
+        // gates EPOLLHUP on LOCAL shutdown); POLLHUP/POLLNVAL are pinned too so the veto set can't shrink.
+        assert!(!connect_poll_succeeded(P::POLLOUT | P::POLLERR), "POLLERR must veto (vsock refusal shape)");
+        assert!(!connect_poll_succeeded(P::POLLOUT | P::POLLHUP), "POLLHUP must veto");
+        assert!(!connect_poll_succeeded(P::POLLOUT | P::POLLNVAL), "POLLNVAL must veto");
+        // POLLOUT absent -> false even on an otherwise-clean revents.
+        assert!(!connect_poll_succeeded(P::POLLIN), "readable-without-writable is not connect success");
+        assert!(!connect_poll_succeeded(P::empty()), "empty revents must not be success");
+        // Why there is no `want` parameter: a pipe's EOF routinely arrives as POLLIN|POLLHUP (final data +
+        // writer closed). A POLLHUP-vetoing predicate applied to a pipe read would reject that completed
+        // read — the (d) quote pipe must build its own EOF-aware check, and the hardcoded-POLLOUT signature
+        // makes reaching for this one a compile error rather than a prose warning.
+        assert!(
+            !connect_poll_succeeded(P::POLLIN | P::POLLHUP),
+            "pipe EOF-with-data shape must never read as connect success"
         );
     }
 }
