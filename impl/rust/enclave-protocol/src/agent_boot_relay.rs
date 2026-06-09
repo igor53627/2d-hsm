@@ -340,10 +340,11 @@ pub(crate) fn relay_round_trip_over_stream<S: std::io::Read + std::io::Write>(
 ///
 /// This is **HOST-side, untrusted** code — NOT an enclave trust boundary; the enclave's own per-leg
 /// channel deadline + downstream verification are what protect custody. The single `deadline` here spans
-/// the WHOLE pump (enclave read + anchor write + anchor read), so the daemon (5b-2b-ii) must size it for
-/// the full round-trip (not one leg) AND set `SO_RCVTIMEO`/`SO_SNDTIMEO` on BOTH the enclave-facing and
-/// anchor-facing sockets — `write_all` to either side is bounded only by `SO_SNDTIMEO`, not by an in-fn
-/// check, so a black-holing peer on the write leg would otherwise stall the pump.
+/// the WHOLE pump (enclave read + anchor write + anchor read). The deadline is checked at every read AND
+/// **before each `write_all`/`flush` leg** (so a lapsed budget never even initiates a write — symmetric
+/// with `relay_round_trip_over_stream`); the daemon (5b-2b-ii) must still set `SO_RCVTIMEO`/`SO_SNDTIMEO`
+/// on BOTH the enclave- and anchor-facing sockets, since the in-fn check bounds only *initiating* a write
+/// — a black-holing peer that stalls a write already in flight is bounded only by `SO_SNDTIMEO`.
 pub(crate) fn relay_forward_once<E, A>(
     enclave: &mut E,
     anchor: &mut A,
@@ -355,10 +356,20 @@ where
 {
     let frame = crate::read_framed_message_with_idle_deadline(enclave, Some(deadline))?;
     let _ = decode_anchor_boot_request(&frame)?; // reject malformed BEFORE an anchor round-trip
+    // Pre-write deadline check on BOTH write legs (matches `relay_round_trip_over_stream`): if the budget
+    // lapsed during the enclave read / anchor read, don't even START another write — fail closed so the
+    // daemon turns it into a retryable close. The blocking `write_all` itself is still bounded only by the
+    // socket `SO_SNDTIMEO` (a 5b-2b-ii obligation); this in-fn check just avoids initiating a doomed write.
+    if std::time::Instant::now() >= deadline {
+        return Err(ProtocolError::WireProtocol("anchor relay: deadline before anchor write"));
+    }
     anchor.write_all(&frame).map_err(ProtocolError::from)?;
     anchor.flush().map_err(ProtocolError::from)?;
     let response = read_bounded_anchor_response(anchor, deadline)?;
     let wire = frame_anchor_response(&response)?;
+    if std::time::Instant::now() >= deadline {
+        return Err(ProtocolError::WireProtocol("anchor relay: deadline before enclave write"));
+    }
     enclave.write_all(&wire).map_err(ProtocolError::from)?;
     enclave.flush().map_err(ProtocolError::from)
 }
@@ -958,6 +969,72 @@ mod tests {
             other => panic!("expected WireProtocol decode rejection, got {other:?}"),
         }
         assert!(anchor.written.is_empty(), "anchor never written on a malformed request");
+    }
+
+    #[test]
+    fn relay_forward_once_past_deadline_forwards_nothing() {
+        // An already-past deadline: the pump must forward nothing to the anchor (the enclave-read guard
+        // trips first here, but the safety property — no forward once the budget is gone — is what matters).
+        let (nonce, rd) = request_for([0x51; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let req_frame = encode_anchor_boot_request(&[0xa5; 8], &[], &req).unwrap();
+        let mut enclave = TestStream::new(req_frame);
+        let mut anchor = TestStream::new(vec![]);
+        assert!(relay_forward_once(&mut enclave, &mut anchor, near_past()).is_err());
+        assert!(anchor.written.is_empty(), "nothing forwarded to the anchor past the deadline");
+        assert!(enclave.written.is_empty(), "nothing written back to the enclave past the deadline");
+    }
+
+    /// Stream that delivers all of `to_read` but BUSY-WAITS across `spin_until` on the read that returns the
+    /// frame body — so the caller crosses the deadline *after* the read completes Ok, exercising the
+    /// pre-write guard (not the read's entry-check). First read (4-byte length prefix) returns instantly.
+    struct DeadlineCrossingStream {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        spin_until: std::time::Instant,
+        reads: u32,
+    }
+    impl std::io::Read for DeadlineCrossingStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads >= 2 {
+                while std::time::Instant::now() < self.spin_until {} // cross the deadline during the body read
+            }
+            std::io::Read::read(&mut self.to_read, buf)
+        }
+    }
+    impl std::io::Write for DeadlineCrossingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_forward_once_deadline_lapse_after_read_blocks_anchor_write() {
+        // The enclave frame reads OK, but the deadline lapses during the body read; the pre-anchor-write
+        // guard then fires BEFORE any anchor write — proving the guard, not the read's entry-check.
+        let (nonce, rd) = request_for([0x52; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let req_frame = encode_anchor_boot_request(&[0xa5; 8], &[], &req).unwrap();
+        let dl = std::time::Instant::now() + Duration::from_millis(5);
+        let mut enclave = DeadlineCrossingStream {
+            to_read: std::io::Cursor::new(req_frame),
+            written: Vec::new(),
+            spin_until: dl,
+            reads: 0,
+        };
+        let mut anchor = TestStream::new(vec![]);
+        match relay_forward_once(&mut enclave, &mut anchor, dl) {
+            Err(crate::ProtocolError::WireProtocol(m)) => {
+                assert!(m.contains("deadline before anchor write"), "expected pre-anchor-write guard, got: {m}")
+            }
+            other => panic!("expected pre-write WireProtocol, got {other:?}"),
+        }
+        assert!(anchor.written.is_empty(), "no anchor write once the deadline lapsed mid-pump");
     }
 
     #[test]

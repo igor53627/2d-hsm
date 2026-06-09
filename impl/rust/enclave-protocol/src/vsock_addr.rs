@@ -14,8 +14,6 @@ use crate::env_config::{
 
 /// Default bind CID: `VMADDR_CID_ANY` (guest accepts connections on any assigned guest CID).
 pub const DEFAULT_VSOCK_CID: u32 = 4_294_967_295;
-/// Loopback-friendly CID (`VMADDR_CID_LOCAL`) for `vsock_loopback` on dev Linux.
-pub const DEFAULT_VSOCK_CID_LOOPBACK: u32 = 1;
 /// Default vsock service port (override via `TWOD_HSM_VSOCK_PORT`).
 pub const DEFAULT_VSOCK_PORT: u32 = 5000;
 /// `VMADDR_CID_HOST` — the host the enclave dials for the anti-rollback boot relay (TASK-7.7 5b-2).
