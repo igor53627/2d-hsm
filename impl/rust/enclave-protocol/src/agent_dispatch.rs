@@ -662,6 +662,10 @@ static AGENT_PROCESS_GLOBAL_TEST_GUARD: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'static, ()> {
     let g = AGENT_PROCESS_GLOBAL_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    // The FULL set: the installed keystore slot too (frame-path tests install into it), not just the
+    // anti-rollback binding + freshness challenge — so the helper's "pristine state" claim actually holds
+    // and no test inherits a keystore a prior frame test left installed.
+    reset_agent_keystore_for_tests();
     reset_anti_rollback_binding_for_tests();
     crate::agent_challenge::reset_outstanding_challenge_for_tests();
     g
