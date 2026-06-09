@@ -596,15 +596,100 @@ The driver **installs nothing** (reconcile installs on its `Fresh` arm) and **do
 - **§8 obligations now SATISFIED by 5b-1** (pure, 26 unit tests against a mock transport): bounded
   full-sequence retry, fresh challenge per attempt, scope-from-`body.config`, `AdoptForward` fail-closed,
   non-`Ready` no-serve (via `decide_serve`, including the `BindingInstall`-with-prior-binding case),
-  serve-gate table. **Still 5b-2 (aya/SNP), split into reviewable sub-slices:** (a) the concrete `impl
-  AnchorBootTransport` — `fetch_report` for the quote + the enclave-initiated vsock relay, which MUST
-  enforce a per-call timeout, correlate the response to the current nonce (drain/discard a late/stale
-  reply from a timed-out prior attempt rather than returning it as a `VerifyNonceMismatch`), and cap the
-  untrusted response byte length before allocating; (b) the agent-gateway **bin** + in-crate boot module
-  (set platform root → unseal the agent keystore → `install_agent_keystore` →
-  `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve); (c) the
-  sealed-blob source + unseal sequencing; (d) the `AdoptForward` signed raw-marks channel + seed +
-  re-seal. **Enclave-initiated vsock pre-serve exchange is the largest 5b-2 feasibility unknown** (today's
-  transport is strictly host-initiated) — confirm it with a spike before (a). Still **UNWIRED**
-  (dead-code) until 5b-2 adds the only caller; **5b-2 MUST land before any release build claims
-  anti-rollback support** (else the slice ships dead).
+  serve-gate table.
+
+**Boot-relay wire protocol + transport seam — slice 5b-2a (`agent_boot_relay.rs`).** The pure,
+CI-testable half of the platform transport. **Request** = a `MessageType::AgentBootRelay` (`0x41`, in the
+reserved `0x40..0x4F` agent band; never serve-dispatchable — `decode_wire_command` fail-closes it) frame
+carrying a canonical integer-keyed CBOR map: `{1: relay_request_version=1, 2: chain_id, 3: env, 4: nonce
+(32B), 5: report_data (64B), 6: quote_report, 7: cert_chain}`; cert_chain bounded by
+`snp_report::MAX_CERT_CHAIN_LEN` (64 KiB, single source) and the frame by `MAX_MESSAGE_SIZE`. **Response**
+= the raw anchor-signed bytes **verbatim** behind a single 4-byte BE length prefix (no re-encode — that
+would break `agent_anchor`'s "signature binds exact wire bytes" property; the enclave never parses anchor
+internals), read by `read_bounded_anchor_response` which checks `MAX_ANCHOR_RESPONSE_LEN` (4096) **before
+allocating** (no OOM from a hostile relay). Two seams, **both deadline-aware**: `BootQuoteProducer`
+(`fetch(report_data, deadline)`) and `BootRelayChannel` (`round_trip(frame, deadline)`, fresh connection
+per call for stale-reply isolation). `RelayAnchorTransport<Q, C>` gives **each leg its own `timeout`
+deadline** (a fresh `Instant::now() + timeout` computed just before each) — so a hung quote can't stall
+boot AND quote latency can't starve the channel's budget (no false channel timeout). Per-attempt
+wall-clock is ≤ 2×timeout; the driver's per-attempt COUNT bound caps total boot. It is the concrete
+`AnchorBootTransport` composing fetch-quote → encode-request → channel-relay → return raw bytes; every
+failure folds to the
+coarse always-retryable `AnchorTransportError`. **No nonce-precheck** (a precheck-to-retryable would
+downgrade a genuine terminal `VerifyNonceMismatch` into a grind lever); a garbage/wrong-nonce reply is
+safe (terminal downstream). 25 unit tests incl. the FULL composition through the 5b-1 driver + 5a verify
+(mock channel + fake quote). `decode_anchor_boot_request` (for the untrusted host relay + tests) is
+hardened — no-trailing-bytes, integer-key rigor (range + no-dup), exact field lengths, `cert_chain`
+bound, and the `report_data == anchor_handshake_report_data(chain,env,nonce)` binding — but is NOT an
+enclave trust boundary (the enclave only *encodes* requests and *verifies* responses), and deliberately
+uses a **lenient** CBOR decode rather than the 4 KiB-per-string strict decoder, since a legitimate
+request carries a multi-KiB cert chain (the request is not signature-bound, so byte-level canonicality is
+not load-bearing). The response framing has a single shared writer (`frame_anchor_response`) so the host
+relay and the reader can't drift.
+
+**Wire-spec registry (synced in 5b-2a):** `MessageType::AgentBootRelay = 0x41` is now registered in the
+source-of-truth `vsock-api-wire-format-spec-draft.md` §10.1 (allocated in the `0x40..0x4F` agent band;
+enclave-initiated; NOT serve-dispatchable; unknown-frame coverage moved to `0x42`). **Canonicality
+contract:** the enclave encoder MUST emit canonical CBOR (it does, via the `put_*` helpers); the host-relay
+*decoder* MAY be lenient after semantic validation (the request is not signature-bound). A canonical
+request golden vector is a 5b-2b test-vector item.
+
+**Still 5b-2 platform/host, split into ordered independently-gated slices (aya/SNP):**
+- **5b-2b — transport + quote leaf** (gated `vsock-transport`): the concrete `VsockBootRelayChannel`
+  (`VsockStream::connect` to host CID 2, fresh-per-call, `SO_*TIMEO` + the shared deadline) +
+  `SnpQuoteProducer` (delegates to `snp_report::fetch_report`, deadline-honoring). **Endpoint contract
+  (define here):** host CID `2` (`VMADDR_CID_HOST`); the relay **port** = `TWOD_HSM_ANCHOR_RELAY_PORT`
+  env, default **`5001`** (a `DEFAULT_ANCHOR_RELAY_PORT: u32 = 5001` const, one greater than the serve
+  `DEFAULT_VSOCK_PORT = 5000` so the two surfaces never collide); both the enclave channel and the
+  host-side relay daemon read the SAME const/env, and the daemon binds that port and uses
+  `decode_anchor_boot_request`. Each of the channel + quote must carry an aya
+  acceptance test for its wall-clock bound (connect/write/read timeouts + non-hanging quote fetch +
+  fresh-connection late-reply isolation).
+- **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →
+  `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
+  `decide_serve(outcome, cfg!(release_build))?` → serve.
+- **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
+- **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
+  `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
+  `hash(adopted)==marks_digest` seed + re-seal/persistence.
+
+**Enclave-initiated outbound vsock is feasible** (the `vsock` crate's `VsockStream::connect` to CID 2,
+separate from the serve-loop listener — spike confirmed via `vsock_listen.rs`), but the live exchange +
+timeouts are validated on aya. Still **UNWIRED**
+(dead-code) until 5b-2b adds the bin caller; **5b-2 MUST land before any release build claims anti-rollback
+support** (else 5a/5b-1/5b-2a ship dead). 5b-2a is the LAST pure layer — its tests already drive the full
+verify+driver+transport composition end-to-end (including the response wire framing via
+`driver_ready_through_real_response_framing`), so the accumulation bottoms out here.
+
+**5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
+MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
+- **Deadline-aware quote fetch (load-bearing).** `BootQuoteProducer::fetch(report_data, deadline)`'s
+  contract requires honoring `deadline`, but `snp_report::fetch_report` today has no deadline and does
+  blocking configfs file I/O. 5b-2b MUST make the quote fetch deadline-aware — either change
+  `fetch_report` to accept/enforce a deadline, or wrap it in a bounded worker — **with defined cleanup of
+  the stale configfs-tsm entry on timeout/abandon** (the entry dir is fixed `twod-hsm`; a left-behind
+  entry must be removed so the next attempt's `fetch_report` `remove_dir`+`create_dir` still works), and
+  an aya acceptance test that a wedged provider fails the attempt promptly rather than hanging boot.
+- **Timeout semantics + total bound.** 5b-2a's single `timeout` is **per-leg** (quote and channel each
+  get `timeout`; one attempt ≤ `2·timeout`; total boot ≤ `max_attempts · 2 · timeout`). 5b-2b SHOULD
+  expose distinct `quote_timeout` / `relay_timeout` (or derive sub-deadlines from one `attempt_timeout`)
+  and state the resulting total-boot bound as a success criterion, so "timeout" is never ambiguous
+  between total-attempt and per-leg.
+- **Socket-timeout precondition.** `read_bounded_anchor_response`'s deadline is only enforceable if the
+  stream has `SO_RCVTIMEO`/non-blocking set. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` +
+  `SO_SNDTIMEO` + a **connect** timeout (so connect can't hang either); the aya test verifies all three.
+- **Host-relay daemon (its own 5b-2b sub-checklist).** Define: daemon location + feature gate; the
+  upstream enclave→anchor request/response schema; the **error→framing mapping** — a relay/anchor error
+  (unavailable, timeout, upstream 5xx) MUST be surfaced to the enclave as a *retryable transport close*
+  (so the driver retries), NEVER as malformed bytes (which the driver would turn into a TERMINAL
+  `VerifyMalformed`, burning the attempt budget on a transient); retry/concurrency model; and tests for
+  anchor-unavailable, timeout, malformed-anchor-response, and oversized-response cases.
+- **Canonical request golden vector** — add an `AgentBootRelay` canonical-request test vector to
+  `testvectors/agent-gateway/` **before** any host-daemon/channel implementation, so external/later relay
+  work implements against bytes, not prose (the encoder is canonical; the decoder is lenient).
+- **Observability** — the boot log MUST distinguish quote-timeout / relay-timeout / anchor-unavailable /
+  oversized-response / malformed-response / verify-failure for operator triage, WITHOUT leaking
+  oracle-grade detail over the serve APIs (boot-time, operator-facing only).
+- **Profile uniformity** — the relay CID/port (`DEFAULT_ANCHOR_RELAY_PORT=5001` / `TWOD_HSM_ANCHOR_RELAY_PORT`)
+  applies uniformly across lab/staging/production; a misconfiguration or collision with the serve port
+  surfaces as a clear fail-closed boot error, never a silent wrong-endpoint connect.

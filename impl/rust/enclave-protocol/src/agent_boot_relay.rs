@@ -1,0 +1,797 @@
+//! Agent Gateway anti-rollback **boot-relay wire protocol + transport seam** (TASK-7.7, slice 5b-2a).
+//!
+//! The boot anti-rollback handshake is enclave-initiated: the enclave produces an SNP quote committing
+//! to its fresh challenge `report_data`, relays it (with the public challenge) to the anchor *through an
+//! untrusted host relay*, and receives the anchor's Ed25519-signed freshness response. This module is
+//! the **pure, CI-testable** half of that: the request CBOR codec, a bounded response reader, the two
+//! platform seams ([`BootRelayChannel`] = the raw round-trip, [`BootQuoteProducer`] = the SNP quote),
+//! and [`RelayAnchorTransport`] — the concrete [`crate::agent_boot_driver::AnchorBootTransport`] that
+//! composes quote-fetch → request-encode → channel-relay and returns the anchor's response **bytes
+//! verbatim** to the 5b-1 driver.
+//!
+//! ## Untrusted-relay threat model (load-bearing)
+//! The host relay is a dumb, UNTRUSTED pipe. This module NEVER trusts or parses the response: it returns
+//! the raw bytes straight to [`crate::agent_boot::boot_reconcile_anti_rollback`], whose
+//! `verify_anchor_response_bytes` strict-decodes them and Ed25519-verifies against the sealed
+//! `anchor_root` + the issued nonce. Re-encoding the response in the enclave would break
+//! `agent_anchor`'s "signature binds the exact wire bytes" property, so the response side here is only a
+//! **bounded read** (cap-before-alloc) — no decode of anchor internals. A garbage / wrong-nonce /
+//! substituted reply is safe: the driver turns it into a terminal `VerifyNonceMismatch` /
+//! `SignatureInvalid` / `Malformed` (fail-closed, never a serve). Every value the request carries
+//! (`chain_id`, `environment_identifier`, `nonce`, `report_data`, the quote, the cert chain) is PUBLIC —
+//! it transits the host to the anchor by design; nothing sealed/secret crosses the seam.
+//!
+//! ## Stale-reply safety (structural)
+//! `BootRelayChannel` implementations MUST open a **fresh connection per `round_trip`** and drop it on
+//! return: a late reply to a timed-out prior attempt then lands on a closed socket and can never be
+//! returned for the current attempt. There is deliberately **no nonce-precheck** in the transport — a
+//! precheck-to-retryable would be harmful (it could downgrade a genuine terminal `VerifyNonceMismatch`
+//! into a retry, a grind lever). The downstream verify against the issued nonce is the sole, sufficient
+//! freshness gate.
+//!
+//! ## UNWIRED — slice 5b-2b adds the platform leaves
+//! Like 5a/5b-1, the module is dead-code in the non-test lib build; the test build drives the FULL
+//! composition (this transport + the 5b-1 driver + 5a verify) end-to-end with a mock channel + fake
+//! quote producer. The remaining aya/SNP work is split into ordered slices (see §8): **5b-2b** the real
+//! `VsockBootRelayChannel` (`VsockStream::connect` to host CID 2, fresh per call, deadline-bounded) +
+//! `SnpQuoteProducer` (delegates to `snp_report::fetch_report`), gated `vsock-transport`, plus the
+//! host-side relay daemon (which uses [`decode_anchor_boot_request`]); **5b-2c** the agent-gateway bin +
+//! boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use crate::agent_boot_driver::{AnchorBootRequest, AnchorBootTransport, AnchorTransportError};
+use crate::ProtocolError;
+use ciborium::value::Value;
+
+/// Body-level version of the boot-relay request map (key 1), distinct from the frame `PROTOCOL_VERSION`
+/// byte — mirrors every wire/agent CBOR map carrying its own key-1 version.
+const RELAY_REQUEST_VERSION: u64 = 1;
+
+/// Upper bound on the anchor's signed response, checked against the length prefix BEFORE allocation so a
+/// hostile relay cannot force a large alloc / OOM in the memory-constrained TEE. The real signed response
+/// (`agent_anchor` schema: keys `1..=7`, optional `8/9` chain-binding, `13` = 64-byte signature) is
+/// ~250–512 B; 4 KiB is generous headroom (matches `agent_cbor::MAX_STR_LEN`'s "tiny agent map" sizing)
+/// and far below `MAX_MESSAGE_SIZE`. FORWARD-COMPAT: a silent hard cap — a future response schema that
+/// grows past it would be rejected; keep it in lockstep with the `agent_anchor` response size.
+pub(crate) const MAX_ANCHOR_RESPONSE_LEN: usize = 4096;
+
+/// Generous upper bound on the SNP quote (`ATTESTATION_REPORT`) the request carries — checked before the
+/// payload allocation so even a buggy/oversized quote producer can't force a large alloc ahead of the
+/// frame-level `MAX_MESSAGE_SIZE` check, and enforced on BOTH encode and decode so the two size envelopes
+/// match (the cert-chain lesson). The real report is ~1184 B; 8 KiB is ample headroom for future report
+/// versions while staying tiny.
+pub(crate) const MAX_QUOTE_REPORT_LEN: usize = 8192;
+
+/// Owned, decoded boot-relay request — for the untrusted **host relay** (5b-2b) and round-trip tests.
+/// NOT an enclave trust boundary: the enclave only *encodes* the request and *verifies the response*; it
+/// never decodes a request. (Kept hardened anyway — see [`decode_anchor_boot_request`].)
+pub(crate) struct DecodedBootRequest {
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub nonce: [u8; 32],
+    pub report_data: [u8; 64],
+    pub quote_report: Vec<u8>,
+    pub cert_chain: Vec<u8>,
+}
+
+/// Encode a boot-relay request frame: a canonical integer-keyed CBOR map (keys 1..=7) carried as the
+/// payload of a [`crate::MessageType::AgentBootRelay`] (`0x41`) frame. Returns the FULL frame ready for
+/// the channel to write. The cert chain is bounded by [`crate::snp_report::MAX_CERT_CHAIN_LEN`] (and the
+/// frame by `MAX_MESSAGE_SIZE`); an over-large chain is a `WireProtocol` error rather than an unbounded
+/// outbound. Built with the same canonical encoders the capability/anchor signers use, so a conformant
+/// host relay/anchor recomputes identical bytes.
+pub(crate) fn encode_anchor_boot_request(
+    quote_report: &[u8],
+    cert_chain: &[u8],
+    request: &AnchorBootRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    // Bound BOTH large fields before reserving/copying, so no producer (however buggy) can force a large
+    // alloc ahead of the frame-level MAX_MESSAGE_SIZE check.
+    if quote_report.len() > MAX_QUOTE_REPORT_LEN {
+        return Err(ProtocolError::WireProtocol("anchor boot request: quote_report too large"));
+    }
+    if cert_chain.len() > crate::snp_report::MAX_CERT_CHAIN_LEN {
+        return Err(ProtocolError::WireProtocol("anchor boot request: cert_chain too large"));
+    }
+    let mut payload = Vec::with_capacity(quote_report.len() + cert_chain.len() + 128);
+    put_uint(&mut payload, 5, 7); // map header: 7 pairs
+    put_uint(&mut payload, 0, 1);
+    put_uint(&mut payload, 0, RELAY_REQUEST_VERSION);
+    put_uint(&mut payload, 0, 2);
+    put_uint(&mut payload, 0, request.chain_id);
+    put_uint(&mut payload, 0, 3);
+    put_text(&mut payload, request.environment_identifier);
+    put_uint(&mut payload, 0, 4);
+    put_bytes(&mut payload, &request.nonce);
+    put_uint(&mut payload, 0, 5);
+    put_bytes(&mut payload, &request.report_data);
+    put_uint(&mut payload, 0, 6);
+    put_bytes(&mut payload, quote_report);
+    put_uint(&mut payload, 0, 7);
+    put_bytes(&mut payload, cert_chain);
+    crate::encode_message(crate::MessageType::AgentBootRelay, &payload)
+}
+
+/// Decode + validate a boot-relay request frame (for the untrusted host relay + tests). Uses a
+/// **lenient** CBOR decode (NOT the 4 KiB-per-string strict decoder — the request legitimately carries a
+/// multi-KiB cert chain, and it is not signature-bound so byte-level canonicality is not load-bearing;
+/// see the body). What IS enforced: no trailing bytes after the map; integer keys exactly `{1..=7}` with
+/// **no duplicates** (`check_strict_keys`; key *ordering* is NOT enforced); version `== 1`; exact-length
+/// `nonce` (32) / `report_data` (64); `cert_chain ≤ MAX_CERT_CHAIN_LEN`; AND the `report_data ==
+/// anchor_handshake_report_data(chain_id, env, nonce)` binding (binds the cleartext scope+nonce to the
+/// quote commitment — defense-in-depth at the relay boundary; the anchor re-checks). Every failure is
+/// [`ProtocolError::WireProtocol`].
+pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequest, ProtocolError> {
+    use crate::agent_cbor::{as_bytes, as_bytes_n, as_u64, check_strict_keys, map_get};
+
+    let framed = crate::decode_message(frame)?;
+    if framed.msg_type != crate::MessageType::AgentBootRelay {
+        return Err(ProtocolError::WireProtocol("not an AGENT_BOOT_RELAY frame"));
+    }
+    // Lenient ciborium decode — NOT `strict_decode_map`, whose per-byte-string cap (`MAX_STR_LEN`,
+    // 4 KiB) is sized for tiny agent maps and would reject a legitimate request carrying the ~1184 B SNP
+    // quote + a cert_chain up to `MAX_CERT_CHAIN_LEN` (64 KiB). The request is enclave-produced and NOT
+    // signature-bound (the anchor re-derives `report_data` from the public fields; the enclave verifies
+    // only the RESPONSE), so byte-level canonical strictness is not load-bearing here. What IS enforced:
+    // no trailing bytes, integer-key rigor (`check_strict_keys`: range + no-dup), exact field
+    // types/lengths, the cert_chain bound, and the `report_data` binding. The whole frame is bounded by
+    // `MAX_MESSAGE_SIZE` upstream in `decode_message`.
+    let mut cursor = std::io::Cursor::new(framed.payload.as_slice());
+    let value: Value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|_| ProtocolError::WireProtocol("boot request: bad CBOR"))?;
+    if cursor.position() as usize != framed.payload.len() {
+        return Err(ProtocolError::WireProtocol("boot request: trailing bytes after CBOR"));
+    }
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol("boot request: payload is not a CBOR map"));
+    };
+    if !check_strict_keys(&map, |n| (1..=7).contains(&n)) {
+        return Err(ProtocolError::WireProtocol("boot request: unexpected/missing/duplicate key"));
+    }
+    let req_u64 = |k: u64| map_get(&map, k).and_then(as_u64).ok_or(ProtocolError::WireProtocol("boot request: bad uint"));
+    if req_u64(1)? != RELAY_REQUEST_VERSION {
+        return Err(ProtocolError::WireProtocol("boot request: unsupported version"));
+    }
+    let chain_id = req_u64(2)?;
+    let environment_identifier = match map_get(&map, 3) {
+        Some(Value::Text(s)) => s.clone(),
+        _ => return Err(ProtocolError::WireProtocol("boot request: env must be text")),
+    };
+    let nonce = map_get(&map, 4).and_then(as_bytes_n::<32>).ok_or(ProtocolError::WireProtocol("boot request: nonce must be 32 bytes"))?;
+    let report_data = map_get(&map, 5).and_then(as_bytes_n::<64>).ok_or(ProtocolError::WireProtocol("boot request: report_data must be 64 bytes"))?;
+    // Check each large field's length on the borrowed slice BEFORE cloning, so an over-large field is
+    // rejected without a second owned allocation.
+    let quote_slice = map_get(&map, 6).and_then(as_bytes).ok_or(ProtocolError::WireProtocol("boot request: quote_report must be bytes"))?;
+    if quote_slice.len() > MAX_QUOTE_REPORT_LEN {
+        return Err(ProtocolError::WireProtocol("boot request: quote_report too large"));
+    }
+    let cert_slice = map_get(&map, 7).and_then(as_bytes).ok_or(ProtocolError::WireProtocol("boot request: cert_chain must be bytes"))?;
+    if cert_slice.len() > crate::snp_report::MAX_CERT_CHAIN_LEN {
+        return Err(ProtocolError::WireProtocol("boot request: cert_chain too large"));
+    }
+    let quote_report = quote_slice.to_vec();
+    let cert_chain = cert_slice.to_vec();
+    // Bind the cleartext (chain, env, nonce) to the quote commitment.
+    let expected = crate::agent_anchor::anchor_handshake_report_data(chain_id, &environment_identifier, &nonce);
+    if report_data != expected {
+        return Err(ProtocolError::WireProtocol("boot request: report_data inconsistent with (chain,env,nonce)"));
+    }
+    Ok(DecodedBootRequest {
+        chain_id,
+        environment_identifier,
+        nonce,
+        report_data,
+        quote_report,
+        cert_chain,
+    })
+}
+
+/// Read the anchor response off a stream: a single 4-byte BE length prefix then exactly that many raw
+/// anchor-signed bytes (no version/type framing — the relay forwards exactly what the anchor signed).
+/// The length is checked against [`MAX_ANCHOR_RESPONSE_LEN`] **before** allocating, so a hostile relay
+/// cannot force a large alloc. Returns the raw bytes verbatim for the driver to verify — this helper
+/// never parses anchor internals.
+///
+/// **Deadline precondition (5b-2b):** the `deadline` is only enforceable if `reader`'s underlying socket
+/// is configured with a read timeout (`SO_RCVTIMEO`) or non-blocking mode — the deadline is re-checked
+/// between/around `read` syscalls, but a fully-blocking `read` that never returns is not interruptible
+/// here. 5b-2b's `VsockBootRelayChannel` MUST set `SO_RCVTIMEO` (+ `SO_SNDTIMEO` + a connect timeout) so a
+/// black-holing relay cannot stall boot; its aya acceptance test MUST verify those socket options.
+pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
+    reader: &mut R,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, ProtocolError> {
+    let mut len_buf = [0u8; 4];
+    crate::read_exact_with_idle_deadline(reader, &mut len_buf, Some(deadline))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_ANCHOR_RESPONSE_LEN {
+        return Err(ProtocolError::WireProtocol("anchor response too large"));
+    }
+    let mut body = vec![0u8; len];
+    crate::read_exact_with_idle_deadline(reader, &mut body, Some(deadline))?;
+    Ok(body)
+}
+
+/// Frame an anchor response for the wire: a single 4-byte BE length prefix + the raw signed bytes. The
+/// canonical writer — shared by the host-relay daemon (5b-2b) and the tests so the response framing is a
+/// FUNCTION, not prose, preventing a BE/LE or prefix-inclusion drift between the writer and
+/// [`read_bounded_anchor_response`]. Rejects a response over [`MAX_ANCHOR_RESPONSE_LEN`] (the reader
+/// would reject it anyway — fail at the source).
+pub(crate) fn frame_anchor_response(response_bytes: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if response_bytes.len() > MAX_ANCHOR_RESPONSE_LEN {
+        return Err(ProtocolError::WireProtocol("anchor response too large to frame"));
+    }
+    let mut out = Vec::with_capacity(4 + response_bytes.len());
+    out.extend_from_slice(&(response_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(response_bytes);
+    Ok(out)
+}
+
+/// The raw enclave-initiated round-trip seam. ONE method; the real (5b-2b) impl over vsock. Obligations
+/// (load-bearing): (a) **fresh connection per call**, dropped on return (stale-reply isolation); (b)
+/// bound connect+write+read by `deadline` (one budget); (c) read the response via
+/// [`read_bounded_anchor_response`] (cap-before-alloc). Every failure maps to the coarse,
+/// always-retryable [`AnchorTransportError`] — the channel cannot smuggle a terminal/serve signal.
+pub(crate) trait BootRelayChannel {
+    fn round_trip(
+        &mut self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, AnchorTransportError>;
+}
+
+/// The SNP-quote seam: fetch a quote committing to `report_data`, returning `(report, cert_chain)`. The
+/// real (5b-2b) impl delegates to `snp_report::fetch_report` (local configfs-tsm file I/O); the test fake
+/// records the `report_data` it was handed (proving the quote↔nonce binding).
+///
+/// **`deadline` bounds the quote fetch's own wall-clock** (`RelayAnchorTransport` gives this leg its own
+/// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't hang boot
+/// AND quote latency can't starve the channel's budget). `fetch` MUST honor it: bound its I/O by
+/// `deadline` and return [`ProtocolError`] (→ retryable `AnchorTransportError`) rather than block past it.
+/// A wedged provider is a platform fault, but it must still fail promptly, not hang.
+pub(crate) trait BootQuoteProducer {
+    fn fetch(
+        &self,
+        report_data: &[u8; 64],
+        deadline: std::time::Instant,
+    ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError>;
+}
+
+/// The concrete [`AnchorBootTransport`] for the 5b-1 driver: compose quote-fetch → request-encode →
+/// channel round-trip, returning the anchor's response bytes verbatim. Monomorphized over the two seams
+/// (no `dyn`); 5b-2b instantiates it with `Q = SnpQuoteProducer`, `C = VsockBootRelayChannel`.
+///
+/// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
+/// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2 * timeout` wall-clock (the
+/// driver's `max_attempts` count bound caps total boot at `max_attempts * 2 * timeout`). 5b-2b MAY split
+/// this into separate `quote_timeout` / `relay_timeout` if the two legs want different budgets.
+pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel> {
+    quote: Q,
+    channel: C,
+    timeout: std::time::Duration,
+}
+
+impl<Q: BootQuoteProducer, C: BootRelayChannel> RelayAnchorTransport<Q, C> {
+    pub(crate) fn new(quote: Q, channel: C, timeout: std::time::Duration) -> Self {
+        Self { quote, channel, timeout }
+    }
+}
+
+impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnchorTransport<Q, C> {
+    fn anchor_round_trip(
+        &mut self,
+        request: &AnchorBootRequest,
+    ) -> Result<Vec<u8>, AnchorTransportError> {
+        // Each leg gets its OWN `timeout` budget (a fresh deadline computed just before it runs), so:
+        // (a) a hung quote fetch is bounded — it can't stall boot; AND (b) quote latency does NOT eat
+        // into the channel's budget (no false channel timeout). Per-attempt wall-clock is therefore
+        // ≤ 2×timeout; the driver bounds the attempt COUNT on top, so total boot stays bounded.
+        let (report, cert_chain) = self
+            .quote
+            .fetch(&request.report_data, std::time::Instant::now() + self.timeout)
+            .map_err(|_| AnchorTransportError("anchor relay: SNP quote fetch failed"))?;
+        let frame = encode_anchor_boot_request(&report, &cert_chain, request)
+            .map_err(|_| AnchorTransportError("anchor relay: request encode failed"))?;
+        // The returned bytes are UNTRUSTED and returned verbatim — verified downstream by the driver.
+        self.channel.round_trip(&frame, std::time::Instant::now() + self.timeout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_anchor::{anchor_handshake_report_data, test_signed_response_bytes};
+    use crate::agent_boot::BootFailReason;
+    use crate::agent_boot_driver::{
+        run_boot_anti_rollback_handshake, BootDriverFail, BootDriverOutcome,
+    };
+    use crate::agent_keystore::{AuditRing, FaucetState, KeystoreBody, KeystoreConfig};
+    use ed25519_dalek::SigningKey;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    const ENV: &str = "testnet";
+    const CHAIN: u64 = 11565;
+
+    fn anchor_key() -> SigningKey {
+        SigningKey::from_bytes(&[5u8; 32])
+    }
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::agent_dispatch::lock_and_reset_agent_process_globals()
+    }
+
+    fn test_config() -> KeystoreConfig {
+        KeystoreConfig {
+            twod_chain_id: CHAIN,
+            environment_identifier: ENV.to_string(),
+            admin_authority_pk: [0xa1; 32],
+            recovery_authority_pk: [0xa2; 32],
+            backup_recovery_wrapping_pubkey: vec![0xb0; 1568],
+            monotonic_treasury_config_version: 1,
+            authority_epoch: 0,
+            anchor_root: anchor_key().verifying_key().to_bytes(),
+        }
+    }
+
+    fn test_body(freshness_epoch: u64, structural_version: u64) -> KeystoreBody {
+        KeystoreBody {
+            config: test_config(),
+            entries: vec![],
+            counters: vec![],
+            faucet: FaucetState {
+                per_dispense_max_amount: [0; 32],
+                max_gas_limit: 21000,
+                max_effective_gas_fee_rate: 100,
+                cumulative_native_spend: [0; 32],
+                lifetime_spend: [0; 32],
+                circuit_breaker_threshold: None,
+            },
+            audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
+            freshness_epoch,
+            structural_version,
+            strict_recovery_counter: 0,
+        }
+    }
+
+    /// Build an `AnchorBootRequest` with a chosen nonce; `report_data` is the real binding hash.
+    fn request_for(nonce: [u8; 32]) -> ([u8; 32], [u8; 64]) {
+        let rd = anchor_handshake_report_data(CHAIN, ENV, &nonce);
+        (nonce, rd)
+    }
+
+    /// Extract the `WireProtocol` message (pins WHICH rejection branch fired, not just "an error").
+    fn wire_msg(r: Result<DecodedBootRequest, ProtocolError>) -> &'static str {
+        match r {
+            Err(ProtocolError::WireProtocol(m)) => m,
+            Err(e) => panic!("expected WireProtocol, got {e:?}"),
+            Ok(_) => panic!("expected WireProtocol error, got Ok"),
+        }
+    }
+
+    /// Hand-build a boot-relay request frame with arbitrary field values (to craft malformed cases the
+    /// encoder would refuse). `cert` may be any size (bypasses the encoder's cert_chain bound).
+    fn craft_frame(version: u64, chain: u64, env: &str, nonce: &[u8], rd: &[u8], quote: &[u8], cert: &[u8]) -> Vec<u8> {
+        use crate::agent_capability::{put_bytes, put_text, put_uint};
+        let mut p = Vec::new();
+        put_uint(&mut p, 5, 7);
+        put_uint(&mut p, 0, 1); put_uint(&mut p, 0, version);
+        put_uint(&mut p, 0, 2); put_uint(&mut p, 0, chain);
+        put_uint(&mut p, 0, 3); put_text(&mut p, env);
+        put_uint(&mut p, 0, 4); put_bytes(&mut p, nonce);
+        put_uint(&mut p, 0, 5); put_bytes(&mut p, rd);
+        put_uint(&mut p, 0, 6); put_bytes(&mut p, quote);
+        put_uint(&mut p, 0, 7); put_bytes(&mut p, cert);
+        crate::encode_message(crate::MessageType::AgentBootRelay, &p).unwrap()
+    }
+
+    /// Fake SNP quote producer: returns canned (report, cert_chain) and records each `report_data`.
+    struct FakeQuote {
+        report: Vec<u8>,
+        cert_chain: Vec<u8>,
+        fail: bool,
+        /// If true, honor the deadline: error when `now >= deadline` (models a real bounded fetch).
+        honor_deadline: bool,
+        seen: std::cell::RefCell<Vec<[u8; 64]>>,
+    }
+    impl FakeQuote {
+        fn ok() -> Self {
+            Self { report: vec![0xa5; 64], cert_chain: vec![0xc7; 8], fail: false, honor_deadline: false, seen: Default::default() }
+        }
+        fn failing() -> Self {
+            Self { report: vec![], cert_chain: vec![], fail: true, honor_deadline: false, seen: Default::default() }
+        }
+        /// A producer that respects the deadline — used to prove a slow quote cannot hang an attempt.
+        fn deadline_honoring() -> Self {
+            Self { report: vec![0xa5; 64], cert_chain: vec![0xc7; 8], fail: false, honor_deadline: true, seen: Default::default() }
+        }
+    }
+    impl BootQuoteProducer for FakeQuote {
+        fn fetch(
+            &self,
+            report_data: &[u8; 64],
+            deadline: std::time::Instant,
+        ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+            self.seen.borrow_mut().push(*report_data);
+            if self.fail {
+                return Err(ProtocolError::PqSigningUnavailable("fake quote fetch failed"));
+            }
+            if self.honor_deadline && std::time::Instant::now() >= deadline {
+                return Err(ProtocolError::PqSigningUnavailable("quote fetch deadline exceeded"));
+            }
+            Ok((self.report.clone(), self.cert_chain.clone()))
+        }
+    }
+
+    /// Scripted mock channel. Each `round_trip` decodes the request frame (exercising
+    /// `decode_anchor_boot_request`) so a `SignFresh`/`SignWrongNonce` action can sign against the live
+    /// per-attempt nonce.
+    enum ChAct {
+        Err,
+        Raw(Vec<u8>),
+        SignFresh { epoch: u64, sv: u64, marks: [u8; 32] },
+        /// Like SignFresh, but round-trips the signed bytes through the REAL wire framing
+        /// (frame_anchor_response → read_bounded_anchor_response) so the response-frame path itself is
+        /// exercised in the composition (a real vsock channel mishandling the 4-byte prefix would fail).
+        SignFreshFramed { epoch: u64, sv: u64, marks: [u8; 32] },
+        SignWrongNonce { epoch: u64, sv: u64, marks: [u8; 32] },
+    }
+    struct MockChannel {
+        actions: VecDeque<ChAct>,
+        connects: u32,
+        seen_nonces: Vec<[u8; 32]>,
+    }
+    impl MockChannel {
+        fn new(actions: Vec<ChAct>) -> Self {
+            Self { actions: actions.into(), connects: 0, seen_nonces: Vec::new() }
+        }
+    }
+    impl BootRelayChannel for MockChannel {
+        fn round_trip(
+            &mut self,
+            request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, AnchorTransportError> {
+            self.connects += 1;
+            // Fresh connection per call: decode THIS attempt's request to recover its nonce.
+            let decoded = decode_anchor_boot_request(request_frame)
+                .expect("driver-encoded request must decode");
+            self.seen_nonces.push(decoded.nonce);
+            let act = self.actions.pop_front().unwrap_or(ChAct::Err);
+            let bytes = match act {
+                ChAct::Err => return Err(AnchorTransportError("mock channel error")),
+                ChAct::Raw(b) => b,
+                ChAct::SignFresh { epoch, sv, marks } => test_signed_response_bytes(
+                    &anchor_key(), CHAIN, ENV, epoch, sv, marks, decoded.nonce,
+                ),
+                ChAct::SignFreshFramed { epoch, sv, marks } => {
+                    let signed = test_signed_response_bytes(&anchor_key(), CHAIN, ENV, epoch, sv, marks, decoded.nonce);
+                    // Exercise the actual response wire framing the 5b-2b vsock channel will use.
+                    let wire = frame_anchor_response(&signed).expect("framable");
+                    let mut cur = std::io::Cursor::new(wire);
+                    read_bounded_anchor_response(&mut cur, far_deadline()).expect("read back")
+                }
+                ChAct::SignWrongNonce { epoch, sv, marks } => {
+                    let mut wrong = decoded.nonce;
+                    wrong[0] ^= 0xff;
+                    test_signed_response_bytes(&anchor_key(), CHAIN, ENV, epoch, sv, marks, wrong)
+                }
+            };
+            Ok(bytes)
+        }
+    }
+
+    // ---- request codec ----
+
+    #[test]
+    fn request_encode_decode_round_trip() {
+        let (nonce, rd) = request_for([0x33; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let frame = encode_anchor_boot_request(&[0xa5; 100], &[0xc7; 8], &req).unwrap();
+        // valid AgentBootRelay frame
+        assert_eq!(crate::peek_msg_type_from_frame(&frame), Some(crate::MessageType::AgentBootRelay));
+        let d = decode_anchor_boot_request(&frame).unwrap();
+        assert_eq!(d.chain_id, CHAIN);
+        assert_eq!(d.environment_identifier, ENV);
+        assert_eq!(d.nonce, nonce);
+        assert_eq!(d.report_data, rd);
+        assert_eq!(d.quote_report, vec![0xa5; 100]);
+        assert_eq!(d.cert_chain, vec![0xc7; 8]);
+    }
+
+    #[test]
+    fn request_round_trip_empty_cert_chain() {
+        let (nonce, rd) = request_for([0x11; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let frame = encode_anchor_boot_request(&[0xa5; 32], &[], &req).unwrap();
+        assert!(decode_anchor_boot_request(&frame).unwrap().cert_chain.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_wrong_frame_type() {
+        // A GET_STATUS-typed frame is not AGENT_BOOT_RELAY.
+        let frame = crate::encode_message(crate::MessageType::GetStatus, &[0xa0]).unwrap();
+        assert!(decode_anchor_boot_request(&frame).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_bad_version() {
+        let (nonce, rd) = request_for([0x22; 32]);
+        // version 2 -> must fail at the version branch specifically.
+        let frame = craft_frame(2, CHAIN, ENV, &nonce, &rd, &[0xa5; 8], &[]);
+        assert!(wire_msg(decode_anchor_boot_request(&frame)).contains("version"));
+    }
+
+    #[test]
+    fn decode_rejects_inconsistent_report_data() {
+        let (nonce, _) = request_for([0x22; 32]);
+        // valid-length but non-matching report_data -> the binding branch fires.
+        let frame = craft_frame(1, CHAIN, ENV, &nonce, &[0x00; 64], &[0xa5; 8], &[]);
+        assert!(wire_msg(decode_anchor_boot_request(&frame)).contains("report_data"));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_nonce_length() {
+        let (_, rd) = request_for([0x22; 32]);
+        // 31-byte nonce -> must fail at the nonce-length branch (before the binding check).
+        let frame = craft_frame(1, CHAIN, ENV, &[0x11; 31], &rd, &[0xa5; 8], &[]);
+        assert!(wire_msg(decode_anchor_boot_request(&frame)).contains("nonce"));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_scope() {
+        // report_data binds (CHAIN, ENV, nonce) but the frame claims chain CHAIN+1 -> the binding check
+        // (report_data == hash(chain,env,nonce)) fails: the realistic relay-substitution attack.
+        let (nonce, rd) = request_for([0x55; 32]);
+        let frame = craft_frame(1, CHAIN + 1, ENV, &nonce, &rd, &[0xa5; 8], &[]);
+        assert!(wire_msg(decode_anchor_boot_request(&frame)).contains("report_data"));
+        // ...and a wrong env likewise breaks the binding.
+        let frame2 = craft_frame(1, CHAIN, "other-env", &nonce, &rd, &[0xa5; 8], &[]);
+        assert!(wire_msg(decode_anchor_boot_request(&frame2)).contains("report_data"));
+    }
+
+    #[test]
+    fn decode_rejects_oversize_cert_chain() {
+        // The host-relay decode path is the real untrusted boundary; an oversize cert_chain must be
+        // rejected there too (not just at the enclave's encode). report_data must match so the bound
+        // check is what fires.
+        let nonce = [0x66; 32];
+        let rd = anchor_handshake_report_data(CHAIN, ENV, &nonce);
+        let too_big = vec![0u8; crate::snp_report::MAX_CERT_CHAIN_LEN + 1];
+        let frame = craft_frame(1, CHAIN, ENV, &nonce, &rd, &[0xa5; 8], &too_big);
+        assert!(wire_msg(decode_anchor_boot_request(&frame)).contains("cert_chain"));
+    }
+
+    #[test]
+    fn decode_accepts_large_cert_chain() {
+        // Regression for the strict_decode_map 4 KiB cap bug: a realistic >4 KiB (here 16 KiB) cert
+        // chain — well within MAX_CERT_CHAIN_LEN — must round-trip through encode + decode.
+        let (nonce, rd) = request_for([0x67; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let big_cert = vec![0x5a; 16 * 1024];
+        let frame = encode_anchor_boot_request(&[0xa5; 1184], &big_cert, &req).unwrap();
+        let d = decode_anchor_boot_request(&frame).unwrap();
+        assert_eq!(d.cert_chain.len(), 16 * 1024);
+        assert_eq!(d.quote_report.len(), 1184);
+    }
+
+    #[test]
+    fn encode_rejects_oversize_cert_chain() {
+        let (nonce, rd) = request_for([0x44; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let too_big = vec![0u8; crate::snp_report::MAX_CERT_CHAIN_LEN + 1];
+        assert!(encode_anchor_boot_request(&[0xa5; 8], &too_big, &req).is_err());
+        // exactly MAX is accepted (still under MAX_MESSAGE_SIZE with the report).
+        let at_max = vec![0u8; crate::snp_report::MAX_CERT_CHAIN_LEN];
+        assert!(encode_anchor_boot_request(&[0xa5; 1184], &at_max, &req).is_ok());
+    }
+
+    #[test]
+    fn encode_and_decode_reject_oversize_quote() {
+        let (nonce, rd) = request_for([0x4a; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        // encode rejects an oversized quote before allocating; a real ~1184 B report is accepted.
+        assert!(encode_anchor_boot_request(&vec![0u8; MAX_QUOTE_REPORT_LEN + 1], &[], &req).is_err());
+        assert!(encode_anchor_boot_request(&vec![0u8; 1184], &[], &req).is_ok());
+        // decode (host-relay path) rejects an oversized quote too — matched envelopes.
+        let frame = craft_frame(1, CHAIN, ENV, &nonce, &rd, &vec![0u8; MAX_QUOTE_REPORT_LEN + 1], &[]);
+        assert!(wire_msg(decode_anchor_boot_request(&frame)).contains("quote_report"));
+    }
+
+    // ---- bounded response read ----
+
+    #[test]
+    fn read_bounded_accepts_small_response_verbatim() {
+        let body = vec![0xab; 300];
+        // The shared writer (`frame_anchor_response`) and the reader round-trip — one codec, no drift.
+        let wire = frame_anchor_response(&body).unwrap();
+        let mut cur = std::io::Cursor::new(wire);
+        let got = read_bounded_anchor_response(&mut cur, far_deadline()).unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn read_bounded_max_boundary() {
+        // Exactly MAX is accepted; MAX+1 is rejected (pins the `>` cap, not `>=`).
+        let at_max = vec![0xcd; MAX_ANCHOR_RESPONSE_LEN];
+        let wire = frame_anchor_response(&at_max).unwrap();
+        let mut cur = std::io::Cursor::new(wire);
+        assert_eq!(read_bounded_anchor_response(&mut cur, far_deadline()).unwrap().len(), MAX_ANCHOR_RESPONSE_LEN);
+        // frame_anchor_response itself refuses MAX+1; and a hand-built MAX+1 prefix is rejected by the reader.
+        assert!(frame_anchor_response(&vec![0u8; MAX_ANCHOR_RESPONSE_LEN + 1]).is_err());
+        let mut over = ((MAX_ANCHOR_RESPONSE_LEN + 1) as u32).to_be_bytes().to_vec();
+        over.extend_from_slice(&vec![0u8; MAX_ANCHOR_RESPONSE_LEN + 1]);
+        let mut cur2 = std::io::Cursor::new(over);
+        assert!(read_bounded_anchor_response(&mut cur2, far_deadline()).is_err());
+    }
+
+    #[test]
+    fn read_bounded_rejects_oversize_before_alloc() {
+        // 0xFFFFFFFF length prefix, no body — must reject on the length check, not try to read 4 GiB.
+        let mut wire = u32::MAX.to_be_bytes().to_vec();
+        wire.extend_from_slice(&[]);
+        let mut cur = std::io::Cursor::new(wire);
+        assert!(read_bounded_anchor_response(&mut cur, far_deadline()).is_err());
+    }
+
+    #[test]
+    fn read_bounded_rejects_truncated_stream() {
+        // length says 300 but only 10 body bytes available -> EOF error.
+        let mut wire = (300u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[0u8; 10]);
+        let mut cur = std::io::Cursor::new(wire);
+        assert!(read_bounded_anchor_response(&mut cur, far_deadline()).is_err());
+    }
+
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(60)
+    }
+
+    // ---- transport composition (direct) ----
+
+    fn transport(quote: FakeQuote, ch: MockChannel) -> RelayAnchorTransport<FakeQuote, MockChannel> {
+        RelayAnchorTransport::new(quote, ch, Duration::from_secs(5))
+    }
+
+    #[test]
+    fn transport_success_returns_verifiable_bytes() {
+        let (nonce, rd) = request_for([0x77; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let mut t = transport(
+            FakeQuote::ok(),
+            MockChannel::new(vec![ChAct::SignFresh { epoch: 7, sv: 2, marks: [0xab; 32] }]),
+        );
+        let bytes = t.anchor_round_trip(&req).expect("ok round trip");
+        // the returned (untrusted) bytes verify against the issued nonce + sealed anchor_root.
+        let st = crate::agent_anchor::verify_anchor_response_bytes(&bytes, &nonce, &test_config())
+            .expect("a conformant signed response verifies");
+        assert_eq!(st.epoch, 7);
+        // the fake quote was handed exactly request.report_data (quote<->nonce binding).
+        assert_eq!(t.quote.seen.borrow().as_slice(), &[rd]);
+    }
+
+    #[test]
+    fn transport_quote_failure_is_retryable_error_no_channel_call() {
+        let (nonce, rd) = request_for([0x88; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let mut t = transport(FakeQuote::failing(), MockChannel::new(vec![]));
+        assert_eq!(t.anchor_round_trip(&req), Err(AnchorTransportError("anchor relay: SNP quote fetch failed")));
+        assert_eq!(t.channel.connects, 0, "channel never called when the quote fetch fails");
+    }
+
+    #[test]
+    fn transport_quote_over_deadline_is_retryable_no_channel_call() {
+        // A quote producer that honors the deadline, with a ZERO timeout, sees now >= deadline and
+        // errors — proving a slow/hung quote fetch cannot block the attempt (it folds to a retryable
+        // AnchorTransportError) and the channel is never reached.
+        let (nonce, rd) = request_for([0xbb; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let mut t = RelayAnchorTransport::new(
+            FakeQuote::deadline_honoring(),
+            MockChannel::new(vec![]),
+            Duration::ZERO, // deadline = now() + 0 ⇒ already past by the time fetch runs
+        );
+        assert_eq!(t.anchor_round_trip(&req), Err(AnchorTransportError("anchor relay: SNP quote fetch failed")));
+        assert_eq!(t.channel.connects, 0, "channel never reached when the quote fetch times out");
+    }
+
+    #[test]
+    fn transport_channel_error_is_retryable() {
+        let (nonce, rd) = request_for([0x99; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let mut t = transport(FakeQuote::ok(), MockChannel::new(vec![ChAct::Err]));
+        assert_eq!(t.anchor_round_trip(&req), Err(AnchorTransportError("mock channel error")));
+    }
+
+    #[test]
+    fn transport_returns_untrusted_bytes_verbatim() {
+        // The transport does NOT pre-reject a garbage reply — it returns it; verification is downstream.
+        let (nonce, rd) = request_for([0xaa; 32]);
+        let req = AnchorBootRequest { chain_id: CHAIN, environment_identifier: ENV, nonce, report_data: rd };
+        let garbage = vec![0xff, 0xff, 0xff];
+        let mut t = transport(FakeQuote::ok(), MockChannel::new(vec![ChAct::Raw(garbage.clone())]));
+        assert_eq!(t.anchor_round_trip(&req), Ok(garbage));
+    }
+
+    // ---- end-to-end through the real 5b-1 driver ----
+
+    #[test]
+    fn driver_ready_through_relay_transport() {
+        let _g = test_lock();
+        let body = test_body(7, 2);
+        let marks = body.compute_local_marks_digest();
+        let mut t = transport(
+            FakeQuote::ok(),
+            MockChannel::new(vec![ChAct::SignFresh { epoch: 7, sv: 2, marks }]),
+        );
+        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+            BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 7),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert_eq!(t.channel.connects, 1);
+    }
+
+    #[test]
+    fn driver_ready_through_real_response_framing() {
+        // Same as driver_ready_through_relay_transport, but the channel round-trips the response through
+        // frame_anchor_response → read_bounded_anchor_response — so the 4-byte-prefix response framing is
+        // exercised in the full composition, not bypassed by returning raw bytes.
+        let _g = test_lock();
+        let body = test_body(7, 2);
+        let marks = body.compute_local_marks_digest();
+        let mut t = transport(
+            FakeQuote::ok(),
+            MockChannel::new(vec![ChAct::SignFreshFramed { epoch: 7, sv: 2, marks }]),
+        );
+        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+            BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 7),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert_eq!(t.channel.connects, 1);
+    }
+
+    #[test]
+    fn driver_retry_then_ready_uses_fresh_nonce_each_attempt() {
+        let _g = test_lock();
+        let body = test_body(7, 2);
+        let marks = body.compute_local_marks_digest();
+        let mut t = transport(
+            FakeQuote::ok(),
+            MockChannel::new(vec![ChAct::Err, ChAct::SignFresh { epoch: 7, sv: 2, marks }]),
+        );
+        assert!(matches!(run_boot_anti_rollback_handshake(&mut t, &body, 5), BootDriverOutcome::Ready(_)));
+        assert_eq!(t.channel.connects, 2, "one channel error then success = 2 connects");
+        assert_ne!(t.channel.seen_nonces[0], t.channel.seen_nonces[1], "a fresh nonce per attempt");
+    }
+
+    #[test]
+    fn driver_wrong_nonce_reply_is_terminal() {
+        let _g = test_lock();
+        let body = test_body(7, 2);
+        let marks = body.compute_local_marks_digest();
+        let mut t = transport(
+            FakeQuote::ok(),
+            MockChannel::new(vec![ChAct::SignWrongNonce { epoch: 7, sv: 2, marks }]),
+        );
+        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+            BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyNonceMismatch)) => {}
+            other => panic!("expected VerifyNonceMismatch, got {other:?}"),
+        }
+        assert_eq!(t.channel.connects, 1, "a wrong-nonce reply is terminal, not a grind lever");
+    }
+
+    #[test]
+    fn driver_oversize_quote_response_garbage_is_terminal_malformed() {
+        let _g = test_lock();
+        let body = test_body(7, 2);
+        // A garbage (non-CBOR) reply -> driver -> verify -> Malformed (terminal). Confirms untrusted
+        // bytes are safely rejected downstream, not by the transport.
+        let mut t = transport(FakeQuote::ok(), MockChannel::new(vec![ChAct::Raw(vec![0xff, 0xff])]));
+        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+            BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyMalformed)) => {}
+            other => panic!("expected VerifyMalformed, got {other:?}"),
+        }
+        assert_eq!(t.channel.connects, 1);
+    }
+}
