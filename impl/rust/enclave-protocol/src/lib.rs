@@ -151,6 +151,13 @@ mod agent_boot;
 // (dead-code) until the slice-5b-2 agent bin + concrete transport land (aya/SNP validation).
 #[cfg(feature = "agent-gateway")]
 mod agent_boot_driver;
+// Agent Gateway anti-rollback boot-relay wire protocol + transport seam (TASK-7.7, slice 5b-2a). The
+// request CBOR codec (MessageType::AgentBootRelay 0x41), the bounded raw-response read, the
+// BootRelayChannel + BootQuoteProducer seams, and RelayAnchorTransport (the concrete
+// `impl AnchorBootTransport`). Pure/CI-testable; the real vsock channel + fetch_report producer + agent
+// bin land in 5b-2b (aya/SNP). UNWIRED (dead-code) until then.
+#[cfg(feature = "agent-gateway")]
+mod agent_boot_relay;
 mod wire;
 
 use serde::{Deserialize, Serialize};
@@ -288,6 +295,11 @@ pub enum MessageType {
     /// the inner CBOR payload carries its own agent_version + opcode. Reserved
     /// outer band 0x40..0x4F. Command handling lands in TASK-7.6.
     AgentGateway = 0x40,
+    /// Agent Gateway anti-rollback **boot-relay** request frame (TASK-7.7 slice 5b-2). Reserved
+    /// outer band `0x40..0x4F`. ENCLAVE-INITIATED: the enclave opens an outbound connection to a host
+    /// relay and writes this frame (SNP quote + public challenge); it is NEVER serve-dispatched, so
+    /// `decode_wire_command` rejects it fail-closed (a hostile inbound `0x41` cannot reach a handler).
+    AgentBootRelay = 0x41,
 }
 
 /// Простой диспетчер команд (скелет).
@@ -388,6 +400,7 @@ pub fn decode_message(data: &[u8]) -> Result<FramedMessage, ProtocolError> {
         0x20 => MessageType::ArmForProduction,
         0x30 => MessageType::GetStatus,
         0x40 => MessageType::AgentGateway,
+        0x41 => MessageType::AgentBootRelay,
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
 
@@ -1438,6 +1451,12 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
         MessageType::AgentGateway => Err(ProtocolError::WireProtocol(
             "agent gateway commands require the agent-gateway feature (reserved by TASK-7.1)",
         )),
+        // AGENT_BOOT_RELAY (0x41) is ENCLAVE-INITIATED (the enclave writes it outbound to a host relay
+        // during the anti-rollback boot handshake); it is never a serve-loop command. A hostile inbound
+        // 0x41 to the serve dispatcher fails closed here (TASK-7.7 slice 5b-2).
+        MessageType::AgentBootRelay => Err(ProtocolError::WireProtocol(
+            "AGENT_BOOT_RELAY is enclave-initiated; not serve-dispatchable",
+        )),
     }
 }
 
@@ -1475,6 +1494,7 @@ pub fn peek_msg_type_from_frame(frame: &[u8]) -> Option<MessageType> {
         Some(0x20) => Some(MessageType::ArmForProduction),
         Some(0x30) => Some(MessageType::GetStatus),
         Some(0x40) => Some(MessageType::AgentGateway),
+        Some(0x41) => Some(MessageType::AgentBootRelay),
         _ => None,
     }
 }
@@ -1603,7 +1623,9 @@ fn try_process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     encode_message(MessageType::GetMeasurement, &body)
 }
 
-fn read_exact_with_idle_deadline<R: std::io::Read>(
+// `pub(crate)` so the agent boot-relay channel (TASK-7.7 5b-2) reuses the same deadline-bounded read
+// for its bounded anchor-response read helper.
+pub(crate) fn read_exact_with_idle_deadline<R: std::io::Read>(
     reader: &mut R,
     buf: &mut [u8],
     idle_deadline: Option<std::time::Instant>,
@@ -3770,8 +3792,10 @@ mod agent_gateway_framing_tests {
         let mk = |type_byte: u8| [0u8, 0, 0, 2, PROTOCOL_VERSION, type_byte];
         assert_eq!(peek_msg_type_from_frame(&mk(0x01)), Some(MessageType::GetMeasurement));
         assert_eq!(peek_msg_type_from_frame(&mk(0x40)), Some(MessageType::AgentGateway));
-        // Old behaviour returned Some(GetMeasurement) for these — must be None now.
-        assert_eq!(peek_msg_type_from_frame(&mk(0x41)), None);
+        // 0x41 = AGENT_BOOT_RELAY (TASK-7.7 5b-2, enclave-initiated boot handshake frame).
+        assert_eq!(peek_msg_type_from_frame(&mk(0x41)), Some(MessageType::AgentBootRelay));
+        // Unknown bytes still fail closed (None) — must NOT fall back to a producer type (the old bug).
+        assert_eq!(peek_msg_type_from_frame(&mk(0x42)), None);
         assert_eq!(peek_msg_type_from_frame(&mk(0xFF)), None);
         assert_eq!(peek_msg_type_from_frame(&[]), None);
     }

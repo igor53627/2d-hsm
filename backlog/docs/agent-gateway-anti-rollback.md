@@ -596,15 +596,53 @@ The driver **installs nothing** (reconcile installs on its `Fresh` arm) and **do
 - **§8 obligations now SATISFIED by 5b-1** (pure, 26 unit tests against a mock transport): bounded
   full-sequence retry, fresh challenge per attempt, scope-from-`body.config`, `AdoptForward` fail-closed,
   non-`Ready` no-serve (via `decide_serve`, including the `BindingInstall`-with-prior-binding case),
-  serve-gate table. **Still 5b-2 (aya/SNP), split into reviewable sub-slices:** (a) the concrete `impl
-  AnchorBootTransport` — `fetch_report` for the quote + the enclave-initiated vsock relay, which MUST
-  enforce a per-call timeout, correlate the response to the current nonce (drain/discard a late/stale
-  reply from a timed-out prior attempt rather than returning it as a `VerifyNonceMismatch`), and cap the
-  untrusted response byte length before allocating; (b) the agent-gateway **bin** + in-crate boot module
-  (set platform root → unseal the agent keystore → `install_agent_keystore` →
-  `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve); (c) the
-  sealed-blob source + unseal sequencing; (d) the `AdoptForward` signed raw-marks channel + seed +
-  re-seal. **Enclave-initiated vsock pre-serve exchange is the largest 5b-2 feasibility unknown** (today's
-  transport is strictly host-initiated) — confirm it with a spike before (a). Still **UNWIRED**
-  (dead-code) until 5b-2 adds the only caller; **5b-2 MUST land before any release build claims
-  anti-rollback support** (else the slice ships dead).
+  serve-gate table.
+
+**Boot-relay wire protocol + transport seam — slice 5b-2a (`agent_boot_relay.rs`).** The pure,
+CI-testable half of the platform transport. **Request** = a `MessageType::AgentBootRelay` (`0x41`, in the
+reserved `0x40..0x4F` agent band; never serve-dispatchable — `decode_wire_command` fail-closes it) frame
+carrying a canonical integer-keyed CBOR map: `{1: relay_request_version=1, 2: chain_id, 3: env, 4: nonce
+(32B), 5: report_data (64B), 6: quote_report, 7: cert_chain}`; cert_chain bounded by
+`snp_report::MAX_CERT_CHAIN_LEN` (64 KiB, single source) and the frame by `MAX_MESSAGE_SIZE`. **Response**
+= the raw anchor-signed bytes **verbatim** behind a single 4-byte BE length prefix (no re-encode — that
+would break `agent_anchor`'s "signature binds exact wire bytes" property; the enclave never parses anchor
+internals), read by `read_bounded_anchor_response` which checks `MAX_ANCHOR_RESPONSE_LEN` (4096) **before
+allocating** (no OOM from a hostile relay). Two seams, **both deadline-aware**: `BootQuoteProducer`
+(`fetch(report_data, deadline)`) and `BootRelayChannel` (`round_trip(frame, deadline)`, fresh connection
+per call for stale-reply isolation). `RelayAnchorTransport<Q, C>` computes ONE absolute `Instant` deadline
+and passes it to BOTH — so the whole round-trip (quote fetch + connect+write+read) shares one wall-clock
+budget and the driver's per-attempt COUNT bound composes with a real time bound (no leg can hang). It is
+the concrete `AnchorBootTransport` composing fetch-quote → encode-request → channel-relay → return raw
+bytes; every failure folds to the
+coarse always-retryable `AnchorTransportError`. **No nonce-precheck** (a precheck-to-retryable would
+downgrade a genuine terminal `VerifyNonceMismatch` into a grind lever); a garbage/wrong-nonce reply is
+safe (terminal downstream). 25 unit tests incl. the FULL composition through the 5b-1 driver + 5a verify
+(mock channel + fake quote). `decode_anchor_boot_request` (for the untrusted host relay + tests) is
+hardened — no-trailing-bytes, integer-key rigor (range + no-dup), exact field lengths, `cert_chain`
+bound, and the `report_data == anchor_handshake_report_data(chain,env,nonce)` binding — but is NOT an
+enclave trust boundary (the enclave only *encodes* requests and *verifies* responses), and deliberately
+uses a **lenient** CBOR decode rather than the 4 KiB-per-string strict decoder, since a legitimate
+request carries a multi-KiB cert chain (the request is not signature-bound, so byte-level canonicality is
+not load-bearing). The response framing has a single shared writer (`frame_anchor_response`) so the host
+relay and the reader can't drift.
+
+**Still 5b-2b (aya/SNP) — only OS-coupled leaves:** (a) the concrete `VsockBootRelayChannel`
+(`VsockStream::connect` to host CID 2, fresh-per-call, `SO_*TIMEO` + the deadline) + `SnpQuoteProducer`
+(delegates to `snp_report::fetch_report`), gated `vsock-transport`; (b) the agent-gateway **bin** +
+in-crate boot module (set platform root → unseal the agent keystore → `install_agent_keystore` →
+`RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` → `decide_serve(outcome,
+cfg!(release_build))?` → serve); (c) the sealed-blob source + unseal sequencing; (d) the `AdoptForward`
+signed raw-marks channel + seed + re-seal; plus the host-side relay daemon (uses
+`decode_anchor_boot_request`). **Enclave-initiated outbound vsock is feasible** (the `vsock` crate's
+`VsockStream::connect` to CID 2, separate from the serve-loop listener — spike confirmed via
+`vsock_listen.rs`), but the live exchange + timeouts are validated on aya. **Each of (a)–(d) is its own
+ordered, independently-gated review slice** (transport+quote leaf → bin/boot-sequencing → sealed-blob
+source/unseal → AdoptForward), NOT one mega-PR — (d) **AdoptForward stays last and separate** because it
+changes the fail-closed behavior (flips `AdoptForwardUnsupported` from terminal to executable) and adds
+an authenticated raw-marks channel + re-seal/persistence; (a)'s `SnpQuoteProducer::fetch` and
+`VsockBootRelayChannel` must each carry an aya acceptance test for their wall-clock bound (connect/write/
+read timeouts + non-hanging quote fetch + fresh-connection late-reply isolation). Still **UNWIRED**
+(dead-code) until 5b-2b adds the bin caller; **5b-2 MUST land before any release build claims anti-rollback
+support** (else 5a/5b-1/5b-2a ship dead). 5b-2a is the LAST pure layer — its tests already drive the full
+verify+driver+transport composition end-to-end (including the response wire framing via
+`driver_ready_through_real_response_framing`), so the accumulation bottoms out here.

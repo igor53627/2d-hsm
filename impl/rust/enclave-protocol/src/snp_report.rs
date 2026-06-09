@@ -30,7 +30,9 @@ const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
 /// Upper bound on the configfs-tsm `auxblob` (VCEK→ASK→ARK chain) we will carry in
 /// GET_MEASUREMENT. A real chain is a few KB; this is generous headroom while staying well under
 /// `MAX_MESSAGE_SIZE` once the report + pq_pubkey are added.
-const MAX_CERT_CHAIN_LEN: usize = 64 * 1024;
+// `pub(crate)` so the agent boot-relay request encoder (TASK-7.7 5b-2) bounds its outbound cert_chain
+// against the single source of truth rather than re-declaring 64 KiB.
+pub(crate) const MAX_CERT_CHAIN_LEN: usize = 64 * 1024;
 
 /// Extract the 48-byte launch measurement from a raw SNP `ATTESTATION_REPORT`.
 pub fn measurement_from_report(report: &[u8]) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
