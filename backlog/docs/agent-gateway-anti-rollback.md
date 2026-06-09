@@ -763,14 +763,19 @@ request golden vector is a 5b-2b test-vector item.
       MUST set a connect timeout in addition to `SO_RCVTIMEO`/`SO_SNDTIMEO` — `connect()` is bounded by
       NEITHER `SO_*TIMEO` nor `relay_forward_once`'s in-fn deadline (which operates on already-connected
       streams), so with the serial loop a black-holing anchor that stalls on connect would wedge the ENTIRE
-      daemon (head-of-line-blocking every queued enclave boot). **HOW to bound it is transport-conditional —
+      daemon (head-of-line-blocking every queued enclave boot). **DECISION ITEM (ordered BEFORE (b)'s
+      connect-bound work): pin the anchor transport.** The connect-bound SHAPE is transport-determined, so
+      (b) cannot be scoped or reviewed until "TCP or UDS" is decided — record the choice here when (b)
+      starts. **HOW to bound it is transport-conditional —
       do NOT hand-copy `connect_bounded`'s sequence:** the anchor leg is TCP-or-UDS (the anchor is a separate
       service; the vsock leg is enclave-facing only). If **TCP**: use `std::net::TcpStream::connect_timeout`
       (it performs the whole nonblocking→poll→`SO_ERROR`→restore-blocking dance internally — no hand-rolling).
       If **UDS**: std has NO `UnixStream` connect-timeout, and a non-blocking AF_UNIX connect that would block
       returns **`EAGAIN`, not `EINPROGRESS`** (connect(2)) — so `connect_bounded`'s `EINPROGRESS`→`poll(POLLOUT)`
       finish sequence is the WRONG shape there; treat `EAGAIN` as a retryable fail-fast (UDS connects are
-      local and either succeed immediately or the listener backlog is full). Only a vsock anchor leg (not a
+      local and either succeed immediately or the listener backlog is full — and the daemon's pump loop must
+      treat that retryable as "this pump failed, serve the next queued boot", i.e. backlog pressure surfaces
+      as a per-pump retry, not an ambiguous daemon-level failure). Only a vsock anchor leg (not a
       realistic deployment) would reuse `connect_bounded`'s sequence — extract it from (a') then, never
       hand-roll (the `getsockopt(SO_ERROR)` check and the `set_nonblocking(false)` restore are both mandatory
       and are exactly the steps a copy drops). **Blast-radius note (explicit non-goal):**
@@ -804,15 +809,20 @@ request golden vector is a 5b-2b test-vector item.
   library boot-sequencing entrypoint** (e.g. `run_agent_gateway_boot(...)`) — the `RelayAnchorTransport` /
   `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
   `[[bin]]`. **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
-  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d)** — (d) =
-  the hard quote bound. (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
-  no longer gates the live serve. **The ONE hard precondition remaining for a live 5b-2c serve (make it an
-  ENFORCEABLE artifact, not just a checklist line):**
-  - **(d) quote bound** — the 5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
+  concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
+  5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
+  (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
+  no longer gates the live serve. **The TWO hard preconditions remaining for a live 5b-2c serve:**
+  1. **(d) quote bound** — the 5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
      into a *serving* path until (d) exists; prefer a structural gate (have (d) introduce a
      `HardBoundedQuoteProducer` type the wrapper requires by signature, so a build lacking (d) **cannot
      construct** the serving path — a compile error, not an omittable runtime/`cfg` check). Wiring it sooner
      reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
+  2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
+     (`max_attempts · 2 · timeout ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
+     ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
+     HERE too so this summary cannot be read as "(d) is the only gate" (a prior wording said "the ONE hard
+     precondition", contradicting the budget MUST below — both gates are required).
 
   *Satisfied precondition (no longer gating, listed for audit):* **(a') connect bound — DONE (PR #56).**
   [`connect_bounded`] is a non-blocking connect + `poll_with_deadline(POLLOUT)` cancellable hard bound:
@@ -912,21 +922,40 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `max_attempts · 2 · timeout ≤ overall_boot_budget` invariant remains the enforced CEILING — valid and
   conservative (the kernel timer can only make real attempts cheaper, never costlier), with the I/O leg
   (which has no kernel cap) still able to consume its full per-leg share. **5b-2c MUST enforce it as a structural artifact (NOT
-  a prose checklist line) — same MUST/enforceable standard the doc applies to (d):** because this invariant is
-  now load-bearing as the sole availability bound, 5b-2c MUST validate it where the transport/driver is
+  a prose checklist line) — same MUST/enforceable standard the doc applies to (d), and gate #2 in the
+  dependency-order list above:** because this invariant is
+  now load-bearing as the sole availability bound, 5b-2c MUST validate **whichever invariant form it ships**
+  (the `2·timeout` form, or the generalized `quote_timeout + channel_timeout` form below if distinct
+  timeouts ship — do NOT hardcode the `2·` special case in the check) where the transport/driver is
   constructed — a constructor/config check that **returns an error** (fail-closed, not merely a
-  `debug_assert`, since the bound must hold in release) when `max_attempts · 2 · timeout > overall_boot_budget`.
+  `debug_assert`, since the bound must hold in release) when the shipped form exceeds `overall_boot_budget`.
+  The check MUST run AFTER `max_attempts` range validation (below), use **checked/saturating arithmetic**
+  (`u32 · Duration` products can overflow; a wrapped product passing the check is the exact failure the gate
+  exists to stop), and reject zero / sub-`MIN_BOUNDARY_BUDGET` timeouts at config-parse time (a 0ms leg is
+  meaningless and `set_read_timeout(ZERO)` is an Err on vsock). *Hardening note (the one prose-only premise
+  this gate rests on):* the `2·` accounting assumes connect+I/O share ONE deadline, which is only
+  wiring-enforced in `round_trip_inner` (see above) — when 5b-2c builds the budget check, prefer computing it
+  where both deadlines ORIGINATE (e.g. a constructor that derives connect and I/O deadlines from one
+  channel-leg value), so the structural gate cannot outlive the wiring assumption it depends on.
   This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **Generalized form (the `2·`
   assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if 5b-2c
   exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
   **`max_attempts · (quote_timeout + channel_timeout) ≤ overall_boot_budget`** — 5b-2c MUST restate and
-  enforce whichever form it ships. **Deferred verification artifact (do not lose behind "DONE PR #56"):** a
-  real-vsock test of the in-flight-connect black-hole *deadline lapse* (currently unit-level-only via
-  `poll_times_out_when_not_ready`) remains a tracked 5b-2b-ii/TASK-7.7 residual — and per the kernel-timer
-  note above it MUST use a deadline **< ~2s** (or raise `SO_VM_SOCKETS_CONNECT_TIMEOUT`) or it will silently
-  test the kernel-`ETIMEDOUT` veto arm instead of the lapse arm. **Term definitions (single source — 5b-2c wires
+  enforce whichever form it ships.
+  - [ ] **Deferred verification artifact (CHECKED residual — do not lose behind "DONE PR #56"):** a
+    real-vsock test of the in-flight-connect black-hole *deadline lapse* (currently unit-level-only via
+    `poll_times_out_when_not_ready`) — the only mode where the caller's `deadline`, not the kernel's ~2s
+    timer, is the binding bound. Owner: 5b-2b-ii/TASK-7.7 residual, due with (d)'s aya work at the latest.
+    Constraint (kernel-timer note above): the test MUST use a deadline **< ~2s** (or raise
+    `SO_VM_SOCKETS_CONNECT_TIMEOUT`) or it will silently test the kernel-`ETIMEDOUT` veto arm instead of the
+    lapse arm.
+
+  **Term definitions (single source — 5b-2c wires
   both into one check):** `max_attempts` = the value 5b-2c passes to
-  `run_boot_anti_rollback_handshake(..., max_attempts)` (driver-clamped to `MAX_BOOT_ATTEMPTS_CEILING = 64`);
+  `run_boot_anti_rollback_handshake(..., max_attempts)` — valid range **`1..=MAX_BOOT_ATTEMPTS_CEILING
+  (= 64)`**; the driver **REJECTS** out-of-range values as `Unstartable` (0 and `> 64` are config errors —
+  it does NOT silently clamp; see `agent_boot_driver.rs`: "reject, don't clamp" — so 5b-2c must validate the
+  range at config parse, not assume clamping);
   `timeout` = the per-leg `Duration` 5b-2c gives `RelayAnchorTransport::new`; `overall_boot_budget` = a NEW
   5b-2c operator config (the total wall-clock the platform allows for boot before fail-closed). 5b-2c MUST
   pick `max_attempts`/`timeout` so the product respects its own `overall_boot_budget`.

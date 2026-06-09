@@ -1549,6 +1549,26 @@ mod vsock_aya_tests {
         // kernel's ~2s connect timer, which never engages for a refusal). Triage note: a deterministic
         // FAILURE here can also mean a stray process is LISTENING on vsock port 5998 (connect then
         // succeeds and the read runs the deadline out) — check `ss --vsock` before chasing the connect path.
+        //
+        // Stage 1 — ARM ATTRIBUTION (matrix finding: round_trip blanket-folds every ProtocolError, so it
+        // cannot pin WHICH arm rejected): call connect_bounded directly and assert the exact veto-arm
+        // string. Kernel reality (af_vsock): the refusal lands as sk_err=ECONNRESET -> error-ready poll
+        // (POLLERR|POLLOUT) -> the connect_poll_succeeded veto; the synchronous and SO_ERROR arms are
+        // structurally unreachable for a refusal (vsock_connect holds the sock lock; REQUEST tx is
+        // workqueued).
+        match connect_bounded(
+            crate::vsock_addr::VMADDR_CID_HOST,
+            5998,
+            Instant::now() + Duration::from_millis(1000),
+        ) {
+            Err(ProtocolError::WireProtocol(msg)) => assert_eq!(
+                msg, "anchor relay: vsock connect failed (poll)",
+                "a no-listener refusal must be rejected by the poll-veto arm specifically"
+            ),
+            Err(other) => panic!("expected the poll-veto arm error, got {other:?}"),
+            Ok(_) => panic!("connect to a dead endpoint must not succeed (stray listener on 5998?)"),
+        }
+        // Stage 2 — PROMPT + RETRYABLE FOLDING through the public channel API.
         let mut ch = VsockBootRelayChannel::new(crate::vsock_addr::VMADDR_CID_HOST, 5998);
         let start = Instant::now();
         let r = ch.round_trip(&build_request_frame(), start + Duration::from_millis(1000));
