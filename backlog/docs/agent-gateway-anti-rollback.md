@@ -835,7 +835,11 @@ request golden vector is a 5b-2b test-vector item.
   `production()` constructor error is FATAL wiring-time config (must be `?`-propagated; funneling any
   construction error through the fetch-path retryable fold would spin the attempt budget on a permanent
   refusal — construction-fatal and fetch-retryable deliberately share `ProtocolError`, position is the
-  discriminator: a sub-slice (3) hazard to keep visible).
+  discriminator: a sub-slice (3) hazard to keep visible); (3) CONFIG LOGGING — the bin MUST log
+  `(max_attempts, per_leg_timeout, overall_boot_budget, nominal_boot_cost)` at config parse, via
+  `ValidatedBootBudget`'s getters ((d-ii)/3): the artifact's static error strings deliberately carry
+  no numbers (house anti-oracle pattern), so the parse-time log line is the operator's only view of
+  the numbers the gate enforced.
   **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
   5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
@@ -850,7 +854,12 @@ request golden vector is a 5b-2b test-vector item.
      (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
      HERE too so this summary cannot be read as "(d) is the only gate" (a prior wording said "the ONE hard
-     precondition", contradicting the budget MUST below — both gates are required).
+     precondition", contradicting the budget MUST below — both gates are required). **The enforceable
+     artifact EXISTS ((d-ii)/3): `quote_subprocess::ValidatedBootBudget`** — checked-arithmetic
+     fail-closed constructor, taken by the producer's constructors as an ordering witness
+     (validation-before-claim by signature); the REMAINING gate-#2 obligation is 5b-2c constructing it
+     from operator config (and logging the four numbers at parse — see the bin preconditions above).
+     Both gates stay required; live serve opens only at (4b) wiring + the (4c) smoke.
 
   *Satisfied precondition (no longer gating, listed for audit):* **(a') connect bound — DONE (PR #56).**
   [`connect_bounded`] is a non-blocking connect + `poll_with_deadline(POLLOUT)` cancellable hard bound:
@@ -961,16 +970,19 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   consumed by both the emitters and the child's code refinement (no transcribed copies); the
   `fetch_report_with_at` promotion obligation is DISCHARGED (entry-path-honored test included); e2e
   real-subprocess tests drive the REAL child core + PRODUCTION env parser through the REAL parent
-  orchestration (full pipeline minus configfs). **Named obligation for (d-ii)-2/3 or 5b-2c:**
-  parent-side reap-status logging — the parent still discards reaped exit statuses (`fold_try_wait`
-  matches `Ok(Some(_))`), so the exit-code table has NO parent-side carrier; child-side, every nonzero
-  exit emits a BEST-EFFORT stderr breadcrumb (`twod-hsm quote child: exit <code>`; the code-10
-  write-failure line subsumes its own) — best-effort, NOT guaranteed: it is written after the frame
-  flush and the parent SIGKILLs on frame receipt, so the breadcrumb can lose that race; the reliable
-  cause-carrier is the in-band ERR frame (parent-visible as the retryable error string), which is why
-  reap logging stays the obligation rather than being discharged by the breadcrumb. The breadcrumb
-  lives in the production-only entrypoint (`agent_quote_child_main`, zero CI coverage by pin (2)
-  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger
+  orchestration (full pipeline minus configfs). **Parent-side reap-status logging — DISCHARGED in
+  (d-ii)/3** (was the named "(d-ii)-2/3 or 5b-2c" obligation): pure `reap_breadcrumb(pid, status)`
+  filter, emission at the `StdChildHandle::try_reap` choke point ALL reap paths share (dispose poll
+  loop, ledger sweep, both Drops — an abandoned-then-exited child's code is captured by a later
+  sweep for free; `fold_try_wait` stays the pure untouched fold). Policy: log real nonzero exit
+  codes (the 1..=6/10/101 table — the kernel preserves a zombie's original status, so codes survive
+  the post-exit SIGKILL) + non-SIGKILL crash signals; SILENT on exit-0 and own-SIGKILL (the uniform
+  disposition kills every child — unfiltered would bury the carrier). Emission is `let _ = writeln!`
+  (NEVER `eprintln!` — panics on broken stderr, and try_reap is reachable from Drop). Honest
+  residuals: the child-side BEST-EFFORT breadcrumb (`twod-hsm quote child: exit <code>`) still races
+  the parent's SIGKILL-on-frame; a never-exiting D-state child logs nothing on either side (nothing
+  to reap); the reliable cause-carrier remains the in-band ERR frame. Runtime journald verification
+  folds into the (4c) aya smoke — (2) producer wrapper + single-ledger
   ownership — **LANDED ((d-ii)/2)**: `HardBoundedQuoteProducer` (in `quote_subprocess`, triple-gated) =
   the structural serve-gate type; its `BootQuoteProducer::fetch` delegates to the killable-subprocess
   orchestration (the (d-i) NO-skeleton rule SATISFIED, not waived — the delegate IS the bound). Pin (1)
@@ -999,9 +1011,19 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `<Q: BootQuoteProducer>` — a generic wrapper re-opens the cooperative-producer hole (4a) deletes.
   Landing (2) does NOT open live serve (the TWO-artifact gate below is unchanged) and does NOT
   discharge pin (2) below (production-shape runtime stays ZERO-CI; the construction-shape CI test is
-  not the discharge — (4c) is); the parent-side reap-status-logging obligation above is explicitly
-  RE-DEFERRED to sub-slice (3)/5b-2c. — (3)
-  budget-gate integration, (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
+  not the discharge — (4c) is). — (3)
+  budget-gate integration — **LANDED ((d-ii)/3)**: `ValidatedBootBudget` (in `quote_subprocess`,
+  triple-gated — the three consumed consts' cfg gates intersect exactly there) = gate #2 of the
+  TWO-artifact live-serve gate; sole constructor `validate(max_attempts, per_leg_timeout,
+  overall_boot_budget)` runs the order-pinned fail-closed chain (zero/over-ceiling attempts → floor
+  → CHECKED overflow → ε-bearing exceeds; checked NOT saturating; the `2·` exists only as a
+  call-site fact — the formula is the generalized leg-sum). The producer's constructors take it as
+  an ORDERING WITNESS (`new(&budget, spawn)` / `production(&budget)`): validation-before-claim is a
+  compile fact. `production_transport(channel)` composes BOTH gates in one call and makes the
+  validated `per_leg_timeout` THE origin of the transport's deadlines (droppable to getter-sourcing
+  if contested — recorded fallback). The parent-side reap obligation is DISCHARGED here (see above);
+  the 5b-2c bin obligation (log the four config numbers at parse) and the witness construction from
+  operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
   the (d-ii) child is the sole surviving caller and fetches unbounded — the rustdoc-pinned "makes the
@@ -1077,10 +1099,13 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   both (NB per the kernel-timer note below, a connect can only consume "nearly the whole leg" when the per-leg `timeout` is ≲ the ~2s kernel connect timer — for longer legs a wedged connect is kernel-capped at ~2s and the I/O budget keeps the rest), AND MUST
   satisfy the boot-budget invariant **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`** (ε = the
   quote-subprocess overhead const `QUOTE_ATTEMPT_OVERHEAD`, see the ε term below) so the bounded
-  retry loop can't blow the operator's total boot deadline. **The ceiling is a CLAIM until sub-slice
-  (3)'s checked-arithmetic validation artifact lands** — even with `HardBoundedQuoteProducer` landed
-  ((d-ii)/2), nothing validates the operator's numbers against the formula yet; do not treat the bound
-  as guaranteed when reasoning about a live serve (the TWO-artifact gate already encodes this). **Invariant (wiring-enforced in 5b-2b — a single
+  retry loop can't blow the operator's total boot deadline. **The checked-arithmetic validation
+  artifact EXISTS ((d-ii)/3): `quote_subprocess::ValidatedBootBudget`** — the invariant is validated
+  fail-closed at construction for any caller holding the witness, and the producer's constructors
+  REQUIRE it by signature. WORDING DISCIPLINE: the ceiling stays NOMINAL sizing arithmetic (ε is not
+  a runtime guarantee — the runtime hard bounds remain the per-leg deadlines), and live serve is
+  STILL gated on (d) incl. the (4c) smoke + (4b) wiring — the artifact landing does NOT open live
+  serve; the surviving gate-#2 obligation is 5b-2c constructing the witness from operator config. **Invariant (wiring-enforced in 5b-2b — a single
   local variable, NOT a structural gate; re-verify on any refactor of `round_trip_inner`):** `connect_bounded`'s
   `deadline` arg is the **per-leg channel deadline** —
   `round_trip_inner` passes the *same* `deadline` local to `connect_bounded` and to the channel-I/O
@@ -1123,7 +1148,24 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   wiring-enforced in `round_trip_inner` (see above) — when 5b-2c builds the budget check, prefer computing it
   where both deadlines ORIGINATE (e.g. a constructor that derives connect and I/O deadlines from one
   channel-leg value), so the structural gate cannot outlive the wiring assumption it depends on.
-  This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **ε term — EXPLICIT in the
+  This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **STATUS ((d-ii)/3 —
+  LANDED): the artifact is `quote_subprocess::ValidatedBootBudget`** (triple-gated — the three
+  consumed consts' cfg gates intersect exactly there; any other home needs a re-exported/
+  parameterized ε, the transcription hole this section forbids). Sole constructor
+  `validate(max_attempts, per_leg_timeout, overall_boot_budget)`: fail-closed `Err` in release;
+  order-pinned chain (range → floor → CHECKED overflow → exceeds; checked NOT saturating — a
+  saturated `Duration::MAX` product would PASS `≤ Duration::MAX`, the exact wrapped-product failure
+  named above); the check arithmetic is written in the GENERALIZED leg-sum form (the `2·` literal
+  appears nowhere in code — a future distinct-timeout split changes constructor INPUTS, never the
+  formula). The BEFORE-claim ordering pin is now STRUCTURAL: `HardBoundedQuoteProducer::{new,
+  production}` take `&ValidatedBootBudget` as an ordering witness. Deadline ORIGINATION is
+  structural too: `ValidatedBootBudget::production_transport(channel)` claims the producer AND
+  constructs `RelayAnchorTransport` from `per_leg_timeout()` in one call — the value the invariant
+  was checked against IS the value both leg deadlines are minted from (the transport cannot take the
+  type BY SIGNATURE — cfg-lattice: `agent_boot_relay` compiles in agent-gateway-without-vsock builds
+  where the type does not exist — so its Duration seam is the deliberate coupling shape). The
+  surviving wiring-enforced residual (connect+I/O sharing ONE channel-leg deadline in
+  `round_trip_inner`) is UNCHANGED — its re-verify pin stands. **ε term — EXPLICIT in the
   operator-facing check [user decision 2026-06-10]:** as of (d), each attempt additionally costs the
   quote-subprocess overhead ε — **the code const `quote_subprocess::QUOTE_ATTEMPT_OVERHEAD`** (derived
   from its dominant term `REAP_GRACE` + a spawn/kill/fd-close margin; assert-pinned so a `REAP_GRACE`
