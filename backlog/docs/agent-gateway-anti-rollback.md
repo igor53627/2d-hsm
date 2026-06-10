@@ -811,7 +811,21 @@ request golden vector is a 5b-2b test-vector item.
   `decide_serve(outcome, cfg!(release_build))?` → serve. Like the daemon (b), 5b-2c needs a **`pub`
   library boot-sequencing entrypoint** (e.g. `run_agent_gateway_boot(...)`) — the `RelayAnchorTransport` /
   `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
-  `[[bin]]`. **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
+  `[[bin]]`. **Manifest obligation (pinned — previously unpinned anywhere):** the 5b-2c bin is a NEW `[[bin]]`
+  target in `enclave-protocol` (e.g. `agent-gateway-vsock`, `src/bin/agent_gateway_vsock.rs`) with
+  `required-features = ["agent-gateway", "vsock-transport"]` — exactly the feature pair the crate-root
+  `agent_quote_child_dispatch` export is cfg-gated on (plus `target_os = "linux"`, so the bin is Linux-only
+  like the export). It MUST NOT reuse or extend `production-vsock`/`staging-vsock` (nor share the
+  `enclave-vsock`/`enclave-vsock-staging` bins): both pull `ml-dsa-65` (`staging-vsock` via `staging-host`),
+  which trips the `ml-dsa-65 ⊕ agent-gateway` role-isolation `compile_error!` (vsock §10.2) — the same wall
+  the (c) CI note records for the test combo. Caveat: `required-features` only gates whether the bin BUILDS;
+  it cannot enforce the dispatch-first rule (the quote child re-execs `current_exe()`, so a main that skips
+  the dispatch call silently boots a second full gateway instead of a quote child). So EITHER give the
+  library a run-main wrapper (e.g. `pub fn agent_gateway_main()` whose first statement is
+  `agent_quote_child_dispatch()`, the `[[bin]]` a thin one-line caller — the same thin-bin rule as (b)'s
+  daemon) OR make "main's first statement is `agent_quote_child_dispatch()`" an explicit, checked 5b-2c
+  acceptance item (see the byte-exact-stdout pin in the (d-ii) note below, which enforces it by test).
+  **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
   5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
   (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
@@ -909,26 +923,96 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   deterministic coverage is the Fake-handle ledger tests) + the entry-path `fetch_report_with_at` refactor;
   (d-ii) adds the configfs child mode (`agent_quote_child_main`, child-side GC) + `HardBoundedQuoteProducer`
   (the structural serve-gate type — deliberately NO skeleton in (d-i): it would satisfy the by-signature
-  gate while the hang remains) + the in-SNP-guest aya validation. **(d-ii) slicing note (review-load):** (d-ii) MAY land as ordered sub-slices, each gated — (1) child
-  CLI + unique-entry fetch + child-side GC, (2) producer wrapper + single-ledger ownership, (3)
-  budget-gate integration, (4) cooperative-path deletion + live wiring — rather than one
-  subprocess+configfs+wiring mega-review. **Named (d-ii) obligations:** promote `fetch_report_with_at`
-  to `pub(crate)` WITH the consuming child PR (deliberately not earlier — a consumer-free seam; add a
-  test that custom entry paths are honored); the production child's STDOUT is PROTOCOL-ONLY (no
+  gate while the hang remains) + the in-SNP-guest aya validation (absorbed into sub-slice (4c) of the
+  slicing below — not a separate co-equal artifact). **(d-ii) slicing note (review-load):** (d-ii) lands as
+  ordered sub-slices, each gated — (1) child dispatch entrypoint + child core (unique-entry fetch +
+  child-side GC) — **LANDED (this PR); bin wiring is 5b-2c.** The bin-facing surface is the
+  crate-root **`agent_quote_child_dispatch()`** export (self-dispatching: returns in a parent, never
+  returns in a child; the marker env stays crate-private so the dispatch condition cannot be re-keyed
+  one-sided) — the 5b-2c bin calls it unconditionally as main's first statement. **Threat-model pin
+  (matrix HIGH "env-injected report_data", refuted 3-0 — oracle equivalence):** child mode is NOT an
+  authentication/trust boundary and deliberately carries no parent-vs-external-launch check — the SNP
+  signing oracle is configfs-tsm + firmware, natively available to ANY equally-privileged in-guest
+  process (the firmware signs any 64-byte report_data for any guest code; the report carries no
+  requesting-process identity), so an env-token/ppid/parent-capability check would be unfalsifiable
+  theater, and deriving report_data from key material inside the child would move secrets INTO the
+  SIGKILL-able child (which deliberately holds zero) for no oracle reduction. report_data binding is
+  enforced by the RELYING PARTY's derive-and-compare rule + the measured-boot chain, NOT by which
+  process requested the report. Two standing preconditions of this argument: the binary is never
+  installed setuid / wrapped by a privileged env-forwarding service, and no relying path ascribes extra
+  weight to "this binary produced the quote". **Named TASK-16 obligation (new):** the AC#5 Layer-1
+  measured-boot chain MUST cover the kernel cmdline and any host-to-init env channel
+  (`systemd.setenv=`-style) — env-dispatched modes (this marker, and any future env-sensitive behavior)
+  assume guest-internal env integrity; direct-boot `KERNEL_HASHES=on` measurement satisfies this.
+  Mechanics, the child
+  exit-code table, and the never-panic/PROTOCOL-ONLY-stdout rules live in the dispatch/entrypoint
+  rustdoc (single source); the outblob post-check messages are snp_report-owned pub(crate) consts
+  consumed by both the emitters and the child's code refinement (no transcribed copies); the
+  `fetch_report_with_at` promotion obligation is DISCHARGED (entry-path-honored test included); e2e
+  real-subprocess tests drive the REAL child core + PRODUCTION env parser through the REAL parent
+  orchestration (full pipeline minus configfs). **Named obligation for (d-ii)-2/3 or 5b-2c:**
+  parent-side reap-status logging — the parent still discards reaped exit statuses (`fold_try_wait`
+  matches `Ok(Some(_))`), so the exit-code table has NO parent-side carrier; child-side, every nonzero
+  exit emits a BEST-EFFORT stderr breadcrumb (`twod-hsm quote child: exit <code>`; the code-10
+  write-failure line subsumes its own) — best-effort, NOT guaranteed: it is written after the frame
+  flush and the parent SIGKILLs on frame receipt, so the breadcrumb can lose that race; the reliable
+  cause-carrier is the in-band ERR frame (parent-visible as the retryable error string), which is why
+  reap logging stays the obligation rather than being discharged by the breadcrumb. The breadcrumb
+  lives in the production-only entrypoint (`agent_quote_child_main`, zero CI coverage by pin (2)
+  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger ownership, (3)
+  budget-gate integration, (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
+  `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
+  `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
+  the (d-ii) child is the sole surviving caller and fetches unbounded — the rustdoc-pinned "makes the
+  narrowing structural: `_at` loses the parameter entirely" obligation lands here, not later), (4b) live
+  wiring of `HardBoundedQuoteProducer` into the boot path — GATED on the 5b-2c boot-budget validation
+  artifact (the fail-closed constructor check below); the TWO-artifact live-serve gate stands: wiring
+  here does NOT open live serve until (4c) completes (d), (4c) the in-guest aya smoke (SNP spike
+  2026-06-10: `.#disk-production-lab` boot+configfs PASS in ~80s warm — the guest path is alive; test
+  delivery = lab profile + test-binary oneshot printing to ttyS0) — acceptance EXPLICITLY includes
+  exercising the production spawn shape (`PipeSource::Stdout` + `clear_env` + stderr→journald),
+  restating pin (2) below as this sub-slice's checked item (the stderr-piped test shape does NOT
+  discharge it) — rather than one subprocess+configfs+wiring mega-review (the bundling an unsplit (4)
+  would have recreated). **Named (d-ii) obligations** *(the `fetch_report_with_at` promotion + entry-path test: DISCHARGED in
+  sub-slice 1)*: the production child's STDOUT is PROTOCOL-ONLY (no
   logging, no panic text — the std panic handler writes to stderr, which production inherits to
   journald; nothing else may write to the pipe); child error classification is CLOSED by design — ALL
   child-reported failures (ERR frames) and ALL parent-side fetch errors fold to the retryable
   transport class at the seam (no terminal smuggling; a host/child cannot manufacture a terminal boot
-  verdict). **Two (d-ii)/5b-2c pins from the (d-i)
+  verdict). **Three (d-ii)/5b-2c pins from the (d-i)
   review:** (1) `HardBoundedQuoteProducer` owns THE one `AbandonedLedger` for the process — the budget
   binds only if exactly one ledger outlives all fetches (a fresh ledger per attempt resets `is_full()`
   and voids the cap; the ledger's own doc carries the same pin); (2) the production spawn shape
   (`PipeSource::Stdout` + `clear_env` + stderr→journald) has ZERO (d-i) coverage — the (d-ii) aya smoke
   of the shipped producer MUST exercise exactly that shape (checked item, not assumed from the
-  stderr-piped test shape).* Acceptance criteria: **"no stuck
-  process accumulation across repeated timeouts"** and **"a subsequent attempt is well-defined (no entry
-  collision) after a timeout"**, plus the aya test that a wedged provider fails the attempt promptly rather
-  than hanging boot. **This is the live-serve blocker:** 5b-2b-ii(a)/(b) only unblock 5b-2c
+  stderr-piped test shape); (3) **5b-2c acceptance item — bin-contract enforcement:** the
+  `agent_quote_child_dispatch()`-as-main's-FIRST-statement + PROTOCOL-ONLY-stdout contract is documented
+  (dispatch rustdoc + this section) but structurally unenforceable until the bin exists — 5b-2c MUST ship
+  a real-subprocess test that spawns the ACTUAL agent bin (`env!("CARGO_BIN_EXE_<agent-bin>")`; production
+  spawn shape: marker env set, `clear_env`, stdout piped) and asserts the child's stdout, read to EOF, is
+  BYTE-EXACTLY the expected frame and nothing else — full-buffer equality, NOT the frame parser (the
+  parser's per-drain-window tolerance must not mask banner/log bytes before or after the frame) — plus the
+  matching exit code. Deterministic deviceless arms (no configfs needed, plain CI): (a) marker env set,
+  report_data env missing ⇒ stdout == `encode_err_frame(1)` exactly, exit 1; (b) valid report_data env on
+  a configfs-less host ⇒ stdout == `encode_err_frame(2)` exactly (create fails), exit 2. Place the test as
+  an INTEGRATION test (`tests/`): Cargo's documented contract sets `CARGO_BIN_EXE_<name>` only when
+  building integration tests/benches, NOT lib unit tests — and the pub(crate) frame encoders are
+  unreachable from an integration test anyway, so pin the expected frames as GOLDEN BYTES (the 2-byte ERR
+  frames are stable wire constants; the in-crate golden-byte test already pins the same encoding). A
+  dispatch moved below any stdout-writing statement — or any stdout logging anywhere in the bin — fails
+  this test by construction.* Acceptance criteria — split by what each environment can actually stage (per the honest
+  limit above, a true D-state wedge cannot be staged on demand ANYWHERE, so NO acceptance item requires a
+  live wedged provider): (1) **D-state/unreapable arm — fake-handle, deterministic (landed in (d-i)):**
+  **"no stuck process accumulation across repeated timeouts"** and **"a subsequent attempt is well-defined
+  (no entry collision) after a timeout"**, proven by the Fake-handle ledger tests (kill-pends →
+  abandon-ledger → budget refusal); promptness needs no live wedge — the parent never waits BY TYPE, so
+  the attempt fails at the deadline regardless of child state; (2) **S-state timeout — real subprocess
+  (CI, repeated on aya):** a stalled-but-killable child stand-in (sleeping, NOT a real provider wedge) is
+  killed at the deadline and the attempt fails promptly with a retryable error rather than hanging boot;
+  (3) **healthy-path in-SNP-guest aya smoke:** the shipped producer in its production spawn shape
+  (`PipeSource::Stdout` + `clear_env` + stderr→journald — pin (2) above) fetches a real quote through
+  configfs-tsm. No acceptance item stages a real D-state provider wedge — that arm's only deterministic
+  coverage is (1), by design. **This is the live-serve blocker:** 5b-2b-ii(a)/(b) only unblock 5b-2c
   *construction/compilation* (the concrete channel exists); a **live anti-rollback serve path requires (d)**.
   There is no "wire it live but best-effort" window — the cooperative deadline is best-effort *within* the
   attempt, but a live serving 5b-2c MUST wait for (d) (the wedged-read hang is otherwise reachable).

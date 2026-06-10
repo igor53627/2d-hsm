@@ -98,6 +98,8 @@ mod cancellable_boundary;
 /// (agent-gateway).
 #[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
 mod quote_subprocess;
+#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+pub use quote_subprocess::agent_quote_child_dispatch;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",

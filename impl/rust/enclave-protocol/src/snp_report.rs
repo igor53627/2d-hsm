@@ -27,12 +27,69 @@ const TSM_ENTRY_NAME: &str = "twod-hsm";
 /// Domain separation for the `report_data` binding (so it is not a bare key hash).
 const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
 
+/// Prefix for the killable quote CHILD's self-named configfs entries (TASK-7.7 5b-2b-ii(d), §8 revised
+/// pin): `twod-hsm-q-<child_pid>`. STRICTLY LONGER than the bare producer name `twod-hsm`, so the
+/// child-side prefix GC can never match (and never remove) the producer/GET_MEASUREMENT entry.
+#[cfg(feature = "agent-gateway")]
+pub(crate) const TSM_QUOTE_ENTRY_PREFIX: &str = "twod-hsm-q-";
+
+/// The quote child's self-named unique entry path: `{TSM_REPORT_DIR}/{PREFIX}{own pid}`. Live-pid
+/// uniqueness forbids collision among live children (a wedged unreaped child still holds its pid), and
+/// post-reap pid recycling is harmless: the child's own sequence starts with a stale-clear of exactly
+/// this name. No parent→child name plumbing exists at all — the child self-names (deletes the env
+/// injection/path-validation surface the parent-minted alternative would need).
+#[cfg(feature = "agent-gateway")]
+#[cfg_attr(not(test), allow(dead_code))] // consumer = the triple-gated quote_subprocess child mode
+pub(crate) fn quote_child_entry_path() -> String {
+    format!("{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}", std::process::id())
+}
+
+/// CHILD-ONLY best-effort orphan GC (path-parameterized so tempdir tests can exercise it): remove every
+/// directory under `dir` whose name starts with [`TSM_QUOTE_ENTRY_PREFIX`]. EVERY error is skipped
+/// silently — EBUSY on a still-wedged sibling's held entry is EXPECTED (≤ ABANDONED_CHILD_BUDGET such
+/// children can be live, §8), an absent dir means off-SNP; GC never blocks on, gates, or fails the
+/// attempt, and is never required to prove all orphans were removed. MUST only ever run inside the
+/// killable child — a parent-side readdir/rmdir against a wedged provider could block uninterruptibly
+/// (the §8 no-parent-configfs-I/O rule).
+#[cfg(feature = "agent-gateway")]
+#[cfg_attr(not(test), allow(dead_code))] // consumer = the triple-gated quote_subprocess child mode
+pub(crate) fn gc_quote_entries_best_effort(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // absent/unreadable dir (off-SNP) — never an error
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(TSM_QUOTE_ENTRY_PREFIX) {
+            let _ = std::fs::remove_dir(entry.path()); // best-effort; EBUSY on a held entry is EXPECTED
+        }
+    }
+}
+
+/// [`gc_quote_entries_best_effort`] at the real configfs-tsm report dir — the form
+/// `agent_quote_child_main` calls.
+#[cfg(feature = "agent-gateway")]
+// Plain allow (not cfg_attr(not(test))): the only caller is the TRIPLE-gated child entrypoint, and no
+// deviceless test can exercise this real-/sys-dir binding — under agent-gateway-only test builds it is
+// legitimately consumer-free and must stay warning-silent there too.
+#[allow(dead_code)]
+pub(crate) fn gc_quote_entries_default() {
+    gc_quote_entries_best_effort(std::path::Path::new(TSM_REPORT_DIR));
+}
+
 /// Upper bound on the configfs-tsm `auxblob` (VCEK→ASK→ARK chain) we will carry in
 /// GET_MEASUREMENT. A real chain is a few KB; this is generous headroom while staying well under
 /// `MAX_MESSAGE_SIZE` once the report + pq_pubkey are added.
 // `pub(crate)` so the agent boot-relay request encoder (TASK-7.7 5b-2) bounds its outbound cert_chain
 // against the single source of truth rather than re-declaring 64 KiB.
 pub(crate) const MAX_CERT_CHAIN_LEN: usize = 64 * 1024;
+
+/// The outblob post-check triage messages — pub(crate) consts (NOT inline literals) because the quote
+/// CHILD's ERR-code refinement (`quote_subprocess::child_err_code`) matches on them: a single source
+/// makes cross-file drift structurally impossible (the previous transcribed-copy + self-referential
+/// pin-test arrangement guaranteed nothing).
+pub(crate) const OUTBLOB_OVERSIZE_MSG: &str = "SNP attestation: outblob exceeds max size";
+pub(crate) const OUTBLOB_SHORT_MSG: &str = "SNP attestation: outblob shorter than ABI minimum";
 
 /// Upper bound on the configfs-tsm `outblob` (the `ATTESTATION_REPORT`). A real report is ~1184 B
 /// (version 5); 8 KiB is ample headroom for future report versions and matches the relay-path quote bound
@@ -82,7 +139,10 @@ pub fn report_data_for_pubkey(pq_pubkey: &[u8]) -> [u8; REPORT_DATA_LEN] {
 /// The configfs-tsm filesystem operations, behind a seam so the deadline + cleanup orchestration in
 /// [`fetch_report_with`] is unit-testable WITHOUT a live `/sys/kernel/config/tsm` (the cleanup-on-timeout
 /// invariant — entry removed even when the deadline fires mid-sequence — is the defect-prone part and the
-/// only one that leaks a stale configfs entry if wrong). [`RealTsmFs`] is the ONLY configfs-touching code.
+/// only one that leaks a stale configfs entry if wrong). Configfs is touched by exactly TWO code surfaces,
+/// both in this file: [`RealTsmFs`] (the seam ops) and the seam-BYPASSING
+/// [`gc_quote_entries_best_effort`] (child-mode-only orphan sweep — see its doc; §8 forbids it
+/// parent-side). Auditors of the no-parent-configfs rule must check BOTH.
 pub(crate) trait TsmFs {
     /// Best-effort remove (== `fs::remove_dir`, ignore error) — used to clear a stale entry and to clean up.
     fn remove_entry(&self, entry: &str);
@@ -93,11 +153,15 @@ pub(crate) trait TsmFs {
     fn read_auxblob(&self, entry: &str) -> Vec<u8>;
 }
 
-/// The real configfs-tsm implementation (the only code that touches `/sys/kernel/config/tsm`). Methods
+/// The real configfs-tsm implementation (one of exactly TWO configfs touchers — the other is the
+/// child-only GC; see the seam doc above). `pub(crate)` SOLELY for the quote-child binding in
+/// `quote_subprocess::agent_quote_child_main` — any other caller, ESPECIALLY anything reachable from
+/// the parent boot path, violates the §8 no-parent-configfs rule (a parent-side configfs op against a
+/// wedged provider can block uninterruptibly). Methods
 /// are lifted verbatim from the previous `fetch_report`/`fetch_report_inner`; safe file I/O (no ioctl,
 /// no unsafe). Exercised live only on an SNP guest (aya); compiles + returns interface-absent errors
 /// everywhere else.
-struct RealTsmFs;
+pub(crate) struct RealTsmFs;
 impl TsmFs for RealTsmFs {
     fn remove_entry(&self, entry: &str) {
         let _ = std::fs::remove_dir(entry);
@@ -133,9 +197,7 @@ impl TsmFs for RealTsmFs {
             .read_to_end(&mut buf)
             .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot read outblob"))?;
         if buf.len() > MAX_OUTBLOB_LEN {
-            return Err(ProtocolError::PqSigningUnavailable(
-                "SNP attestation: outblob exceeds max size",
-            ));
+            return Err(ProtocolError::PqSigningUnavailable(OUTBLOB_OVERSIZE_MSG));
         }
         Ok(buf)
     }
@@ -208,7 +270,7 @@ pub(crate) fn fetch_report_with<F: TsmFs>(
 /// in practice: the (d-ii) child calls with `None`/unbounded, and the cooperative `Option<Instant>`
 /// plumbing is deletion-approved — any future deadline-bearing direct caller must add its own
 /// fast-path; that (d-ii) deletion makes the narrowing structural: `_at` loses the parameter entirely).
-fn fetch_report_with_at<F: TsmFs>(
+pub(crate) fn fetch_report_with_at<F: TsmFs>(
     fs: &F,
     entry_path: &str,
     report_data: &[u8; REPORT_DATA_LEN],
@@ -233,9 +295,14 @@ fn fetch_report_inner_with<F: TsmFs>(
     check_deadline(deadline)?;
     let report = fs.read_outblob(entry)?;
     if report.len() < MIN_REPORT_LEN {
-        return Err(ProtocolError::PqSigningUnavailable(
-            "SNP attestation: outblob shorter than ABI minimum",
-        ));
+        return Err(ProtocolError::PqSigningUnavailable(OUTBLOB_SHORT_MSG));
+    }
+    // MAX post-check HERE (not only inside RealTsmFs::read_outblob): the seam contract must hold for
+    // EVERY TsmFs impl, the child's code-5 refinement must be reachable through the REAL fetch path
+    // devicelessly, and the encoder-reject arm downstream becomes structurally unreachable for the
+    // report half. (RealTsmFs's cap-before-alloc read stays — defense in depth at the alloc boundary.)
+    if report.len() > MAX_OUTBLOB_LEN {
+        return Err(ProtocolError::PqSigningUnavailable(OUTBLOB_OVERSIZE_MSG));
     }
     check_deadline(deadline)?;
     let cert_chain = fs.read_auxblob(entry);
@@ -611,5 +678,64 @@ mod tests {
         assert!(check_deadline(Some(past())).is_err());
         assert!(check_deadline(Some(future())).is_ok());
         assert!(check_deadline(None).is_ok(), "None is unbounded — never errors");
+    }
+    /// (d-ii) quote-child naming/GC tests live HERE (not in the triple-gated quote_subprocess) so the
+    /// items they exercise are test-used in EVERY agent-gateway combo — no dead-code warnings in the
+    /// agent-gateway-only CI lanes.
+    #[cfg(feature = "agent-gateway")]
+    mod quote_child_naming {
+        use super::super::*;
+
+        #[test]
+        fn quote_entry_prefix_can_never_match_the_producer_entry() {
+            // STRUCTURAL pin of the §8 "GC can never remove the producer entry" rule (prose + a
+            // stale-literal test would survive a rename; this fails the moment the relation breaks).
+            assert!(
+                !TSM_ENTRY_NAME.starts_with(TSM_QUOTE_ENTRY_PREFIX),
+                "the fixed producer entry name must never match the quote-child GC prefix"
+            );
+            assert!(
+                TSM_QUOTE_ENTRY_PREFIX.len() > TSM_ENTRY_NAME.len(),
+                "prefix strictly longer than the bare producer name (the documented invariant)"
+            );
+        }
+
+        #[test]
+        fn quote_child_entry_path_is_prefixed_own_pid() {
+            let path = quote_child_entry_path();
+            assert_eq!(
+                path,
+                format!("{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}", std::process::id()),
+                "self-named path = report dir + prefix + OWN pid"
+            );
+        }
+
+        #[test]
+        fn gc_removes_prefix_only_spares_fixed_name() {
+            // Regression: GC nuking the fixed producer entry (GET_MEASUREMENT breakage) or unrelated
+            // names. Spares the REAL const (not a transcribed literal).
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["twod-hsm-q-123", "twod-hsm-q-99999", TSM_ENTRY_NAME, "unrelated"] {
+                std::fs::create_dir(dir.path().join(name)).unwrap();
+            }
+            gc_quote_entries_best_effort(dir.path());
+            assert!(!dir.path().join("twod-hsm-q-123").exists(), "prefixed orphan removed");
+            assert!(!dir.path().join("twod-hsm-q-99999").exists(), "prefixed orphan removed");
+            assert!(dir.path().join(TSM_ENTRY_NAME).exists(), "the FIXED producer entry is spared");
+            assert!(dir.path().join("unrelated").exists(), "unrelated names spared");
+        }
+
+        #[test]
+        fn gc_tolerates_unremovable_and_absent_dir() {
+            // Regression: GC failure gating the boot attempt — a held (EBUSY-class) entry and an
+            // absent dir must both be silent no-ops.
+            let dir = tempfile::tempdir().unwrap();
+            let held = dir.path().join("twod-hsm-q-7");
+            std::fs::create_dir(&held).unwrap();
+            std::fs::write(held.join("inner"), b"x").unwrap(); // non-empty => remove_dir fails
+            gc_quote_entries_best_effort(dir.path()); // must not panic/Err
+            assert!(held.exists(), "unremovable entry skipped, not an error");
+            gc_quote_entries_best_effort(std::path::Path::new("/nonexistent/2d-hsm-gc-test"));
+        }
     }
 }
