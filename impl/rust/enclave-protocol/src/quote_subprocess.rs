@@ -22,8 +22,9 @@
 //! [`crate::agent_boot_relay::BootQuoteProducer`] impl DELIVERS the bound (the (d-i) NO-skeleton rule is
 //! SATISFIED, not waived: `fetch` delegates to the killable-subprocess orchestration
 //! `fetch_quote_via_child`, so the wedged-read hang is killed at the deadline — no by-signature gate-lie
-//! remains). Still-open (d-ii): budget-gate integration (3), cooperative-path deletion (4a), live wiring
-//! (4b), the in-guest aya smoke (4c).
+//! remains); (d-ii)/3 added [`ValidatedBootBudget`] — gate #2 of the TWO-artifact live-serve gate (the
+//! fail-closed boot-budget check), taken by the producer's constructors as an ordering witness.
+//! Still-open (d-ii): cooperative-path deletion (4a), live wiring (4b), the in-guest aya smoke (4c).
 //!
 //! Consumer-free until (4b)/5b-2c wire it — the module-wide allow is NOT transitional leftovers: under
 //! the CI leaf combo (`vsock-transport,agent-gateway`) this compiles with its only consumer not yet
@@ -32,7 +33,7 @@
 
 use crate::cancellable_boundary::{
     classify_pipe_revents, poll_with_deadline, remaining_or_lapsed, PipeReadiness,
-    DEADLINE_LAPSED_MSG,
+    DEADLINE_LAPSED_MSG, MIN_BOUNDARY_BUDGET,
 };
 use crate::ProtocolError;
 use std::time::{Duration, Instant};
@@ -311,15 +312,18 @@ pub(crate) const ABANDONED_CHILD_BUDGET: usize =
 /// ~7× headroom, so a CLEANLY killed child is reaped on the spot (no success-path zombie, no ledger
 /// churn), while a D-state child costs at most 10ms before abandonment. This grace is the dominant term
 /// of the per-attempt overhead [`QUOTE_ATTEMPT_OVERHEAD`] (spawn + kill + grace + fd close), which lands
-/// BETWEEN the quote and channel legs; 5b-2c's budget check carries it as the explicit
-/// `max_attempts · ε` term.
+/// BETWEEN the quote and channel legs; the boot-budget check ([`ValidatedBootBudget`], (d-ii)/3)
+/// carries it as the explicit `max_attempts · ε` term.
 pub(crate) const REAP_GRACE: Duration = Duration::from_millis(10);
 
-/// ε — the per-attempt quote-subprocess overhead the 5b-2c budget check MUST carry as an explicit term:
+/// ε — the per-attempt quote-subprocess overhead the boot-budget check carries as an explicit term:
 /// `max_attempts · (2·timeout + ε) ≤ overall_boot_budget` (§8). DERIVED from its dominant term (the reap
 /// grace) plus a ~2ms margin for spawn + SIGKILL + fd close, so a future `REAP_GRACE` retune cannot
 /// silently strand a stale literal in the budget arithmetic — the same derive-don't-transcribe rule as
-/// [`ABANDONED_CHILD_BUDGET`]. 5b-2c consumes THIS const, never a hand-copied number.
+/// [`ABANDONED_CHILD_BUDGET`]. THE consumer is [`per_attempt_nominal_cost`] inside
+/// [`ValidatedBootBudget::validate`] ((d-ii)/3) — never a hand-copied number, and never a SECOND
+/// consumption site: 5b-2c's surviving step is constructing the witness from operator config, not
+/// re-consuming ε.
 pub(crate) const QUOTE_ATTEMPT_OVERHEAD: Duration =
     REAP_GRACE.saturating_add(Duration::from_millis(2));
 
@@ -735,9 +739,11 @@ static PROCESS_QUOTE_LEDGER_CLAIMED: std::sync::atomic::AtomicBool =
 /// nor `Default` (a clone would mint a second ledger and fork the budget — treat any later derive as a
 /// pin violation); (iv) `fetch(&mut self)` makes the single mutator a borrow-checker fact.
 ///
-/// Budget-gate integration (the 5b-2c `max_attempts·(2·timeout+ε)` fail-closed constructor check
-/// consuming [`QUOTE_ATTEMPT_OVERHEAD`]) is sub-slice (3)/5b-2c — deliberately NOT here. The
-/// TWO-artifact live-serve gate stands: this type landing does NOT open live serve.
+/// Budget-gate integration landed in (d-ii)/3: [`ValidatedBootBudget`] (below) is the fail-closed
+/// `max_attempts·(2·timeout+ε)` constructor check consuming [`QUOTE_ATTEMPT_OVERHEAD`], and BOTH
+/// constructors here take it as an ordering witness (validation strictly precedes the permanent
+/// claim, by signature). The TWO-artifact live-serve gate stands: neither type landing opens live
+/// serve — that waits for (4b) wiring + the (4c) in-guest smoke.
 ///
 /// Generic over the spawn seam (default = the production [`ExecChildSpawn`]) so the deviceless
 /// ledger-pin tests drive the SAME producer over fake handles (a real ledger cannot be filled: S-state
@@ -756,7 +762,20 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
     /// beats forgetting possibly-live children). TEST RULE: tests calling `new` MUST hold
     /// `crate::agent_dispatch::lock_and_reset_agent_process_globals()` for the whole test body (the
     /// reset clears the claim); behavior tests use `new_unclaimed_for_tests` instead.
-    pub(crate) fn new(spawn: S) -> Result<Self, ProtocolError> {
+    ///
+    /// `_budget` is a pure ORDERING WITNESS, deliberately unread (underscore-named — no
+    /// unused_variables lint): constructing a [`ValidatedBootBudget`] IS the budget validation (its
+    /// only constructor validates), so this signature makes "§8: budget validation BEFORE the
+    /// permanent process claim" a compile fact for the VALIDATION STEP — no claim can precede a
+    /// successful validation. SCOPE HONESTY: the witness proves SOME budget validated; it does not
+    /// bind THE SAME instance to the values the wiring later uses. That binding is
+    /// `production_transport` for the timeout (structural — the transport is minted from the
+    /// witness) and a recorded (4b) acceptance obligation for the driver count
+    /// (`budget.max_attempts()` from the SAME instance) — a wiring that validates a throwaway
+    /// budget and hand-feeds different numbers is a (4b)-review failure, not a compile error. The
+    /// producer reads NOTHING from it (reading config here would duplicate the driver's config flow
+    /// — a second source of truth).
+    pub(crate) fn new(_budget: &ValidatedBootBudget, spawn: S) -> Result<Self, ProtocolError> {
         use std::sync::atomic::Ordering;
         if PROCESS_QUOTE_LEDGER_CLAIMED
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -787,15 +806,14 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
 impl HardBoundedQuoteProducer<ExecChildSpawn> {
     /// THE (4b)/5b-2c constructor: the production spawn shape ([`ExecChildSpawn::production`] — the
     /// `/proc/self/exe` rationale lives THERE, single source) + the process-ledger claim, one call.
-    /// The infallible spawner leaves "constructed twice" as the ONLY error — surfaced at boot wiring,
-    /// never inside the retry loop, and the wiring MUST `?`-propagate it as fatal: mapping it into the
-    /// retryable `AnchorTransportError` class would spin the driver's whole attempt budget on a
-    /// permanent refusal. Returning `Result` is the same fail-closed construction surface sub-slice
-    /// (3)'s boot-budget gate composes onto (no signature break later) — and (3) MUST run its budget
-    /// validation BEFORE this call: a post-claim validation failure burns the claim for the process
-    /// (fail-closed, but only a supervisor restart heals a pure config mistake).
-    pub(crate) fn production() -> Result<Self, ProtocolError> {
-        Self::new(ExecChildSpawn::production())
+    /// Budget-validation-before-claim is enforced BY SIGNATURE ((d-ii)/3 witness — see [`Self::new`]);
+    /// the burned-claim WHY stays: only a supervisor restart heals a post-claim config mistake, which
+    /// is why the witness exists. The infallible spawner leaves "constructed twice" as the ONLY error
+    /// — FATAL wiring config, surfaced at boot wiring, never inside the retry loop; the wiring MUST
+    /// `?`-propagate it (mapping it into the retryable `AnchorTransportError` class would spin the
+    /// driver's whole attempt budget on a permanent refusal — position is the discriminator).
+    pub(crate) fn production(budget: &ValidatedBootBudget) -> Result<Self, ProtocolError> {
+        Self::new(budget, ExecChildSpawn::production())
     }
 }
 
@@ -815,11 +833,230 @@ impl<S: QuoteChildSpawn> crate::agent_boot_relay::BootQuoteProducer for HardBoun
 
 /// Test-only: clear the process-ledger claim. Called ONLY from
 /// `crate::agent_dispatch::lock_and_reset_agent_process_globals` (the crate's single reset site, per
-/// its own "a NEW agent process-global adds its reset HERE" pin) and the in-module claim test via that
-/// helper.
+/// its own "a NEW agent process-global adds its reset HERE" pin) and the in-module SERIALIZED claim
+/// tests (the claim test + the production_transport composition test), each restoring the pristine
+/// flag on exit.
 #[cfg(test)]
 pub(crate) fn reset_process_quote_ledger_claim_for_tests() {
     PROCESS_QUOTE_LEDGER_CLAIMED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// (d-ii)/3 — ValidatedBootBudget: the boot-budget validation artifact. Gate #2 of the TWO-artifact
+// live-serve gate (§8 "Per-leg sizing floor"). Fail-closed constructor check, checked arithmetic,
+// pure (no I/O, no process globals). Lives HERE for cohabitation with ε's definition (the formula's
+// dominant term) and to avoid a second triple-gated mod declaration in lib.rs; a same-gated sibling
+// module consuming `crate::quote_subprocess::QUOTE_ATTEMPT_OVERHEAD` by path would be equally
+// transcription-free (cfg drift self-detects as a compile error) — the HARD requirement is only
+// that the artifact's gate is never WIDER than the three consumed consts' intersection (ε: triple;
+// MIN_BOUNDARY_BUDGET: linux+vsock; MAX_BOOT_ATTEMPTS_CEILING: agent-gateway = exactly this
+// module's triple gate).
+// ---------------------------------------------------------------------------------------------------
+
+/// Shared by the add- and mul-overflow arms (two emit sites + the overflow tests — single-source
+/// rule, cf. 73ddd5d). DISTINCT from the exceeds string so the overflow tests prove the CHECKED arm
+/// fired rather than a saturate-then-compare accident slipping through the comparison.
+const BOOT_BUDGET_OVERFLOW_MSG: &str = "boot budget: nominal boot cost arithmetic overflow";
+
+/// Upper sanity ceiling on the per-leg timeout. Load-bearing, not just taste: every blessed value
+/// flows into `Instant::now() + timeout` deadline mints (`RelayAnchorTransport::anchor_round_trip`),
+/// where std's `Add` PANICS on overflow (linux `Instant` seconds are i64) — without this arm,
+/// `validate()` would bless e.g. `Duration::from_secs(u64::MAX / 2)` (every other arm passes against
+/// `overall = Duration::MAX`) and the gate's fail-closed contract would be voided by a downstream
+/// abort on the FIRST round-trip. One hour is orders of magnitude above any sane boot leg and orders
+/// below the i64-seconds overflow band — both failure classes stay far away; a per-leg value above
+/// it is a config error by definition.
+pub(crate) const MAX_PER_LEG_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Nominal per-attempt cost: quote leg + channel leg + ε ([`QUOTE_ATTEMPT_OVERHEAD`] — THE const,
+/// never a transcribed number; a `REAP_GRACE` retune moves ε and this check with it). Written in the
+/// GENERALIZED leg-sum shape (§8: "do NOT hardcode the 2· special case"):
+/// [`ValidatedBootBudget::validate`] passes the ONE per-leg value for both legs (the single-budget
+/// model, final for 5b-2b); the deferred distinct-timeout split changes the constructor INPUTS (the
+/// two arguments), never this formula — the `2·` literal appears nowhere in code.
+///
+/// Checked Duration ops ONLY — never integer-millis conversion (the wrap hazard §8 names), and never
+/// plain `+`/`*` (which PANIC on overflow: also wrong for a fail-closed constructor, which must
+/// return `Err`, not abort boot).
+fn per_attempt_nominal_cost(
+    quote_leg: Duration,
+    channel_leg: Duration,
+) -> Result<Duration, ProtocolError> {
+    quote_leg
+        .checked_add(channel_leg)
+        .and_then(|legs| legs.checked_add(QUOTE_ATTEMPT_OVERHEAD))
+        .ok_or(ProtocolError::WireProtocol(BOOT_BUDGET_OVERFLOW_MSG))
+}
+
+/// Proof that `(max_attempts, per_leg_timeout)` fits `overall_boot_budget` under the §8 nominal
+/// invariant `max_attempts · (quote_leg + channel_leg + ε) ≤ overall_boot_budget` (shipped form:
+/// both legs = the one `per_leg_timeout`, i.e. `max_attempts · (2·timeout + ε)`). Gate #2 of the
+/// TWO-artifact live-serve gate; gate #1 is [`HardBoundedQuoteProducer`], whose constructors take
+/// this type as an ordering witness — in a shipped binary no producer (and transitively, via the §8
+/// concrete-type obligation, no serve path) exists without a validated budget.
+///
+/// **ε is NOMINAL sizing arithmetic, not a runtime ceiling** (§8, verbatim obligation): only the
+/// reap grace is code-bounded; `Command::spawn`, SIGKILL delivery and the ~1ms sleeps can stretch
+/// under scheduler load. This check stops MIS-SIZED CONFIGS — the failure class that is actually
+/// configurable; the runtime hard bounds remain the per-leg deadlines themselves.
+///
+/// **`≤` is the enforced comparison**: a budget EXACTLY equal to the nominal product passes but is
+/// mis-sized by definition — operators MUST size `overall_boot_budget` with slack above the nominal
+/// product (§8 decision: documented, deliberately NOT enforced). There is also deliberately NO upper
+/// sanity bound on `overall_boot_budget` (`Duration::MAX` is accepted): the gate stops
+/// under-budgeting; oversizing is operator slack.
+///
+/// **Hardening note (one of TWO prose-enforced premises this gate rests on — the other is the (4b)
+/// same-instance count obligation, see [`Self::max_attempts`]):** the two-leg accounting
+/// assumes connect+I/O share ONE channel-leg deadline — wiring-enforced in
+/// `agent_boot_relay::round_trip_inner` ONLY; re-verify on any refactor there. This artifact is
+/// where the per-leg value ORIGINATES for 5b-2c: [`Self::production_transport`] threads
+/// `per_leg_timeout` into `RelayAnchorTransport::new` itself, so the value the invariant was checked
+/// against IS the value both leg deadlines are minted from. The transport cannot take this type BY
+/// SIGNATURE — cfg-lattice fact: `agent_boot_relay` compiles in agent-gateway-without-vsock builds
+/// where this type does not exist — so the Duration-typed seam there is the deliberate coupling
+/// shape, not an oversight.
+///
+/// Clone/Copy are deliberate and SAFE here, in documented contrast to the producer: copying a
+/// validated VALUE forks no state, while cloning the producer would fork the ledger budget (that
+/// type's no-Clone pin stands untouched).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedBootBudget {
+    max_attempts: u32,
+    per_leg_timeout: Duration,
+    overall_boot_budget: Duration,
+    nominal_boot_cost: Duration,
+}
+
+impl ValidatedBootBudget {
+    /// THE constructor — fail-closed, release-mode `Err` returns (NOT `debug_assert`: §8 requires
+    /// the bound to hold in release). Errors are FATAL wiring-time config: `?`-propagate at boot
+    /// wiring, NEVER fold into the fetch-path retryable class (construction-fatal and
+    /// fetch-retryable deliberately share `ProtocolError`; POSITION is the discriminator — and the
+    /// witness signature on the producer makes the wrong position unrepresentable).
+    ///
+    /// Validation chain, IN ORDER (each earlier arm wins; order is test-pinned):
+    ///  1. `max_attempts == 0` → `"boot budget: max_attempts must be >= 1"`.
+    ///  2. `max_attempts > MAX_BOOT_ATTEMPTS_CEILING` → the ceiling string — the bound DERIVED from
+    ///     the const (never 64). The driver's own runtime range check (reject-don't-clamp) is
+    ///     DELIBERATE duplication, not drift: the driver keeps its self-contained no-infinite-loop
+    ///     property at a different error surface (`BootDriverFail::Unstartable`, runtime triage)
+    ///     while this arm is the §8-mandated config-parse-time half (`ProtocolError`, wiring
+    ///     triage); both derive from THE one const.
+    ///  3. `per_leg_timeout < MIN_BOUNDARY_BUDGET` → the floor string — covers ZERO (a 0ms leg is
+    ///     meaningless; `set_read_timeout(ZERO)` is an `Err` on vsock); floor INCLUSIVE (== MIN
+    ///     passes), mirroring `remaining_or_lapsed`.
+    ///  4. `per_leg_timeout > MAX_PER_LEG_TIMEOUT` → the ceiling string — the sanity arm that keeps
+    ///     every blessed value safe for the downstream `Instant::now() + timeout` mints (std's `Add`
+    ///     panics on overflow; see the const doc). Ceiling INCLUSIVE on the pass side (== MAX
+    ///     passes).
+    ///  5. nominal cost via [`per_attempt_nominal_cost`] then `.checked_mul(max_attempts)` →
+    ///     [`BOOT_BUDGET_OVERFLOW_MSG`] on `None`. CHECKED, not saturating, by load-bearing choice:
+    ///     a SATURATED `Duration::MAX` product would PASS the `≤` check against
+    ///     `overall_boot_budget == Duration::MAX` — saturating arithmetic re-opens the exact
+    ///     failure this arm exists to stop ("a wrapped product passing the check", §8). NB with
+    ///     arm 4 in place these overflow arms are UNREACHABLE through `validate()` (64 · (2h + ε)
+    ///     fits comfortably) — they are defense-in-depth against a ceiling retune/removal, and the
+    ///     add arm stays directly pinned via the helper.
+    ///  6. `nominal_boot_cost > overall_boot_budget` → the exceeds string; `≤` passes (equality
+    ///     passes — see the type doc). No separate zero-budget arm: attempts ≥ 1 ∧ timeout ≥ 1ms ⇒
+    ///     cost > 0 ⇒ a zero budget fails here.
+    ///
+    /// Transposition note: the two adjacent `Duration` params swapped at a call site always FAIL
+    /// CLOSED for any valid config (nominal' = n·(2B+ε) > B > t), so no silent acceptance is
+    /// reachable — a config-struct wrapper would be mechanism without a reachable failure.
+    ///
+    /// The static error strings deliberately carry no numbers (house pattern); the 5b-2c bin's
+    /// TWO-PHASE logging contract (a CHECKED §8 obligation): (a) log the RAW config triplet BEFORE
+    /// calling this — on `Err` there is no witness and no getters, and a numberless fail-closed
+    /// boot must still leave the operator the numbers; (b) on `Ok`, log the getter line incl.
+    /// `nominal_boot_cost` AND the slack (`overall_boot_budget − nominal_boot_cost`; zero slack
+    /// validates but deserves a WARN).
+    pub(crate) fn validate(
+        max_attempts: u32,
+        per_leg_timeout: Duration,
+        overall_boot_budget: Duration,
+    ) -> Result<Self, ProtocolError> {
+        if max_attempts == 0 {
+            return Err(ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1"));
+        }
+        if max_attempts > crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING {
+            return Err(ProtocolError::WireProtocol(
+                "boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING",
+            ));
+        }
+        if per_leg_timeout < MIN_BOUNDARY_BUDGET {
+            return Err(ProtocolError::WireProtocol(
+                "boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET",
+            ));
+        }
+        if per_leg_timeout > MAX_PER_LEG_TIMEOUT {
+            return Err(ProtocolError::WireProtocol(
+                "boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT",
+            ));
+        }
+        let per_attempt = per_attempt_nominal_cost(per_leg_timeout, per_leg_timeout)?;
+        let nominal_boot_cost = per_attempt
+            .checked_mul(max_attempts)
+            .ok_or(ProtocolError::WireProtocol(BOOT_BUDGET_OVERFLOW_MSG))?;
+        if nominal_boot_cost > overall_boot_budget {
+            return Err(ProtocolError::WireProtocol(
+                "boot budget: nominal boot cost exceeds overall_boot_budget",
+            ));
+        }
+        Ok(Self { max_attempts, per_leg_timeout, overall_boot_budget, nominal_boot_cost })
+    }
+
+    /// For `run_boot_anti_rollback_handshake` — (4b) wiring MUST source the driver's count from
+    /// HERE, from THE SAME witness instance fed to [`Self::production_transport`] (a named,
+    /// test-backed (4b) acceptance item, §8): the witness signature alone does not bind the count,
+    /// so a wiring that validates one budget and hand-feeds the driver a different number compiles —
+    /// the exact drift the acceptance test must refuse.
+    pub(crate) fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+    /// THE per-leg timeout origin for (4b)/5b-2c (`RelayAnchorTransport::new`'s `timeout`).
+    pub(crate) fn per_leg_timeout(&self) -> Duration {
+        self.per_leg_timeout
+    }
+    /// Boot-log triage ONLY — NEVER a runtime deadline source: ε is nominal sizing arithmetic and
+    /// the runtime hard bounds remain the per-leg deadlines (§8 restated at the misuse site).
+    pub(crate) fn overall_boot_budget(&self) -> Duration {
+        self.overall_boot_budget
+    }
+    /// Boot-log triage ONLY (the "nominal X ≤ budget Y" slack line) — same warning as above. Stored
+    /// at construction: no recompute path, no second formula site.
+    pub(crate) fn nominal_boot_cost(&self) -> Duration {
+        self.nominal_boot_cost
+    }
+
+    /// THE (4b)/5b-2c serve-path composition — both live-serve gate ARTIFACTS by signature, one
+    /// call: claims the process producer (gate #1) and constructs the transport whose per-leg
+    /// deadlines ORIGINATE from this validated value (gate #2 — the value the invariant was checked
+    /// against IS the value both leg deadlines are minted from; the connect+I/O sharing of the
+    /// channel leg stays wiring-enforced in `round_trip_inner`, see the type doc). SCOPE HONESTY:
+    /// this binds the producer claim + the TIMEOUT leg structurally; the ATTEMPT COUNT stays a
+    /// named, test-backed (4b) acceptance item (`budget.max_attempts()` from this same instance —
+    /// see that getter) because the driver keeps its raw-u32 signature. The quote seam is the CONCRETE
+    /// [`HardBoundedQuoteProducer`] (default `S = ExecChildSpawn`) per the §8 never-generic-Q
+    /// obligation; `C` stays the seam trait because a real `VsockBootRelayChannel` cannot exist in
+    /// CI — 5b-2c instantiates `C = VsockBootRelayChannel` (§8). ONLY error: the producer claim
+    /// refusal — FATAL wiring config, `?`-propagate, never fold into the retryable fetch path.
+    /// Consumer-free until (4b), exactly like `production()` was when (d-ii)/2 landed.
+    pub(crate) fn production_transport<C: crate::agent_boot_relay::BootRelayChannel>(
+        &self,
+        channel: C,
+    ) -> Result<
+        crate::agent_boot_relay::RelayAnchorTransport<HardBoundedQuoteProducer, C>,
+        ProtocolError,
+    > {
+        let producer = HardBoundedQuoteProducer::production(self)?;
+        Ok(crate::agent_boot_relay::RelayAnchorTransport::new(
+            producer,
+            channel,
+            self.per_leg_timeout,
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1743,13 +1980,20 @@ mod tests {
 
     #[test]
     fn producer_new_claims_the_process_ledger_exactly_once() {
-        // THE claim test (serialized — the ONLY test calling new()/production()): (a) production()
+        // THE claim test (serialized; the OTHER claim site is the equally-serialized
+        // production_transport_claims_once_and_threads_the_validated_timeout — no third caller of
+        // new()/production() exists): (a) production()
         // claims; (b) a second construction refuses with the exact fail-closed string; (c) Drop must
         // NOT release (release-on-drop hands the next producer a fresh ledger — the §8 voided-cap
         // hole); (d) the crate reset site clears the claim (a forgotten hook in
-        // lock_and_reset_agent_process_globals fails HERE — reset-site symmetry).
+        // lock_and_reset_agent_process_globals fails HERE — reset-site symmetry). NB ((d-ii)/3):
+        // validation-before-claim has no runtime ordering arm because the witness SIGNATURE is the
+        // artifact — `budget` below is constructed first or this test does not compile. test_budget()
+        // construction inside the lock-held body is lock-order-safe: validate() is pure, no globals.
         let g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let first = HardBoundedQuoteProducer::production().expect("first claim must succeed");
+        let budget = test_budget();
+        let first =
+            HardBoundedQuoteProducer::production(&budget).expect("first claim must succeed");
         // Composition pin: production() must wire EXACTLY the pinned production spawn shape (the
         // shape-pin test asserts ExecChildSpawn::production() directly; THIS assert closes the gap
         // where production()'s one-line body silently swaps in a different shape and every CI test
@@ -1758,7 +2002,7 @@ mod tests {
         assert_eq!(first.spawn.pipe_source, PipeSource::Stdout);
         assert!(first.spawn.clear_env && first.spawn.leading_args.is_empty());
         assert!(first.spawn.extra_env.is_empty(), "production child env = marker + report_data ONLY");
-        let err = HardBoundedQuoteProducer::new(FakeSpawn::new(FakePlan::Silent, false))
+        let err = HardBoundedQuoteProducer::new(&budget, FakeSpawn::new(FakePlan::Silent, false))
             .err()
             .expect("second construction must refuse");
         assert!(
@@ -1770,14 +2014,14 @@ mod tests {
         );
         drop(first);
         assert!(
-            HardBoundedQuoteProducer::new(FakeSpawn::new(FakePlan::Silent, false)).is_err(),
+            HardBoundedQuoteProducer::new(&budget, FakeSpawn::new(FakePlan::Silent, false)).is_err(),
             "Drop must NOT release the claim (release-on-drop re-opens the voided-cap hole)"
         );
         // Re-locking while holding g would deadlock (the guard Mutex is non-reentrant) — drop FIRST.
         drop(g);
         let _g2 = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         assert!(
-            HardBoundedQuoteProducer::new(FakeSpawn::new(FakePlan::Silent, false)).is_ok(),
+            HardBoundedQuoteProducer::new(&budget, FakeSpawn::new(FakePlan::Silent, false)).is_ok(),
             "the crate reset site must clear the claim (reset-site symmetry)"
         );
         // Leave the flag PRISTINE on exit (the assert above re-claimed it): a future test that calls
@@ -1888,6 +2132,265 @@ mod tests {
             crate::agent_boot_relay::decode_anchor_boot_request(&captured[0]).expect("decodable");
         assert_eq!(decoded.quote_report, test_report(&rd), "producer report flowed into the frame");
         assert_eq!(decoded.report_data, rd, "report_data binding flowed unmodified");
+    }
+
+    // ---- (d-ii)/3 ValidatedBootBudget (pure; gate #2 of the TWO-artifact live-serve gate) ----
+
+    fn generous() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// The witness most tests need: ceiling attempts, a comfortable timeout, an hour of budget.
+    fn test_budget() -> ValidatedBootBudget {
+        ValidatedBootBudget::validate(
+            crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING,
+            Duration::from_millis(50),
+            generous(),
+        )
+        .expect("helper budget must validate")
+    }
+
+    /// Test-side derivation of the nominal product `n·(t+t+ε)` — deliberately a SECOND derivation
+    /// (not a call into the production `per_attempt_nominal_cost`) so the boundary tests stay an
+    /// independent check of the formula, but single-sourced across them: a formula retune is one
+    /// test-side edit, not three drifting copies (the third copy drifting LARGER would silently
+    /// weaken the ε-pin's positive arm — `validate` accepts any overall ≥ nominal).
+    fn nominal_product(n: u32, t: Duration) -> Duration {
+        t.checked_add(t)
+            .and_then(|legs| legs.checked_add(QUOTE_ATTEMPT_OVERHEAD))
+            .and_then(|p| p.checked_mul(n))
+            .expect("test arithmetic fits")
+    }
+
+    #[test]
+    fn boot_budget_rejects_zero_max_attempts() {
+        // Regression: the zero rejection must exist at CONFIG-parse time, not lean on the driver's
+        // runtime Unstartable (different surface, §8-mandated config-parse half).
+        let err = ValidatedBootBudget::validate(0, Duration::from_millis(50), generous())
+            .expect_err("zero attempts must refuse");
+        assert!(
+            matches!(err, ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn boot_budget_rejects_over_ceiling_max_attempts() {
+        // Regression: reject-don't-clamp drift between the artifact and the driver. Bound DERIVED
+        // from the const (no 64 literal anywhere in this test).
+        let ceiling = crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING;
+        let err = ValidatedBootBudget::validate(ceiling + 1, Duration::from_millis(50), generous())
+            .expect_err("over-ceiling must refuse");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING")
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            ValidatedBootBudget::validate(ceiling, Duration::from_millis(50), generous()).is_ok(),
+            "the ceiling itself is valid (reject is strictly-greater)"
+        );
+    }
+
+    #[test]
+    fn boot_budget_range_error_wins_over_floor_and_budget() {
+        // Regression: §8 "the check MUST run AFTER max_attempts range validation" silently
+        // reordered — operator first-fix triage would point at the wrong knob. Three arms: with
+        // EVERY arm violated, the range strings win; with valid attempts the floor wins next.
+        let err = ValidatedBootBudget::validate(0, Duration::ZERO, Duration::ZERO)
+            .expect_err("all-violated must refuse");
+        assert!(
+            matches!(err, ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1")),
+            "zero-attempts must win over floor/budget, got {err:?}"
+        );
+        let over = crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING + 1;
+        let err = ValidatedBootBudget::validate(over, Duration::ZERO, Duration::ZERO)
+            .expect_err("all-violated must refuse");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING")
+            ),
+            "ceiling must win over floor/budget, got {err:?}"
+        );
+        let err = ValidatedBootBudget::validate(1, Duration::ZERO, Duration::ZERO)
+            .expect_err("floor+budget violated must refuse");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET")
+            ),
+            "floor must precede the budget arithmetic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn boot_budget_rejects_sub_floor_timeout() {
+        // Regression: a 0ms/sub-floor leg reaching the platform (set_read_timeout(ZERO) is an Err
+        // on vsock; sub-floor poll budgets are the MIN_BOUNDARY_BUDGET hazard). Consts only — a
+        // floor retune moves this test with it. Floor INCLUSIVE: == MIN passes.
+        for bad in [Duration::ZERO, MIN_BOUNDARY_BUDGET - Duration::from_nanos(1)] {
+            let err = ValidatedBootBudget::validate(1, bad, generous())
+                .expect_err("sub-floor timeout must refuse");
+            assert!(
+                matches!(
+                    err,
+                    ProtocolError::WireProtocol("boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET")
+                ),
+                "got {err:?}"
+            );
+        }
+        assert!(
+            ValidatedBootBudget::validate(1, MIN_BOUNDARY_BUDGET, generous()).is_ok(),
+            "the floor itself is valid (inclusive, mirroring remaining_or_lapsed)"
+        );
+    }
+
+    #[test]
+    fn boot_budget_exact_equality_passes_and_getters_echo() {
+        // Regression: ≤ silently tightened to < (§8 pins ≤; operator slack stays prose), or getters
+        // drifting from the validated values. Overall computed FROM the consts via checked ops.
+        let n = crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING;
+        let t = Duration::from_millis(50);
+        let overall = nominal_product(n, t);
+        let b = ValidatedBootBudget::validate(n, t, overall)
+            .expect("budget exactly equal to the nominal product must pass (≤, not <)");
+        assert_eq!(b.max_attempts(), n);
+        assert_eq!(b.per_leg_timeout(), t);
+        assert_eq!(b.overall_boot_budget(), overall);
+        assert_eq!(b.nominal_boot_cost(), overall, "stored nominal == the computed product");
+    }
+
+    #[test]
+    fn boot_budget_one_nanosecond_short_fails() {
+        // Regression: hidden slack/rounding at the boundary — a mis-sized config constructing in
+        // RELEASE is the exact fail-closed MUST this artifact exists for.
+        let n = crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING;
+        let t = Duration::from_millis(50);
+        let overall = nominal_product(n, t);
+        let err = ValidatedBootBudget::validate(n, t, overall - Duration::from_nanos(1))
+            .expect_err("one nanosecond short must refuse");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: nominal boot cost exceeds overall_boot_budget")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn boot_budget_epsilon_less_product_is_not_a_ceiling() {
+        // THE ε-is-the-const pin (§8 verbatim: "the ε-less product is NOT a valid ceiling"): an
+        // implementation that drops ε — or transcribes a stale number — passes the equality/boundary
+        // tests trivially; THIS test fails it. Both sides computed from QUOTE_ATTEMPT_OVERHEAD, so a
+        // REAP_GRACE retune moves the check and this test TOGETHER (chains to the
+        // attempt_overhead_dominated_by_reap_grace derivation pin).
+        let n = crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING;
+        let t = Duration::from_millis(50);
+        let epsilon_less = t.checked_add(t).and_then(|l| l.checked_mul(n)).expect("fits");
+        let err = ValidatedBootBudget::validate(n, t, epsilon_less)
+            .expect_err("the ε-less product must NOT be accepted as a ceiling");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: nominal boot cost exceeds overall_boot_budget")
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            ValidatedBootBudget::validate(n, t, nominal_product(n, t)).is_ok(),
+            "the ε-bearing product is the valid ceiling"
+        );
+    }
+
+    #[test]
+    fn boot_budget_sanity_ceiling_guards_the_instant_mints() {
+        // Regression: validate() blessing a per-leg value that PANICS downstream — the transport
+        // mints deadlines as `Instant::now() + timeout` (std Add panics on overflow; linux Instant
+        // seconds are i64), so without the ceiling arm `u64::MAX / 2` secs passes every other arm
+        // against overall == Duration::MAX and aborts boot on the FIRST round-trip instead of the
+        // wiring-time Err the gate promises. TEST DISCIPLINE: huge values go STRAIGHT into validate.
+        let err = ValidatedBootBudget::validate(1, Duration::from_secs(u64::MAX / 2), Duration::MAX)
+            .expect_err("an Instant-overflow-capable timeout must refuse at the ceiling");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT")
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            ValidatedBootBudget::validate(1, MAX_PER_LEG_TIMEOUT, Duration::MAX).is_ok(),
+            "the ceiling itself is valid (inclusive on the pass side)"
+        );
+        let err =
+            ValidatedBootBudget::validate(1, MAX_PER_LEG_TIMEOUT + Duration::from_nanos(1), Duration::MAX)
+                .expect_err("one nanosecond over the ceiling must refuse");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn boot_budget_overflow_refuses_not_wraps() {
+        // Regression: §8's named failure — "a wrapped product passing the check". CHECKED, not
+        // saturating, is load-bearing: a SATURATED Duration::MAX product would PASS ≤ against
+        // overall == Duration::MAX. With the MAX_PER_LEG_TIMEOUT arm in place the overflow arms are
+        // UNREACHABLE through validate() (64 · (2h + ε) fits comfortably) — they are defense in
+        // depth against a ceiling retune/removal, so the add arm is pinned DIRECTLY on the helper
+        // (in-module, callable): the huge value goes STRAIGHT in (plain Duration ops on it in test
+        // setup would panic, not refuse).
+        let err = per_attempt_nominal_cost(Duration::from_secs(u64::MAX), Duration::from_secs(u64::MAX))
+            .expect_err("add overflow must refuse, not wrap or pass");
+        assert!(matches!(err, ProtocolError::WireProtocol(BOOT_BUDGET_OVERFLOW_MSG)), "got {err:?}");
+    }
+
+    #[test]
+    fn production_transport_claims_once_and_threads_the_validated_timeout() {
+        // Regression: a transport constructed with a timeout OTHER than the validated value (the
+        // deadline-origination drift the §8 hardening note names), or a second producer door
+        // bypassing the single claim. Serialized per the TEST RULE (holds the crate guard for the
+        // whole body; the SECOND claim site, named by the claim test's pin).
+        struct NeverChannel;
+        impl crate::agent_boot_relay::BootRelayChannel for NeverChannel {
+            fn round_trip(
+                &mut self,
+                _request_frame: &[u8],
+                _deadline: Instant,
+            ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+                panic!("composition test never round-trips");
+            }
+        }
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        let budget = test_budget();
+        let transport = budget
+            .production_transport(NeverChannel)
+            .expect("first composition must claim and construct");
+        assert_eq!(
+            transport.per_leg_timeout_for_tests(),
+            budget.per_leg_timeout(),
+            "the transport timeout MUST be the validated per-leg value (deadline origination)"
+        );
+        let err = budget
+            .production_transport(NeverChannel)
+            .err()
+            .expect("second composition must refuse via the single claim");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote producer: process quote ledger already claimed")
+            ),
+            "got {err:?}"
+        );
+        // Pristine exit, same hygiene as the claim test.
+        reset_process_quote_ledger_claim_for_tests();
     }
 
     // ---- (d-ii) child mode (deviceless over the TsmFs seam) ----
