@@ -374,6 +374,18 @@ impl<H: ChildHandle> Drop for KillOnDrop<H> {
 // Core orchestration — generic over the spawn seam so (d-i) ships AND fully tests it without configfs.
 // ---------------------------------------------------------------------------------------------------
 
+/// Set `O_NONBLOCK` on a pipe/stream read end (safe nix fcntl; the `fs` feature). Generic over `AsFd`
+/// so the orchestration applies it uniformly to the real `QuotePipe` and the test fakes' streams.
+fn set_nonblock<F: std::os::fd::AsFd>(fd: &F) -> Result<(), ProtocolError> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    let flags = fcntl(fd, FcntlArg::F_GETFL)
+        .map_err(|_| ProtocolError::WireProtocol("quote child: F_GETFL failed"))?;
+    let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags))
+        .map_err(|_| ProtocolError::WireProtocol("quote child: F_SETFL failed"))?;
+    Ok(())
+}
+
 /// Uniform disposition — runs on EVERY path including success (a kill-free success path would let a
 /// child that already wrote its frame linger if it wedges in its own cleanup): SIGKILL → bounded reap
 /// (poll `try_reap` every ~1ms, ≤ [`REAP_GRACE`] total) → if still `Running`, abandon to the ledger.
@@ -447,6 +459,16 @@ fn fetch_quote_via_child_inner<S: QuoteChildSpawn>(
     // (3) Spawn under the RAII guard.
     let (mut pipe, handle) = spawn.spawn(report_data)?;
     let guard = KillOnDrop::new(handle);
+    // (3b) O_NONBLOCK on the parent read end (belt-and-braces: poll says readable before every read,
+    // but a spurious wakeup must re-poll, not block). HERE and not inside the spawner: this step is
+    // fallible, and only the orchestration can route a failure through the bounded dispose/abandon
+    // path — so even an exotic fcntl failure (seccomp policy) cannot leave a child outside the
+    // ledger's custody accounting.
+    if let Err(e) = set_nonblock(&pipe) {
+        drop(pipe);
+        dispose_child(guard.into_inner(), ledger);
+        return Err(e);
+    }
     // (4) Drain one frame, hard-bounded.
     let reply = read_child_reply(&mut pipe, deadline);
     // (5) Close the parent read end BEFORE disposition: ledger slots must pin zero fds. (Orphan death
@@ -573,8 +595,8 @@ fn hex128(data: &[u8; 64]) -> String {
 /// `spawn()`: brake-check → `Command { program, leading_args }` → optional `env_clear` → marker +
 /// report_data + `extra_env` → `stdin = null` → pipe per [`PipeSource`] (the OTHER stream: production
 /// `Stdout`-pipe inherits stderr → guest journald for kill-storm triage [user decision]; test
-/// `Stderr`-pipe nulls stdout to suppress the libtest banner) → set the parent read end `O_NONBLOCK`
-/// (belt-and-braces; the drain re-polls on `WouldBlock`).
+/// `Stderr`-pipe nulls stdout to suppress the libtest banner). The parent read end's `O_NONBLOCK` is
+/// set by the ORCHESTRATION, not here (custody: its failure must route through the ledger).
 pub(crate) struct ExecChildSpawn {
     pub(crate) program: std::path::PathBuf,
     pub(crate) leading_args: Vec<std::ffi::OsString>,
@@ -630,16 +652,12 @@ impl QuoteChildSpawn for ExecChildSpawn {
             PipeSource::Stderr => guard.get_mut().0.stderr.take().map(QuotePipe::Stderr),
         }
         .ok_or(ProtocolError::WireProtocol("quote child: pipe end missing after spawn"))?;
-        // O_NONBLOCK on the parent read end (safe nix fcntl; `fs` feature). Belt-and-braces: poll says
-        // readable before every read, but a spurious wakeup must re-poll, not block.
-        {
-            use nix::fcntl::{fcntl, FcntlArg, OFlag};
-            let flags = fcntl(&pipe, FcntlArg::F_GETFL)
-                .map_err(|_| ProtocolError::WireProtocol("quote child: F_GETFL failed"))?;
-            let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
-            fcntl(&pipe, FcntlArg::F_SETFL(flags))
-                .map_err(|_| ProtocolError::WireProtocol("quote child: F_SETFL failed"))?;
-        }
+        // (That ok_or is DEFENSIVE-UNREACHABLE: std guarantees the Option is Some when the matching
+        // Stdio::piped() was configured and spawn() returned Ok — kept because reaching it must still
+        // kill the child via the guard rather than leak it. The O_NONBLOCK fcntl deliberately does NOT
+        // happen here: the seam has no ledger, so a fallible step here could only kill+single-reap on
+        // failure; the orchestration owns it — its failure path routes through the SAME bounded
+        // dispose/abandon custody as every other error.)
         Ok((pipe, guard.into_inner()))
     }
 }
