@@ -825,6 +825,17 @@ request golden vector is a 5b-2b test-vector item.
   `agent_quote_child_dispatch()`, the `[[bin]]` a thin one-line caller — the same thin-bin rule as (b)'s
   daemon) OR make "main's first statement is `agent_quote_child_dispatch()`" an explicit, checked 5b-2c
   acceptance item (see the byte-exact-stdout pin in the (d-ii) note below, which enforces it by test).
+  **Two further 5b-2c preconditions recorded from the (d-ii)/2 review:** (1) DEPLOYMENT — the agent bin
+  must be self-contained w.r.t. the loader (RPATH/static): the production quote child re-execs it under
+  `clear_env`, which strips `LD_LIBRARY_PATH`-style vars (fine for the Nix-built guest binary; a
+  dynamically-linked build for another target would silently break child exec — the (4c) smoke is the
+  checked validation); (2) NO in-process whole-handshake retry loop — the producer's process-ledger
+  claim is permanent, so the entrypoint runs ONE handshake and on failure EXITS for supervisor restart
+  (an in-process outer retry would fail closed on its second iteration by construction); relatedly the
+  `production()` constructor error is FATAL wiring-time config (must be `?`-propagated; funneling any
+  construction error through the fetch-path retryable fold would spin the attempt budget on a permanent
+  refusal — construction-fatal and fetch-retryable deliberately share `ProtocolError`, position is the
+  discriminator: a sub-slice (3) hazard to keep visible).
   **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
   5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
@@ -1066,7 +1077,10 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   both (NB per the kernel-timer note below, a connect can only consume "nearly the whole leg" when the per-leg `timeout` is ≲ the ~2s kernel connect timer — for longer legs a wedged connect is kernel-capped at ~2s and the I/O budget keeps the rest), AND MUST
   satisfy the boot-budget invariant **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`** (ε = the
   quote-subprocess overhead const `QUOTE_ATTEMPT_OVERHEAD`, see the ε term below) so the bounded
-  retry loop can't blow the operator's total boot deadline. **Invariant (wiring-enforced in 5b-2b — a single
+  retry loop can't blow the operator's total boot deadline. **The ceiling is a CLAIM until sub-slice
+  (3)'s checked-arithmetic validation artifact lands** — even with `HardBoundedQuoteProducer` landed
+  ((d-ii)/2), nothing validates the operator's numbers against the formula yet; do not treat the bound
+  as guaranteed when reasoning about a live serve (the TWO-artifact gate already encodes this). **Invariant (wiring-enforced in 5b-2b — a single
   local variable, NOT a structural gate; re-verify on any refactor of `round_trip_inner`):** `connect_bounded`'s
   `deadline` arg is the **per-leg channel deadline** —
   `round_trip_inner` passes the *same* `deadline` local to `connect_bounded` and to the channel-I/O
