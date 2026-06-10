@@ -966,9 +966,12 @@ impl ValidatedBootBudget {
     /// CLOSED for any valid config (nominal' = n·(2B+ε) > B > t), so no silent acceptance is
     /// reachable — a config-struct wrapper would be mechanism without a reachable failure.
     ///
-    /// The static error strings deliberately carry no numbers (house pattern); the 5b-2c bin MUST
-    /// log `(max_attempts, per_leg_timeout, overall_boot_budget, nominal_boot_cost)` at config
-    /// parse — a named §8 obligation, served by the getters below.
+    /// The static error strings deliberately carry no numbers (house pattern); the 5b-2c bin's
+    /// TWO-PHASE logging contract (a CHECKED §8 obligation): (a) log the RAW config triplet BEFORE
+    /// calling this — on `Err` there is no witness and no getters, and a numberless fail-closed
+    /// boot must still leave the operator the numbers; (b) on `Ok`, log the getter line incl.
+    /// `nominal_boot_cost` AND the slack (`overall_boot_budget − nominal_boot_cost`; zero slack
+    /// validates but deserves a WARN).
     pub(crate) fn validate(
         max_attempts: u32,
         per_leg_timeout: Duration,

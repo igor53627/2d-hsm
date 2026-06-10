@@ -848,7 +848,9 @@ request golden vector is a 5b-2b test-vector item.
   alone does not bind the count — the 4b test must refuse the drift).
   **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
-  5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
+  boot-budget gate** — TWO gates, both now ENFORCEABLE artifacts that LANDED ((d-ii)/2 + (d-ii)/3, not
+  checklist lines); what remains on each is the 5b-2c WIRING/SMOKE work itemized in the state note
+  below, and live serve stays closed until that work completes.
   (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
   no longer gates the live serve. **The TWO hard preconditions for a live 5b-2c serve (state:
   gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3 — the REMAINING work on
@@ -1171,8 +1173,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `Duration::MAX` product would PASS `≤ Duration::MAX` — saturation re-opens the same hole; this rule
   carries unchanged into the generalized distinct-timeout form if it ever ships), and reject zero /
   sub-`MIN_BOUNDARY_BUDGET` timeouts at config-parse time (a 0ms leg is
-  meaningless and `set_read_timeout(ZERO)` is an Err on vsock). *Hardening note (the one prose-only premise
-  this gate rests on):* the `2·` accounting assumes connect+I/O share ONE deadline, which is only
+  meaningless and `set_read_timeout(ZERO)` is an Err on vsock). *Hardening note (one of TWO
+  prose-enforced premises this gate rests on — the other is the same-instance driver-count binding,
+  the named test-backed (4b) item above):* the `2·` accounting assumes connect+I/O share ONE deadline, which is only
   wiring-enforced in `round_trip_inner` (see above) — when 5b-2c builds the budget check, prefer computing it
   where both deadlines ORIGINATE (e.g. a constructor that derives connect and I/O deadlines from one
   channel-leg value), so the structural gate cannot outlive the wiring assumption it depends on.
