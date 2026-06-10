@@ -681,9 +681,11 @@ impl ExecChildSpawn {
     /// arm to route (linux-only module by cfg, so /proc is guaranteed; the test `smoke_spawn` keeps
     /// `current_exe()` deliberately — it needs libtest argv targeting, a different world). No leading
     /// args (the 5b-2c bin's main calls [`agent_quote_child_dispatch`] first, unconditionally);
-    /// `clear_env` (child env = exactly the marker + report_data the spawner sets AFTER `env_clear`);
-    /// protocol pipe = `Stdout` (PROTOCOL-ONLY); stderr INHERITED → guest journald for kill-storm
-    /// triage [user decision 2026-06-10].
+    /// `clear_env` (child env = exactly the marker + report_data the spawner sets AFTER `env_clear` —
+    /// NB this also strips loader vars like `LD_LIBRARY_PATH`: fine for the NixOS guest binary, whose
+    /// library paths are RPATH-linked by the Nix toolchain, and the (4c) in-guest smoke is the checked
+    /// validation of exactly that); protocol pipe = `Stdout` (PROTOCOL-ONLY); stderr INHERITED → guest
+    /// journald for kill-storm triage [user decision 2026-06-10].
     pub(crate) fn production() -> Self {
         Self {
             program: std::path::PathBuf::from("/proc/self/exe"),
@@ -724,7 +726,11 @@ static PROCESS_QUOTE_LEDGER_CLAIMED: std::sync::atomic::AtomicBool =
 /// [`ABANDONED_CHILD_BUDGET`]'s cross-handshake accumulation hole (a caller looping handshakes must
 /// reuse this one producer or fail closed; ONE boot handshake per process is the design — a supervisor
 /// restart is a new process and claims fresh); (ii) [`fetch_quote_via_child`] and [`AbandonedLedger`]
-/// are module-PRIVATE, so outside this module the producer is the only quote-fetch door; (iii) the
+/// are module-PRIVATE, so outside this module the producer is the only quote-fetch door — NB the
+/// door's SHAPE is not sealed: [`ExecChildSpawn`]'s fields stay pub(crate) (the smokes build test
+/// shapes), so an in-crate caller could claim THE producer over a custom spawner; shape discipline
+/// rests on (4b) wiring [`Self::production`] + the §8 concrete-type obligation, while the BOUND
+/// itself stays intact for any spawner (every `S` routes through the same orchestration); (iii) the
 /// `ledger` field is private, no method replaces it, and the type deliberately derives neither `Clone`
 /// nor `Default` (a clone would mint a second ledger and fork the budget — treat any later derive as a
 /// pin violation); (iv) `fetch(&mut self)` makes the single mutator a borrow-checker fact.
@@ -760,7 +766,13 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
                 "quote producer: process quote ledger already claimed",
             ));
         }
-        Ok(Self { spawn, ledger: AbandonedLedger::new() })
+        Ok(Self::unclaimed(spawn))
+    }
+
+    /// The ONE construction literal (private, unconditional): `new()` reaches it only after winning
+    /// the claim; the cfg(test) escape hatch reaches it directly.
+    fn unclaimed(spawn: S) -> Self {
+        Self { spawn, ledger: AbandonedLedger::new() }
     }
 
     /// Test-only escape hatch: bypasses the process claim so behavior tests parallelize (cfg(test) —
@@ -768,16 +780,20 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
     /// serialized discriminating test).
     #[cfg(test)]
     fn new_unclaimed_for_tests(spawn: S) -> Self {
-        Self { spawn, ledger: AbandonedLedger::new() }
+        Self::unclaimed(spawn)
     }
 }
 
 impl HardBoundedQuoteProducer<ExecChildSpawn> {
-    /// THE (4b)/5b-2c constructor: the production spawn shape + the process-ledger claim, one call.
-    /// The `/proc/self/exe` literal removes the `current_exe()` error arm, so the ONLY error is
-    /// "constructed twice" — surfaced at boot wiring, never inside the retry loop. Returning `Result`
-    /// is the same fail-closed construction surface sub-slice (3)'s boot-budget gate composes onto (no
-    /// signature break later).
+    /// THE (4b)/5b-2c constructor: the production spawn shape ([`ExecChildSpawn::production`] — the
+    /// `/proc/self/exe` rationale lives THERE, single source) + the process-ledger claim, one call.
+    /// The infallible spawner leaves "constructed twice" as the ONLY error — surfaced at boot wiring,
+    /// never inside the retry loop, and the wiring MUST `?`-propagate it as fatal: mapping it into the
+    /// retryable `AnchorTransportError` class would spin the driver's whole attempt budget on a
+    /// permanent refusal. Returning `Result` is the same fail-closed construction surface sub-slice
+    /// (3)'s boot-budget gate composes onto (no signature break later) — and (3) MUST run its budget
+    /// validation BEFORE this call: a post-claim validation failure burns the claim for the process
+    /// (fail-closed, but only a supervisor restart heals a pure config mistake).
     pub(crate) fn production() -> Result<Self, ProtocolError> {
         Self::new(ExecChildSpawn::production())
     }
@@ -1658,7 +1674,7 @@ mod tests {
         let mut p = HardBoundedQuoteProducer::new_unclaimed_for_tests(spawn);
         let start = Instant::now();
         let err = p
-            .fetch(&[0u8; 64], start + Duration::from_millis(200))
+            .fetch(&[0u8; 64], start + Duration::from_millis(100))
             .expect_err("wedged child must lapse through the trait path");
         assert!(
             matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
@@ -1688,9 +1704,12 @@ mod tests {
         let spawn = FakeSpawn::new(FakePlan::Silent, false);
         let spawns = Rc::clone(&spawn.spawns);
         let mut p = HardBoundedQuoteProducer::new_unclaimed_for_tests(spawn);
+        // 50ms deadlines: well above the MIN_BOUNDARY_BUDGET floor (1ms) yet 3x cheaper than the
+        // 150ms first draft — the discriminated property is ledger accumulation, not lapse timing
+        // (the lapse string/timing is pinned by producer_fetch_is_the_hard_bound_not_a_skeleton).
         for expected in 1..=3usize {
             let _ = p
-                .fetch(&[0u8; 64], Instant::now() + Duration::from_millis(150))
+                .fetch(&[0u8; 64], Instant::now() + Duration::from_millis(50))
                 .expect_err("silent child must lapse");
             assert_eq!(p.ledger.len(), expected, "ledger must accumulate MONOTONE across fetches");
         }
@@ -1731,6 +1750,13 @@ mod tests {
         // lock_and_reset_agent_process_globals fails HERE — reset-site symmetry).
         let g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         let first = HardBoundedQuoteProducer::production().expect("first claim must succeed");
+        // Composition pin: production() must wire EXACTLY the pinned production spawn shape (the
+        // shape-pin test asserts ExecChildSpawn::production() directly; THIS assert closes the gap
+        // where production()'s one-line body silently swaps in a different shape and every CI test
+        // stays green until the expensive (4c) in-guest failure).
+        assert_eq!(first.spawn.program, std::path::PathBuf::from("/proc/self/exe"));
+        assert_eq!(first.spawn.pipe_source, PipeSource::Stdout);
+        assert!(first.spawn.clear_env && first.spawn.leading_args.is_empty());
         let err = HardBoundedQuoteProducer::new(FakeSpawn::new(FakePlan::Silent, false))
             .err()
             .expect("second construction must refuse");
@@ -1753,6 +1779,11 @@ mod tests {
             HardBoundedQuoteProducer::new(FakeSpawn::new(FakePlan::Silent, false)).is_ok(),
             "the crate reset site must clear the claim (reset-site symmetry)"
         );
+        // Leave the flag PRISTINE on exit (the assert above re-claimed it): a future test that calls
+        // new() without following the TEST RULE would otherwise inherit this test's leftover claim as
+        // a scheduling-dependent flake far from its root cause. (Still hygiene, not a license — the
+        // TEST RULE stands.)
+        reset_process_quote_ledger_claim_for_tests();
     }
 
     #[test]
@@ -1805,8 +1836,11 @@ mod tests {
     fn producer_composes_into_relay_transport() {
         // Regression: composition drift at the exact (4b) mount point — the hard producer inside the
         // REAL RelayAnchorTransport must compile and flow bytes TODAY (quote↔nonce binding flowing
-        // producer→request unmodified, the seam-minted deadline threading through) so (4b) is
-        // zero-rework. ORDER MATTERS: report_data is DERIVED first — decode_anchor_boot_request
+        // producer→request unmodified) so (4b) is zero-rework. Scope honesty: this pins BYTE FLOW
+        // only — deadline-verbatim is pinned at the producer level by
+        // producer_fetch_is_the_hard_bound_not_a_skeleton arm (b) and at the transport level by the
+        // relay module's deadline_honoring FakeQuote tests; this test's channel discards its
+        // deadline. ORDER MATTERS: report_data is DERIVED first — decode_anchor_boot_request
         // enforces report_data == anchor_handshake_report_data(chain, env, nonce), so a fixture-first
         // test fails confusingly.
         let nonce = [0x5Cu8; 32];

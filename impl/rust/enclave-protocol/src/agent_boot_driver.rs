@@ -59,8 +59,9 @@
 //! driver with a mock channel + fake quote). The remaining aya/SNP work is split into ordered,
 //! independently-gated slices (see `agent-gateway-anti-rollback.md` §8): **5b-2b-ii** the `vsock-transport`
 //! leaf (`VsockBootRelayChannel` fresh-connection-per-call/deadline-bounded + host relay daemon).
-//! (`SnpQuoteProducer` = `snp_report::fetch_report_deadline` already landed in 5b-2b-i — `agent-gateway`,
-//! CI-tested, NOT behind `vsock-transport`.) **5b-2c** the agent-gateway bin + boot
+//! (`SnpQuoteProducer` = `snp_report::fetch_report_deadline` landed in 5b-2b-i but is COOPERATIVE and
+//! deletion-approved ((d-ii)(4a)); the production quote producer is `HardBoundedQuoteProducer` —
+//! (d-ii)/2, `quote_subprocess`, triple-gated.) **5b-2c** the agent-gateway bin + boot
 //! sequencing (set platform root → unseal the agent keystore → `install_agent_keystore` →
 //! `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve);
 //! **5b-2d** the sealed-blob source + unseal sequencing; **5b-2e** the `AdoptForward` signed raw-marks
@@ -111,7 +112,9 @@ pub(crate) trait AnchorBootTransport {
     /// [`AnchorTransportError`] (retryable) rather than block. (5b-2a's `RelayAnchorTransport` gives the
     /// quote producer AND the relay channel each their own `timeout` deadline — so a hung quote can't
     /// stall boot and quote latency can't starve the channel; 5b-2b's concrete impls just honor the
-    /// deadline they're handed. Per-attempt wall-clock ≤ 2×timeout; the count bound caps total boot.)
+    /// deadline they're handed. Per-attempt wall-clock ≤ 2×timeout + ε — ε = the quote-subprocess
+    /// dispose overhead `QUOTE_ATTEMPT_OVERHEAD`, a load-bearing term per §8: total boot ≤
+    /// `max_attempts · (2·timeout + ε)`, and the ε-less product is NOT a valid ceiling.)
     fn anchor_round_trip(
         &mut self,
         request: &AnchorBootRequest,

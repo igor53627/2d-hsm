@@ -1012,7 +1012,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   verdict). **Three (d-ii)/5b-2c pins from the (d-i)
   review:** (1) `HardBoundedQuoteProducer` owns THE one `AbandonedLedger` for the process — the budget
   binds only if exactly one ledger outlives all fetches (a fresh ledger per attempt resets `is_full()`
-  and voids the cap; the ledger's own doc carries the same pin); (2) the production spawn shape
+  and voids the cap; the ledger's own doc carries the same pin) — **DISCHARGED structurally in
+  (d-ii)/2, see the LANDED note above (process claim + privacy demotions + no-Clone + `&mut self`)**;
+  (2) the production spawn shape
   (`PipeSource::Stdout` + `clear_env` + stderr→journald) has ZERO (d-i) coverage — the (d-ii) aya smoke
   of the shipped producer MUST exercise exactly that shape (checked item, not assumed from the
   stderr-piped test shape); (3) **5b-2c acceptance item — bin-contract enforcement:** the

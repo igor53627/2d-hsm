@@ -240,8 +240,9 @@ fn check_deadline(deadline: Option<std::time::Instant>) -> Result<(), ProtocolEr
 /// interruptible under `#![forbid(unsafe_code)]` (a hard bound needs a *cancellable boundary* — the
 /// **killable subprocess**, the only sanctioned option per the revised §8 pin ("kernel timeout" was
 /// eliminated: configfs-tsm offers none; a plain worker thread can only abandon a stuck reader) — the
-/// harness LANDED in 5b-2b-ii(d-i) — `quote_subprocess` — with the configfs child
-/// mode following in (d-ii); the stale-clear covers the leak meanwhile).
+/// harness LANDED in 5b-2b-ii(d-i) — `quote_subprocess` — the configfs child mode in (d-ii)/1 and the
+/// wired producer type `HardBoundedQuoteProducer` in (d-ii)/2; the stale-clear covers the leak on THIS
+/// cooperative path until its (4a) deletion).
 pub(crate) fn fetch_report_with<F: TsmFs>(
     fs: &F,
     report_data: &[u8; REPORT_DATA_LEN],
@@ -330,8 +331,10 @@ pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<(Vec<u8>, Vec
 ///
 /// **`pub(crate)` + `agent-gateway`-gated deliberately** (its only caller is
 /// `agent_boot_relay::SnpQuoteProducer::fetch`, itself `agent-gateway`-only): the deadline here is
-/// best-effort/cooperative — it does NOT hard-bound a wedged in-kernel `read(outblob)` until 5b-2b-ii lands
-/// a cancellable boundary — so this MUST NOT be wired into a live serve/boot path from outside the crate.
+/// best-effort/cooperative — it does NOT hard-bound a wedged in-kernel `read(outblob)`. The cancellable
+/// boundary EXISTS now (`HardBoundedQuoteProducer`, (d-ii)/2 — the producer the serve path will take by
+/// signature), which makes this whole cooperative path deletion-approved ((4a), `SnpQuoteProducer` with
+/// it) — so this MUST NOT be wired into a live serve/boot path from outside the crate.
 /// Crate-private visibility *type-enforces* that obligation (the doc'd "must not wire externally" is now a
 /// compile error, not just prose); the feature gate keeps it from being dead code in the non-agent builds.
 /// The unbounded producer [`fetch_report`] stays `pub` — the legitimate GET_MEASUREMENT path with no
