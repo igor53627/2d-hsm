@@ -193,9 +193,23 @@ pub(crate) fn fetch_report_with<F: TsmFs>(
         }
     }
     let entry = format!("{TSM_REPORT_DIR}/{TSM_ENTRY_NAME}");
-    fs.remove_entry(&entry); // clear any stale entry from a previous crashed boot
-    let result = fetch_report_inner_with(fs, &entry, report_data, deadline);
-    fs.remove_entry(&entry); // UNCONDITIONAL cleanup — last statement on every path (incl. timeout)
+    fetch_report_with_at(fs, &entry, report_data, deadline)
+}
+
+/// Entry-path-parameterized core of [`fetch_report_with`] (refactor-only split for 5b-2b-ii(d): the
+/// killable quote CHILD fetches at its own unique self-named `twod-hsm-q-<pid>` path — (d-ii) — while the
+/// producer path keeps the fixed name above; FakeTsmFs ignores entry strings, so the existing sequence
+/// tests pin this split moved nothing). Body unchanged: stale-clear → inner sequence → UNCONDITIONAL
+/// trailing cleanup on every path (incl. timeout).
+fn fetch_report_with_at<F: TsmFs>(
+    fs: &F,
+    entry_path: &str,
+    report_data: &[u8; REPORT_DATA_LEN],
+    deadline: Option<std::time::Instant>,
+) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+    fs.remove_entry(entry_path); // clear any stale entry from a previous crashed boot
+    let result = fetch_report_inner_with(fs, entry_path, report_data, deadline);
+    fs.remove_entry(entry_path); // UNCONDITIONAL cleanup — last statement on every path (incl. timeout)
     result
 }
 
