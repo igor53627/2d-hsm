@@ -322,8 +322,11 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> RelayAnchorTransport<Q, C> {
     }
 
     /// Test-only pin accessor for the (d-ii)/3 composition test (deadline origination). Gated to
-    /// exactly the combos where `ValidatedBootBudget` exists, so `cargo test --features
-    /// agent-gateway` (CI) sees no dead code.
+    /// exactly the combos where `ValidatedBootBudget` exists: the inner cfg below contributes
+    /// `test + linux + vsock-transport`, and the ENCLOSING MODULE is `agent-gateway`-gated
+    /// (lib.rs), completing the triple — the same outer/inner split as the `agent_dispatch` reset
+    /// hook. So `cargo test --features agent-gateway` (CI) sees no dead code, and a
+    /// `linux+vsock-transport`-without-`agent-gateway` build never compiles this file at all.
     #[cfg(all(test, target_os = "linux", feature = "vsock-transport"))]
     pub(crate) fn per_leg_timeout_for_tests(&self) -> std::time::Duration {
         self.timeout
