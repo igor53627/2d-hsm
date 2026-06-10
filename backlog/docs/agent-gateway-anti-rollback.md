@@ -953,10 +953,13 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   orchestration (full pipeline minus configfs). **Named obligation for (d-ii)-2/3 or 5b-2c:**
   parent-side reap-status logging — the parent still discards reaped exit statuses (`fold_try_wait`
   matches `Ok(Some(_))`), so the exit-code table has NO parent-side carrier; child-side, every nonzero
-  exit emits ONE stderr breadcrumb (`twod-hsm quote child: exit <code>`; the code-10 write-failure
-  line subsumes its own), giving codes 1..=6 journald visibility — but the breadcrumb lives in the
-  production-only entrypoint (`agent_quote_child_main`, zero CI coverage by pin (2) below), so its
-  verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger ownership, (3)
+  exit emits a BEST-EFFORT stderr breadcrumb (`twod-hsm quote child: exit <code>`; the code-10
+  write-failure line subsumes its own) — best-effort, NOT guaranteed: it is written after the frame
+  flush and the parent SIGKILLs on frame receipt, so the breadcrumb can lose that race; the reliable
+  cause-carrier is the in-band ERR frame (parent-visible as the retryable error string), which is why
+  reap logging stays the obligation rather than being discharged by the breadcrumb. The breadcrumb
+  lives in the production-only entrypoint (`agent_quote_child_main`, zero CI coverage by pin (2)
+  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger ownership, (3)
   budget-gate integration, (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
@@ -992,10 +995,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   matching exit code. Deterministic deviceless arms (no configfs needed, plain CI): (a) marker env set,
   report_data env missing ⇒ stdout == `encode_err_frame(1)` exactly, exit 1; (b) valid report_data env on
   a configfs-less host ⇒ stdout == `encode_err_frame(2)` exactly (create fails), exit 2. Place the test as
-  a unit test inside the bin's crate (`CARGO_BIN_EXE_*` is set for unit tests too) so the pub(crate) frame
-  encoders are the expected-bytes source, or pin the golden bytes. A dispatch moved below any
-  stdout-writing statement — or any stdout logging anywhere in the bin — fails this test by
-  construction.* Acceptance criteria — split by what each environment can actually stage (per the honest
+  an INTEGRATION test (`tests/`): Cargo's documented contract sets `CARGO_BIN_EXE_<name>` only when
+  building integration tests/benches, NOT lib unit tests — and the pub(crate) frame encoders are
+  unreachable from an integration test anyway, so pin the expected frames as GOLDEN BYTES (the 2-byte ERR
+  frames are stable wire constants; the in-crate golden-byte test already pins the same encoding). A
+  dispatch moved below any stdout-writing statement — or any stdout logging anywhere in the bin — fails
+  this test by construction.* Acceptance criteria — split by what each environment can actually stage (per the honest
   limit above, a true D-state wedge cannot be staged on demand ANYWHERE, so NO acceptance item requires a
   live wedged provider): (1) **D-state/unreapable arm — fake-handle, deterministic (landed in (d-i)):**
   **"no stuck process accumulation across repeated timeouts"** and **"a subsequent attempt is well-defined

@@ -859,13 +859,15 @@ pub(crate) fn parse_report_data_env(val: &std::ffi::OsStr) -> Result<[u8; 64], P
 /// write to it) → exit. NEVER spawns anything (and the spawner-level + orchestration-level brakes
 /// refuse even if it tried).
 pub(crate) fn agent_quote_child_main() -> ! {
-    /// Production-only exit: ONE stderr breadcrumb per nonzero exit (`twod-hsm quote child: exit
-    /// <code>`) so codes 1..=6 are journald-visible via inherited stderr — the parent still discards
-    /// reaped statuses (§8 reap-logging obligation). Code 10 is skipped: `emit` already wrote its more
-    /// specific write-failure line. Lives HERE and not in `emit`/`quote_child_main_with` BY DESIGN: in
-    /// the real-subprocess CI smokes stderr IS the protocol pipe and the parser rejects trailing bytes
-    /// — a breadcrumb in the shared core would corrupt the smoke protocol stream. This entrypoint has
-    /// zero CI coverage (§8 pin: production shape is aya-smoke-only); the (4c) aya smoke verifies it.
+    /// Production-only exit: a BEST-EFFORT stderr breadcrumb per nonzero exit (`twod-hsm quote child:
+    /// exit <code>`) toward journald via inherited stderr — best-effort because it is written AFTER
+    /// the frame flush and the parent SIGKILLs on frame receipt, so it can lose the race; the reliable
+    /// cause-carrier is the in-band ERR frame (parent-visible), and parent-side reap logging stays the
+    /// named §8 obligation. Code 10 is skipped: `emit` already wrote its more specific write-failure
+    /// line. Lives HERE and not in `emit`/`quote_child_main_with` BY DESIGN: in the real-subprocess CI
+    /// smokes stderr IS the protocol pipe and the parser rejects trailing bytes — a breadcrumb in the
+    /// shared core would corrupt the smoke protocol stream. This entrypoint has zero CI coverage (§8
+    /// pin: production shape is aya-smoke-only); the (4c) aya smoke verifies it.
     fn exit_child(code: i32) -> ! {
         if code != 0 && code != CHILD_EXIT_WRITE_FAILED {
             use std::io::Write as _;
@@ -929,10 +931,12 @@ pub(crate) fn agent_quote_child_main() -> ! {
 /// external input (env, configfs blobs, frame bytes); unreachable cases fold to the nearest honest
 /// code, guarded by `debug_assert!` so tests check what release must never hit). NB the PARENT
 /// currently discards reaped exit statuses (parent-side reap-status logging is a named §8 obligation);
-/// child-side, every nonzero exit emits ONE stderr breadcrumb from the production entrypoint
+/// child-side, every nonzero exit emits a BEST-EFFORT stderr breadcrumb from the production entrypoint
 /// (`twod-hsm quote child: exit <code>`, journald via inherited stderr — the code-10 write-failure
-/// line subsumes its own), so the table IS journald-visible from the child but has no parent-side
-/// carrier yet.
+/// line subsumes its own). Best-effort because it races the parent: the breadcrumb is written AFTER
+/// the frame flush, and the parent SIGKILLs the child as soon as it parses the frame — the reliable
+/// cause-carrier is the in-band ERR frame itself (parent-visible as the retryable error string), not
+/// journald; reap logging remains the obligation.
 pub fn agent_quote_child_dispatch() {
     if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
         agent_quote_child_main();
