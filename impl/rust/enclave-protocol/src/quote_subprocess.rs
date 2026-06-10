@@ -736,7 +736,18 @@ fn child_err_code(step: FetchStep, err: &ProtocolError) -> u8 {
         // infallible; check_deadline(None) never errors — create always records first). A TOTAL fold,
         // deliberately NOT `unreachable!()`: the child must never panic (a panic = exit 101 with no
         // frame — the exact undiagnosable ambiguity the frame protocol exists to prevent).
-        FetchStep::None => 4,
+        FetchStep::None => {
+            // debug_assert (compiled OUT of the release child — release keeps the total fold to 4,
+            // preserving the never-panic rule) makes the prose guard above CHECKED in the deviceless
+            // debug tests: it fires if a fallible pre-create op, a Some deadline, or a tracker
+            // record-after-delegate reordering ever makes this arm reachable.
+            debug_assert!(
+                false,
+                "fetch Err with no step recorded — pinned-None-deadline invariant broken; \
+                 rework child_err_code's step mapping"
+            );
+            4
+        }
     }
 }
 
@@ -759,7 +770,7 @@ fn emit<W: std::io::Write>(out: &mut W, frame: &[u8], ok_code: i32) -> i32 {
         // not fetch" (the parent discards reaped exit statuses today — §8 records parent-side reap
         // logging as a named obligation). In the test smokes stderr IS the protocol pipe — but this
         // path only fires when that pipe is already dead, so the write is a harmless no-op Err.
-        let _ = writeln!(std::io::stderr(), "2d-hsm quote child: frame write failed (parent gone?)");
+        let _ = writeln!(std::io::stderr(), "twod-hsm quote child: frame write failed (parent gone?)");
         CHILD_EXIT_WRITE_FAILED
     }
 }
@@ -848,6 +859,20 @@ pub(crate) fn parse_report_data_env(val: &std::ffi::OsStr) -> Result<[u8; 64], P
 /// write to it) → exit. NEVER spawns anything (and the spawner-level + orchestration-level brakes
 /// refuse even if it tried).
 pub(crate) fn agent_quote_child_main() -> ! {
+    /// Production-only exit: ONE stderr breadcrumb per nonzero exit (`twod-hsm quote child: exit
+    /// <code>`) so codes 1..=6 are journald-visible via inherited stderr — the parent still discards
+    /// reaped statuses (§8 reap-logging obligation). Code 10 is skipped: `emit` already wrote its more
+    /// specific write-failure line. Lives HERE and not in `emit`/`quote_child_main_with` BY DESIGN: in
+    /// the real-subprocess CI smokes stderr IS the protocol pipe and the parser rejects trailing bytes
+    /// — a breadcrumb in the shared core would corrupt the smoke protocol stream. This entrypoint has
+    /// zero CI coverage (§8 pin: production shape is aya-smoke-only); the (4c) aya smoke verifies it.
+    fn exit_child(code: i32) -> ! {
+        if code != 0 && code != CHILD_EXIT_WRITE_FAILED {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "twod-hsm quote child: exit {code}");
+        }
+        std::process::exit(code);
+    }
     let mut out = std::io::stdout();
     let rd = std::env::var_os(QUOTE_CHILD_REPORT_DATA_ENV)
         .ok_or(ProtocolError::WireProtocol("quote child: report_data env missing"))
@@ -857,11 +882,11 @@ pub(crate) fn agent_quote_child_main() -> ! {
         // ONE error arm for missing AND malformed env: ERR(1) frame, exit 1 — but a FAILED frame write
         // escalates to CHILD_EXIT_WRITE_FAILED like every other path (emit owns the policy), so
         // "bad env, frame delivered" and "parent was gone" stay distinguishable in the exit status.
-        Err(_) => std::process::exit(emit(&mut out, &encode_err_frame(1), 1)),
+        Err(_) => exit_child(emit(&mut out, &encode_err_frame(1), 1)),
     };
     crate::snp_report::gc_quote_entries_default();
     let code = quote_child_main_with(&crate::snp_report::RealTsmFs, &rd, &mut out);
-    std::process::exit(code);
+    exit_child(code);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -875,17 +900,39 @@ pub(crate) fn agent_quote_child_main() -> ! {
 /// returns immediately in a normal (parent) process; never returns in a spawned quote child. Exported
 /// at the crate root (this module is private), so the §8 "first statement of main" contract is
 /// satisfiable by `enclave_protocol::agent_quote_child_dispatch();` — the dispatch CONDITION (the
-/// marker env) stays crate-private and cannot be re-keyed one-sided. A forgotten dispatch fail-closes:
-/// the child runs the full boot logic against an env-cleared environment, writes no valid frame, and
-/// the parent's decode error folds retryable → `RetriesExhausted` — never a hang, never a serve.
+/// marker env) stays crate-private and cannot be re-keyed one-sided. A forgotten dispatch fail-closes,
+/// but the enforcement is the PARENT's kill bound, not the child failing fast: the dispatch-less child
+/// runs the full boot logic against an env-cleared environment and may scribble boot-logic output onto
+/// protocol stdout — or block and write nothing at all — until it is killed. Either way the parent's
+/// only wait is the pipe deadline (`read_child_reply`'s `poll_with_deadline`): garbage fails frame
+/// decode, silence lapses the deadline, both fold retryable → `RetriesExhausted`, and the unconditional
+/// disposition SIGKILLs the child on every path — never a hang, never a serve, because the parent
+/// bounds it, not because the child cooperates.
+///
+/// **NOT an authentication boundary (threat-model; §8 pin, matrix HIGH refuted 3-0):** dispatch
+/// deliberately carries no parent-vs-external-launch check. The SNP signing oracle is configfs-tsm +
+/// firmware — natively available to ANY equally-privileged in-guest process, and the report carries no
+/// requesting-process identity — so an env-token/ppid/parent-capability check would be unfalsifiable
+/// theater, and deriving report_data from key material inside the child would move secrets INTO the
+/// SIGKILL-able child (which deliberately holds zero) for no oracle reduction. report_data trust comes
+/// from the relying party's derive-and-compare rule + the measured-boot chain (TASK-16 must cover the
+/// cmdline/env channel). Standing preconditions: the binary is never installed setuid nor wrapped by a
+/// privileged env-forwarding service, and no relying path ascribes extra weight to "this binary
+/// produced the quote".
 ///
 /// **Child exit-code table (ops/journald triage):**
 /// `0` ok (frame delivered) · `1` bad/missing report_data env (ERR(1) frame delivered) · `2..=6` fetch
 /// failed at {2 create, 3 inblob, 4 outblob read, 5 outblob oversize, 6 outblob short} (ERR frame
 /// delivered; same code) · `10` [`CHILD_EXIT_WRITE_FAILED`] — the frame write itself failed (parent
-/// gone; one stderr breadcrumb is emitted) · `101` rust panic (must never happen — the child code is
-/// total). NB the PARENT currently discards reaped exit statuses (codes land only in journald via
-/// stderr inheritance); parent-side reap-status logging is a named §8 obligation.
+/// gone; one stderr breadcrumb is emitted) · `101` rust panic (must never happen — child-reachable
+/// code MUST stay total: no `unwrap`/`expect`/`unreachable!()`/indexing/unchecked arithmetic on
+/// external input (env, configfs blobs, frame bytes); unreachable cases fold to the nearest honest
+/// code, guarded by `debug_assert!` so tests check what release must never hit). NB the PARENT
+/// currently discards reaped exit statuses (parent-side reap-status logging is a named §8 obligation);
+/// child-side, every nonzero exit emits ONE stderr breadcrumb from the production entrypoint
+/// (`twod-hsm quote child: exit <code>`, journald via inherited stderr — the code-10 write-failure
+/// line subsumes its own), so the table IS journald-visible from the child but has no parent-side
+/// carrier yet.
 pub fn agent_quote_child_dispatch() {
     if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
         agent_quote_child_main();
