@@ -61,7 +61,8 @@ pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, Protoco
 /// never treat a bare `Ok(_)` as "ready for I/O". For the CONNECT/stream-write case use
 /// [`connect_poll_succeeded`] (clean `POLLOUT`, error flags veto) — do not hand-roll the flag check. A pipe
 /// READ caller (the future (d) quote pipe) must NOT use that predicate: on a pipe `POLLHUP` is a normal EOF
-/// that can arrive WITH final data (`POLLIN|POLLHUP`); (d) needs its own EOF-aware check.
+/// that can arrive WITH final data (`POLLIN|POLLHUP`); the (d) pipe predicate is
+/// `quote_subprocess::classify_pipe_revents` (EOF-aware — landed in (d-i)).
 ///
 /// The per-call timeout is re-derived from the budget *remaining to the absolute `deadline`* (via
 /// [`remaining_or_lapsed`]) and shrinks across `EINTR` retries, so the absolute deadline is the true bound
@@ -110,7 +111,8 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
 /// gates `EPOLLHUP` on *local* shutdown, unlike inet) and the veto fires on `POLLERR`. On a **pipe READ**
 /// (the future (d) quote-subprocess fd) `POLLHUP` is instead a *normal EOF* that can arrive WITH final data
 /// (`POLLIN|POLLHUP`) — a predicate like this one would drop the last quote bytes, so (d) must build its own
-/// EOF-aware POLLIN check; hardcoding `POLLOUT` here makes that misuse impossible rather than
+/// EOF-aware POLLIN check (now `quote_subprocess::classify_pipe_revents`, landed in (d-i));
+/// hardcoding `POLLOUT` here makes that misuse impossible rather than
 /// comment-guarded.
 pub(crate) fn connect_poll_succeeded(revents: nix::poll::PollFlags) -> bool {
     use nix::poll::PollFlags;
@@ -213,7 +215,8 @@ mod tests {
         assert!(!connect_poll_succeeded(P::empty()), "empty revents must not be success");
         // Why there is no `want` parameter: a pipe's EOF routinely arrives as POLLIN|POLLHUP (final data +
         // writer closed). A POLLHUP-vetoing predicate applied to a pipe read would reject that completed
-        // read — the (d) quote pipe must build its own EOF-aware check, and the hardcoded-POLLOUT signature
+        // read — the (d) quote pipe has its own EOF-aware check (quote_subprocess::
+        // classify_pipe_revents), and the hardcoded-POLLOUT signature
         // makes reaching for this one a compile error rather than a prose warning.
         assert!(
             !connect_poll_succeeded(P::POLLIN | P::POLLHUP),

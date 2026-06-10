@@ -177,7 +177,8 @@ fn check_deadline(deadline: Option<std::time::Instant>) -> Result<(), ProtocolEr
 /// checks bound the *gaps* between fs ops; a single in-kernel `read(outblob)` that blocks forever is not
 /// interruptible under `#![forbid(unsafe_code)]` (a hard bound needs a *cancellable boundary* — killable
 /// subprocess / kernel timeout, NOT a plain worker thread which can only abandon a stuck reader — a
-/// deferred follow-up; the stale-clear covers the leak meanwhile).
+/// killable-subprocess harness LANDED in 5b-2b-ii(d-i) — `quote_subprocess` — with the configfs child
+/// mode following in (d-ii); the stale-clear covers the leak meanwhile).
 pub(crate) fn fetch_report_with<F: TsmFs>(
     fs: &F,
     report_data: &[u8; REPORT_DATA_LEN],

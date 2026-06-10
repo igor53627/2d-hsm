@@ -862,18 +862,47 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `fetch_report_deadline` (via the `TsmFs` seam) checks `deadline` around each configfs op and runs
   **unconditional stale-entry cleanup on every path incl. mid-sequence timeout** (the entry dir is fixed
   `twod-hsm`; cleanup runs as the last statement so the next attempt's `remove_dir`+`create_dir` still
-  works — pinned by `fetch_cleans_up_on_mid_sequence_deadline_timeout`). **Hard wall-clock bound — STILL
-  DEFERRED (tracked here):** a single in-kernel blocking `read(outblob)` cannot be interrupted under
-  `#![forbid(unsafe_code)]`, so the cooperative deadline is **best-effort, NOT a guaranteed ceiling against
-  a wedged kernel/configfs provider.** A true hard bound needs a **cancellable boundary** — and a plain
-  worker thread is NOT sufficient: it cannot cancel a wedged `read(outblob)`, it can only *abandon* a stuck
-  thread, which leaks the thread AND leaves the fixed `twod-hsm` configfs entry in use (so the next
-  attempt's `create_dir` collides). 5b-2b-ii MUST therefore use one of: (i) a **killable subprocess**
-  helper (SIGKILL on timeout), (ii) a kernel-supported read timeout if one exists, or (iii) **unique
-  per-attempt configfs entry names** + an explicit abort/leak policy (bounded stuck-reader budget; refuse
-  boot past a threshold) — NOTE option (iii) is incompatible with the current fixed-`twod-hsm` start-of-
-  attempt stale-clear (a wedged reader's unique entry is not reclaimed by it), so (iii) MUST add orphan-
-  entry GC; (i)/(ii) keep the fixed-name clear valid and are preferred. Acceptance criteria: **"no stuck
+  works — pinned by `fetch_cleans_up_on_mid_sequence_deadline_timeout`; that cooperative machinery —
+  `SnpQuoteProducer`, `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — is
+  APPROVED FOR DELETION in (d-ii) [user sign-off 2026-06-10], making "wire the cooperative producer
+  anyway" structurally impossible rather than a prose caveat). **Hard wall-clock bound — (d-i) harness
+  LANDED (this PR); (d) remains OPEN until (d-ii):** a single in-kernel blocking `read(outblob)` cannot be
+  interrupted under `#![forbid(unsafe_code)]`, so the cooperative deadline is **best-effort, NOT a
+  guaranteed ceiling against a wedged kernel/configfs provider.** A true hard bound needs a **cancellable
+  boundary**, and 5b-2b-ii MUST use a **killable-subprocess** one — **REVISED PIN (was: "(i)/(ii) keep the
+  fixed-name clear valid and are preferred"; that claim is FALSE under the exact failure (d) exists for):**
+  SIGKILL only *pends* against a child wedged in an uninterruptible (D-state) configfs read — the child
+  does not exit and its open fds are NOT released, so it still HOLDS the fixed `twod-hsm` entry; the next
+  attempt's best-effort `remove_entry` fails SILENTLY (`RealTsmFs` ignores the error) and `create_entry`
+  fails `EEXIST` behind the misleading "needs kernel >= 6.7 / TSM provider" message — ONE wedged child
+  poisons every remaining attempt in the boot budget with a wrong-cause error. **Shipped design = (i) +
+  (iii)'s naming companion:** the quote fetch runs in a killable subprocess whose PIPE is the cancellable
+  boundary (`poll_with_deadline(POLLIN)`; EOF-aware `classify_pipe_revents` — on a pipe `POLLIN|POLLHUP`
+  is the NORMAL final-data shape, `read()==0` the only authoritative EOF); the subprocess path uses unique
+  **child-self-named** entries `twod-hsm-q-<child_pid>` (live-pid uniqueness forbids collision; a recycled
+  pid's child clears its own stale name); orphan entries are reclaimed by best-effort prefix GC run
+  **inside the next killable child** — the parent performs **NO configfs I/O of any kind** (parent-side
+  readdir/rmdir against a wedged provider could itself block uninterruptibly — a permanent boot hang,
+  strictly worse than fail-closed; in the child, a wedged GC is just another killable attempt). The prefix
+  `twod-hsm-q-` is strictly longer than the bare `twod-hsm`, so GC can never match the producer entry.
+  Abandoned (killed-but-unreaped) children are bounded by `ABANDONED_CHILD_BUDGET =
+  MAX_BOOT_ATTEMPTS_CEILING (= 64)` (derived AND assert-pinned); the fetch refuses to spawn past it
+  (retryable → fail-closed `RetriesExhausted`) — the option-(iii) "refuse boot past a threshold" policy,
+  implemented. NO blocking `wait()` exists in the (d) path BY TYPE (`ChildHandle` = `kill_best_effort` +
+  WNOHANG `try_reap` only; bounded ≤10ms reap grace, so ε ≈ ≤12ms/attempt of spawn+kill+reap overhead —
+  see the budget invariant below for the explicit `max_attempts · ε` term [user decision 2026-06-10]).
+  Production child stderr → **journald (`inherit`)** for kill-storm triage [user decision 2026-06-10].
+  The fixed `twod-hsm` entry remains EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's. The
+  "unconditional cleanup on every path" invariant is rescoped: it holds in-process and for a SURVIVING
+  child; a killed child structurally cannot clean — next-child/next-boot GC owns that case (configfs is
+  RAM-backed; nothing survives reboot). *(d-i) landed: deviceless killable-subprocess harness
+  (`quote_subprocess.rs` — EOF-aware pipe predicate, capped incremental frame codec, deadline-bounded
+  drain, kill/WNOHANG-reap/abandon ledger, budget = 64, real-subprocess CI smokes; honest limit stated in
+  the test docs: a true D-state child cannot be staged on demand ANYWHERE — the unreapable arm's only
+  deterministic coverage is the Fake-handle ledger tests) + the entry-path `fetch_report_with_at` refactor;
+  (d-ii) adds the configfs child mode (`agent_quote_child_main`, child-side GC) + `HardBoundedQuoteProducer`
+  (the structural serve-gate type — deliberately NO skeleton in (d-i): it would satisfy the by-signature
+  gate while the hang remains) + the in-SNP-guest aya validation.* Acceptance criteria: **"no stuck
   process accumulation across repeated timeouts"** and **"a subsequent attempt is well-defined (no entry
   collision) after a timeout"**, plus the aya test that a wedged provider fails the attempt promptly rather
   than hanging boot. **This is the live-serve blocker:** 5b-2b-ii(a)/(b) only unblock 5b-2c
@@ -937,11 +966,16 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   wiring-enforced in `round_trip_inner` (see above) — when 5b-2c builds the budget check, prefer computing it
   where both deadlines ORIGINATE (e.g. a constructor that derives connect and I/O deadlines from one
   channel-leg value), so the structural gate cannot outlive the wiring assumption it depends on.
-  This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **Generalized form (the `2·`
-  assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if 5b-2c
-  exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
-  **`max_attempts · (quote_timeout + channel_timeout) ≤ overall_boot_budget`** — 5b-2c MUST restate and
-  enforce whichever form it ships.
+  This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **ε term — EXPLICIT in the
+  operator-facing check [user decision 2026-06-10]:** as of (d), each attempt additionally costs the
+  quote-subprocess overhead ε = spawn + SIGKILL + ≤`REAP_GRACE`(10ms) WNOHANG polling + fd close ≈ ≤12ms
+  (all non-blocking by construction — no `wait()` exists behind the `ChildHandle` seam), landing BETWEEN
+  the legs. The enforced check is therefore **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`**
+  (worst case `max_attempts·ε ≈ ≤0.8s`) — an explicit term, not documented slack. **Generalized form (the
+  `2·` assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if
+  5b-2c exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
+  **`max_attempts · (quote_timeout + channel_timeout + ε) ≤ overall_boot_budget`** — 5b-2c MUST restate
+  and enforce whichever form it ships.
   - [ ] **Deferred verification artifact (CHECKED residual — do not lose behind "DONE PR #56"):** a
     real-vsock test of the in-flight-connect black-hole *deadline lapse* (currently unit-level-only via
     `poll_times_out_when_not_ready`) — the only mode where the caller's `deadline`, not the kernel's ~2s
@@ -976,10 +1010,14 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   The connect/socket timeout **budget is derived from the per-leg `Duration`** (a fraction of it), NOT a
   separate operator knob, so channel (a) and daemon (b) coordinate on the same source and the total-boot
   bound stays verifiable.
-- **Serialization premise (write it down).** Quote fetches are **strictly serial within a guest**: the
-  start-of-attempt `remove_entry`+`create_entry` on the FIXED `twod-hsm` entry is only safe if no other
-  fetch overlaps. True for the single boot path today; any future parallel-attempt / split-timeout idea
-  MUST first move to unique-per-attempt entries (+ the option-(iii) orphan GC) or it silently corrupts.
+- **Serialization premise (write it down).** Quote fetches are **strictly serial within a guest** —
+  unchanged, but as of 5b-2b-ii(d) the protected invariant changed: the fixed-`twod-hsm` start-of-attempt
+  `remove`+`create` premise now applies ONLY to the unbounded producer path; the subprocess quote path uses
+  unique `twod-hsm-q-<pid>` entries. Serial execution is now load-bearing for a NEW reason: the
+  **child-side prefix GC** may only run when no sibling quote child is mid-fetch (a concurrent attempt's
+  entry could be swept between its `create` and its blob I/O). Serial driver attempts + the
+  one-handshake-per-process rule guarantee ≤ 1 live quote child. Any future parallel-attempt idea MUST
+  first scope GC per attempt owner.
 - **Host-relay daemon (its own 5b-2b sub-checklist).** Define: daemon location + feature gate; the
   upstream enclave→anchor request/response schema; the **error→framing mapping** — a relay/anchor error
   (unavailable, timeout, upstream 5xx) MUST be surfaced to the enclave as a *retryable transport close*
