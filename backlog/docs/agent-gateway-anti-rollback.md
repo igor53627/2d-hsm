@@ -835,16 +835,24 @@ request golden vector is a 5b-2b test-vector item.
   `production()` constructor error is FATAL wiring-time config (must be `?`-propagated; funneling any
   construction error through the fetch-path retryable fold would spin the attempt budget on a permanent
   refusal — construction-fatal and fetch-retryable deliberately share `ProtocolError`, position is the
-  discriminator: a sub-slice (3) hazard to keep visible); (3) CONFIG LOGGING — the bin MUST log
-  `(max_attempts, per_leg_timeout, overall_boot_budget, nominal_boot_cost)` at config parse, via
-  `ValidatedBootBudget`'s getters ((d-ii)/3): the artifact's static error strings deliberately carry
-  no numbers (house anti-oracle pattern), so the parse-time log line is the operator's only view of
-  the numbers the gate enforced.
+  discriminator: a sub-slice (3) hazard to keep visible); (3) CONFIG LOGGING — a CHECKED 5b-2c task
+  item with a smoke/integration assertion, not a prose nicety (the artifact's static error strings
+  deliberately carry no numbers — house anti-oracle pattern — so without this line a fail-closed
+  boot is numberless and undebuggable). Scope precisely: (a) BEFORE validation, log the RAW config
+  triplet (the getters exist only on success — a failed validate() must still leave the operator the
+  numbers); (b) on success, log the getter line incl. `nominal_boot_cost` AND the slack
+  (`overall_boot_budget − nominal_boot_cost`) — a zero-slack config validates (`≤` passes) but is
+  mis-sized by definition and deserves a WARN-level line; (4) DRIVER-COUNT BINDING — a named,
+  TEST-BACKED acceptance item: the count passed to `run_boot_anti_rollback_handshake` MUST be
+  `budget.max_attempts()` from THE SAME witness instance fed to `production_transport` (the witness
+  alone does not bind the count — the 4b test must refuse the drift).
   **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
   5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
   (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
-  no longer gates the live serve. **The TWO hard preconditions remaining for a live 5b-2c serve:**
+  no longer gates the live serve. **The TWO hard preconditions for a live 5b-2c serve (state:
+  gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3 — the REMAINING work on
+  both is 5b-2c WIRING: (4b)+(4c) for #1, witness-construction-from-config for #2):**
   1. **(d) quote bound** — the 5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
      into a *serving* path until (d) exists; prefer a structural gate (have (d) introduce a
      `HardBoundedQuoteProducer` type the wrapper requires by signature, so a build lacking (d) **cannot
@@ -979,7 +987,10 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   one level up (the child-side synchronous-breadcrumb acceptance does NOT transfer: the child is
   killable, the parent is not; and O_NONBLOCK on fd 2 flips the SHARED open file description).
   Emission must live OUTSIDE the fetch (e.g. bin/driver level between attempts) or behind a
-  genuinely non-blocking channel. ALSO record for that implementation: an `ExitStatus` cannot
+  genuinely non-blocking channel — and the carrier itself is an EXPLICIT 5b-2c design task (e.g. a
+  bounded in-memory status buffer the fetch appends to non-blockingly and the bin drains between
+  attempts), followed by bin-level emission + smoke verification: without a named carrier design,
+  implementers either reintroduce the forbidden in-fetch write or skip parent-side logging entirely. ALSO record for that implementation: an `ExitStatus` cannot
   distinguish own-SIGKILL from an EXTERNAL SIGKILL (the Linux OOM-killer delivers exactly SIGKILL),
   so any filter silencing the uniform-disposition kill also silences OOM kills — an accepted blind
   spot to document, not paper over ("crashes must not be swallowed" cannot be promised for the
@@ -1029,11 +1040,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   producer's constructors take it as an ORDERING WITNESS (`new(&budget, spawn)` /
   `production(&budget)`): validation-before-claim is a compile fact — SCOPE HONESTY: the witness
   proves SOME budget validated, not that THE SAME instance feeds the wiring; the timeout binding is
-  structural via `production_transport(channel)` (composes BOTH gates in one call, mints the
-  transport from `per_leg_timeout()`; droppable to getter-sourcing if contested — recorded
-  fallback), and **the driver-count binding is a recorded (4b) acceptance obligation: the count
+  structural via `production_transport(channel)` (composes both gate ARTIFACTS in one call, mints
+  the transport from `per_leg_timeout()`; droppable to getter-sourcing if contested — recorded
+  fallback), and **the driver-count binding is a named, TEST-BACKED (4b) acceptance item: the count
   passed to `run_boot_anti_rollback_handshake` MUST be `budget.max_attempts()` from THE SAME witness
-  instance** (the driver keeps its raw-u32 signature for cfg-lattice reasons). The parent-side reap
+  instance, and the (4b) test must refuse the drift** (the driver keeps its raw-u32 signature for
+  cfg-lattice reasons). The parent-side reap
   obligation is RE-SCOPED to 5b-2c with hard constraints (see above — the in-fetch emission was
   reverted); the 5b-2c bin obligation (log the four config numbers at parse) and the witness
   construction from operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
@@ -1153,9 +1165,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   transport/driver is
   constructed — a constructor/config check that **returns an error** (fail-closed, not merely a
   `debug_assert`, since the bound must hold in release) when the shipped form exceeds `overall_boot_budget`.
-  The check MUST run AFTER `max_attempts` range validation (below), use **checked/saturating arithmetic**
-  (`u32 · Duration` products can overflow; a wrapped product passing the check is the exact failure the gate
-  exists to stop), and reject zero / sub-`MIN_BOUNDARY_BUDGET` timeouts at config-parse time (a 0ms leg is
+  The check MUST run AFTER `max_attempts` range validation (below), use **CHECKED arithmetic ONLY —
+  saturating arithmetic is FORBIDDEN for budget products** (`u32 · Duration` products can overflow; a
+  wrapped product passing the check is the exact failure the gate exists to stop, and a SATURATED
+  `Duration::MAX` product would PASS `≤ Duration::MAX` — saturation re-opens the same hole; this rule
+  carries unchanged into the generalized distinct-timeout form if it ever ships), and reject zero /
+  sub-`MIN_BOUNDARY_BUDGET` timeouts at config-parse time (a 0ms leg is
   meaningless and `set_read_timeout(ZERO)` is an Err on vsock). *Hardening note (the one prose-only premise
   this gate rests on):* the `2·` accounting assumes connect+I/O share ONE deadline, which is only
   wiring-enforced in `round_trip_inner` (see above) — when 5b-2c builds the budget check, prefer computing it

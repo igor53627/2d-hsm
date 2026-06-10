@@ -906,7 +906,8 @@ fn per_attempt_nominal_cost(
 /// sanity bound on `overall_boot_budget` (`Duration::MAX` is accepted): the gate stops
 /// under-budgeting; oversizing is operator slack.
 ///
-/// **Hardening note (the one prose-only premise this gate rests on):** the two-leg accounting
+/// **Hardening note (one of TWO prose-enforced premises this gate rests on — the other is the (4b)
+/// same-instance count obligation, see [`Self::max_attempts`]):** the two-leg accounting
 /// assumes connect+I/O share ONE channel-leg deadline — wiring-enforced in
 /// `agent_boot_relay::round_trip_inner` ONLY; re-verify on any refactor there. This artifact is
 /// where the per-leg value ORIGINATES for 5b-2c: [`Self::production_transport`] threads
@@ -1003,7 +1004,11 @@ impl ValidatedBootBudget {
         Ok(Self { max_attempts, per_leg_timeout, overall_boot_budget, nominal_boot_cost })
     }
 
-    /// For `run_boot_anti_rollback_handshake` ((4b) wiring sources the driver's count from HERE).
+    /// For `run_boot_anti_rollback_handshake` — (4b) wiring MUST source the driver's count from
+    /// HERE, from THE SAME witness instance fed to [`Self::production_transport`] (a named,
+    /// test-backed (4b) acceptance item, §8): the witness signature alone does not bind the count,
+    /// so a wiring that validates one budget and hand-feeds the driver a different number compiles —
+    /// the exact drift the acceptance test must refuse.
     pub(crate) fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -1022,11 +1027,14 @@ impl ValidatedBootBudget {
         self.nominal_boot_cost
     }
 
-    /// THE (4b)/5b-2c serve-path composition — both live-serve gates by signature, one call: claims
-    /// the process producer (gate #1) and constructs the transport whose per-leg deadlines ORIGINATE
-    /// from this validated value (gate #2 — the value the invariant was checked against IS the value
-    /// both leg deadlines are minted from; the connect+I/O sharing of the channel leg stays
-    /// wiring-enforced in `round_trip_inner`, see the type doc). The quote seam is the CONCRETE
+    /// THE (4b)/5b-2c serve-path composition — both live-serve gate ARTIFACTS by signature, one
+    /// call: claims the process producer (gate #1) and constructs the transport whose per-leg
+    /// deadlines ORIGINATE from this validated value (gate #2 — the value the invariant was checked
+    /// against IS the value both leg deadlines are minted from; the connect+I/O sharing of the
+    /// channel leg stays wiring-enforced in `round_trip_inner`, see the type doc). SCOPE HONESTY:
+    /// this binds the producer claim + the TIMEOUT leg structurally; the ATTEMPT COUNT stays a
+    /// named, test-backed (4b) acceptance item (`budget.max_attempts()` from this same instance —
+    /// see that getter) because the driver keeps its raw-u32 signature. The quote seam is the CONCRETE
     /// [`HardBoundedQuoteProducer`] (default `S = ExecChildSpawn`) per the §8 never-generic-Q
     /// obligation; `C` stays the seam trait because a real `VsockBootRelayChannel` cannot exist in
     /// CI — 5b-2c instantiates `C = VsockBootRelayChannel` (§8). ONLY error: the producer claim
