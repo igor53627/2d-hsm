@@ -338,12 +338,17 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         // Each leg gets its OWN `timeout` budget (a fresh deadline computed just before it runs), so quote
         // latency does NOT eat into the channel's budget (no false channel timeout). The quote leg's hard
         // bound EXISTS ((d-ii)/2): `HardBoundedQuoteProducer` kills a wedged child at this deadline, so
-        // with it the `2×timeout(+ε)` per-attempt bound holds. Wiring it here is (4b), gated on the
-        // TWO-artifact live-serve gate ((d) incl. the (4c) smoke + the 5b-2c boot-budget validation);
-        // until then the cooperative `SnpQuoteProducer` caveat stays accurate FOR THE COOPERATIVE IMPL
-        // ONLY (it cannot interrupt a wedged in-kernel `read(outblob)` — why a live 5b-2c serve stays
-        // gated). The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver
-        // bounds the attempt COUNT on top.
+        // with it the `2×timeout(+ε)` per-attempt bound holds — and the boot-budget validation artifact
+        // EXISTS too ((d-ii)/3, `ValidatedBootBudget`; its `production_transport` is the production
+        // construction path for THIS type, threading the validated per-leg value into `timeout`, which
+        // also keeps the `Instant::now() + self.timeout` mints below panic-free via the
+        // MAX_PER_LEG_TIMEOUT sanity arm — an in-crate test caller bypassing the budget owns that
+        // hazard itself). Wiring it here is (4b), gated on the TWO-artifact live-serve gate ((d) incl.
+        // the (4c) smoke + 5b-2c constructing the budget witness from operator config); until then the
+        // cooperative `SnpQuoteProducer` caveat stays accurate FOR THE COOPERATIVE IMPL ONLY (it
+        // cannot interrupt a wedged in-kernel `read(outblob)` — why a live 5b-2c serve stays gated).
+        // The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver bounds
+        // the attempt COUNT on top.
         let (report, cert_chain) = self
             .quote
             .fetch(&request.report_data, std::time::Instant::now() + self.timeout)
