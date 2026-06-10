@@ -12,8 +12,9 @@
 //! `ioctl`/`socket` — see Cargo.toml for why we don't rely on it and what each feature is for). Linux +
 //! vsock-transport gated, mirroring the channel it serves.
 //!
-//! The (a') consumer is LIVE: `agent_boot_relay::connect_bounded` calls `poll_with_deadline` +
-//! `connect_poll_succeeded`. The module-wide `allow(dead_code)` below is NOT transitional leftovers — it
+//! BOTH consumers are LIVE: (a') `agent_boot_relay::connect_bounded` (`poll_with_deadline` +
+//! `connect_poll_succeeded`) and (d-i) `quote_subprocess::read_child_reply` (`poll_with_deadline` +
+//! `classify_pipe_revents`). The module-wide `allow(dead_code)` below is NOT transitional leftovers — it
 //! is held for the **consumer-free feature combos**: the only consumer (`agent_boot_relay`) is gated on
 //! `agent-gateway`, while this module compiles under plain `vsock-transport`; the `production-vsock` /
 //! `staging-vsock` profiles (which can never enable `agent-gateway` — the `ml-dsa-65 ⊕ agent-gateway`
@@ -58,10 +59,11 @@ pub(crate) fn remaining_or_lapsed(deadline: Instant) -> Result<Duration, Protoco
 ///
 /// **`Ok(revents)` does NOT imply the requested `events` are set** — the caller MUST inspect `revents`.
 /// `poll` reports `POLLERR`/`POLLHUP`/`POLLNVAL` regardless of `events`, so a readiness can be error-only —
-/// never treat a bare `Ok(_)` as "ready for I/O". For the CONNECT/stream-write case use
-/// [`connect_poll_succeeded`] (clean `POLLOUT`, error flags veto) — do not hand-roll the flag check. A pipe
-/// READ caller (the future (d) quote pipe) must NOT use that predicate: on a pipe `POLLHUP` is a normal EOF
-/// that can arrive WITH final data (`POLLIN|POLLHUP`); (d) needs its own EOF-aware check.
+/// never treat a bare `Ok(_)` as "ready for I/O". Both readiness predicates live RIGHT BELOW, one per
+/// hard bound — do not hand-roll the flag check: [`connect_poll_succeeded`] for the CONNECT/stream-write
+/// case (clean `POLLOUT`, error flags veto), [`classify_pipe_revents`] for a pipe READ (EOF-aware: on a
+/// pipe `POLLHUP` is a normal EOF that can arrive WITH final data, `POLLIN|POLLHUP`). They are NOT
+/// interchangeable — each one's doc explains why the other would be wrong for its fd.
 ///
 /// The per-call timeout is re-derived from the budget *remaining to the absolute `deadline`* (via
 /// [`remaining_or_lapsed`]) and shrinks across `EINTR` retries, so the absolute deadline is the true bound
@@ -109,13 +111,41 @@ pub(crate) fn poll_with_deadline<Fd: AsFd>(
 /// correctness — on AF_VSOCK a refused/timed-out connect surfaces `POLLERR|POLLOUT` (no `POLLHUP`; vsock
 /// gates `EPOLLHUP` on *local* shutdown, unlike inet) and the veto fires on `POLLERR`. On a **pipe READ**
 /// (the future (d) quote-subprocess fd) `POLLHUP` is instead a *normal EOF* that can arrive WITH final data
-/// (`POLLIN|POLLHUP`) — a predicate like this one would drop the last quote bytes, so (d) must build its own
-/// EOF-aware POLLIN check; hardcoding `POLLOUT` here makes that misuse impossible rather than
+/// (`POLLIN|POLLHUP`) — a predicate like this one would drop the last quote bytes; the pipe case is owned
+/// by [`classify_pipe_revents`] below. Hardcoding `POLLOUT` here makes cross-use impossible rather than
 /// comment-guarded.
 pub(crate) fn connect_poll_succeeded(revents: nix::poll::PollFlags) -> bool {
     use nix::poll::PollFlags;
     revents.contains(PollFlags::POLLOUT)
         && !revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+}
+
+/// Classification of a pipe read-end `revents` from [`poll_with_deadline`]`(POLLIN, ..)` — the (d)
+/// quote-pipe counterpart of [`connect_poll_succeeded`], deliberately co-located so the two halves of
+/// the `Ok(revents)` contract are one decision table in one place (and reachable for any
+/// vsock-transport-only consumer, unlike the agent-gateway-gated quote module that consumes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeReadiness {
+    /// Go `read()`. Covers `POLLIN` (data), `POLLIN|POLLHUP` (the NORMAL Linux final-data +
+    /// writer-closed shape — exactly what the connect predicate's POLLHUP veto would wrongly reject)
+    /// and bare `POLLHUP` (drained EOF — read returns 0). `read() == 0` is the ONLY authoritative EOF;
+    /// POLLHUP presence is never treated as EOF by itself.
+    ReadNow,
+    /// `POLLERR`/`POLLNVAL` without any readable signal — the fd is broken; fold to a retryable error
+    /// (re-polling would spin; reading would error anyway without the triage context).
+    BrokenFd,
+}
+
+/// Total classification: any readable-or-EOF signal wins (data must be drained even alongside error
+/// flags); only an error-without-readability is broken. An empty/unknown `revents` (anomalous for a
+/// single-fd POLLIN poll that reported readiness) is conservatively BrokenFd — retryable, never a spin.
+pub(crate) fn classify_pipe_revents(revents: nix::poll::PollFlags) -> PipeReadiness {
+    use nix::poll::PollFlags as P;
+    if revents.intersects(P::POLLIN | P::POLLHUP) {
+        PipeReadiness::ReadNow
+    } else {
+        PipeReadiness::BrokenFd
+    }
 }
 
 #[cfg(test)]
@@ -213,11 +243,48 @@ mod tests {
         assert!(!connect_poll_succeeded(P::empty()), "empty revents must not be success");
         // Why there is no `want` parameter: a pipe's EOF routinely arrives as POLLIN|POLLHUP (final data +
         // writer closed). A POLLHUP-vetoing predicate applied to a pipe read would reject that completed
-        // read — the (d) quote pipe must build its own EOF-aware check, and the hardcoded-POLLOUT signature
+        // read — the (d) quote pipe has its own EOF-aware check (quote_subprocess::
+        // classify_pipe_revents), and the hardcoded-POLLOUT signature
         // makes reaching for this one a compile error rather than a prose warning.
         assert!(
             !connect_poll_succeeded(P::POLLIN | P::POLLHUP),
             "pipe EOF-with-data shape must never read as connect success"
+        );
+    }
+    #[test]
+    fn pipe_revents_pollin_alone_proceeds() {
+        // Regression: a predicate too strict refuses plain data.
+        assert_eq!(classify_pipe_revents(PollFlags::POLLIN), PipeReadiness::ReadNow);
+    }
+
+    #[test]
+    fn pipe_revents_pollin_pollhup_proceeds() {
+        // THE connect-predicate reflex (POLLHUP veto) dropping final quote bytes — mirror-inverse of
+        // `connect_poll_succeeded_requires_clean_pollout`: on a pipe POLLIN|POLLHUP is the NORMAL
+        // final-data + writer-closed shape.
+        assert_eq!(
+            classify_pipe_revents(PollFlags::POLLIN | PollFlags::POLLHUP),
+            PipeReadiness::ReadNow
+        );
+    }
+
+    #[test]
+    fn pipe_revents_pollhup_alone_proceeds() {
+        // Regression: drained EOF read as a spurious failure (clean child-exit-after-write race) —
+        // bare POLLHUP means "go read; expect 0".
+        assert_eq!(classify_pipe_revents(PollFlags::POLLHUP), PipeReadiness::ReadNow);
+    }
+
+    #[test]
+    fn pipe_revents_pollerr_pollnval_without_pollin_broken() {
+        // Regression: a broken fd misread as EOF-success or spun on forever.
+        assert_eq!(classify_pipe_revents(PollFlags::POLLERR), PipeReadiness::BrokenFd);
+        assert_eq!(classify_pipe_revents(PollFlags::POLLNVAL), PipeReadiness::BrokenFd);
+        assert_eq!(classify_pipe_revents(PollFlags::empty()), PipeReadiness::BrokenFd);
+        // ...but error flags NEVER mask pending data.
+        assert_eq!(
+            classify_pipe_revents(PollFlags::POLLIN | PollFlags::POLLERR),
+            PipeReadiness::ReadNow
         );
     }
 }

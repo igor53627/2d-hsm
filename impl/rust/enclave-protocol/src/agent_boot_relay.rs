@@ -264,11 +264,13 @@ pub(crate) trait BootRelayChannel {
 ///
 /// **Best-effort caveat (load-bearing):** under `#![forbid(unsafe_code)]` a single in-kernel blocking
 /// syscall (e.g. configfs `read(outblob)`) cannot be interrupted, so this is a *between-steps* bound, NOT
-/// a hard wall-clock guarantee against a wedged kernel. A true hard bound needs a *cancellable boundary*
-/// (killable subprocess / kernel-supported timeout / unique-per-attempt entries — NOT a plain worker
-/// thread, which can only abandon a stuck reader) — a tracked deferred follow-up (see §8). Callers (the
-/// boot serve-gate) MUST size their own timeouts treating the quote-fetch deadline as best-effort, not as
-/// a guaranteed ceiling.
+/// a hard wall-clock guarantee against a wedged kernel. The hard bound is the **killable-subprocess
+/// cancellable boundary** — REVISED §8 pin, the old option menu is closed: "kernel-supported timeout"
+/// was eliminated (configfs-tsm offers no read timeout), and unique-entry naming is the subprocess
+/// design's COMPANION (child-self-named `twod-hsm-q-<pid>`), not an alternative; a plain worker thread
+/// can only abandon a stuck reader. The harness landed in 5b-2b-ii(d-i) (`quote_subprocess`); the wired
+/// `HardBoundedQuoteProducer` lands in (d-ii). Until then callers (the boot serve-gate) MUST size their
+/// own timeouts treating the quote-fetch deadline as best-effort, not as a guaranteed ceiling.
 pub(crate) trait BootQuoteProducer {
     fn fetch(
         &self,

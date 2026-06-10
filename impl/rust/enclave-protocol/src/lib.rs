@@ -93,6 +93,11 @@ pub mod vsock_listen;
 /// (TASK-7.7 5b-2b-ii (a')/(d)). Linux + vsock-transport gated (backed by `nix::poll`).
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 mod cancellable_boundary;
+/// Killable-subprocess hard bound for the SNP quote fetch (TASK-7.7 5b-2b-ii(d) — invariants/design in
+/// the module header + §8). Triple-gated: needs nix (vsock-transport) AND the quote/boot types
+/// (agent-gateway).
+#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+mod quote_subprocess;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",
