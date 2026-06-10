@@ -959,7 +959,37 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   cause-carrier is the in-band ERR frame (parent-visible as the retryable error string), which is why
   reap logging stays the obligation rather than being discharged by the breadcrumb. The breadcrumb
   lives in the production-only entrypoint (`agent_quote_child_main`, zero CI coverage by pin (2)
-  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger ownership, (3)
+  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger
+  ownership — **LANDED ((d-ii)/2)**: `HardBoundedQuoteProducer` (in `quote_subprocess`, triple-gated) =
+  the structural serve-gate type; its `BootQuoteProducer::fetch` delegates to the killable-subprocess
+  orchestration (the (d-i) NO-skeleton rule SATISFIED, not waived — the delegate IS the bound). Pin (1)
+  below DISCHARGED structurally, four stacked levers: (i) a process-claim flag
+  (`compare_exchange` in `new()`, NEVER released incl. Drop — drop+reconstruct hands the next producer
+  a fresh ledger and IS the voided-cap hole; reset only via the crate test-reset site
+  `lock_and_reset_agent_process_globals`, per that helper's adds-its-reset-HERE pin), which also closes
+  the cross-handshake accumulation hole on `ABANDONED_CHILD_BUDGET` — consequence recorded: ONE boot
+  handshake per process; a second producer construction refuses fail-closed at boot wiring (a
+  supervisor restart is a new process and claims fresh; if a future design legitimately needs producer
+  reuse across transports, the fix is `into_parts`-style reuse of the ONE producer, NOT claim release);
+  (ii) the orchestration (`fetch_quote_via_child`) + `AbandonedLedger` demoted module-PRIVATE — outside
+  the module the producer is the only quote-fetch door; (iii) private `ledger` field, no
+  Clone/Default (a clone = a forked budget; any later derive is a pin violation); (iv)
+  `BootQuoteProducer::fetch` migrated to **`&mut self`** — the single-mutator rule as a borrow-checker
+  fact, uniform with the sibling seams (Mutex REJECTED: a lock held across a multi-second pipe poll
+  blocks a second caller UNBOUNDED, violating the seam's own deadline contract, and poison makes budget
+  accounting unprovable; RefCell trades the compile-time proof for a latent runtime borrow panic).
+  `ExecChildSpawn::production()` = the `/proc/self/exe` LITERAL (infallible — no error arm; the magic
+  link resolves at EXEC time to the running parent's inode, so a mid-boot on-disk upgrade cannot drift
+  the parent/child frame halves across versions, which a `current_exe()` PATH would race; matches the
+  (d-i) seam pin verbatim); `HardBoundedQuoteProducer::production() -> Result` = the one-call (4b)/5b-2c
+  entry whose ONLY error is the claim refusal — the same fail-closed construction surface sub-slice
+  (3)'s boot-budget gate composes onto. **NEW 5b-2c obligation:** the serve-path signature must name the
+  CONCRETE `HardBoundedQuoteProducer` (default `S = ExecChildSpawn`), NEVER a generic
+  `<Q: BootQuoteProducer>` — a generic wrapper re-opens the cooperative-producer hole (4a) deletes.
+  Landing (2) does NOT open live serve (the TWO-artifact gate below is unchanged) and does NOT
+  discharge pin (2) below (production-shape runtime stays ZERO-CI; the construction-shape CI test is
+  not the discharge — (4c) is); the parent-side reap-status-logging obligation above is explicitly
+  RE-DEFERRED to sub-slice (3)/5b-2c. — (3)
   budget-gate integration, (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
