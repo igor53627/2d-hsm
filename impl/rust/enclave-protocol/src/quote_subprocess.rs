@@ -568,53 +568,13 @@ fn fold_try_wait(r: std::io::Result<Option<std::process::ExitStatus>>) -> ReapOu
     }
 }
 
-/// POSIX-fixed; the nix `signal` feature is not enabled and one constant does not justify it.
-const SIGKILL_RAW: i32 = 9;
-
-/// Parent-side carrier for the child exit-code table (§8 named obligation "(d-ii)-2/3 or 5b-2c",
-/// discharged here in (d-ii)/3). Pure so the filter is unit-testable via
-/// `std::os::unix::process::ExitStatusExt::from_raw` (safe; the module is linux-gated) — a real
-/// `ExitStatus` exists only at the [`StdChildHandle`] reap site, and [`fold_try_wait`] STAYS the
-/// pure status-free fold. Filter: `Some` for any REAL nonzero exit code (the table 1..=6/10/101 —
-/// the kernel preserves a zombie's original status, so this works even when our SIGKILL arrives
-/// after exit) and for non-SIGKILL signal deaths (crashes — SIGSEGV/SIGABRT must not be swallowed);
-/// `None` for code 0 and for SIGKILL (the uniform per-fetch disposition SIGKILLs EVERY child —
-/// unfiltered, every healthy fetch would print one journald line and bury the carrier this exists
-/// to provide).
-fn reap_breadcrumb(pid: u32, status: std::process::ExitStatus) -> Option<String> {
-    use std::os::unix::process::ExitStatusExt;
-    match (status.code(), status.signal()) {
-        (Some(c), _) if c != 0 => {
-            Some(format!("twod-hsm quote parent: reaped quote child pid {pid} exit code {c}"))
-        }
-        (None, Some(sig)) if sig != SIGKILL_RAW => {
-            Some(format!("twod-hsm quote parent: reaped quote child pid {pid} signal {sig}"))
-        }
-        _ => None,
-    }
-}
-
 impl ChildHandle for StdChildHandle {
     fn kill_best_effort(&mut self) {
         // Result deliberately discarded — see the trait doc (Ok-vs-Err after reap is version-dependent).
         let _ = self.0.kill();
     }
     fn try_reap(&mut self) -> ReapOutcome {
-        let r = self.0.try_wait();
-        if let Ok(Some(status)) = &r {
-            if let Some(line) = reap_breadcrumb(self.0.id(), *status) {
-                use std::io::Write;
-                // Best-effort, NEVER panics (try_reap is reachable from Drop): `let _ = writeln!`,
-                // NOT eprintln! — eprintln! panics on a broken stderr (journald backpressure would
-                // become a panic-in-Drop). Production stderr = journald (the bin inherits). At most
-                // one line per child on every path (Exited handles drop immediately; std caches the
-                // status, so a pathological double call duplicates a line, never blocks). Bounded:
-                // ≤ max_attempts + ABANDONED_CHILD_BUDGET lines per boot. In the smokes the parent
-                // IS the test binary: visible-but-harmless, and only genuinely failed children fire.
-                let _ = writeln!(std::io::stderr(), "{line}");
-            }
-        }
-        fold_try_wait(r)
+        fold_try_wait(self.0.try_wait())
     }
 }
 
@@ -1326,15 +1286,14 @@ pub(crate) fn agent_quote_child_main() -> ! {
 /// gone; one stderr breadcrumb is emitted) · `101` rust panic (must never happen — child-reachable
 /// code MUST stay total: no `unwrap`/`expect`/`unreachable!()`/indexing/unchecked arithmetic on
 /// external input (env, configfs blobs, frame bytes); unreachable cases fold to the nearest honest
-/// code, guarded by `debug_assert!` so tests check what release must never hit). NB the table's
-/// parent-side carrier ((d-ii)/3, discharging the named §8 obligation): the PARENT logs reaped
-/// nonzero codes and non-SIGKILL crash signals via [`reap_breadcrumb`] at the `try_reap` choke
-/// point (own-SIGKILL and exit-0 deliberately silent — the uniform disposition SIGKILLs every
-/// child). Child-side, every nonzero exit additionally emits a BEST-EFFORT breadcrumb from the
-/// production entrypoint (`twod-hsm quote child: exit <code>` — it races the parent's
-/// SIGKILL-on-frame, and a never-exiting D-state child logs nothing on either side, nothing to
-/// reap); the reliable cause-carrier remains the in-band ERR frame (parent-visible as the retryable
-/// error string). Runtime journald verification folds into the (4c) aya smoke.
+/// code, guarded by `debug_assert!` so tests check what release must never hit). NB the PARENT
+/// currently discards reaped exit statuses (parent-side reap-status logging is a named §8 obligation);
+/// child-side, every nonzero exit emits a BEST-EFFORT stderr breadcrumb from the production entrypoint
+/// (`twod-hsm quote child: exit <code>`, journald via inherited stderr — the code-10 write-failure
+/// line subsumes its own). Best-effort because it races the parent: the breadcrumb is written AFTER
+/// the frame flush, and the parent SIGKILLs the child as soon as it parses the frame — the reliable
+/// cause-carrier is the in-band ERR frame itself (parent-visible as the retryable error string), not
+/// journald; reap logging remains the obligation.
 pub fn agent_quote_child_dispatch() {
     if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
         agent_quote_child_main();
@@ -2362,47 +2321,6 @@ mod tests {
         );
         // Pristine exit, same hygiene as the claim test.
         reset_process_quote_ledger_claim_for_tests();
-    }
-
-    // ---- (d-ii)/3 reap breadcrumb (pure filter; emission rides StdChildHandle::try_reap) ----
-
-    #[test]
-    fn reap_breadcrumb_carries_child_error_exit_codes() {
-        // Regression: §8 named obligation — the child exit-code table (1..=6, 10, 101) had NO
-        // parent-side carrier. Wait-status encoding: exit code lives in bits 8..16 (code << 8) —
-        // same from_raw precedent as the smoke exit asserts.
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            reap_breadcrumb(7, std::process::ExitStatus::from_raw(2 << 8)).as_deref(),
-            Some("twod-hsm quote parent: reaped quote child pid 7 exit code 2")
-        );
-        assert_eq!(
-            reap_breadcrumb(7, std::process::ExitStatus::from_raw(10 << 8)).as_deref(),
-            Some("twod-hsm quote parent: reaped quote child pid 7 exit code 10")
-        );
-    }
-
-    #[test]
-    fn reap_breadcrumb_silent_on_success_and_own_sigkill() {
-        // Regression: the uniform disposition SIGKILLs EVERY child — an unfiltered breadcrumb emits
-        // one journald line per healthy fetch and buries the carrier it exists to provide.
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(reap_breadcrumb(7, std::process::ExitStatus::from_raw(0)), None);
-        assert_eq!(reap_breadcrumb(7, std::process::ExitStatus::from_raw(SIGKILL_RAW)), None);
-    }
-
-    #[test]
-    fn reap_breadcrumb_names_crash_signals() {
-        // Regression: a crashed child (non-self-inflicted signal — SIGSEGV here) swallowed by the
-        // SIGKILL filter. No real-subprocess smoke on top: the existing smokes already route through
-        // StdChildHandle::try_reap (a process cannot capture its own stderr in-process); the pure
-        // formatter carries the test weight — the fold_try_wait pattern; production-shape journald
-        // emission folds into the (4c) aya smoke.
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            reap_breadcrumb(42, std::process::ExitStatus::from_raw(11)).as_deref(),
-            Some("twod-hsm quote parent: reaped quote child pid 42 signal 11")
-        );
     }
 
     // ---- (d-ii) child mode (deviceless over the TsmFs seam) ----
