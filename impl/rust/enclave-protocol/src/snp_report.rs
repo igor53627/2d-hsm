@@ -27,6 +27,53 @@ const TSM_ENTRY_NAME: &str = "twod-hsm";
 /// Domain separation for the `report_data` binding (so it is not a bare key hash).
 const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
 
+/// Prefix for the killable quote CHILD's self-named configfs entries (TASK-7.7 5b-2b-ii(d), §8 revised
+/// pin): `twod-hsm-q-<child_pid>`. STRICTLY LONGER than the bare producer name `twod-hsm`, so the
+/// child-side prefix GC can never match (and never remove) the producer/GET_MEASUREMENT entry.
+#[cfg(feature = "agent-gateway")]
+pub(crate) const TSM_QUOTE_ENTRY_PREFIX: &str = "twod-hsm-q-";
+
+/// The quote child's self-named unique entry path: `{TSM_REPORT_DIR}/{PREFIX}{own pid}`. Live-pid
+/// uniqueness forbids collision among live children (a wedged unreaped child still holds its pid), and
+/// post-reap pid recycling is harmless: the child's own sequence starts with a stale-clear of exactly
+/// this name. No parent→child name plumbing exists at all — the child self-names (deletes the env
+/// injection/path-validation surface the parent-minted alternative would need).
+#[cfg(feature = "agent-gateway")]
+#[cfg_attr(not(test), allow(dead_code))] // consumer = the triple-gated quote_subprocess child mode
+pub(crate) fn quote_child_entry_path() -> String {
+    format!("{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}", std::process::id())
+}
+
+/// CHILD-ONLY best-effort orphan GC (path-parameterized so tempdir tests can exercise it): remove every
+/// directory under `dir` whose name starts with [`TSM_QUOTE_ENTRY_PREFIX`]. EVERY error is skipped
+/// silently — EBUSY on a still-wedged sibling's held entry is EXPECTED (≤ ABANDONED_CHILD_BUDGET such
+/// children can be live, §8), an absent dir means off-SNP; GC never blocks on, gates, or fails the
+/// attempt, and is never required to prove all orphans were removed. MUST only ever run inside the
+/// killable child — a parent-side readdir/rmdir against a wedged provider could block uninterruptibly
+/// (the §8 no-parent-configfs-I/O rule).
+#[cfg(feature = "agent-gateway")]
+#[cfg_attr(not(test), allow(dead_code))] // consumer = the triple-gated quote_subprocess child mode
+pub(crate) fn gc_quote_entries_best_effort(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // absent/unreadable dir (off-SNP) — never an error
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(TSM_QUOTE_ENTRY_PREFIX) {
+            let _ = std::fs::remove_dir(entry.path()); // best-effort; EBUSY on a held entry is EXPECTED
+        }
+    }
+}
+
+/// [`gc_quote_entries_best_effort`] at the real configfs-tsm report dir — the form
+/// `agent_quote_child_main` calls.
+#[cfg(feature = "agent-gateway")]
+#[cfg_attr(not(test), allow(dead_code))] // consumer = the triple-gated quote_subprocess child mode
+pub(crate) fn gc_quote_entries_default() {
+    gc_quote_entries_best_effort(std::path::Path::new(TSM_REPORT_DIR));
+}
+
 /// Upper bound on the configfs-tsm `auxblob` (VCEK→ASK→ARK chain) we will carry in
 /// GET_MEASUREMENT. A real chain is a few KB; this is generous headroom while staying well under
 /// `MAX_MESSAGE_SIZE` once the report + pq_pubkey are added.
@@ -97,7 +144,7 @@ pub(crate) trait TsmFs {
 /// are lifted verbatim from the previous `fetch_report`/`fetch_report_inner`; safe file I/O (no ioctl,
 /// no unsafe). Exercised live only on an SNP guest (aya); compiles + returns interface-absent errors
 /// everywhere else.
-struct RealTsmFs;
+pub(crate) struct RealTsmFs;
 impl TsmFs for RealTsmFs {
     fn remove_entry(&self, entry: &str) {
         let _ = std::fs::remove_dir(entry);
@@ -208,7 +255,7 @@ pub(crate) fn fetch_report_with<F: TsmFs>(
 /// in practice: the (d-ii) child calls with `None`/unbounded, and the cooperative `Option<Instant>`
 /// plumbing is deletion-approved — any future deadline-bearing direct caller must add its own
 /// fast-path; that (d-ii) deletion makes the narrowing structural: `_at` loses the parameter entirely).
-fn fetch_report_with_at<F: TsmFs>(
+pub(crate) fn fetch_report_with_at<F: TsmFs>(
     fs: &F,
     entry_path: &str,
     report_data: &[u8; REPORT_DATA_LEN],
