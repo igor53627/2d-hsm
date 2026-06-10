@@ -668,6 +668,11 @@ pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'s
     reset_agent_keystore_for_tests();
     reset_anti_rollback_binding_for_tests();
     crate::agent_challenge::reset_outstanding_challenge_for_tests();
+    // The quote-producer process-ledger claim ((d-ii)/2) — triple-gated like its module (the enclosing
+    // module is already agent-gateway-gated; the inner cfg completes the gate so non-linux / non-vsock
+    // agent-gateway test builds compile clean).
+    #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+    crate::quote_subprocess::reset_process_quote_ledger_claim_for_tests();
     g
 }
 

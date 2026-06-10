@@ -825,6 +825,17 @@ request golden vector is a 5b-2b test-vector item.
   `agent_quote_child_dispatch()`, the `[[bin]]` a thin one-line caller — the same thin-bin rule as (b)'s
   daemon) OR make "main's first statement is `agent_quote_child_dispatch()`" an explicit, checked 5b-2c
   acceptance item (see the byte-exact-stdout pin in the (d-ii) note below, which enforces it by test).
+  **Two further 5b-2c preconditions recorded from the (d-ii)/2 review:** (1) DEPLOYMENT — the agent bin
+  must be self-contained w.r.t. the loader (RPATH/static): the production quote child re-execs it under
+  `clear_env`, which strips `LD_LIBRARY_PATH`-style vars (fine for the Nix-built guest binary; a
+  dynamically-linked build for another target would silently break child exec — the (4c) smoke is the
+  checked validation); (2) NO in-process whole-handshake retry loop — the producer's process-ledger
+  claim is permanent, so the entrypoint runs ONE handshake and on failure EXITS for supervisor restart
+  (an in-process outer retry would fail closed on its second iteration by construction); relatedly the
+  `production()` constructor error is FATAL wiring-time config (must be `?`-propagated; funneling any
+  construction error through the fetch-path retryable fold would spin the attempt budget on a permanent
+  refusal — construction-fatal and fetch-retryable deliberately share `ProtocolError`, position is the
+  discriminator: a sub-slice (3) hazard to keep visible).
   **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
   5b-2c budget-validation artifact** — TWO remaining gates, both ENFORCEABLE artifacts, not checklist lines.
@@ -959,7 +970,37 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   cause-carrier is the in-band ERR frame (parent-visible as the retryable error string), which is why
   reap logging stays the obligation rather than being discharged by the breadcrumb. The breadcrumb
   lives in the production-only entrypoint (`agent_quote_child_main`, zero CI coverage by pin (2)
-  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger ownership, (3)
+  below), so its verification folds into the (4c) aya smoke — (2) producer wrapper + single-ledger
+  ownership — **LANDED ((d-ii)/2)**: `HardBoundedQuoteProducer` (in `quote_subprocess`, triple-gated) =
+  the structural serve-gate type; its `BootQuoteProducer::fetch` delegates to the killable-subprocess
+  orchestration (the (d-i) NO-skeleton rule SATISFIED, not waived — the delegate IS the bound). Pin (1)
+  below DISCHARGED structurally, four stacked levers: (i) a process-claim flag
+  (`compare_exchange` in `new()`, NEVER released incl. Drop — drop+reconstruct hands the next producer
+  a fresh ledger and IS the voided-cap hole; reset only via the crate test-reset site
+  `lock_and_reset_agent_process_globals`, per that helper's adds-its-reset-HERE pin), which also closes
+  the cross-handshake accumulation hole on `ABANDONED_CHILD_BUDGET` — consequence recorded: ONE boot
+  handshake per process; a second producer construction refuses fail-closed at boot wiring (a
+  supervisor restart is a new process and claims fresh; if a future design legitimately needs producer
+  reuse across transports, the fix is `into_parts`-style reuse of the ONE producer, NOT claim release);
+  (ii) the orchestration (`fetch_quote_via_child`) + `AbandonedLedger` demoted module-PRIVATE — outside
+  the module the producer is the only quote-fetch door; (iii) private `ledger` field, no
+  Clone/Default (a clone = a forked budget; any later derive is a pin violation); (iv)
+  `BootQuoteProducer::fetch` migrated to **`&mut self`** — the single-mutator rule as a borrow-checker
+  fact, uniform with the sibling seams (Mutex REJECTED: a lock held across a multi-second pipe poll
+  blocks a second caller UNBOUNDED, violating the seam's own deadline contract, and poison makes budget
+  accounting unprovable; RefCell trades the compile-time proof for a latent runtime borrow panic).
+  `ExecChildSpawn::production()` = the `/proc/self/exe` LITERAL (infallible — no error arm; the magic
+  link resolves at EXEC time to the running parent's inode, so a mid-boot on-disk upgrade cannot drift
+  the parent/child frame halves across versions, which a `current_exe()` PATH would race; matches the
+  (d-i) seam pin verbatim); `HardBoundedQuoteProducer::production() -> Result` = the one-call (4b)/5b-2c
+  entry whose ONLY error is the claim refusal — the same fail-closed construction surface sub-slice
+  (3)'s boot-budget gate composes onto. **NEW 5b-2c obligation:** the serve-path signature must name the
+  CONCRETE `HardBoundedQuoteProducer` (default `S = ExecChildSpawn`), NEVER a generic
+  `<Q: BootQuoteProducer>` — a generic wrapper re-opens the cooperative-producer hole (4a) deletes.
+  Landing (2) does NOT open live serve (the TWO-artifact gate below is unchanged) and does NOT
+  discharge pin (2) below (production-shape runtime stays ZERO-CI; the construction-shape CI test is
+  not the discharge — (4c) is); the parent-side reap-status-logging obligation above is explicitly
+  RE-DEFERRED to sub-slice (3)/5b-2c. — (3)
   budget-gate integration, (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
@@ -982,7 +1023,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   verdict). **Three (d-ii)/5b-2c pins from the (d-i)
   review:** (1) `HardBoundedQuoteProducer` owns THE one `AbandonedLedger` for the process — the budget
   binds only if exactly one ledger outlives all fetches (a fresh ledger per attempt resets `is_full()`
-  and voids the cap; the ledger's own doc carries the same pin); (2) the production spawn shape
+  and voids the cap; the ledger's own doc carries the same pin) — **DISCHARGED structurally in
+  (d-ii)/2, see the LANDED note above (process claim + privacy demotions + no-Clone + `&mut self`)**;
+  (2) the production spawn shape
   (`PipeSource::Stdout` + `clear_env` + stderr→journald) has ZERO (d-i) coverage — the (d-ii) aya smoke
   of the shipped producer MUST exercise exactly that shape (checked item, not assumed from the
   stderr-piped test shape); (3) **5b-2c acceptance item — bin-contract enforcement:** the
@@ -1034,7 +1077,10 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   both (NB per the kernel-timer note below, a connect can only consume "nearly the whole leg" when the per-leg `timeout` is ≲ the ~2s kernel connect timer — for longer legs a wedged connect is kernel-capped at ~2s and the I/O budget keeps the rest), AND MUST
   satisfy the boot-budget invariant **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`** (ε = the
   quote-subprocess overhead const `QUOTE_ATTEMPT_OVERHEAD`, see the ε term below) so the bounded
-  retry loop can't blow the operator's total boot deadline. **Invariant (wiring-enforced in 5b-2b — a single
+  retry loop can't blow the operator's total boot deadline. **The ceiling is a CLAIM until sub-slice
+  (3)'s checked-arithmetic validation artifact lands** — even with `HardBoundedQuoteProducer` landed
+  ((d-ii)/2), nothing validates the operator's numbers against the formula yet; do not treat the bound
+  as guaranteed when reasoning about a live serve (the TWO-artifact gate already encodes this). **Invariant (wiring-enforced in 5b-2b — a single
   local variable, NOT a structural gate; re-verify on any refactor of `round_trip_inner`):** `connect_bounded`'s
   `deadline` arg is the **per-leg channel deadline** —
   `round_trip_inner` passes the *same* `deadline` local to `connect_bounded` and to the channel-I/O
