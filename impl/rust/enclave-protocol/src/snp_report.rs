@@ -207,7 +207,7 @@ pub(crate) fn fetch_report_with<F: TsmFs>(
 /// performs the stale-clear `remove_entry` before the first in-sequence check (recorded narrowing; moot
 /// in practice: the (d-ii) child calls with `None`/unbounded, and the cooperative `Option<Instant>`
 /// plumbing is deletion-approved — any future deadline-bearing direct caller must add its own
-/// fast-path).
+/// fast-path; that (d-ii) deletion makes the narrowing structural: `_at` loses the parameter entirely).
 fn fetch_report_with_at<F: TsmFs>(
     fs: &F,
     entry_path: &str,

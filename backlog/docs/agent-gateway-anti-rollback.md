@@ -909,7 +909,17 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   deterministic coverage is the Fake-handle ledger tests) + the entry-path `fetch_report_with_at` refactor;
   (d-ii) adds the configfs child mode (`agent_quote_child_main`, child-side GC) + `HardBoundedQuoteProducer`
   (the structural serve-gate type — deliberately NO skeleton in (d-i): it would satisfy the by-signature
-  gate while the hang remains) + the in-SNP-guest aya validation. **Two (d-ii)/5b-2c pins from the (d-i)
+  gate while the hang remains) + the in-SNP-guest aya validation. **(d-ii) slicing note (review-load):** (d-ii) MAY land as ordered sub-slices, each gated — (1) child
+  CLI + unique-entry fetch + child-side GC, (2) producer wrapper + single-ledger ownership, (3)
+  budget-gate integration, (4) cooperative-path deletion + live wiring — rather than one
+  subprocess+configfs+wiring mega-review. **Named (d-ii) obligations:** promote `fetch_report_with_at`
+  to `pub(crate)` WITH the consuming child PR (deliberately not earlier — a consumer-free seam; add a
+  test that custom entry paths are honored); the production child's STDOUT is PROTOCOL-ONLY (no
+  logging, no panic text — the std panic handler writes to stderr, which production inherits to
+  journald; nothing else may write to the pipe); child error classification is CLOSED by design — ALL
+  child-reported failures (ERR frames) and ALL parent-side fetch errors fold to the retryable
+  transport class at the seam (no terminal smuggling; a host/child cannot manufacture a terminal boot
+  verdict). **Two (d-ii)/5b-2c pins from the (d-i)
   review:** (1) `HardBoundedQuoteProducer` owns THE one `AbandonedLedger` for the process — the budget
   binds only if exactly one ledger outlives all fetches (a fresh ledger per attempt resets `is_full()`
   and voids the cap; the ledger's own doc carries the same pin); (2) the production spawn shape
@@ -970,8 +980,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   a prose checklist line) — same MUST/enforceable standard the doc applies to (d), and gate #2 in the
   dependency-order list above:** because this invariant is
   now load-bearing as the sole availability bound, 5b-2c MUST validate **whichever invariant form it ships**
-  (the `2·timeout` form, or the generalized `quote_timeout + channel_timeout` form below if distinct
-  timeouts ship — do NOT hardcode the `2·` special case in the check) where the transport/driver is
+  (the `2·timeout + ε` form, or the generalized `quote_timeout + channel_timeout + ε` form below if
+  distinct timeouts ship — BOTH carry ε; do NOT hardcode the `2·` special case in the check) where the
+  transport/driver is
   constructed — a constructor/config check that **returns an error** (fail-closed, not merely a
   `debug_assert`, since the bound must hold in release) when the shipped form exceeds `overall_boot_budget`.
   The check MUST run AFTER `max_attempts` range validation (below), use **checked/saturating arithmetic**
@@ -988,8 +999,15 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   from its dominant term `REAP_GRACE` + a spawn/kill/fd-close margin; assert-pinned so a `REAP_GRACE`
   retune moves ε with it — 5b-2c consumes the CONST, never a transcribed number; currently 12ms, all
   non-blocking by construction — no `wait()` exists behind the `ChildHandle` seam), landing BETWEEN
-  the legs. The enforced check is therefore **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`**
-  (worst case `max_attempts·ε ≈ ≤0.8s` at the 64-ceiling) — an explicit term, not documented slack. **Generalized form (the
+  the legs. **ε's nature, stated honestly: NOMINAL accounting, not a hard wall-clock ceiling** — only
+  the reap grace is code-bounded; `Command::spawn`, SIGKILL delivery and the ~1ms sleeps can stretch
+  under scheduler load. The config-time check is therefore SIZING ARITHMETIC enforced fail-closed at
+  construction (it stops mis-sized configs, the failure class that is actually configurable), NOT a
+  runtime guarantee — the runtime hard bounds remain the per-leg deadlines themselves, and operators
+  MUST size `overall_boot_budget` with slack above the nominal product (a budget set exactly equal to
+  it is mis-sized by definition). The enforced check is therefore
+  **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`**
+  (nominal worst case `max_attempts·ε ≈ ≤0.8s` at the 64-ceiling) — an explicit term, not silent slack. **Generalized form (the
   `2·` assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if
   5b-2c exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
   **`max_attempts · (quote_timeout + channel_timeout + ε) ≤ overall_boot_budget`** — 5b-2c MUST restate
@@ -1034,7 +1052,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   unique `twod-hsm-q-<pid>` entries. Serial execution is now load-bearing for a NEW reason: the
   **child-side prefix GC** may only run when no sibling quote child is mid-fetch (a concurrent attempt's
   entry could be swept between its `create` and its blob I/O). Serial driver attempts + the
-  one-handshake-per-process rule guarantee ≤ 1 live quote child. Any future parallel-attempt OR
+  one-handshake-per-process rule guarantee **≤ 1 ACTIVE (non-abandoned) quote child** — NB up to
+  `ABANDONED_CHILD_BUDGET` (64) killed-but-unreapable D-state children can simultaneously remain LIVE,
+  each still holding its `twod-hsm-q-<pid>` entry; the child-side GC MUST treat held entries as
+  EXPECTED, never impossible: best-effort `remove_dir` per prefixed name, EVERY failure (EBUSY on a
+  still-wedged sibling's entry, absent dir) skipped silently, never blocking or gating the attempt, and
+  GC is never required to prove all orphans were removed before proceeding. Any future parallel-attempt OR
   split-timeout idea (the distinct `quote_timeout` decision deferred to 5b-2c is the named candidate)
   MUST first (a) scope GC per attempt owner, AND (b) re-derive BOTH naming premises — the subprocess
   path's per-pid uniqueness assumes ≤1 live quote child, and the PRODUCER path still uses the fixed
