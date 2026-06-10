@@ -94,8 +94,10 @@ fn child_err_str(code: u8) -> &'static str {
     }
 }
 
+/// Precondition: `b.len() >= 4` (every caller length-guards first — `from_be_bytes` over the
+/// `try_into` makes the 4-byte intent explicit; a short slice still panics rather than misparses).
 fn be_u32(b: &[u8]) -> u32 {
-    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    u32::from_be_bytes(b[..4].try_into().expect("be_u32 caller guarantees >= 4 bytes"))
 }
 
 /// Incremental, cap-before-alloc frame parser. Length fields are validated against the crate ABI bounds
@@ -638,9 +640,10 @@ impl QuoteChildSpawn for ExecChildSpawn {
                 cmd.stdout(std::process::Stdio::null());
             }
         }
-        let child = cmd
-            .spawn()
-            .map_err(|_| ProtocolError::WireProtocol("quote child: spawn failed"))?;
+        // Preserve the OS error (ENOENT/EACCES/EMFILE…) — unlike the child-frame arms (a fixed static
+        // table, anti-oracle), a parent-side spawn failure is pure operator triage and the errno is the
+        // diagnosis; it still folds to the same retryable class at the seam.
+        let child = cmd.spawn().map_err(ProtocolError::Io)?;
         // Guard the child from THE INSTANT it exists: the pipe-take and fcntl steps below are fallible,
         // and an early `?` would otherwise drop a LIVE child (std Child::Drop neither kills nor reaps)
         // outside both the kill discipline and the ledger budget — the exact custody leak this module
@@ -1154,6 +1157,12 @@ mod tests {
         let reaps = Rc::clone(&sentinel.reaps);
         ledger.abandon(sentinel);
         let spawn = FakeSpawn::new(FakePlan::Silent, false);
+        // checked_sub-with-now()-fallback is CORRECT here (and in cancellable_boundary) because the
+        // lapse check is remaining_or_lapsed, whose MIN_BOUNDARY_BUDGET floor treats a bare now() as
+        // already-lapsed — the fallback cannot turn this into a NON-past fluke. Contrast
+        // snp_report::tests::past(), which deliberately uses direct subtraction: its consumer
+        // (check_deadline) is a STRICT `now >= d` compare where a now()-fallback could race to a
+        // not-yet-lapsed instant. Two patterns, two lapse semantics — not an inconsistency.
         let past = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
