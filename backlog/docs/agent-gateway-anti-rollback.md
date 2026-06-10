@@ -868,7 +868,8 @@ request golden vector is a 5b-2b test-vector item.
      artifact EXISTS ((d-ii)/3): `quote_subprocess::ValidatedBootBudget`** — checked-arithmetic
      fail-closed constructor, taken by the producer's constructors as an ordering witness
      (validation-before-claim by signature); the REMAINING gate-#2 obligation is 5b-2c constructing it
-     from operator config (and logging the four numbers at parse — see the bin preconditions above).
+     from operator config (and the TWO-PHASE logging obligation — raw triplet before validation,
+     getters + slack after success; see the bin preconditions above).
      Both gates stay required; live serve opens only at (4b) wiring + the (4c) smoke.
 
   *Satisfied precondition (no longer gating, listed for audit):* **(a') connect bound — DONE (PR #56).**
@@ -1049,7 +1050,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   instance, and the (4b) test must refuse the drift** (the driver keeps its raw-u32 signature for
   cfg-lattice reasons). The parent-side reap
   obligation is RE-SCOPED to 5b-2c with hard constraints (see above — the in-fetch emission was
-  reverted); the 5b-2c bin obligation (log the four config numbers at parse) and the witness
+  reverted); the 5b-2c bin obligation (the TWO-PHASE config logging — raw triplet pre-validation,
+  getters + slack post-success) and the witness
   construction from operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
