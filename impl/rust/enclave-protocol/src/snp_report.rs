@@ -175,9 +175,10 @@ fn check_deadline(deadline: Option<std::time::Instant>) -> Result<(), ProtocolEr
 /// GET_MEASUREMENT). On **every** path it **unconditionally cleans up** the entry — the cleanup is the
 /// last statement, so an error or mid-sequence timeout still leaves no stale `twod-hsm` entry. Per-step
 /// checks bound the *gaps* between fs ops; a single in-kernel `read(outblob)` that blocks forever is not
-/// interruptible under `#![forbid(unsafe_code)]` (a hard bound needs a *cancellable boundary* — killable
-/// subprocess / kernel timeout, NOT a plain worker thread which can only abandon a stuck reader — a
-/// killable-subprocess harness LANDED in 5b-2b-ii(d-i) — `quote_subprocess` — with the configfs child
+/// interruptible under `#![forbid(unsafe_code)]` (a hard bound needs a *cancellable boundary* — the
+/// **killable subprocess**, the only sanctioned option per the revised §8 pin ("kernel timeout" was
+/// eliminated: configfs-tsm offers none; a plain worker thread can only abandon a stuck reader) — the
+/// harness LANDED in 5b-2b-ii(d-i) — `quote_subprocess` — with the configfs child
 /// mode following in (d-ii); the stale-clear covers the leak meanwhile).
 pub(crate) fn fetch_report_with<F: TsmFs>(
     fs: &F,
@@ -201,7 +202,12 @@ pub(crate) fn fetch_report_with<F: TsmFs>(
 /// killable quote CHILD fetches at its own unique self-named `twod-hsm-q-<pid>` path — (d-ii) — while the
 /// producer path keeps the fixed name above; FakeTsmFs ignores entry strings, so the existing sequence
 /// tests pin this split moved nothing). Body unchanged: stale-clear → inner sequence → UNCONDITIONAL
-/// trailing cleanup on every path (incl. timeout).
+/// trailing cleanup on every path (incl. timeout). **NB: the past-deadline "touches NO fs" fast-path
+/// stays in the WRAPPER above** — a direct `_at` caller with an already-lapsed `Some(deadline)` still
+/// performs the stale-clear `remove_entry` before the first in-sequence check (recorded narrowing; moot
+/// in practice: the (d-ii) child calls with `None`/unbounded, and the cooperative `Option<Instant>`
+/// plumbing is deletion-approved — any future deadline-bearing direct caller must add its own
+/// fast-path).
 fn fetch_report_with_at<F: TsmFs>(
     fs: &F,
     entry_path: &str,

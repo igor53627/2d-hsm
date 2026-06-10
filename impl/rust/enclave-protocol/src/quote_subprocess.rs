@@ -27,38 +27,17 @@
 //! landed, and (like `cancellable_boundary`) it must stay warning-free there.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::cancellable_boundary::{poll_with_deadline, remaining_or_lapsed, DEADLINE_LAPSED_MSG};
+use crate::cancellable_boundary::{
+    classify_pipe_revents, poll_with_deadline, remaining_or_lapsed, PipeReadiness,
+    DEADLINE_LAPSED_MSG,
+};
 use crate::ProtocolError;
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------------------------------
-// Readiness predicate — the (d) counterpart of `connect_poll_succeeded` (which hardcodes POLLOUT
-// precisely so it CANNOT be reused here: its unconditional POLLHUP veto would drop final quote bytes).
-// ---------------------------------------------------------------------------------------------------
-
-/// Classification of a pipe read-end `revents` from [`poll_with_deadline`]`(POLLIN, ..)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PipeReadiness {
-    /// Go `read()`. Covers `POLLIN` (data), `POLLIN|POLLHUP` (the NORMAL Linux final-data +
-    /// writer-closed shape) and bare `POLLHUP` (drained EOF — read returns 0). `read() == 0` is the
-    /// ONLY authoritative EOF; POLLHUP presence is never treated as EOF by itself.
-    ReadNow,
-    /// `POLLERR`/`POLLNVAL` without any readable signal — the fd is broken; fold to a retryable error
-    /// (re-polling would spin; reading would error anyway without the triage context).
-    BrokenFd,
-}
-
-/// Total classification: any readable-or-EOF signal wins (data must be drained even alongside error
-/// flags); only an error-without-readability is broken. An empty/unknown `revents` (anomalous for a
-/// single-fd POLLIN poll that reported readiness) is conservatively BrokenFd — retryable, never a spin.
-pub(crate) fn classify_pipe_revents(revents: nix::poll::PollFlags) -> PipeReadiness {
-    use nix::poll::PollFlags as P;
-    if revents.intersects(P::POLLIN | P::POLLHUP) {
-        PipeReadiness::ReadNow
-    } else {
-        PipeReadiness::BrokenFd
-    }
-}
+// The pipe-readiness predicate (`PipeReadiness` / `classify_pipe_revents`) lives NEXT TO the shared
+// primitive in `cancellable_boundary`, beside its connect twin `connect_poll_succeeded` — both halves of
+// poll_with_deadline's "caller MUST inspect revents" contract are one decision table in one place (and
+// the predicate stays reachable for vsock-transport-only consumers, which this module is not).
 
 // ---------------------------------------------------------------------------------------------------
 // Frame codec — pure over bytes (no fd). One reply frame per child lifetime, child → parent.
@@ -93,8 +72,12 @@ pub(crate) enum FrameProgress {
     /// Not enough bytes yet — keep draining (header length fields are validated as soon as their bytes
     /// arrive; a lying prefix can never force an allocation).
     NeedMore,
-    /// A complete frame was parsed; `frame_len` = its exact length (the caller rejects trailing bytes).
-    Complete { reply: ChildReply, frame_len: usize },
+    /// A complete frame was parsed — and the accumulator held EXACTLY the frame: the parser itself
+    /// rejects trailing bytes (single-frame protocol; the invariant lives in ONE place). NB this is
+    /// per-drain-window best-effort: junk the child writes AFTER the frame-completing chunk is never
+    /// observed, because the drain deliberately returns at Complete without waiting for EOF (budget) —
+    /// see `read_child_reply`'s doc.
+    Complete { reply: ChildReply },
 }
 
 /// Map a child ERR code to the parent-side static triage string (fixed table; unknown codes fold to a
@@ -127,10 +110,10 @@ pub(crate) fn parse_child_frame(accum: &[u8]) -> Result<FrameProgress, ProtocolE
             if accum.len() < 2 {
                 return Ok(FrameProgress::NeedMore);
             }
-            Ok(FrameProgress::Complete {
-                reply: ChildReply::ChildError(child_err_str(accum[1])),
-                frame_len: 2,
-            })
+            if accum.len() > 2 {
+                return Err(ProtocolError::WireProtocol("quote child: trailing bytes after frame"));
+            }
+            Ok(FrameProgress::Complete { reply: ChildReply::ChildError(child_err_str(accum[1])) })
         }
         FRAME_STATUS_OK => {
             if accum.len() < 1 + 4 {
@@ -155,12 +138,14 @@ pub(crate) fn parse_child_frame(accum: &[u8]) -> Result<FrameProgress, ProtocolE
             if accum.len() < total {
                 return Ok(FrameProgress::NeedMore);
             }
+            if accum.len() > total {
+                return Err(ProtocolError::WireProtocol("quote child: trailing bytes after frame"));
+            }
             Ok(FrameProgress::Complete {
                 reply: ChildReply::Quote {
                     report: accum[5..5 + report_len].to_vec(),
                     cert_chain: accum[chain_at + 4..total].to_vec(),
                 },
-                frame_len: total,
             })
         }
         _ => Err(ProtocolError::WireProtocol("quote child: malformed frame status")),
@@ -199,8 +184,12 @@ pub(crate) fn encode_err_frame(code: u8) -> [u8; 2] {
 /// Read one child reply frame off `pipe`, hard-bounded by the absolute `deadline`:
 /// `poll_with_deadline(POLLIN, deadline)` → [`classify_pipe_revents`] → `read` ≤ 4096 B → incremental
 /// [`parse_child_frame`], looping with the SAME absolute deadline throughout (partial data never extends
-/// it). On `Complete`, trailing bytes beyond the frame are REJECTED and the fn returns WITHOUT waiting
-/// for EOF (no budget spent on a child that keeps talking). `read() == 0` before `Complete` ⇒ the writer
+/// it). At `Complete` the fn returns WITHOUT waiting for EOF (no budget spent on a child that keeps
+/// talking) — so the parser's trailing-byte rejection is **per-drain-window best-effort, not an
+/// invariant**: junk the child writes AFTER the frame-completing chunk is never observed (the
+/// echo-verify and downstream report verification bound the damage; a post-`Complete` extra read was
+/// considered and rejected — it narrows the race by nanoseconds, needs a third readiness outcome, and
+/// taxes every successful fetch). `read() == 0` before `Complete` ⇒ the writer
 /// died mid-frame (retryable). A deadline lapse passes through as the helper's neutral
 /// [`DEADLINE_LAPSED_MSG`] UNRELABELED — the orchestration applies the single connect-style relabel arm.
 /// Generic over `AsFd + Read`: production drains a `ChildStdout`, the CI smokes a `ChildStderr`, and the
@@ -225,12 +214,7 @@ pub(crate) fn read_child_reply<R: std::os::fd::AsFd + std::io::Read>(
             Ok(0) => return Err(ProtocolError::WireProtocol("quote child: pipe closed mid-frame")),
             Ok(n) => {
                 accum.extend_from_slice(&buf[..n]);
-                if let FrameProgress::Complete { reply, frame_len } = parse_child_frame(&accum)? {
-                    if accum.len() > frame_len {
-                        return Err(ProtocolError::WireProtocol(
-                            "quote child: trailing bytes after frame",
-                        ));
-                    }
+                if let FrameProgress::Complete { reply } = parse_child_frame(&accum)? {
                     return Ok(reply);
                 }
             }
@@ -280,9 +264,30 @@ pub(crate) trait QuoteChildSpawn {
 }
 
 /// Abandoned (killed-but-not-yet-reapable) children, bounded. Entries hold pid + status memory only —
-/// the pipe fd is dropped before abandonment, so a ledger slot pins ZERO fds.
+/// the pipe fd is dropped before abandonment, so a ledger slot pins ZERO fds (a slot DOES pin a pid /
+/// potential zombie until a later sweep or process exit — bounded by the budget; systemd reaps at exit).
+///
+/// **Lifecycle pins (the budget only binds if these hold):** there must be EXACTLY ONE ledger per
+/// process, living as long as the boot path — (d-ii)'s `HardBoundedQuoteProducer` owns it; constructing
+/// a fresh ledger per attempt would reset `is_full()` and void the cap (see §8). There is no terminal
+/// sweep after the LAST fetch: children abandoned on late attempts stay zombies until process exit —
+/// `Drop` below runs one final best-effort kill+reap pass to shrink that window, but a still-wedged
+/// child is structurally unreapable and is left to pid-1.
 pub(crate) struct AbandonedLedger<H: ChildHandle> {
     children: Vec<H>,
+}
+
+impl<H: ChildHandle> Drop for AbandonedLedger<H> {
+    /// Final best-effort pass (non-blocking — one kill + one WNOHANG reap per child): reclaims every
+    /// since-un-wedged child at end of life instead of leaving them zombies for the process lifetime.
+    /// Cannot help a still-wedged child (nothing non-blocking can) — that one reparents to pid 1 at
+    /// process exit.
+    fn drop(&mut self) {
+        for h in &mut self.children {
+            h.kill_best_effort();
+            let _ = h.try_reap();
+        }
+    }
 }
 
 /// Hard cap on abandoned children per process. DERIVED from the driver ceiling (≤ 1 child per fetch ×
@@ -298,9 +303,18 @@ pub(crate) const ABANDONED_CHILD_BUDGET: usize =
 /// is abandoned to the ledger. Empirically an S-state child is reapable ~1.3ms after SIGKILL — 10ms is
 /// ~7× headroom, so a CLEANLY killed child is reaped on the spot (no success-path zombie, no ledger
 /// churn), while a D-state child costs at most 10ms before abandonment. This grace is the dominant term
-/// of the per-attempt overhead ε ≈ ≤12ms (spawn + kill + grace + fd close), which lands BETWEEN the
-/// quote and channel legs; 5b-2c's budget check carries it as the explicit `max_attempts · ε` term.
+/// of the per-attempt overhead [`QUOTE_ATTEMPT_OVERHEAD`] (spawn + kill + grace + fd close), which lands
+/// BETWEEN the quote and channel legs; 5b-2c's budget check carries it as the explicit
+/// `max_attempts · ε` term.
 pub(crate) const REAP_GRACE: Duration = Duration::from_millis(10);
+
+/// ε — the per-attempt quote-subprocess overhead the 5b-2c budget check MUST carry as an explicit term:
+/// `max_attempts · (2·timeout + ε) ≤ overall_boot_budget` (§8). DERIVED from its dominant term (the reap
+/// grace) plus a ~2ms margin for spawn + SIGKILL + fd close, so a future `REAP_GRACE` retune cannot
+/// silently strand a stale literal in the budget arithmetic — the same derive-don't-transcribe rule as
+/// [`ABANDONED_CHILD_BUDGET`]. 5b-2c consumes THIS const, never a hand-copied number.
+pub(crate) const QUOTE_ATTEMPT_OVERHEAD: Duration =
+    REAP_GRACE.saturating_add(Duration::from_millis(2));
 
 impl<H: ChildHandle> AbandonedLedger<H> {
     pub(crate) fn new() -> Self {
@@ -324,9 +338,13 @@ impl<H: ChildHandle> AbandonedLedger<H> {
 }
 
 /// RAII guard from spawn until disposition: if the parent panics (or any early `?` escapes) between
-/// spawn and the normal disposition, Drop fires `kill_best_effort` + ONE best-effort `try_reap` — no
-/// orphan survives a parent panic. Disarmed via [`KillOnDrop::into_inner`] on the normal path. (Drop
-/// does NOT run under parent SIGKILL — systemd, pid 1 in the NixOS guest, reaps the ≤1 leaked child.)
+/// spawn and the normal disposition, Drop fires `kill_best_effort` + ONE best-effort `try_reap`.
+/// **Honest contract: the KILL is guaranteed, the reap is best-effort** — a just-killed child is
+/// typically reapable only ~1.3ms later, so the single zero-delay WNOHANG on the panic path usually
+/// returns `Running` and the dead child stays an unledgered zombie until process exit (no LIVE orphan
+/// survives, but the zombie is invisible to the budget — accepted: panics here are program bugs, not a
+/// host-drivable path). Disarmed via [`KillOnDrop::into_inner`] on the normal path. (Drop does NOT run
+/// under parent SIGKILL — systemd, pid 1 in the NixOS guest, reaps the ≤1 leaked child.)
 pub(crate) struct KillOnDrop<H: ChildHandle>(Option<H>);
 
 impl<H: ChildHandle> KillOnDrop<H> {
@@ -335,6 +353,11 @@ impl<H: ChildHandle> KillOnDrop<H> {
     }
     pub(crate) fn into_inner(mut self) -> H {
         self.0.take().expect("KillOnDrop consumed twice")
+    }
+    /// Access the still-guarded handle (e.g. to take the pipe end or poll a test child) without
+    /// disarming the kill-on-panic guarantee.
+    pub(crate) fn get_mut(&mut self) -> &mut H {
+        self.0.as_mut().expect("KillOnDrop consumed")
     }
 }
 
@@ -377,7 +400,10 @@ fn dispose_child<H: ChildHandle>(mut h: H, ledger: &mut AbandonedLedger<H>) {
 /// 2. refuse (retryable) if the ledger is full — BEFORE spawning;
 /// 3. spawn the child (RAII [`KillOnDrop`] guard from this instant);
 /// 4. [`read_child_reply`] on the pipe, same absolute deadline;
-/// 5. drop the pipe (parent read fd closed — an un-wedged orphan dies on EPIPE at its next write);
+/// 5. drop the pipe (parent read fd closed — a ledger slot pins ZERO fds; an un-wedged orphan dies to
+///    its pending SIGKILL before any userspace write, and if that kill somehow failed it exits at its
+///    first FAILED write: Rust ignores SIGPIPE — std re-ignores it in the re-exec'd child — so EPIPE is
+///    an `Err`, not a kernel kill; the (d-ii) child pins ANY write error ⇒ immediate nonzero exit);
 /// 6. UNCONDITIONAL disposition (kill → bounded reap → abandon), success included;
 /// 7. on `Quote`: re-check `len ≥ MIN_REPORT_LEN`, then ECHO-VERIFY the report's embedded report_data
 ///    against the requested one (a corrupted pipe or misrouted report must not enter the relay request);
@@ -406,6 +432,13 @@ fn fetch_quote_via_child_inner<S: QuoteChildSpawn>(
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
     // (0) Fast-path BEFORE any side effect (relabelled by the caller's single arm).
     remaining_or_lapsed(deadline)?;
+    // (0b) Recursion brake at the POLICY level: inside a quote child the marker env is set — refuse to
+    // fetch at all. ExecChildSpawn::spawn carries the same check for direct-seam use, but the seam
+    // exists to permit other spawner impls, and a future impl that faithfully implements the trait
+    // contract would otherwise lose the depth-1 guarantee (the orchestration owns the policy).
+    if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
+        return Err(ProtocolError::WireProtocol("quote child: fetch refused inside child"));
+    }
     // (1) Reclaim since-un-wedged children, then (2) enforce the budget BEFORE spawning.
     ledger.sweep();
     if ledger.is_full() {
@@ -416,8 +449,11 @@ fn fetch_quote_via_child_inner<S: QuoteChildSpawn>(
     let guard = KillOnDrop::new(handle);
     // (4) Drain one frame, hard-bounded.
     let reply = read_child_reply(&mut pipe, deadline);
-    // (5) Close the parent read end BEFORE disposition: ledger slots must pin zero fds, and an
-    // un-wedged orphan must die on EPIPE at its next write.
+    // (5) Close the parent read end BEFORE disposition: ledger slots must pin zero fds. (Orphan death
+    // is owned by the pending SIGKILL on un-wedge; the closed pipe is the BACKSTOP — a surviving
+    // orphan's next write returns Err(EPIPE), NOT a kernel kill (Rust ignores SIGPIPE), and the (d-ii)
+    // child contract pins ANY write error ⇒ immediate nonzero exit. The test helper honors it via
+    // unwrap-panic → libtest failure → nonzero exit.)
     drop(pipe);
     // (6) Uniform disposition on EVERY path, success included.
     dispose_child(guard.into_inner(), ledger);
@@ -561,11 +597,14 @@ impl QuoteChildSpawn for ExecChildSpawn {
         if self.clear_env {
             cmd.env_clear();
         }
-        cmd.env(QUOTE_CHILD_ENV, "1");
-        cmd.env(QUOTE_CHILD_REPORT_DATA_ENV, hex128(report_data));
+        // extra_env FIRST, reserved keys LAST: the spawner-computed marker + report_data always win —
+        // a caller plumbing debug env through extra_env must not be able to override them (a stale
+        // report_data override would surface as a misleading "echo mismatch" pointing at the pipe).
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
+        cmd.env(QUOTE_CHILD_ENV, "1");
+        cmd.env(QUOTE_CHILD_REPORT_DATA_ENV, hex128(report_data));
         cmd.stdin(std::process::Stdio::null());
         match self.pipe_source {
             PipeSource::Stdout => {
@@ -577,12 +616,18 @@ impl QuoteChildSpawn for ExecChildSpawn {
                 cmd.stdout(std::process::Stdio::null());
             }
         }
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|_| ProtocolError::WireProtocol("quote child: spawn failed"))?;
+        // Guard the child from THE INSTANT it exists: the pipe-take and fcntl steps below are fallible,
+        // and an early `?` would otherwise drop a LIVE child (std Child::Drop neither kills nor reaps)
+        // outside both the kill discipline and the ledger budget — the exact custody leak this module
+        // exists to prevent. On those error paths the guard's Drop fires kill + best-effort reap (the
+        // child is milliseconds old and necessarily still S-state, so the kill lands).
+        let mut guard = KillOnDrop::new(StdChildHandle(child));
         let pipe = match self.pipe_source {
-            PipeSource::Stdout => child.stdout.take().map(QuotePipe::Stdout),
-            PipeSource::Stderr => child.stderr.take().map(QuotePipe::Stderr),
+            PipeSource::Stdout => guard.get_mut().0.stdout.take().map(QuotePipe::Stdout),
+            PipeSource::Stderr => guard.get_mut().0.stderr.take().map(QuotePipe::Stderr),
         }
         .ok_or(ProtocolError::WireProtocol("quote child: pipe end missing after spawn"))?;
         // O_NONBLOCK on the parent read end (safe nix fcntl; `fs` feature). Belt-and-braces: poll says
@@ -595,7 +640,7 @@ impl QuoteChildSpawn for ExecChildSpawn {
             fcntl(&pipe, FcntlArg::F_SETFL(flags))
                 .map_err(|_| ProtocolError::WireProtocol("quote child: F_SETFL failed"))?;
         }
-        Ok((pipe, StdChildHandle(child)))
+        Ok((pipe, guard.into_inner()))
     }
 }
 
@@ -609,7 +654,6 @@ impl QuoteChildSpawn for ExecChildSpawn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::poll::PollFlags as P;
     use std::cell::RefCell;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -619,49 +663,23 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
-    /// A minimal structurally-valid report: MIN_REPORT_LEN zeros with `rd` spliced at the ABI offset,
-    /// so `report_data_from_report` reads back exactly `rd`.
-    fn test_report(rd: &[u8; 64]) -> Vec<u8> {
-        let mut r = vec![0u8; crate::snp_report::MIN_REPORT_LEN];
+    /// A structurally-valid report of `len` zeros with `rd` spliced at the ABI offset, so
+    /// `report_data_from_report` reads back exactly `rd` — the ONE splice site for every fixture
+    /// (a report-ABI change is a one-place edit, and all tests pin the same wire shape).
+    fn test_report_of_len(len: usize, rd: &[u8; 64]) -> Vec<u8> {
+        let mut r = vec![0u8; len];
         r[crate::snp_report::REPORT_DATA_OFFSET..crate::snp_report::REPORT_DATA_OFFSET + 64]
             .copy_from_slice(rd);
         r
     }
 
-    // ---- predicate (pure) ----
-
-    #[test]
-    fn pipe_revents_pollin_alone_proceeds() {
-        // Regression: a predicate too strict refuses plain data.
-        assert_eq!(classify_pipe_revents(P::POLLIN), PipeReadiness::ReadNow);
+    /// The minimal valid report (MIN_REPORT_LEN).
+    fn test_report(rd: &[u8; 64]) -> Vec<u8> {
+        test_report_of_len(crate::snp_report::MIN_REPORT_LEN, rd)
     }
 
-    #[test]
-    fn pipe_revents_pollin_pollhup_proceeds() {
-        // THE connect-predicate reflex (POLLHUP veto) dropping final quote bytes — mirror-inverse of
-        // `connect_poll_succeeded_requires_clean_pollout`: on a pipe POLLIN|POLLHUP is the NORMAL
-        // final-data + writer-closed shape.
-        assert_eq!(classify_pipe_revents(P::POLLIN | P::POLLHUP), PipeReadiness::ReadNow);
-    }
-
-    #[test]
-    fn pipe_revents_pollhup_alone_proceeds() {
-        // Regression: drained EOF read as a spurious failure (clean child-exit-after-write race) —
-        // bare POLLHUP means "go read; expect 0".
-        assert_eq!(classify_pipe_revents(P::POLLHUP), PipeReadiness::ReadNow);
-    }
-
-    #[test]
-    fn pipe_revents_pollerr_pollnval_without_pollin_broken() {
-        // Regression: a broken fd misread as EOF-success or spun on forever.
-        assert_eq!(classify_pipe_revents(P::POLLERR), PipeReadiness::BrokenFd);
-        assert_eq!(classify_pipe_revents(P::POLLNVAL), PipeReadiness::BrokenFd);
-        assert_eq!(classify_pipe_revents(P::empty()), PipeReadiness::BrokenFd);
-        // ...but error flags NEVER mask pending data.
-        assert_eq!(classify_pipe_revents(P::POLLIN | P::POLLERR), PipeReadiness::ReadNow);
-    }
-
-    // ---- frame codec (pure) ----
+    // ---- frame codec (pure; the readiness-predicate tests live with the predicate in
+    //      cancellable_boundary) ----
 
     #[test]
     fn frame_ok_roundtrip_golden_bytes() {
@@ -677,13 +695,23 @@ mod tests {
         assert_eq!(frame.len(), 1 + 4 + 192 + 4 + 3);
         assert_eq!(&frame[1 + 4 + 192..1 + 4 + 192 + 4], &(3u32).to_be_bytes());
         match parse_child_frame(&frame).expect("parse") {
-            FrameProgress::Complete { reply: ChildReply::Quote { report: r, cert_chain: c }, frame_len } => {
+            FrameProgress::Complete { reply: ChildReply::Quote { report: r, cert_chain: c } } => {
                 assert_eq!(r, report);
                 assert_eq!(c, chain);
-                assert_eq!(frame_len, frame.len());
             }
             other => panic!("expected Complete/Quote, got {other:?}"),
         }
+        // The parser OWNS the trailing-byte rejection (single-frame protocol, one place): the exact
+        // frame parses, one extra byte errors.
+        let mut with_junk = frame.clone();
+        with_junk.push(0x00);
+        assert!(
+            matches!(
+                parse_child_frame(&with_junk),
+                Err(ProtocolError::WireProtocol("quote child: trailing bytes after frame"))
+            ),
+            "parser must reject trailing bytes itself"
+        );
         // Empty cert_chain roundtrips (auxblob is best-effort).
         let frame2 = encode_ok_frame(&report, &[]).expect("encode empty chain");
         match parse_child_frame(&frame2).expect("parse") {
@@ -693,12 +721,7 @@ mod tests {
             other => panic!("expected Complete/Quote, got {other:?}"),
         }
         // Max-size payloads roundtrip (the frame the >64KiB drain test depends on being legal).
-        let max_report = {
-            let mut r = vec![0u8; crate::snp_report::MAX_OUTBLOB_LEN];
-            r[crate::snp_report::REPORT_DATA_OFFSET..crate::snp_report::REPORT_DATA_OFFSET + 64]
-                .copy_from_slice(&rd);
-            r
-        };
+        let max_report = test_report_of_len(crate::snp_report::MAX_OUTBLOB_LEN, &rd);
         let max_chain = vec![0xAB; crate::snp_report::MAX_CERT_CHAIN_LEN];
         let max_frame = encode_ok_frame(&max_report, &max_chain).expect("encode max");
         assert_eq!(max_frame.len(), MAX_QUOTE_FRAME_LEN, "derived max-frame const matches encoder");
@@ -758,7 +781,7 @@ mod tests {
             (200, "quote child: unknown error code"),
         ] {
             match parse_child_frame(&encode_err_frame(code)).expect("ERR frame parses") {
-                FrameProgress::Complete { reply: ChildReply::ChildError(msg), frame_len: 2 } => {
+                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
                     assert_eq!(msg, expect);
                 }
                 other => panic!("expected Complete/ChildError, got {other:?}"),
@@ -812,12 +835,7 @@ mod tests {
         nix::sys::socket::setsockopt(&b, nix::sys::socket::sockopt::SndBuf, &4096)
             .expect("shrink writer SndBuf");
         let rd = [0x33u8; 64];
-        let report = {
-            let mut r = vec![0u8; crate::snp_report::MAX_OUTBLOB_LEN];
-            r[crate::snp_report::REPORT_DATA_OFFSET..crate::snp_report::REPORT_DATA_OFFSET + 64]
-                .copy_from_slice(&rd);
-            r
-        };
+        let report = test_report_of_len(crate::snp_report::MAX_OUTBLOB_LEN, &rd);
         let chain = vec![0x77; crate::snp_report::MAX_CERT_CHAIN_LEN];
         let frame = encode_ok_frame(&report, &chain).unwrap();
         assert_eq!(frame.len(), MAX_QUOTE_FRAME_LEN, "must exercise the max frame");
@@ -839,8 +857,11 @@ mod tests {
 
     #[test]
     fn read_reply_trailing_bytes_after_frame_rejected() {
-        // Regression: a corrupt/malicious child's trailing bytes silently tolerated (detect-and-error,
-        // never ignore — and never spend budget waiting for EOF to find out).
+        // Regression: a corrupt/malicious child's trailing bytes silently tolerated when they land in
+        // the drain window. PREMISE this test rests on (Linux-only module, deterministic there): the
+        // single write_all below is one ≤16KiB skb on AF_UNIX, delivered whole by one read — so frame
+        // and junk arrive in the SAME chunk. Junk written in a LATER chunk is deliberately out of scope
+        // (the drain returns at Complete without waiting EOF — per-window best-effort, see the fn doc).
         let (mut a, mut b) = UnixStream::pair().unwrap();
         let rd = [0x44u8; 64];
         let mut bytes = encode_ok_frame(&test_report(&rd), &[]).unwrap();
@@ -1001,7 +1022,10 @@ mod tests {
     fn fetch_kills_and_ledgers_unreapable_child_promptly() {
         // Regression: any blocking-wait / unbounded-sleep reintroduction in the dispose path. A silent
         // pipe + an unreapable handle (the D-state stand-in): the fetch must return ~at the deadline,
-        // kill exactly once, abandon to the ledger, and surface the relabelled retryable lapse.
+        // kill exactly once, abandon to the ledger, and surface the relabelled retryable lapse. The
+        // exact-string assert below ALSO pins the single relabel arm end-to-end via the shared const
+        // (a reworded literal would dead-code the arm) — mirroring
+        // `connect_bounded_entry_lapse_is_relabelled_deviceless`.
         let spawn = FakeSpawn::new(FakePlan::Silent, false);
         let mut ledger = AbandonedLedger::new();
         let start = Instant::now();
@@ -1055,9 +1079,7 @@ mod tests {
         let mut ledger = AbandonedLedger::new();
         let _ = fetch_quote_via_child(&spawn, &mut ledger, &[0u8; 64], Instant::now() + Duration::from_millis(150));
         assert_eq!(ledger.len(), 1, "precondition: one abandoned child");
-        // The wedged child "un-wedges": flip every abandoned handle reapable via the shared flag...
-        // (the fake shares `reapable` per handle; reach it through a fresh fetch's sweep)
-        // — we made FakeSpawn hand each handle its own flag, so flip via the ledger handle itself:
+        // The wedged child "un-wedges": flip the abandoned handles' reapable flags via the ledger.
         for h in &ledger.children {
             *h.reapable.borrow_mut() = true;
         }
@@ -1084,6 +1106,15 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(*spawn.spawns.borrow(), 0, "must refuse BEFORE spawning");
+    }
+
+    #[test]
+    fn attempt_overhead_dominated_by_reap_grace() {
+        // Pins the eps derivation: QUOTE_ATTEMPT_OVERHEAD must track REAP_GRACE (its dominant term) —
+        // a future REAP_GRACE retune must move eps WITH it, never strand a stale number for 5b-2c's
+        // budget check to transcribe.
+        assert!(QUOTE_ATTEMPT_OVERHEAD >= REAP_GRACE);
+        assert!(QUOTE_ATTEMPT_OVERHEAD <= REAP_GRACE + Duration::from_millis(5));
     }
 
     #[test]
@@ -1163,26 +1194,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fetch_quote_lapse_is_relabelled() {
-        // Pins the single relabel arm end-to-end via the const (a reworded literal would dead-code the
-        // arm silently) — mirrors `connect_bounded_entry_lapse_is_relabelled_deviceless`.
-        let spawn = FakeSpawn::new(FakePlan::Silent, false);
-        let mut ledger = AbandonedLedger::new();
-        let err = fetch_quote_via_child(
-            &spawn,
-            &mut ledger,
-            &[0u8; 64],
-            Instant::now() + Duration::from_millis(120),
-        )
-        .expect_err("silent child must lapse");
-        match err {
-            ProtocolError::WireProtocol(msg) => {
-                assert_eq!(msg, "anchor relay: quote pipe deadline lapsed");
-            }
-            other => panic!("expected WireProtocol, got {other:?}"),
-        }
-    }
     // ---- real-subprocess smokes (current_exe + env-guarded #[ignore] helper; protocol over STDERR
     //      because the spawned TEST binary's stdout carries the unstable libtest banner) ----
     // These prove S-state behavior + the real Child/pipe/env plumbing. They run DEVICELESS in CI.
@@ -1191,6 +1202,11 @@ mod tests {
 
     const HELPER_GUARD_ENV: &str = "TWOD_HSM_QUOTE_CHILD_TEST";
 
+    /// Hand-rolled ON PURPOSE (not the `hex` dev-dep the other test modules use): this is the
+    /// PROTOTYPE of (d-ii)'s production `parse_report_data_env` — the production child cannot take the
+    /// `hex` dep (not an agent-gateway dependency), so the decoder that ships there should be the one
+    /// already exercised here, promoted with review, not rewritten. Lowercase-only by design (the
+    /// encoder `hex128` emits lowercase; the env round-trip is closed).
     fn unhex128(s: &str) -> [u8; 64] {
         fn nib(c: u8) -> u8 {
             match c {
@@ -1214,6 +1230,14 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper: spawned by the smoke tests below; no-op without the guard env"]
     fn helper_quote_child() {
+        // DOUBLE guard: dispatch requires BOTH the mode env AND the spawner's marker env. The real
+        // spawner always sets the marker; an operator shell never does — so a stale
+        // TWOD_HSM_QUOTE_CHILD_TEST export cannot hijack an unfiltered `cargo test -- --ignored` run
+        // (single-guard would turn it into a wedge-loop or, worse, an exit(0) FALSE-GREEN that
+        // silently skips the rest of the suite).
+        if std::env::var_os(super::QUOTE_CHILD_ENV).is_none() {
+            return; // not spawned by the harness: instant green no-op
+        }
         let Some(mode) = std::env::var(HELPER_GUARD_ENV).ok() else {
             return; // guard unset: instant green no-op (protects --include-ignored sweeps)
         };
@@ -1279,6 +1303,21 @@ mod tests {
         }
     }
 
+    /// REAP_GRACE (10ms) is a PRODUCTION budget term, not a CI scheduling guarantee — on a loaded
+    /// shared runner a SIGKILLed child's kill→reapable transition can exceed it, landing the handle in
+    /// the ledger a few ms before it dies. The production-relevant property is "a subsequent sweep
+    /// reclaims it" (exactly what every later fetch does), so the smokes assert THAT, bounded:
+    /// retry-sweep ≤500ms, then require empty. Never "fix" a flake here by bumping REAP_GRACE — that
+    /// silently inflates the doc-pinned ε term ([`QUOTE_ATTEMPT_OVERHEAD`]).
+    fn assert_eventually_swept(ledger: &mut AbandonedLedger<StdChildHandle>) {
+        let bound = Instant::now() + Duration::from_millis(500);
+        while ledger.len() > 0 && Instant::now() < bound {
+            std::thread::sleep(Duration::from_millis(10));
+            ledger.sweep();
+        }
+        assert_eq!(ledger.len(), 0, "killed child must be reaped by a subsequent sweep");
+    }
+
     #[test]
     fn exec_spawn_reads_helper_frame_to_eof() {
         // Regression: AsFd/pipe/env plumbing breakage in the REAL spawn path — end-to-end
@@ -1294,7 +1333,7 @@ mod tests {
         .expect("end-to-end fetch over a real subprocess");
         assert_eq!(report, test_report(&rd), "report delivered verbatim (incl. echo)");
         assert_eq!(chain, vec![0xC1, 0xC2]);
-        assert_eq!(ledger.len(), 0, "exited helper must be reaped, not abandoned");
+        assert_eventually_swept(&mut ledger);
     }
 
     #[test]
@@ -1319,8 +1358,9 @@ mod tests {
     fn wedged_child_returns_at_deadline_not_child_exit() {
         // THE hang (d) exists to kill, on a REAL child: a sleep-forever helper writes nothing; the
         // fetch must return at ~the deadline (hangs here if anyone reintroduces wait()/
-        // wait_with_output), the relabelled lapse must surface, and the killed S-state sleeper must be
-        // reaped within the bounded grace (ledger empty — bounded-reap pin).
+        // wait_with_output — pinned by the ELAPSED bound; the no-wait rule is also structural via the
+        // ChildHandle type), the relabelled lapse must surface, and the killed sleeper must be
+        // reclaimed by a subsequent sweep (see assert_eventually_swept — NOT a 10ms-grace microbench).
         let mut ledger = AbandonedLedger::new();
         let start = Instant::now();
         let err = fetch_quote_via_child(
@@ -1335,7 +1375,7 @@ mod tests {
             "got {err:?}"
         );
         assert!(start.elapsed() < Duration::from_secs(3), "must return at the deadline");
-        assert_eq!(ledger.len(), 0, "SIGKILLed S-state sleeper must reap within REAP_GRACE");
+        assert_eventually_swept(&mut ledger);
     }
 
     #[test]
@@ -1345,9 +1385,12 @@ mod tests {
         // signal 9. (Replaces the unsatisfiable "still Running at fetch-return" shape — a real S-state
         // sleeper dies to SIGKILL within the grace, so only the SIGNAL is assertable evidence.)
         use std::os::unix::process::ExitStatusExt;
-        let (pipe, mut handle) = smoke_spawn("wedge").spawn(&[0u8; 64]).expect("spawn");
-        handle.kill_best_effort();
-        let status = poll_status(&mut handle, Duration::from_secs(2));
+        let (pipe, handle) = smoke_spawn("wedge").spawn(&[0u8; 64]).expect("spawn");
+        // KillOnDrop: if poll_status's assert panics, the guard still kills the sleeper — a bare
+        // handle would leak a LIVE child past the whole test run.
+        let mut guard = KillOnDrop::new(handle);
+        guard.get_mut().kill_best_effort();
+        let status = poll_status(guard.get_mut(), Duration::from_secs(2));
         assert_eq!(status.signal(), Some(9), "the wedged child must die by SIGKILL, got {status:?}");
         drop(pipe);
     }
@@ -1382,8 +1425,9 @@ mod tests {
             extra_env: vec![],
             ..smoke_spawn("unused")
         };
-        let (pipe, mut handle) = spawn.spawn(&[0u8; 64]).expect("spawn");
-        let status = poll_status(&mut handle, Duration::from_secs(10));
+        let (pipe, handle) = spawn.spawn(&[0u8; 64]).expect("spawn");
+        let mut guard = KillOnDrop::new(handle); // leak-proof if the poll assert panics
+        let status = poll_status(guard.get_mut(), Duration::from_secs(10));
         assert!(status.success(), "guard-less helper must no-op PASS, got {status:?}");
         drop(pipe);
     }
@@ -1392,8 +1436,9 @@ mod tests {
     fn spawn_brake_refuses_inside_child() {
         // Regression: fork-bomb recursion — inside a child (marker env set) a nested spawn MUST refuse.
         // Tested in the CHILD's env (via the helper) so the test process's own env is never mutated.
-        let (pipe, mut handle) = smoke_spawn("brake").spawn(&[0u8; 64]).expect("spawn");
-        let status = poll_status(&mut handle, Duration::from_secs(10));
+        let (pipe, handle) = smoke_spawn("brake").spawn(&[0u8; 64]).expect("spawn");
+        let mut guard = KillOnDrop::new(handle); // leak-proof if the poll assert panics
+        let status = poll_status(guard.get_mut(), Duration::from_secs(10));
         assert_eq!(
             status.code(),
             Some(0),

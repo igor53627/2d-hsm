@@ -798,7 +798,10 @@ request golden vector is a 5b-2b test-vector item.
       old "readback would need unsafe" exemption is EXPIRED — (d) SHOULD assert its socket-timeout values the
       same way.
       Plus the hard wall-clock bound for a wedged in-kernel read (a CANCELLABLE boundary — killable
-      subprocess / kernel timeout / unique-per-attempt entries, NOT a plain worker thread; see the deadline
+      subprocess — the only sanctioned boundary per the REVISED (d) pin below (the old menu is closed:
+  "kernel timeout" was ELIMINATED — configfs-tsm offers no read-timeout mechanism — and unique
+  per-attempt entries are the subprocess design's COMPANION, not an alternative), NOT a plain worker
+  thread; see the deadline
       requirement below). **(d) is the critical-path blocker for a live 5b-2c serve** (a/b/c are
       necessary-but-insufficient) — do NOT deprioritize it as "last". (Note: the channel half of these
       behavioral tests already landed in 5b-2b-ii(a) — `vsock_channel_*` aya tests — leaving (d) the configfs
@@ -819,7 +822,7 @@ request golden vector is a 5b-2b test-vector item.
      construct** the serving path — a compile error, not an omittable runtime/`cfg` check). Wiring it sooner
      reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
-     (`max_attempts · 2 · timeout ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
+     (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
      HERE too so this summary cannot be read as "(d) is the only gate" (a prior wording said "the ONE hard
      precondition", contradicting the budget MUST below — both gates are required).
@@ -892,17 +895,27 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   WNOHANG `try_reap` only; bounded ≤10ms reap grace, so ε ≈ ≤12ms/attempt of spawn+kill+reap overhead —
   see the budget invariant below for the explicit `max_attempts · ε` term [user decision 2026-06-10]).
   Production child stderr → **journald (`inherit`)** for kill-storm triage [user decision 2026-06-10].
-  The fixed `twod-hsm` entry remains EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's. The
+  The fixed `twod-hsm` entry becomes EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's **once
+  (d-ii) deletes the cooperative boot fetch** (deletion approved; until then the deletion-approved
+  `fetch_report_deadline` path still uses the fixed name — do not build interim code on the exclusivity). The
   "unconditional cleanup on every path" invariant is rescoped: it holds in-process and for a SURVIVING
   child; a killed child structurally cannot clean — next-child/next-boot GC owns that case (configfs is
   RAM-backed; nothing survives reboot). *(d-i) landed: deviceless killable-subprocess harness
-  (`quote_subprocess.rs` — EOF-aware pipe predicate, capped incremental frame codec, deadline-bounded
+  (`quote_subprocess.rs` — EOF-aware pipe predicate [co-located with the connect predicate in
+  `cancellable_boundary`], capped incremental frame codec [the PARSER owns trailing-byte rejection;
+  per-drain-window best-effort by design], deadline-bounded
   drain, kill/WNOHANG-reap/abandon ledger, budget = 64, real-subprocess CI smokes; honest limit stated in
   the test docs: a true D-state child cannot be staged on demand ANYWHERE — the unreapable arm's only
   deterministic coverage is the Fake-handle ledger tests) + the entry-path `fetch_report_with_at` refactor;
   (d-ii) adds the configfs child mode (`agent_quote_child_main`, child-side GC) + `HardBoundedQuoteProducer`
   (the structural serve-gate type — deliberately NO skeleton in (d-i): it would satisfy the by-signature
-  gate while the hang remains) + the in-SNP-guest aya validation.* Acceptance criteria: **"no stuck
+  gate while the hang remains) + the in-SNP-guest aya validation. **Two (d-ii)/5b-2c pins from the (d-i)
+  review:** (1) `HardBoundedQuoteProducer` owns THE one `AbandonedLedger` for the process — the budget
+  binds only if exactly one ledger outlives all fetches (a fresh ledger per attempt resets `is_full()`
+  and voids the cap; the ledger's own doc carries the same pin); (2) the production spawn shape
+  (`PipeSource::Stdout` + `clear_env` + stderr→journald) has ZERO (d-i) coverage — the (d-ii) aya smoke
+  of the shipped producer MUST exercise exactly that shape (checked item, not assumed from the
+  stderr-piped test shape).* Acceptance criteria: **"no stuck
   process accumulation across repeated timeouts"** and **"a subsequent attempt is well-defined (no entry
   collision) after a timeout"**, plus the aya test that a wedged provider fails the attempt promptly rather
   than hanging boot. **This is the live-serve blocker:** 5b-2b-ii(a)/(b) only unblock 5b-2c
@@ -910,8 +923,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   There is no "wire it live but best-effort" window — the cooperative deadline is best-effort *within* the
   attempt, but a live serving 5b-2c MUST wait for (d) (the wedged-read hang is otherwise reachable).
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
-  is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout`; total boot ≤
-  `max_attempts · 2 · timeout`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
+  is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout` + the subprocess overhead ε
+  ([`QUOTE_ATTEMPT_OVERHEAD`], as of (d)); total boot ≤ `max_attempts · (2·timeout + ε)`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
   `Instant::now()+timeout`. **Decision (was an unassigned SHOULD):** exposing *distinct*
   `quote_timeout`/`relay_timeout` is **deferred to 5b-2c** (the bin that constructs the transport and owns
   operator config) — NOT 5b-2b-i/ii, which keep the single-budget model. 5b-2c, if it splits them, MUST
@@ -925,7 +938,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   to the deadline; see above.) **Per-leg sizing floor (5b-2c):** the
   per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
   both (NB per the kernel-timer note below, a connect can only consume "nearly the whole leg" when the per-leg `timeout` is ≲ the ~2s kernel connect timer — for longer legs a wedged connect is kernel-capped at ~2s and the I/O budget keeps the rest), AND MUST
-  satisfy the boot-budget invariant **`max_attempts · 2 · timeout ≤ overall_boot_budget`** so the bounded
+  satisfy the boot-budget invariant **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`** (ε = the
+  quote-subprocess overhead const `QUOTE_ATTEMPT_OVERHEAD`, see the ε term below) so the bounded
   retry loop can't blow the operator's total boot deadline. **Invariant (wiring-enforced in 5b-2b — a single
   local variable, NOT a structural gate; re-verify on any refactor of `round_trip_inner`):** `connect_bounded`'s
   `deadline` arg is the **per-leg channel deadline** —
@@ -937,7 +951,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   re-verify it; the named break mode is handing `connect_bounded` the *overall* boot deadline, which would
   void the `2·timeout` accounting. 5b-2c does NOT thread this deadline (it only constructs the channel and
   supplies `max_attempts`/`timeout`), so the surviving 5b-2c obligation is purely the budget sizing
-  (`max_attempts · 2 · timeout ≤ overall_boot_budget`). **Post-(a') threat model (kernel-timer-aware):** with
+  (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`). **Post-(a') threat model (kernel-timer-aware):** with
   the fd/thread leak gone, a black-holing host no longer exhausts the guest fd table. For the remaining TIME
   cost, note the kernel's own per-socket connect timer: a non-blocking AF_VSOCK connect arms
   `vsk->connect_timeout` (**default `VSOCK_DEFAULT_CONNECT_TIMEOUT` ≈ 2s**; `connect_bounded` does not set
@@ -948,9 +962,11 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   worst-case connect-only cost is `max_attempts · min(timeout, ~2s)` (the no-listener/reset case is prompt,
   milliseconds). Budget-consumption was never a *new* exposure from (a') (the old watchdog also blocked the
   caller up to the budget; (a') removed the *leak*, not the time cost), and the
-  `max_attempts · 2 · timeout ≤ overall_boot_budget` invariant remains the enforced CEILING — valid and
-  conservative (the kernel timer can only make real attempts cheaper, never costlier), with the I/O leg
-  (which has no kernel cap) still able to consume its full per-leg share. **5b-2c MUST enforce it as a structural artifact (NOT
+  enforced CEILING is the ε-bearing form `max_attempts · (2·timeout + ε) ≤ overall_boot_budget` — the
+  TIMEOUT portion is conservative (the kernel connect timer can only make real attempts cheaper, never
+  costlier; the I/O leg, which has no kernel cap, can still consume its full per-leg share), but ε is
+  ADDITIVE overhead the kernel timer cannot absorb (it lands between the legs), which is exactly why the
+  ε-less product is NOT a valid ceiling and every statement of this invariant carries the ε term. **5b-2c MUST enforce it as a structural artifact (NOT
   a prose checklist line) — same MUST/enforceable standard the doc applies to (d), and gate #2 in the
   dependency-order list above:** because this invariant is
   now load-bearing as the sole availability bound, 5b-2c MUST validate **whichever invariant form it ships**
@@ -968,10 +984,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   channel-leg value), so the structural gate cannot outlive the wiring assumption it depends on.
   This is a checked 5b-2c task item, ordered BEFORE any live-serve wrapper. **ε term — EXPLICIT in the
   operator-facing check [user decision 2026-06-10]:** as of (d), each attempt additionally costs the
-  quote-subprocess overhead ε = spawn + SIGKILL + ≤`REAP_GRACE`(10ms) WNOHANG polling + fd close ≈ ≤12ms
-  (all non-blocking by construction — no `wait()` exists behind the `ChildHandle` seam), landing BETWEEN
+  quote-subprocess overhead ε — **the code const `quote_subprocess::QUOTE_ATTEMPT_OVERHEAD`** (derived
+  from its dominant term `REAP_GRACE` + a spawn/kill/fd-close margin; assert-pinned so a `REAP_GRACE`
+  retune moves ε with it — 5b-2c consumes the CONST, never a transcribed number; currently 12ms, all
+  non-blocking by construction — no `wait()` exists behind the `ChildHandle` seam), landing BETWEEN
   the legs. The enforced check is therefore **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`**
-  (worst case `max_attempts·ε ≈ ≤0.8s`) — an explicit term, not documented slack. **Generalized form (the
+  (worst case `max_attempts·ε ≈ ≤0.8s` at the 64-ceiling) — an explicit term, not documented slack. **Generalized form (the
   `2·` assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if
   5b-2c exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
   **`max_attempts · (quote_timeout + channel_timeout + ε) ≤ overall_boot_budget`** — 5b-2c MUST restate
@@ -1016,8 +1034,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   unique `twod-hsm-q-<pid>` entries. Serial execution is now load-bearing for a NEW reason: the
   **child-side prefix GC** may only run when no sibling quote child is mid-fetch (a concurrent attempt's
   entry could be swept between its `create` and its blob I/O). Serial driver attempts + the
-  one-handshake-per-process rule guarantee ≤ 1 live quote child. Any future parallel-attempt idea MUST
-  first scope GC per attempt owner.
+  one-handshake-per-process rule guarantee ≤ 1 live quote child. Any future parallel-attempt OR
+  split-timeout idea (the distinct `quote_timeout` decision deferred to 5b-2c is the named candidate)
+  MUST first (a) scope GC per attempt owner, AND (b) re-derive BOTH naming premises — the subprocess
+  path's per-pid uniqueness assumes ≤1 live quote child, and the PRODUCER path still uses the fixed
+  `twod-hsm` remove+create, which silently corrupts if two producer fetches (or a producer fetch and a
+  pre-(d-ii) cooperative boot fetch) ever overlap.
 - **Host-relay daemon (its own 5b-2b sub-checklist).** Define: daemon location + feature gate; the
   upstream enclave→anchor request/response schema; the **error→framing mapping** — a relay/anchor error
   (unavailable, timeout, upstream 5xx) MUST be surfaced to the enclave as a *retryable transport close*
