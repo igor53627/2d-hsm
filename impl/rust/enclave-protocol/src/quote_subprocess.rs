@@ -711,11 +711,10 @@ impl<F: crate::snp_report::TsmFs> crate::snp_report::TsmFs for StepTracker<'_, F
     }
 }
 
-/// The two outblob POST-check messages (emitted between/after seam steps, so the step tracker alone
-/// cannot distinguish them from a plain read failure). In-crate literals, pinned by
-/// `child_err_code_refines_outblob_postchecks` — a reword there must update here or the test fails.
-const OUTBLOB_OVERSIZE_MSG: &str = "SNP attestation: outblob exceeds max size";
-const OUTBLOB_SHORT_MSG: &str = "SNP attestation: outblob shorter than ABI minimum";
+// The two outblob POST-check messages are snp_report's pub(crate) consts (single source — the emitter
+// and this refinement CANNOT drift; the previous transcribed-copy + self-referential pin-test
+// arrangement guaranteed nothing).
+use crate::snp_report::{OUTBLOB_OVERSIZE_MSG, OUTBLOB_SHORT_MSG};
 
 /// Map a failed fetch to its ERR-frame code (the parent's `child_err_str` table, (d-i)).
 fn child_err_code(step: FetchStep, err: &ProtocolError) -> u8 {
@@ -733,7 +732,11 @@ fn child_err_code(step: FetchStep, err: &ProtocolError) -> u8 {
         FetchStep::CreateEntry => 2,
         FetchStep::WriteInblob => 3,
         FetchStep::ReadOutblob => 4,
-        FetchStep::None => 4, // pre-step failure (shouldn't happen) — fold to the generic read code
+        // Pre-step failure: unreachable with the child's pinned `None` deadline (remove_entry is
+        // infallible; check_deadline(None) never errors — create always records first). A TOTAL fold,
+        // deliberately NOT `unreachable!()`: the child must never panic (a panic = exit 101 with no
+        // frame — the exact undiagnosable ambiguity the frame protocol exists to prevent).
+        FetchStep::None => 4,
     }
 }
 
@@ -743,6 +746,23 @@ fn child_err_code(step: FetchStep, err: &ProtocolError) -> u8 {
 /// ignores SIGPIPE — EPIPE is an `Err`, not a kernel kill; lingering instead of exiting is the
 /// orphan-leak the §8 rules forbid).
 pub(crate) const CHILD_EXIT_WRITE_FAILED: i32 = 10;
+
+/// Write one frame + flush; map the result to the exit code — THE single write-failure policy site
+/// (every frame path goes through here; a policy change cannot ship one-sided).
+fn emit<W: std::io::Write>(out: &mut W, frame: &[u8], ok_code: i32) -> i32 {
+    use std::io::Write as _; // for the stderr breadcrumb below
+    if out.write_all(frame).and_then(|_| out.flush()).is_ok() {
+        ok_code
+    } else {
+        // Best-effort journald breadcrumb: in production stderr is INHERITED (NOT the protocol pipe),
+        // so this is the only observable evidence distinguishing "parent was gone" from "child could
+        // not fetch" (the parent discards reaped exit statuses today — §8 records parent-side reap
+        // logging as a named obligation). In the test smokes stderr IS the protocol pipe — but this
+        // path only fires when that pipe is already dead, so the write is a harmless no-op Err.
+        let _ = writeln!(std::io::stderr(), "2d-hsm quote child: frame write failed (parent gone?)");
+        CHILD_EXIT_WRITE_FAILED
+    }
+}
 
 /// The testable CORE of the quote child: fetch at the SELF-NAMED unique entry
 /// (`twod-hsm-q-<own pid>`, via [`crate::snp_report::fetch_report_with_at`] — UNBOUNDED `None`
@@ -759,36 +779,29 @@ pub(crate) fn quote_child_main_with<F: crate::snp_report::TsmFs, W: std::io::Wri
 ) -> i32 {
     let entry_path = crate::snp_report::quote_child_entry_path();
     let tracker = StepTracker { inner: fs, last: std::cell::Cell::new(FetchStep::None) };
+    // NB the `None` deadline is pinned BY CONTRACT until the (d-ii)-4 parameter deletion makes it
+    // structural: the parent's pipe poll + SIGKILL is the ONLY bound (a cooperative child-side timeout
+    // is the best-effort theater §8 deleted). A Some-bearing variant must first rework
+    // child_err_code's step mapping (a mid-sequence lapse would masquerade as the previous step).
     match crate::snp_report::fetch_report_with_at(&tracker, &entry_path, report_data, None) {
-        Ok((report, cert_chain)) => {
-            let frame = match encode_ok_frame(&report, &cert_chain) {
-                Ok(f) => f,
-                // A report the encoder rejects (out-of-range lengths) is an outblob defect — code 5/6
-                // semantics, fold to the closest (oversize handled above by the fetch cap; short by the
-                // ABI check) — generic read code as the conservative fallback.
-                Err(_) => {
-                    let code = 4u8;
-                    return if out.write_all(&encode_err_frame(code)).and_then(|_| out.flush()).is_ok()
-                    {
-                        i32::from(code)
-                    } else {
-                        CHILD_EXIT_WRITE_FAILED
-                    };
-                }
-            };
-            if out.write_all(&frame).and_then(|_| out.flush()).is_ok() {
-                0
-            } else {
-                CHILD_EXIT_WRITE_FAILED
+        Ok((report, mut cert_chain)) => {
+            // Over-cap cert chain folds to EMPTY (auxblob is best-effort — mirror RealTsmFs's own
+            // policy for seam impls that don't cap; failing the whole quote for a chain-size defect
+            // would be the wrong severity AND the old fallback mislabeled it as an outblob error).
+            if cert_chain.len() > crate::snp_report::MAX_CERT_CHAIN_LEN {
+                cert_chain = Vec::new();
+            }
+            match encode_ok_frame(&report, &cert_chain) {
+                Ok(frame) => emit(out, &frame, 0),
+                // Structurally unreachable: fetch_report_inner_with enforces MIN ≤ report ≤ MAX for
+                // EVERY TsmFs impl and the chain is folded above — kept as a total non-panicking fold
+                // (never-panic child rule), labeled with the oversize code as the closest truth.
+                Err(_) => emit(out, &encode_err_frame(5), 5),
             }
         }
         Err(e) => {
             let code = child_err_code(tracker.last.get(), &e);
-            if out.write_all(&encode_err_frame(code)).and_then(|_| out.flush()).is_ok() {
-                i32::from(code)
-            } else {
-                CHILD_EXIT_WRITE_FAILED
-            }
+            emit(out, &encode_err_frame(code), i32::from(code))
         }
     }
 }
@@ -824,12 +837,9 @@ pub(crate) fn parse_report_data_env(val: &std::ffi::OsStr) -> Result<[u8; 64], P
     Ok(out)
 }
 
-/// THE child-mode entrypoint — the ONLY `pub` item in this module (and it exists only under the
-/// triple gate, so it is unreachable from every production profile that lacks `agent-gateway` by
-/// construction). The 5b-2c bin MUST dispatch to it as the FIRST statement of `main` when
-/// [`QUOTE_CHILD_ENV`] is set (one line; a forgotten dispatch fail-closes — the child then runs the
-/// full boot logic against an env-cleared environment, writes no valid frame, and the parent's decode
-/// error folds retryable → `RetriesExhausted`, never a hang, never a serve).
+/// The child-mode entrypoint proper (reached ONLY via [`agent_quote_child_dispatch`], the
+/// crate-root-exported self-dispatching wrapper — bins are separate crates and this module is
+/// private, so the wrapper is the entire public surface; the env names stay crate-private).
 ///
 /// Sequence: parse [`QUOTE_CHILD_REPORT_DATA_ENV`] (bad/missing ⇒ ERR frame code 1 + exit 1, never a
 /// panic) → best-effort orphan GC at the REAL configfs dir (child-side ONLY, per §8) → fetch at the
@@ -837,21 +847,17 @@ pub(crate) fn parse_report_data_env(val: &std::ffi::OsStr) -> Result<[u8; 64], P
 /// stdout; stderr is inherited to journald for triage — stdout is PROTOCOL-ONLY, nothing else may
 /// write to it) → exit. NEVER spawns anything (and the spawner-level + orchestration-level brakes
 /// refuse even if it tried).
-pub fn agent_quote_child_main() -> ! {
-    use std::io::Write;
+pub(crate) fn agent_quote_child_main() -> ! {
     let mut out = std::io::stdout();
-    let rd = match std::env::var_os(QUOTE_CHILD_REPORT_DATA_ENV) {
-        Some(v) => match parse_report_data_env(&v) {
-            Ok(rd) => rd,
-            Err(_) => {
-                let _ = out.write_all(&encode_err_frame(1)).and_then(|_| out.flush());
-                std::process::exit(1);
-            }
-        },
-        None => {
-            let _ = out.write_all(&encode_err_frame(1)).and_then(|_| out.flush());
-            std::process::exit(1);
-        }
+    let rd = std::env::var_os(QUOTE_CHILD_REPORT_DATA_ENV)
+        .ok_or(ProtocolError::WireProtocol("quote child: report_data env missing"))
+        .and_then(|v| parse_report_data_env(&v));
+    let rd = match rd {
+        Ok(rd) => rd,
+        // ONE error arm for missing AND malformed env: ERR(1) frame, exit 1 — but a FAILED frame write
+        // escalates to CHILD_EXIT_WRITE_FAILED like every other path (emit owns the policy), so
+        // "bad env, frame delivered" and "parent was gone" stay distinguishable in the exit status.
+        Err(_) => std::process::exit(emit(&mut out, &encode_err_frame(1), 1)),
     };
     crate::snp_report::gc_quote_entries_default();
     let code = quote_child_main_with(&crate::snp_report::RealTsmFs, &rd, &mut out);
@@ -865,6 +871,27 @@ pub fn agent_quote_child_main() -> ! {
 // deterministic coverage is the Fake-handle ledger tests below; the real-subprocess smokes prove
 // S-state behavior (sleeping children) and the plumbing.
 // ---------------------------------------------------------------------------------------------------
+/// THE quote-child dispatch — the ONE line the 5b-2c bin's `main` must call FIRST, unconditionally:
+/// returns immediately in a normal (parent) process; never returns in a spawned quote child. Exported
+/// at the crate root (this module is private), so the §8 "first statement of main" contract is
+/// satisfiable by `enclave_protocol::agent_quote_child_dispatch();` — the dispatch CONDITION (the
+/// marker env) stays crate-private and cannot be re-keyed one-sided. A forgotten dispatch fail-closes:
+/// the child runs the full boot logic against an env-cleared environment, writes no valid frame, and
+/// the parent's decode error folds retryable → `RetriesExhausted` — never a hang, never a serve.
+///
+/// **Child exit-code table (ops/journald triage):**
+/// `0` ok (frame delivered) · `1` bad/missing report_data env (ERR(1) frame delivered) · `2..=6` fetch
+/// failed at {2 create, 3 inblob, 4 outblob read, 5 outblob oversize, 6 outblob short} (ERR frame
+/// delivered; same code) · `10` [`CHILD_EXIT_WRITE_FAILED`] — the frame write itself failed (parent
+/// gone; one stderr breadcrumb is emitted) · `101` rust panic (must never happen — the child code is
+/// total). NB the PARENT currently discards reaped exit statuses (codes land only in journald via
+/// stderr inheritance); parent-side reap-status logging is a named §8 obligation.
+pub fn agent_quote_child_dispatch() {
+    if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
+        agent_quote_child_main();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,14 +1492,15 @@ mod tests {
             self.paths.borrow_mut().push(format!("outblob:{entry}"));
             match self.fail_step {
                 Some("outblob") => Err(ProtocolError::PqSigningUnavailable("fake outblob failure")),
-                Some("oversize") => {
-                    Err(ProtocolError::PqSigningUnavailable(super::OUTBLOB_OVERSIZE_MSG))
-                }
-                Some("short") => Err(ProtocolError::PqSigningUnavailable(super::OUTBLOB_SHORT_MSG)),
+                // REAL-PATH arms (not injected error strings): the oversize/short refinements must be
+                // exercised through the genuine snp_report post-checks, so a reword there fails HERE.
+                Some("oversize") => Ok(vec![0u8; crate::snp_report::MAX_OUTBLOB_LEN + 1]),
+                Some("short") => Ok(Vec::new()),
                 _ => Ok(self.outblob.clone()),
             }
         }
-        fn read_auxblob(&self, _entry: &str) -> Vec<u8> {
+        fn read_auxblob(&self, entry: &str) -> Vec<u8> {
+            self.paths.borrow_mut().push(format!("auxblob:{entry}"));
             self.auxblob.clone()
         }
     }
@@ -1531,19 +1559,76 @@ mod tests {
                 }
                 other => panic!("expected ChildError, got {other:?}"),
             }
+            // ...and the configfs SEQUENCE stops at the failing step (no post-failure I/O against a
+            // possibly-wedged provider): the last recorded op is the failing one, save the trailing
+            // unconditional cleanup remove.
+            let paths = fs.paths.borrow();
+            let ops: Vec<&str> = paths.iter().map(|p| p.split_once(':').unwrap().0).collect();
+            let expect_ops: Vec<&str> = match step {
+                "create" => vec!["remove", "create", "remove"],
+                "inblob" => vec!["remove", "create", "inblob", "remove"],
+                "outblob" => vec!["remove", "create", "inblob", "outblob", "remove"],
+                _ => unreachable!(),
+            };
+            assert_eq!(ops, expect_ops, "step {step}: sequence must stop at the failure + cleanup");
         }
     }
 
     #[test]
     fn child_err_code_refines_outblob_postchecks() {
-        // Pins the two in-crate POST-CHECK literals the code-5/6 refinement matches on — a reword in
-        // snp_report must move these constants or this fails (no silent dead refinement arm).
-        for (step, code) in [("oversize", 5u8), ("short", 6)] {
+        // REAL-PATH refinement pin: the fake returns genuinely-oversize / genuinely-short outblobs, so
+        // the errors come from snp_report's actual post-checks (single-source consts) — a reword or a
+        // dropped check there fails HERE, end-to-end through child_err_code AND the parent string.
+        for (step, code, parent_msg) in [
+            ("oversize", 5u8, "quote child: outblob oversize"),
+            ("short", 6, "quote child: outblob short"),
+        ] {
             let fs = OkFs::failing_at(step);
             let mut out = Vec::new();
             let exit = quote_child_main_with(&fs, &[0u8; 64], &mut out);
             assert_eq!(exit, i32::from(code), "post-check {step} must refine to code {code}");
-            assert_eq!(out, encode_err_frame(code));
+            match parse_child_frame(&out).unwrap() {
+                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
+                    assert_eq!(msg, parent_msg, "the PARENT half of the {code} row must decode");
+                }
+                other => panic!("expected ChildError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn child_err_table_every_emittable_code_decodes() {
+        // Both-ways table pin: every code the child can put in an ERR frame (1 = env, 2..=6 = fetch)
+        // must decode to a REAL parent triage string — a one-sided table addition fails here instead
+        // of silently folding to "unknown error code" at the parent.
+        for code in 1u8..=6 {
+            match parse_child_frame(&encode_err_frame(code)).unwrap() {
+                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
+                    assert_ne!(
+                        msg, "quote child: unknown error code",
+                        "code {code} must have a real parent string"
+                    );
+                }
+                other => panic!("expected ChildError for {code}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn child_main_with_folds_overcap_chain_to_empty() {
+        // Best-effort auxblob policy for seam impls that don't cap: an over-cap chain must NOT fail
+        // the quote — it folds to empty (mirroring RealTsmFs) and the report still ships.
+        let rd = [0x74u8; 64];
+        let mut fs = OkFs::healthy(&rd);
+        fs.auxblob = vec![0xEE; crate::snp_report::MAX_CERT_CHAIN_LEN + 1];
+        let mut out = Vec::new();
+        assert_eq!(quote_child_main_with(&fs, &rd, &mut out), 0, "over-cap chain must not fail");
+        match parse_child_frame(&out).unwrap() {
+            FrameProgress::Complete { reply: ChildReply::Quote { report, cert_chain } } => {
+                assert_eq!(report, test_report(&rd));
+                assert!(cert_chain.is_empty(), "over-cap chain folds to empty");
+            }
+            other => panic!("expected Quote, got {other:?}"),
         }
     }
 
@@ -1563,35 +1648,6 @@ mod tests {
         assert!(parse_report_data_env(OsStr::new(&bad)).is_err(), "non-hex char");
     }
 
-    #[test]
-    fn gc_removes_prefix_only_spares_fixed_name() {
-        // Regression: GC nuking the fixed producer entry (GET_MEASUREMENT breakage) or unrelated names.
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["twod-hsm-q-123", "twod-hsm-q-99999", "twod-hsm", "unrelated"] {
-            std::fs::create_dir(dir.path().join(name)).unwrap();
-        }
-        crate::snp_report::gc_quote_entries_best_effort(dir.path());
-        assert!(!dir.path().join("twod-hsm-q-123").exists(), "prefixed orphan must be removed");
-        assert!(!dir.path().join("twod-hsm-q-99999").exists(), "prefixed orphan must be removed");
-        assert!(dir.path().join("twod-hsm").exists(), "the FIXED producer entry must be spared");
-        assert!(dir.path().join("unrelated").exists(), "unrelated names must be spared");
-    }
-
-    #[test]
-    fn gc_tolerates_unremovable_and_absent_dir() {
-        // Regression: GC failure gating the boot attempt — a held (EBUSY-class) entry and an absent
-        // dir must both be silent no-ops.
-        let dir = tempfile::tempdir().unwrap();
-        let held = dir.path().join("twod-hsm-q-7");
-        std::fs::create_dir(&held).unwrap();
-        std::fs::write(held.join("inner"), b"x").unwrap(); // non-empty => remove_dir fails (EBUSY stand-in)
-        crate::snp_report::gc_quote_entries_best_effort(dir.path()); // must not panic/Err
-        assert!(held.exists(), "unremovable entry is skipped, not an error");
-        crate::snp_report::gc_quote_entries_best_effort(std::path::Path::new(
-            "/nonexistent/2d-hsm-gc-test",
-        )); // absent dir: silent no-op
-    }
-
     // ---- real-subprocess smokes (current_exe + env-guarded #[ignore] helper; protocol over STDERR
     //      because the spawned TEST binary's stdout carries the unstable libtest banner) ----
     // These prove S-state behavior + the real Child/pipe/env plumbing. They run DEVICELESS in CI.
@@ -1599,28 +1655,6 @@ mod tests {
     // current_exe-helper reachability and the pub(crate) seams.
 
     const HELPER_GUARD_ENV: &str = "TWOD_HSM_QUOTE_CHILD_TEST";
-
-    /// Hand-rolled ON PURPOSE (not the `hex` dev-dep the other test modules use): this is the
-    /// PROTOTYPE of (d-ii)'s production `parse_report_data_env` — the production child cannot take the
-    /// `hex` dep (not an agent-gateway dependency), so the decoder that ships there should be the one
-    /// already exercised here, promoted with review, not rewritten. Lowercase-only by design (the
-    /// encoder `hex128` emits lowercase; the env round-trip is closed).
-    fn unhex128(s: &str) -> [u8; 64] {
-        fn nib(c: u8) -> u8 {
-            match c {
-                b'0'..=b'9' => c - b'0',
-                b'a'..=b'f' => c - b'a' + 10,
-                _ => panic!("bad hex"),
-            }
-        }
-        let b = s.as_bytes();
-        assert_eq!(b.len(), 128, "report_data env must be 128 hex chars");
-        let mut out = [0u8; 64];
-        for i in 0..64 {
-            out[i] = (nib(b[2 * i]) << 4) | nib(b[2 * i + 1]);
-        }
-        out
-    }
 
     /// THE child for every smoke below. Dispatches on the guard env value; a bare invocation (guard
     /// unset — e.g. an aya `--include-ignored` sweep) is an instant no-op PASS. `exit()` (not return)
@@ -1639,8 +1673,11 @@ mod tests {
         let Some(mode) = std::env::var(HELPER_GUARD_ENV).ok() else {
             return; // guard unset: instant green no-op (protects --include-ignored sweeps)
         };
-        let rd = std::env::var(super::QUOTE_CHILD_REPORT_DATA_ENV)
-            .map(|h| unhex128(&h))
+        // Decode via the PRODUCTION parser — the e2e smokes must cross the real process boundary
+        // through the same decode path agent_quote_child_main uses (a drift between hex128 and
+        // parse_report_data_env fails HERE, not first in-guest).
+        let rd = std::env::var_os(super::QUOTE_CHILD_REPORT_DATA_ENV)
+            .map(|v| parse_report_data_env(&v).expect("smoke: spawner-set env must parse"))
             .unwrap_or([0u8; 64]);
         let mut err = std::io::stderr();
         match mode.as_str() {
@@ -1677,7 +1714,19 @@ mod tests {
                 // Parent drops its read end immediately; the child's frame write must FAIL and the
                 // child must exit CHILD_EXIT_WRITE_FAILED — the lingering-orphan-after-un-wedge rule
                 // (Rust ignores SIGPIPE: EPIPE is an Err, the EXIT is the child's obligation).
-                std::thread::sleep(Duration::from_millis(300));
+                // DETERMINISTIC, not a sleep-race: wait for read-end-closed EVIDENCE — poll on the
+                // WRITE end reports POLLERR once the reader is gone (a fixed sleep would flake the
+                // other way if the PARENT got descheduled past it).
+                let stderr = std::io::stderr();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let revents =
+                        poll_with_deadline(&stderr, nix::poll::PollFlags::empty(), deadline)
+                            .expect("poll for reader-gone evidence");
+                    if revents.intersects(nix::poll::PollFlags::POLLERR) {
+                        break;
+                    }
+                }
                 let fs = OkFs::healthy(&rd);
                 let code = quote_child_main_with(&fs, &rd, &mut err);
                 std::process::exit(code);

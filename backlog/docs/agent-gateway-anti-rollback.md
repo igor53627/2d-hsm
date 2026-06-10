@@ -910,21 +910,23 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   (d-ii) adds the configfs child mode (`agent_quote_child_main`, child-side GC) + `HardBoundedQuoteProducer`
   (the structural serve-gate type — deliberately NO skeleton in (d-i): it would satisfy the by-signature
   gate while the hang remains) + the in-SNP-guest aya validation. **(d-ii) slicing note (review-load):** (d-ii) lands as ordered sub-slices, each gated — (1) child
-  CLI + unique-entry fetch + child-side GC — **LANDED (this PR): `agent_quote_child_main` (env parse →
-  child-side GC → self-named fetch over RealTsmFs → PROTOCOL-ONLY stdout; ERR(1)+exit-1 on bad env,
-  never a panic), `quote_child_main_with` testable core (StepTracker maps step→ERR code structurally,
-  the two outblob post-checks refine by pinned literals), `parse_report_data_env`,
-  `CHILD_EXIT_WRITE_FAILED` (=10) implements the EPIPE-exit obligation,
-  `snp_report::{TSM_QUOTE_ENTRY_PREFIX, quote_child_entry_path, gc_quote_entries_best_effort}` +
-  `fetch_report_with_at` promoted pub(crate) per the obligation (entry-path-honored test included);
-  e2e real-subprocess test drives the REAL child core through the REAL parent orchestration (full
-  pipeline minus configfs)** — (2) producer wrapper + single-ledger ownership, (3)
+  CLI + unique-entry fetch + child-side GC — **LANDED (this PR).** The bin-facing surface is the
+  crate-root **`agent_quote_child_dispatch()`** export (self-dispatching: returns in a parent, never
+  returns in a child; the marker env stays crate-private so the dispatch condition cannot be re-keyed
+  one-sided) — the 5b-2c bin calls it unconditionally as main's first statement. Mechanics, the child
+  exit-code table, and the never-panic/PROTOCOL-ONLY-stdout rules live in the dispatch/entrypoint
+  rustdoc (single source); the outblob post-check messages are snp_report-owned pub(crate) consts
+  consumed by both the emitters and the child's code refinement (no transcribed copies); the
+  `fetch_report_with_at` promotion obligation is DISCHARGED (entry-path-honored test included); e2e
+  real-subprocess tests drive the REAL child core + PRODUCTION env parser through the REAL parent
+  orchestration (full pipeline minus configfs). **Named obligation for (d-ii)-2/3 or 5b-2c:**
+  parent-side reap-status logging (today the parent discards reaped exit statuses; the child's exit
+  codes land only in journald via inherited stderr + the write-failure breadcrumb) — (2) producer wrapper + single-ledger ownership, (3)
   budget-gate integration, (4) cooperative-path deletion + live wiring + the in-guest disk-quote-test
   smoke (SNP spike 2026-06-10: `.#disk-production-lab` boot+configfs PASS in ~80s warm — the guest
   path is alive; test delivery = lab profile + test-binary oneshot printing to ttyS0) — rather than
-  one subprocess+configfs+wiring mega-review. **Named (d-ii) obligations:** promote `fetch_report_with_at`
-  to `pub(crate)` WITH the consuming child PR (deliberately not earlier — a consumer-free seam; add a
-  test that custom entry paths are honored); the production child's STDOUT is PROTOCOL-ONLY (no
+  one subprocess+configfs+wiring mega-review. **Named (d-ii) obligations** *(the `fetch_report_with_at` promotion + entry-path test: DISCHARGED in
+  sub-slice 1)*: the production child's STDOUT is PROTOCOL-ONLY (no
   logging, no panic text — the std panic handler writes to stderr, which production inherits to
   journald; nothing else may write to the pipe); child error classification is CLOSED by design — ALL
   child-reported failures (ERR frames) and ALL parent-side fetch errors fold to the retryable
