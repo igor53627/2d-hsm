@@ -927,8 +927,8 @@ fn per_attempt_nominal_cost(
 /// **Hardening note (the one prose-only premise this gate rests on):** the two-leg accounting
 /// assumes connect+I/O share ONE channel-leg deadline — wiring-enforced in
 /// `agent_boot_relay::round_trip_inner` ONLY; re-verify on any refactor there. This artifact is
-/// where the per-leg value ORIGINATES for 5b-2c: [`Self::per_leg_timeout`] is THE source
-/// `RelayAnchorTransport::new`'s `timeout` must be fed from, so the value the invariant was checked
+/// where the per-leg value ORIGINATES for 5b-2c: [`Self::production_transport`] threads
+/// `per_leg_timeout` into `RelayAnchorTransport::new` itself, so the value the invariant was checked
 /// against IS the value both leg deadlines are minted from. The transport cannot take this type BY
 /// SIGNATURE — cfg-lattice fact: `agent_boot_relay` compiles in agent-gateway-without-vsock builds
 /// where this type does not exist — so the Duration-typed seam there is the deliberate coupling
@@ -1026,6 +1026,31 @@ impl ValidatedBootBudget {
     /// at construction: no recompute path, no second formula site.
     pub(crate) fn nominal_boot_cost(&self) -> Duration {
         self.nominal_boot_cost
+    }
+
+    /// THE (4b)/5b-2c serve-path composition — both live-serve gates by signature, one call: claims
+    /// the process producer (gate #1) and constructs the transport whose per-leg deadlines ORIGINATE
+    /// from this validated value (gate #2 — the value the invariant was checked against IS the value
+    /// both leg deadlines are minted from; the connect+I/O sharing of the channel leg stays
+    /// wiring-enforced in `round_trip_inner`, see the type doc). The quote seam is the CONCRETE
+    /// [`HardBoundedQuoteProducer`] (default `S = ExecChildSpawn`) per the §8 never-generic-Q
+    /// obligation; `C` stays the seam trait because a real `VsockBootRelayChannel` cannot exist in
+    /// CI — 5b-2c instantiates `C = VsockBootRelayChannel` (§8). ONLY error: the producer claim
+    /// refusal — FATAL wiring config, `?`-propagate, never fold into the retryable fetch path.
+    /// Consumer-free until (4b), exactly like `production()` was when (d-ii)/2 landed.
+    pub(crate) fn production_transport<C: crate::agent_boot_relay::BootRelayChannel>(
+        &self,
+        channel: C,
+    ) -> Result<
+        crate::agent_boot_relay::RelayAnchorTransport<HardBoundedQuoteProducer, C>,
+        ProtocolError,
+    > {
+        let producer = HardBoundedQuoteProducer::production(self)?;
+        Ok(crate::agent_boot_relay::RelayAnchorTransport::new(
+            producer,
+            channel,
+            self.per_leg_timeout,
+        ))
     }
 }
 
@@ -1951,7 +1976,9 @@ mod tests {
 
     #[test]
     fn producer_new_claims_the_process_ledger_exactly_once() {
-        // THE claim test (serialized — the ONLY test calling new()/production()): (a) production()
+        // THE claim test (serialized; the OTHER claim site is the equally-serialized
+        // production_transport_claims_once_and_threads_the_validated_timeout — no third caller of
+        // new()/production() exists): (a) production()
         // claims; (b) a second construction refuses with the exact fail-closed string; (c) Drop must
         // NOT release (release-on-drop hands the next producer a fresh ledger — the §8 voided-cap
         // hole); (d) the crate reset site clears the claim (a forgotten hook in
@@ -2294,6 +2321,47 @@ mod tests {
         let err = ValidatedBootBudget::validate(1, Duration::from_secs(u64::MAX), Duration::MAX)
             .expect_err("add overflow must refuse, not wrap or pass");
         assert!(matches!(err, ProtocolError::WireProtocol(BOOT_BUDGET_OVERFLOW_MSG)), "got {err:?}");
+    }
+
+    #[test]
+    fn production_transport_claims_once_and_threads_the_validated_timeout() {
+        // Regression: a transport constructed with a timeout OTHER than the validated value (the
+        // deadline-origination drift the §8 hardening note names), or a second producer door
+        // bypassing the single claim. Serialized per the TEST RULE (holds the crate guard for the
+        // whole body; the SECOND claim site, named by the claim test's pin).
+        struct NeverChannel;
+        impl crate::agent_boot_relay::BootRelayChannel for NeverChannel {
+            fn round_trip(
+                &mut self,
+                _request_frame: &[u8],
+                _deadline: Instant,
+            ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+                panic!("composition test never round-trips");
+            }
+        }
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        let budget = test_budget();
+        let transport = budget
+            .production_transport(NeverChannel)
+            .expect("first composition must claim and construct");
+        assert_eq!(
+            transport.per_leg_timeout_for_tests(),
+            budget.per_leg_timeout(),
+            "the transport timeout MUST be the validated per-leg value (deadline origination)"
+        );
+        let err = budget
+            .production_transport(NeverChannel)
+            .err()
+            .expect("second composition must refuse via the single claim");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote producer: process quote ledger already claimed")
+            ),
+            "got {err:?}"
+        );
+        // Pristine exit, same hygiene as the claim test.
+        reset_process_quote_ledger_claim_for_tests();
     }
 
     // ---- (d-ii)/3 reap breadcrumb (pure filter; emission rides StdChildHandle::try_reap) ----

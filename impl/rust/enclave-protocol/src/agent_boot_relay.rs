@@ -312,8 +312,21 @@ pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel
 }
 
 impl<Q: BootQuoteProducer, C: BootRelayChannel> RelayAnchorTransport<Q, C> {
+    /// `new` stays Duration-typed and reachable for in-crate fakes/tests (it also compiles in
+    /// agent-gateway-without-vsock builds where `ValidatedBootBudget` does not exist — the
+    /// cfg-lattice fact); the PRODUCTION path's exclusivity through the validated budget is
+    /// `ValidatedBootBudget::production_transport` (quote_subprocess, plain-text reference) + the
+    /// (4b) acceptance obligation — same residual class as `ExecChildSpawn`'s pub(crate) fields.
     pub(crate) fn new(quote: Q, channel: C, timeout: std::time::Duration) -> Self {
         Self { quote, channel, timeout }
+    }
+
+    /// Test-only pin accessor for the (d-ii)/3 composition test (deadline origination). Gated to
+    /// exactly the combos where `ValidatedBootBudget` exists, so `cargo test --features
+    /// agent-gateway` (CI) sees no dead code.
+    #[cfg(all(test, target_os = "linux", feature = "vsock-transport"))]
+    pub(crate) fn per_leg_timeout_for_tests(&self) -> std::time::Duration {
+        self.timeout
     }
 }
 
