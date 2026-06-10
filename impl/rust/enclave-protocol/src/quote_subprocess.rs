@@ -770,6 +770,14 @@ fn emit<W: std::io::Write>(out: &mut W, frame: &[u8], ok_code: i32) -> i32 {
         // not fetch" (the parent discards reaped exit statuses today — §8 records parent-side reap
         // logging as a named obligation). In the test smokes stderr IS the protocol pipe — but this
         // path only fires when that pipe is already dead, so the write is a harmless no-op Err.
+        // ACCEPTED HAZARD (compact 8305, Low): this write is synchronous — a backpressured journald
+        // could delay the child's exit here. Deliberate: by emit-time the configfs entry is already
+        // cleaned (fetch cleanup precedes emit) so the child holds nothing; a parent-alive child is
+        // SIGKILLed by the unconditional disposition regardless of where it blocks; only an ORPHAN
+        // (parent died → that's what EPIPE here means) can linger, costing one pid until journald
+        // drains. The alternative — fcntl(O_NONBLOCK) on inherited stderr — flips the SHARED open
+        // file description non-blocking for every process holding it (incl. a still-alive parent's
+        // own stderr), a strictly worse failure mode than a delayed orphan exit.
         let _ = writeln!(std::io::stderr(), "twod-hsm quote child: frame write failed (parent gone?)");
         CHILD_EXIT_WRITE_FAILED
     }
