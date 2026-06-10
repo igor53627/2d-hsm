@@ -1757,6 +1757,7 @@ mod tests {
         assert_eq!(first.spawn.program, std::path::PathBuf::from("/proc/self/exe"));
         assert_eq!(first.spawn.pipe_source, PipeSource::Stdout);
         assert!(first.spawn.clear_env && first.spawn.leading_args.is_empty());
+        assert!(first.spawn.extra_env.is_empty(), "production child env = marker + report_data ONLY");
         let err = HardBoundedQuoteProducer::new(FakeSpawn::new(FakePlan::Silent, false))
             .err()
             .expect("second construction must refuse");
