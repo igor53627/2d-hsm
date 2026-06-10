@@ -36,9 +36,11 @@
 //! `VsockBootRelayChannel` (fresh per call, hard-cancellable `connect_bounded` to host CID 2 — LANDED, (a)
 //! PR #54 + (a') PR #56) and the still-open host-side relay daemon (b) (which uses
 //! [`decode_anchor_boot_request`]) — the `vsock-transport`-gated
-//! leaf. (`SnpQuoteProducer` already landed HERE in 5b-2b-i — `agent-gateway`-gated + CI-tested, dead-code
-//! until 5b-2c wires it; it delegates to the deadline-bounded `snp_report::fetch_report_deadline`, NOT the
-//! unbounded producer `fetch_report`. It is NOT behind `vsock-transport`.) Then **5b-2c** the agent-gateway
+//! leaf. (`SnpQuoteProducer` landed HERE in 5b-2b-i — `agent-gateway`-gated + CI-tested, NOT behind
+//! `vsock-transport`; it delegates to the deadline-bounded `snp_report::fetch_report_deadline`. It is
+//! **deletion-approved** ((d-ii)(4a)) — the wired producer is `HardBoundedQuoteProducer`
+//! ((d-ii)/2, `quote_subprocess`, triple-gated; plain-text reference); live wiring is (4b)/5b-2c.) Then
+//! **5b-2c** the agent-gateway
 //! bin + boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -259,21 +261,30 @@ pub(crate) trait BootRelayChannel {
 ///
 /// **`deadline` bounds the quote fetch's own wall-clock** (`RelayAnchorTransport` gives this leg its own
 /// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't starve
-/// the channel's budget). `fetch` MUST honor it COOPERATIVELY: check `deadline` around its I/O steps and
-/// return [`ProtocolError`] (→ retryable `AnchorTransportError`) rather than block past it.
+/// the channel's budget). `fetch` MUST honor it and return [`ProtocolError`] (→ retryable
+/// `AnchorTransportError`) rather than block past it.
 ///
-/// **Best-effort caveat (load-bearing):** under `#![forbid(unsafe_code)]` a single in-kernel blocking
-/// syscall (e.g. configfs `read(outblob)`) cannot be interrupted, so this is a *between-steps* bound, NOT
-/// a hard wall-clock guarantee against a wedged kernel. The hard bound is the **killable-subprocess
-/// cancellable boundary** — REVISED §8 pin, the old option menu is closed: "kernel-supported timeout"
-/// was eliminated (configfs-tsm offers no read timeout), and unique-entry naming is the subprocess
-/// design's COMPANION (child-self-named `twod-hsm-q-<pid>`), not an alternative; a plain worker thread
-/// can only abandon a stuck reader. The harness landed in 5b-2b-ii(d-i) (`quote_subprocess`); the wired
-/// `HardBoundedQuoteProducer` lands in (d-ii). Until then callers (the boot serve-gate) MUST size their
-/// own timeouts treating the quote-fetch deadline as best-effort, not as a guaranteed ceiling.
+/// **The hard bound EXISTS ((d-ii)/2):** `HardBoundedQuoteProducer` in `quote_subprocess` (triple-gated
+/// `linux + vsock-transport + agent-gateway`; plain-text reference — the type does not exist in every
+/// build that has this trait). Its `fetch` IS the killable-subprocess orchestration: spawn → pipe-poll
+/// to the seam-minted absolute deadline → SIGKILL at the lapse → bounded reap → abandoned-child ledger.
+///
+/// **`&mut self` (load-bearing):** the production impl owns process-level mutable state — THE one
+/// abandoned-child ledger, whose budget binds only under strictly-serial fetches (§8 pin). The
+/// exclusive borrow makes the single-mutator rule a borrow-checker fact and is uniform with the
+/// sibling seams ([`BootRelayChannel::round_trip`], `AnchorBootTransport::anchor_round_trip`). NOT
+/// interior mutability by design: a `Mutex` held across a multi-second blocking pipe poll would make
+/// a second caller block UNBOUNDED on `lock()` — violating this very deadline contract — and a panic
+/// mid-sweep poisons the ledger into unprovable budget accounting; `RefCell` trades the compile-time
+/// proof for a latent runtime borrow panic.
+///
+/// **Best-effort caveat (now scoped to the cooperative impl only):** [`SnpQuoteProducer`] honors the
+/// deadline *between* configfs steps; a single wedged in-kernel `read(outblob)` is not interruptible
+/// under `#![forbid(unsafe_code)]`. It is deletion-approved ((d-ii)(4a)) and MUST NOT be wired into a
+/// serving path; until (4b)/5b-2c wires the hard producer, this caveat governs the cooperative impl.
 pub(crate) trait BootQuoteProducer {
     fn fetch(
-        &self,
+        &mut self,
         report_data: &[u8; 64],
         deadline: std::time::Instant,
     ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError>;
@@ -281,7 +292,9 @@ pub(crate) trait BootQuoteProducer {
 
 /// The concrete [`AnchorBootTransport`] for the 5b-1 driver: compose quote-fetch → request-encode →
 /// channel round-trip, returning the anchor's response bytes verbatim. Monomorphized over the two seams
-/// (no `dyn`); 5b-2b instantiates it with `Q = SnpQuoteProducer`, `C = VsockBootRelayChannel`.
+/// (no `dyn`); (4b)/5b-2c instantiates it with `Q = HardBoundedQuoteProducer` (plain-text reference —
+/// triple-gated type; the cooperative `SnpQuoteProducer` is deletion-approved, (4a)) and
+/// `C = VsockBootRelayChannel`.
 ///
 /// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
 /// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2 * timeout` wall-clock (the
@@ -306,13 +319,14 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         request: &AnchorBootRequest,
     ) -> Result<Vec<u8>, AnchorTransportError> {
         // Each leg gets its OWN `timeout` budget (a fresh deadline computed just before it runs), so quote
-        // latency does NOT eat into the channel's budget (no false channel timeout). The quote leg's bound
-        // is **cooperative/best-effort only**: `SnpQuoteProducer` → `fetch_report_deadline` checks the
-        // deadline between configfs steps but CANNOT interrupt a wedged in-kernel `read(outblob)` (the hard
-        // `2×timeout` per-attempt bound holds only once 5b-2b-ii(d)'s cancellable-boundary quote producer
-        // lands; until then a wedged provider can overrun — which is why a live 5b-2c serve is gated on (d)).
-        // The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver bounds the
-        // attempt COUNT on top.
+        // latency does NOT eat into the channel's budget (no false channel timeout). The quote leg's hard
+        // bound EXISTS ((d-ii)/2): `HardBoundedQuoteProducer` kills a wedged child at this deadline, so
+        // with it the `2×timeout(+ε)` per-attempt bound holds. Wiring it here is (4b), gated on the
+        // TWO-artifact live-serve gate ((d) incl. the (4c) smoke + the 5b-2c boot-budget validation);
+        // until then the cooperative `SnpQuoteProducer` caveat stays accurate FOR THE COOPERATIVE IMPL
+        // ONLY (it cannot interrupt a wedged in-kernel `read(outblob)` — why a live 5b-2c serve stays
+        // gated). The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver
+        // bounds the attempt COUNT on top.
         let (report, cert_chain) = self
             .quote
             .fetch(&request.report_data, std::time::Instant::now() + self.timeout)
@@ -410,17 +424,18 @@ where
     deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
 }
 
-/// The production [`BootQuoteProducer`]: fetch the SNP quote via configfs-tsm, honoring the deadline
-/// **cooperatively** (between-steps). Pure delegation to [`crate::snp_report::fetch_report_deadline`],
-/// which checks the deadline around each configfs op — so the *gaps* are bounded, but a single wedged
-/// in-kernel `read(outblob)` is bounded only by the deferred cancellable-boundary hard-bound (see the
-/// trait's best-effort caveat and §8), NOT by this deadline. The real configfs read runs only inside the SNP
-/// guest (aya); off-configfs it returns a prompt interface-absent / deadline error (never a hang in CI),
-/// so even the CI fast-path test is safe.
+/// The COOPERATIVE [`BootQuoteProducer`] — **deletion-approved, removed in (d-ii)(4a)**: fetch the SNP
+/// quote via configfs-tsm, honoring the deadline **cooperatively** (between-steps). Pure delegation to
+/// [`crate::snp_report::fetch_report_deadline`], which checks the deadline around each configfs op — so
+/// the *gaps* are bounded, but a single wedged in-kernel `read(outblob)` is bounded only by the
+/// killable-subprocess hard bound (`HardBoundedQuoteProducer`, (d-ii)/2 — see the trait doc), NOT by
+/// this deadline; it MUST NOT be wired into a serving path. The real configfs read runs only inside the
+/// SNP guest (aya); off-configfs it returns a prompt interface-absent / deadline error (never a hang in
+/// CI), so even the CI fast-path test is safe.
 pub(crate) struct SnpQuoteProducer;
 impl BootQuoteProducer for SnpQuoteProducer {
     fn fetch(
-        &self,
+        &mut self,
         report_data: &[u8; 64],
         deadline: std::time::Instant,
     ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
@@ -764,7 +779,8 @@ mod tests {
         fail: bool,
         /// If true, honor the deadline: error when `now >= deadline` (models a real bounded fetch).
         honor_deadline: bool,
-        seen: std::cell::RefCell<Vec<[u8; 64]>>,
+        /// Plain `Vec` — `fetch(&mut self)` made the old `RefCell` ceremony unnecessary.
+        seen: Vec<[u8; 64]>,
     }
     impl FakeQuote {
         fn ok() -> Self {
@@ -780,11 +796,11 @@ mod tests {
     }
     impl BootQuoteProducer for FakeQuote {
         fn fetch(
-            &self,
+            &mut self,
             report_data: &[u8; 64],
             deadline: std::time::Instant,
         ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-            self.seen.borrow_mut().push(*report_data);
+            self.seen.push(*report_data);
             if self.fail {
                 return Err(ProtocolError::PqSigningUnavailable("fake quote fetch failed"));
             }
@@ -1124,7 +1140,7 @@ mod tests {
             .expect("a conformant signed response verifies");
         assert_eq!(st.epoch, 7);
         // the fake quote was handed exactly request.report_data (quote<->nonce binding).
-        assert_eq!(t.quote.seen.borrow().as_slice(), &[rd]);
+        assert_eq!(t.quote.seen.as_slice(), &[rd]);
     }
 
     #[test]

@@ -95,7 +95,9 @@ pub mod vsock_listen;
 mod cancellable_boundary;
 /// Killable-subprocess hard bound for the SNP quote fetch (TASK-7.7 5b-2b-ii(d) — invariants/design in
 /// the module header + §8). Triple-gated: needs nix (vsock-transport) AND the quote/boot types
-/// (agent-gateway).
+/// (agent-gateway). Also home of `HardBoundedQuoteProducer` — the (d-ii)/2 structural serve-gate
+/// producer (plain-backtick reference: the module is triple-gated, so an intra-doc link would break
+/// `cargo doc --features agent-gateway` on non-linux/non-vsock combos).
 #[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
 mod quote_subprocess;
 #[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
