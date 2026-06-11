@@ -301,9 +301,11 @@ pub(crate) trait BootQuoteProducer {
 /// count bound caps total boot at `max_attempts · (2·timeout + ε)` — the ε term is load-bearing, §8:
 /// the ε-less product is NOT a valid ceiling). The single-budget model is final for 5b-2b; splitting
 /// into distinct `quote_timeout` / `relay_timeout` is deferred to 5b-2c (see §8). The bound is HARD
-/// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); no cooperative impl remains ((4a)
-/// deleted `SnpQuoteProducer`), so a best-effort instantiation of this transport is unrepresentable
-/// in-tree.
+/// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); (4a) deleted the only cooperative
+/// impl (`SnpQuoteProducer`) — SCOPE HONESTLY: that deletes the TYPE, not the CLASS (the trait stays
+/// open and `new` reachable, so an in-crate unbounded shim would still compile); the production door
+/// that names the concrete producer is `ValidatedBootBudget::production_transport`
+/// (quote_subprocess), guarded by the §8 never-generic-Q rule + the (4b) acceptance review.
 pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel> {
     quote: Q,
     channel: C,
