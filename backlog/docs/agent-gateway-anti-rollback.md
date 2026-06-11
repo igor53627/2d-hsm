@@ -756,7 +756,9 @@ request golden vector is a 5b-2b test-vector item.
       implementation + prompt-refusal/round-trip/read-timeout/blocking-readback VERIFIED on aya; the
       in-flight-connect black-hole lapse test is now IMPLEMENTED as `quote_smoke` phase `vsock-lapse`
       ((4c): in-guest guest→nonexistent-CID probe through the quadruple-gated `connect_bounded_for_smoke`
-      shim, 400ms deadline, lapse-arm const asserted exactly) — verdict pending the SNP run (see PR); the
+      shim, 400ms deadline, lapse-arm const asserted exactly) — **PASSED on aya 2026-06-11 (2 SNP runs,
+      RESULT PASS phases=7; the lapse fired at ~399ms — our deadline, not the ~2s kernel timer — after a
+      floor-slop fix absorbing poll(2)'s whole-ms truncation)**; the
       checked-residual box below tracks it.** **HARD PRECONDITION for a live 5b-2c serve
       (mirroring (d)) — SATISFIED:** (a') is landed, so 5b-2c no longer needs the risk-acceptance fallback for
       the connect leg. *(Historical: the PR #54 watchdog soft-bound was bounded by the deadline via
@@ -909,8 +911,8 @@ request golden vector is a 5b-2b test-vector item.
   (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
   no longer gates the live serve. **The TWO hard preconditions for a live 5b-2c serve (state:
   gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3, the (4b) wiring landed
-  ((d-ii)/4b), the (4c) smoke is IMPLEMENTED (this PR) with its aya verdict pending the SNP run
-  (see PR) — once that PASS lands, gate #1 is fully closed and live serve waits ONLY on 5b-2c
+  ((d-ii)/4b), the (4c) smoke PASSED on aya (2 SNP runs 2026-06-11, RESULT PASS phases=7) — so
+  **gate #1 (d) is now FULLY CLOSED** and live serve waits ONLY on 5b-2c
   (the `pub` wrapper `run_agent_gateway_boot`, witness-construction-from-operator-config / bin-side
   env-flag parsing, the agent bin, the byte-exact-stdout test RE-TARGETED to the agent bin, the
   serve loop, the 5b-2c boot-budget validation) + the (b) host-relay daemon for a real anchor):**
@@ -924,8 +926,8 @@ request golden vector is a 5b-2b test-vector item.
      `<Q: BootQuoteProducer>` wrapper re-opens the class this deletion closed (the trait stays open;
      a 5-line in-crate shim over pub `fetch_report` would compile). Enforce BOTH at 5b-2c review.
      The (4b) wiring LANDED ((d-ii)/4b, never-generic-Q held: the wired entry is concrete, the
-     generic core module-private); the (4c) smoke is IMPLEMENTED (this PR) — what remains gating
-     live serve on this gate is its aya PASS (pending the SNP run, see PR).
+     generic core module-private); the (4c) smoke PASSED on aya (2 SNP runs 2026-06-11, RESULT PASS
+     phases=7) — **this gate (d) is FULLY CLOSED**; live serve waits only on 5b-2c.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
      (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
@@ -936,8 +938,8 @@ request golden vector is a 5b-2b test-vector item.
      (validation-before-claim by signature); the REMAINING gate-#2 obligation is 5b-2c constructing it
      from operator config (bin-side env/flag parsing — the TWO-PHASE logging half is
      LIBRARY-DISCHARGED at (4b), see precondition (3) above; the bin only forwards the lines).
-     Both gates stay required; live serve opens only at the (4c) smoke PASS (pending the SNP run,
-     see PR) + 5b-2c.
+     Both gates stay required; the (4c) smoke PASSED (aya, 2026-06-11) so live serve now opens only
+     at 5b-2c + the (b) host-relay daemon.
 
   *Satisfied precondition (no longer gating, listed for audit):* **(a') connect bound — DONE (PR #56).**
   [`connect_bounded`] is a non-blocking connect + `poll_with_deadline(POLLOUT)` cancellable hard bound:
@@ -1188,16 +1190,17 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   ZERO-CI by pin — the (4c) in-guest run is the coverage. The TWO-artifact live-serve gate stands:
   wiring here does NOT open live serve until (4c) PASSes, (4c) the in-guest aya smoke (SNP spike
   2026-06-10: `.#disk-production-lab` boot+configfs PASS in ~80s warm — the guest path is alive; test
-  delivery = lab profile + test-binary oneshot printing to ttyS0) — **IMPLEMENTED (this PR; aya
-  verdict PENDING THE SNP RUN, see PR — every discharge in this entry flips only on that PASS):**
+  delivery = lab profile + test-binary oneshot printing to ttyS0) — **PASSED on aya 2026-06-11
+  (2 SNP runs, RESULT PASS phases=7, all three witnesses; ~80s warm):**
   the lab-only `twod-hsm-quote-smoke` `[[bin]]` (feature `lab-quote-smoke`, release-banned;
   dispatch-first main = the 5b-2c main SHAPE) + `quote_smoke::run_quote_smoke()` driving seven
   ordered phases (vsock-lapse → gc-seed → budget-claim → quote-1 → gc-clean → quote-2 → breadcrumb;
   order LOAD-BEARING — the claim is permanent) inside `.#disk-production-lab-quote-smoke` (oneshot
   under the production sandbox knobs, journal+console, ExecStartPost journald-arrival assert), host
   gate `run-nix-snp-quote-smoke.sh` (three independent witnesses: `RESULT PASS` + the raw ttyS0
-  breadcrumb + the unit's journald-arrival marker). Discharges NAMED, each naming exactly what RUNS
-  (all pending the SNP run, see PR): **pin (2)** — the production spawn shape (`PipeSource::Stdout`
+  breadcrumb + the unit's journald-arrival marker). **PASSED on aya 2026-06-11 (2 SNP runs, RESULT
+  PASS phases=7, all three witnesses; ~80s warm boot).** Discharges NAMED, each naming exactly what RUNS:
+  **pin (2)** — the production spawn shape (`PipeSource::Stdout`
   + `clear_env` + stderr→journald) runs live via `ExecChildSpawn::production()` through
   `HardBoundedQuoteProducer::fetch` at `twod-hsm-q-<pid>`, breadcrumb observed IN journald AND on
   ttyS0; **dispatch-first realism** — a real `/proc/self/exe` re-exec, both polarities (healthy
@@ -1392,8 +1395,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   5b-2c exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
   **`max_attempts · (quote_timeout + channel_timeout + ε) ≤ overall_boot_budget`** — 5b-2c MUST restate
   and enforce whichever form it ships.
-  - [ ] **Deferred verification artifact (CHECKED residual — do not lose behind "DONE PR #56") —
-    IMPLEMENTED in (4c), verdict pending the SNP run (see PR); flip this box on the aya PASS:** the
+  - [x] **Deferred verification artifact (CHECKED residual — do not lose behind "DONE PR #56") —
+    DISCHARGED in (4c), PASSED on aya 2026-06-11 (2 SNP runs; lapse fired at ~399ms, our deadline,
+    after a floor-slop fix for poll(2)'s whole-ms truncation):** the
     real-vsock in-flight-connect black-hole *deadline lapse* test (previously unit-level-only via
     `poll_times_out_when_not_ready`) is `quote_smoke` phase `vsock-lapse`: IN-GUEST
     guest→nonexistent CID (999_999_983) through the quadruple-gated `connect_bounded_for_smoke`
