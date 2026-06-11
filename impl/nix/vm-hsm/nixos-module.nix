@@ -236,6 +236,10 @@ in
       ExecStartPost = "${journaldAssert}";
       SyslogIdentifier = "twod-hsm-quote-smoke";
       StandardOutput = "journal+console"; # markers + breadcrumbs -> journald AND ttyS0
+      # 5b-2c TEMPLATE CAVEAT: this is harmless HERE (the smoke parent writes nothing to its own
+      # stdout — all child PROTOCOL frames are PIPED to the parent, never inherited). The 5b-2c serve
+      # bin MUST re-evaluate StandardOutput: if its own process stdout ever becomes a protocol
+      # transport, journal+console would tee binary frames to journald+ttyS0 — set it to `null`/`journal`.
       StandardError = "journal+console";
       # PRODUCTION SANDBOX KNOBS (mirror the enclave unit's block above). What this newly validates
       # is NOT configfs-under-hardening per se (the passing disk-production-lab smoke already

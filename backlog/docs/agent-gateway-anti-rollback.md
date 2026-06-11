@@ -912,7 +912,8 @@ request golden vector is a 5b-2b test-vector item.
   no longer gates the live serve. **The TWO hard preconditions for a live 5b-2c serve (state:
   gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3, the (4b) wiring landed
   ((d-ii)/4b), the (4c) smoke PASSED on aya (2 SNP runs 2026-06-11, RESULT PASS phases=7) — so
-  **gate #1 (d) is now FULLY CLOSED** and live serve waits ONLY on 5b-2c
+  **gate #1 (d) is now FULLY CLOSED** (the spawn shape ran live; the smoke is a DEBUG build — the
+  release-built agent bin's spawn shape is an explicit 5b-2c residual, recorded below) and live serve waits ONLY on 5b-2c
   (the `pub` wrapper `run_agent_gateway_boot`, witness-construction-from-operator-config / bin-side
   env-flag parsing, the agent bin, the byte-exact-stdout test RE-TARGETED to the agent bin, the
   serve loop, the 5b-2c boot-budget validation) + the (b) host-relay daemon for a real anchor):**
@@ -1403,7 +1404,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
     guest→nonexistent CID (999_999_983) through the quadruple-gated `connect_bounded_for_smoke`
     shim, 400ms deadline, the lapse-arm const `VSOCK_CONNECT_LAPSE_MSG` asserted EXACTLY (the veto
     string = the staging assumption broke = a loud FAIL printing the observed string), elapsed ∈
-    [400, 1500) ms. RECORDED FACTS so nobody re-derives them: HOST-side staging is IMPOSSIBLE —
+    `[400ms − 25ms floor-slop, 1500)` (the slop absorbs poll(2)'s whole-ms truncation — the real lapse
+    fired at ~399ms on aya). RECORDED FACTS so nobody re-derives them: HOST-side staging is IMPOSSIBLE —
     host→nonexistent CID fails synchronously `ENODEV` in `vhost_transport_send_pkt` (no
     `EINPROGRESS`, no black hole); a listening-never-accepting peer completes the handshake at
     `listen()` time; unbound ports RST promptly (= the already-aya-verified veto arm). Mechanism:

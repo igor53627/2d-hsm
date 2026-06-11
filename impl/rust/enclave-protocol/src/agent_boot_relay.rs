@@ -1594,7 +1594,7 @@ mod vsock_aya_tests {
     /// (af_vsock): the non-blocking connect returns `EINPROGRESS` (the synchronous-`Ok`/`Err` arms are
     /// structurally unreachable for a refusal — `vsock_connect` holds the sock lock and the REQUEST tx is
     /// workqueued), the transport's RST then lands as `sk_err = ECONNRESET`, and the poll wakes *immediately*
-    /// with `POLLERR|POLLOUT` → the `connect_poll_succeeded` veto arm ("vsock connect failed (poll)").
+    /// with `POLLERR|POLLOUT` → the `connect_poll_succeeded` veto arm ([`VSOCK_CONNECT_VETO_MSG`]).
     /// The elapsed bound is BELOW the deadline, so this assert genuinely discriminates prompt refusal
     /// from a deadline-lapse (a lapse would run the full deadline out and fail the bound). It does NOT exercise
     /// the deadline-LAPSE path (a black-holed in-flight connect): that is covered structurally by

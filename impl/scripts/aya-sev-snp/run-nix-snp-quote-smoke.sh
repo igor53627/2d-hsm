@@ -10,11 +10,13 @@
 #   twod-hsm-quote-smoke: PHASE <name> PASS|FAIL <detail>
 #   twod-hsm-quote-smoke: RESULT PASS phases=7 | RESULT FAIL phase=<first-failed>
 #
-# HOST-SIDE PASS = ALL THREE independent witnesses in the captured serial log:
-#   1. the bin's own verdict        — 'twod-hsm-quote-smoke: RESULT PASS'
+# HOST-SIDE PASS = ALL THREE witnesses in the captured serial log (TWO independent facts: the bin
+# verdict, and the breadcrumb — the latter double-attested across two TRANSPORTS, console + journald,
+# which is the point: it proves the inherited-stderr fan-out reaches both sinks):
+#   1. the bin's own verdict        — 'twod-hsm-quote-smoke: RESULT PASS phases=7' (count anchored)
 #   2. the raw child breadcrumb     — the staged ERR(1) child's stderr line on ttyS0 (console tee)
 #   3. the in-guest journald assert — 'twod-hsm-quote-smoke: journald-breadcrumb PASS'
-#      (the unit's ExecStartPost retry-grep proving the breadcrumb ARRIVED in journald)
+#      (the unit's ExecStartPost retry-grep proving the SAME breadcrumb ARRIVED in journald)
 #
 # SELF-MATCH GUARD: this script never echoes the breadcrumb literal — grep #2's pattern must only
 # ever match the child's own stderr write in the log.
@@ -60,7 +62,7 @@ GUEST_CID="$GUEST_CID" twod_hsm_stop_stale_qemu
 QPID=""
 cleanup() {
   [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null && { kill "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }
-  rm -f "$WORK"
+  rm -f "$WORK" "$LOG"
 }
 trap cleanup EXIT
 
@@ -100,15 +102,23 @@ if [[ -z "$VERDICT" ]]; then
 fi
 echo "      verdict: $VERDICT"
 
-# Give the unit's ExecStartPost journald assert a beat to print, then stop the guest.
-sleep 3
+# Poll for witness #3 (the unit's ExecStartPost journald assert, which runs AFTER ExecStart exits and
+# retries journalctl up to ~10s) with a BOUNDED wait instead of a blind grace — a slow cold/loaded
+# 2-vCPU boot could otherwise still be in the retry loop when a fixed sleep elapses (review hardening).
+for _ in $(seq 1 30); do
+  grep -aq 'twod-hsm-quote-smoke: journald-breadcrumb \(PASS\|FAIL\)' "$LOG" 2>/dev/null && break
+  sleep 0.5
+done
 kill "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
 QPID=""
 
 PASS=1
-if ! grep -aq 'twod-hsm-quote-smoke: RESULT PASS' "$LOG"; then
-  echo "[FAIL] witness 1/3: the bin did not report RESULT PASS" >&2
+# Anchor on the FULL verdict incl. the phases=7 count — a future phase add/remove or a miscount that
+# still lands on the no-fail branch would emit e.g. 'RESULT PASS phases=6' and a bare 'RESULT PASS'
+# grep would still pass, silently breaking the documented 7-phase contract (review finding).
+if ! grep -aq 'twod-hsm-quote-smoke: RESULT PASS phases=7' "$LOG"; then
+  echo "[FAIL] witness 1/3: the bin did not report RESULT PASS phases=7" >&2
   PASS=0
 fi
 if ! grep -aq 'twod-hsm quote child: exit 1' "$LOG"; then

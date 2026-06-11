@@ -167,13 +167,20 @@ fn phase_vsock_lapse() -> Result<String, String> {
 /// Phase 2 — `gc-seed` (goal iii staging): mkdir the synthetic orphan-shaped entry. configfs mkdir
 /// creates an inert entry (no inblob written → no report generation; rmdir-able), which the NEXT
 /// quote child's leading prefix GC must sweep (asserted by `gc-clean`). Parent-side configfs I/O =
-/// the recorded smoke-only allowance (module doc).
+/// the recorded smoke-only allowance (module doc). The post-mkdir PRESENCE re-read makes the
+/// seed→sweep coupling EXPLICIT: it forbids `gc-clean`'s residue==0 from degenerating to a trivial
+/// pass on a boot where the orphan was never actually staged (review hardening — gc-clean alone is
+/// residue-only and cannot tell "swept a real orphan" from "nothing was there").
 fn phase_gc_seed() -> Result<String, String> {
     let path = synthetic_stale_entry_path();
     match std::fs::create_dir(&path) {
-        Ok(()) => Ok(format!("seeded={path}")),
-        Err(e) => Err(format!("mkdir {path} failed: {e}")),
+        Ok(()) => {}
+        Err(e) => return Err(format!("mkdir {path} failed: {e}")),
     }
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(format!("seed {path} not present after mkdir (configfs lifecycle anomaly)"));
+    }
+    Ok(format!("seeded={path}"))
 }
 
 /// Phase 3 — `budget-claim`: validate the boot budget (nominal 2·(2·10s+ε) ≈ 40.02s ≤ 45s; 10s ≥
@@ -244,6 +251,10 @@ fn fetch_and_check(
 /// GC"): after `quote-1`, NO `twod-hsm-q-*` entry may remain — the seeded stale entry was swept by
 /// the child's leading `gc_quote_entries_default()` and the child removed its own self-named entry
 /// (cleanup-precedes-emit). Never asserts on the bare `twod-hsm` entry (see [`prefixed_residue`]).
+/// This residue==0 is a FOREIGN-orphan-sweep witness ONLY because `gc-seed` (phase 2) PASSED and the
+/// LOAD-BEARING phase order ran it before `quote-1` — the gc-seed presence re-read is what keeps this
+/// assert from being a trivial residue-only pass (review hardening; the GC function itself is also
+/// deviceless-pinned by `snp_report::gc_removes_prefix_only_spares_fixed_name`).
 fn phase_gc_clean() -> Result<String, String> {
     let residue = prefixed_residue()?;
     if residue.is_empty() {
