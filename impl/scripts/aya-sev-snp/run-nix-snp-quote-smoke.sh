@@ -119,8 +119,10 @@ QPID=""
 PASS=1
 # Anchor on the FULL verdict incl. the phases=7 count — a future phase add/remove or a miscount that
 # still lands on the no-fail branch would emit e.g. 'RESULT PASS phases=6' and a bare 'RESULT PASS'
-# grep would still pass, silently breaking the documented 7-phase contract (review finding).
-if ! grep -aq 'twod-hsm-quote-smoke: RESULT PASS phases=7' "$LOG"; then
+# grep would still pass, silently breaking the documented 7-phase contract (review finding). The
+# `phases=7([^0-9]|$)` boundary rejects `phases=70` (substring trap) while staying CR-safe on the
+# serial console (any trailing \r or space satisfies the non-digit class).
+if ! grep -aqE 'twod-hsm-quote-smoke: RESULT PASS phases=7([^0-9]|$)' "$LOG"; then
   echo "[FAIL] witness 1/3: the bin did not report RESULT PASS phases=7" >&2
   PASS=0
 fi

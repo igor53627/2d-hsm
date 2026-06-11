@@ -100,7 +100,10 @@ in
       # configfs writes, vsock black-hole probing). Make "lab-only" MECHANICAL, not just prose: a
       # mainnet (productionMode) image must NEVER embed it — fail at eval, not silently ship the
       # debug smoke into a mainnet build. Only the lab outputs (disk-production-lab-quote-smoke,
-      # productionMode=false) may pass quoteSmokePackage.
+      # productionMode=false) may pass quoteSmokePackage. EVAL-ENFORCED: fires on every module
+      # evaluation, so the `disk-production-lab-quote-smoke` eval (CI eval-regression + run-book)
+      # exercises the PASS side; the FAIL side has no output to point at precisely BECAUSE this guard
+      # makes a mainnet-with-quoteSmokePackage image un-constructible (it throws here at eval).
       assertion = quoteSmokePackage == null || !productionMode;
       message =
         "twod-hsm: quoteSmokePackage (the (4c) debug quote-smoke) MUST NOT be embedded in a "
