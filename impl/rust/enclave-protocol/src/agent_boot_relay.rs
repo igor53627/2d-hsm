@@ -304,8 +304,10 @@ pub(crate) trait BootQuoteProducer {
 /// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); (4a) deleted the only cooperative
 /// impl (`SnpQuoteProducer`) — SCOPE HONESTLY: that deletes the TYPE, not the CLASS (the trait stays
 /// open and `new` reachable, so an in-crate unbounded shim would still compile); the production door
-/// that names the concrete producer is `ValidatedBootBudget::production_transport`
-/// (quote_subprocess), guarded by the §8 never-generic-Q rule + the (4b) acceptance review.
+/// that names the concrete producer is `ValidatedBootBudget::transport_with_spawn` (the shared mint;
+/// `production_transport` is its production-spawn instantiation), consumed by the (4b) wired entry
+/// `run_boot_handshake_wired` (`agent_gateway_boot`, plain-text reference — triple-gated module),
+/// guarded by the §8 never-generic-Q rule.
 pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel> {
     quote: Q,
     channel: C,
@@ -317,7 +319,8 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> RelayAnchorTransport<Q, C> {
     /// agent-gateway-without-vsock builds where `ValidatedBootBudget` does not exist — the
     /// cfg-lattice fact); the PRODUCTION path's exclusivity through the validated budget is
     /// `ValidatedBootBudget::production_transport` (quote_subprocess, plain-text reference) + the
-    /// (4b) acceptance obligation — same residual class as `ExecChildSpawn`'s pub(crate) fields.
+    /// (4b) discharge — same residual class as `ExecChildSpawn`'s pub(crate) fields, now also
+    /// carried by the shared mint `transport_with_spawn` (any new caller is a review flag).
     pub(crate) fn new(quote: Q, channel: C, timeout: std::time::Duration) -> Self {
         Self { quote, channel, timeout }
     }
@@ -343,12 +346,13 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         // latency does NOT eat into the channel's budget (no false channel timeout). The quote leg's hard
         // bound EXISTS ((d-ii)/2): `HardBoundedQuoteProducer` kills a wedged child at this deadline, so
         // with it the `2×timeout(+ε)` per-attempt bound holds — and the boot-budget validation artifact
-        // EXISTS too ((d-ii)/3, `ValidatedBootBudget`; its `production_transport` is the production
+        // EXISTS too ((d-ii)/3, `ValidatedBootBudget`; its `transport_with_spawn` mint — of which
+        // `production_transport` is the production-spawn instantiation — is the production
         // construction path for THIS type, threading the validated per-leg value into `timeout`, which
         // also keeps the `Instant::now() + self.timeout` mints below panic-free via the
         // MAX_PER_LEG_TIMEOUT sanity arm — an in-crate test caller bypassing the budget owns that
-        // hazard itself). Wiring it here is (4b), gated on the TWO-artifact live-serve gate ((d) incl.
-        // the (4c) smoke + 5b-2c constructing the budget witness from operator config); the cooperative
+        // hazard itself). Wired at (4b) by `run_boot_handshake_wired` (agent_gateway_boot); live serve
+        // still gated on (4c) + 5b-2c (witness from operator config); the cooperative
         // producer is GONE ((4a)) — nothing best-effort remains wireable.
         // The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver bounds
         // the attempt COUNT on top.
