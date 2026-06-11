@@ -26,6 +26,9 @@
   sealRootSource ? "file",
   deriveRootPrintCeremony ? false,
   pqSealedSignerOverride ? null,
+  # TASK-7.7 (d-ii)/4c: opt-in in-guest quote-smoke oneshot (the lab-only twod-hsm-quote-smoke bin;
+  # see nixos-module.nix). Default off — only disk-production-lab-quote-smoke sets it.
+  quoteSmokePackage ? null,
 }:
 
 let
@@ -48,7 +51,7 @@ let
     inherit system;
     specialArgs = profile.specialArgs // {
       snpDeriveRootPackage = snp-derive-root;
-      inherit deriveRootSelftest sealRootSource deriveRootPrintCeremony;
+      inherit deriveRootSelftest sealRootSource deriveRootPrintCeremony quoteSmokePackage;
     };
     modules = [
       ./nixos-module.nix

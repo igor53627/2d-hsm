@@ -58,6 +58,14 @@ compile_error!(
     "lab file provisioning features are for debug/integration builds only, not release"
 );
 
+// (4c) in-guest quote smoke (TASK-7.7 5b-2b-ii (d-ii)/4c): a diagnostic surface for lab/debug guest
+// images only — it deliberately stages a vsock black-hole lapse, configfs entry seeding and a
+// nonzero-exit child, none of which belongs in a production binary.
+#[cfg(all(release_build, feature = "lab-quote-smoke"))]
+compile_error!(
+    "`lab-quote-smoke` is the (4c) in-guest smoke surface — debug/lab builds only, never release"
+);
+
 // AGENT_K1_PROVE_IDENTITY signing is non-collision-unproven against EIP-2718 typed txs until the
 // 2D type-0x19 reservation merges (2D PR #144 / vsock spec §10.8). Hard-ban it from release builds.
 #[cfg(all(release_build, feature = "agent-prove-identity-preview"))]
@@ -111,6 +119,17 @@ pub use quote_subprocess::agent_quote_child_dispatch;
 // (§8 hard rule). Crate-private, NO pub export: live serve stays gated on (4c) + 5b-2c.
 #[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
 mod agent_gateway_boot;
+// (4c) in-guest quote smoke (TASK-7.7 5b-2b-ii (d-ii)/4c). QUADRUPLE-gated: the triple gate of the
+// consumed items (`quote_subprocess`/`agent_boot_relay` vsock leaves) ∩ the bare `lab-quote-smoke`
+// marker — narrower than every consumed item, never wider (§8 hard rule). NOT the 5b-2c serve
+// wrapper: no handshake, no `decide_serve`, no listener; `agent_gateway_boot` stays crate-private
+// and unexported (the pin above is untouched) — live serve remains gated on 5b-2c.
+#[cfg(all(target_os = "linux", feature = "vsock-transport",
+          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+mod quote_smoke;
+#[cfg(all(target_os = "linux", feature = "vsock-transport",
+          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+pub use quote_smoke::run_quote_smoke;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",

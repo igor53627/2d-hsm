@@ -527,6 +527,85 @@ pub(crate) const QUOTE_CHILD_ENV: &str = "TWOD_HSM_QUOTE_CHILD";
 /// that appears verbatim in the report).
 pub(crate) const QUOTE_CHILD_REPORT_DATA_ENV: &str = "TWOD_HSM_QUOTE_CHILD_REPORT_DATA";
 
+/// (4c) breadcrumb-arm staging for `quote_smoke` phase `breadcrumb`: re-exec `/proc/self/exe` with
+/// the marker env set and [`QUOTE_CHILD_REPORT_DATA_ENV`] DELIBERATELY ABSENT, so the child's env
+/// parse fails → byte-exact `encode_err_frame(1)` on the piped stdout + exit 1 + the
+/// `twod-hsm quote child: exit 1` breadcrumb on the INHERITED stderr (the journald leg under test —
+/// the unit's `ExecStartPost` journald grep is the arrival assert). Returns
+/// `(exit_code, full stdout buffer)`; every failure folds to a `String` (the smoke is total).
+///
+/// The env consts stay crate-private — this helper lives beside them, single-sourced, zero
+/// transcription. Stdout is read to EOF FIRST, then a BOUNDED reap: `try_wait` polled ~50ms with a
+/// 5s ceiling, SIGKILL + one final `wait` on overrun — never an unbounded `wait()` (the (d) rule;
+/// the post-kill `wait` is safe: stdout already hit EOF, the child is exiting, not D-state-wedged).
+///
+/// TEST RULE (the `agent_gateway_boot` analogue, verbatim): **never call this from cargo-test
+/// code** — in a test process `/proc/self/exe` is the libtest binary with no dispatch (a recursive
+/// full-suite child). Only the (4c) bin (whose `main`'s first statement IS the dispatch) may call it.
+///
+/// This is probe staging, NOT a production parent shape: the production spawner
+/// ([`ExecChildSpawn`]) always sets report_data (reserved keys win — see its `spawn`), so the
+/// absent-env arm is reachable only through deliberate staging like this.
+#[cfg(all(target_os = "linux", feature = "vsock-transport",
+          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+pub(crate) fn smoke_breadcrumb_arm() -> Result<(i32, Vec<u8>), String> {
+    use std::io::Read as _;
+
+    let mut child = std::process::Command::new("/proc/self/exe")
+        .env_clear()
+        .env(QUOTE_CHILD_ENV, "1")
+        // QUOTE_CHILD_REPORT_DATA_ENV deliberately ABSENT — the ERR(1) arm under test.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit()) // breadcrumb → the unit's journald stream
+        .spawn()
+        .map_err(|e| format!("spawn /proc/self/exe failed: {e}"))?;
+
+    // Read the protocol pipe to EOF FIRST (the child writes one 2-byte frame and exits; waiting for
+    // the exit before draining would deadlock only for oversized frames, but order-discipline is free).
+    let mut out = Vec::new();
+    match child.stdout.take() {
+        Some(mut pipe) => {
+            if let Err(e) = pipe.read_to_end(&mut out) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("read child stdout failed: {e}"));
+            }
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("child stdout pipe missing after spawn".to_string());
+        }
+    }
+
+    // Bounded reap: try_wait poll ~50ms, 5s ceiling; SIGKILL + final wait on overrun (never unbounded).
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return match status.code() {
+                    Some(code) => Ok((code, out)),
+                    None => Err(format!("child terminated by signal: {status}")),
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= reap_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("child failed to exit within the 5s reap ceiling (killed)".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("try_wait on the breadcrumb child failed: {e}"));
+            }
+        }
+    }
+}
+
 /// Which std stream the child writes its protocol frame to. Production ((d-ii)) uses `Stdout`; the CI
 /// smokes use `Stderr` because the spawned TEST binary's stdout carries the unstable libtest banner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,7 +1211,7 @@ impl ValidatedBootBudget {
 // ---------------------------------------------------------------------------------------------------
 // (d-ii) CHILD MODE — the code that runs INSIDE the killable child. Everything here is testable
 // deviceless over the TsmFs seam; only `agent_quote_child_main`'s RealTsmFs/GC binding needs the SNP
-// guest (exercised by the disk-quote-test smoke, sub-slice 4).
+// guest (exercised by the `disk-production-lab-quote-smoke` (4c) smoke).
 // ---------------------------------------------------------------------------------------------------
 
 /// Which configfs step the fetch last attempted — drives the ERR-frame code without string-matching
@@ -1338,8 +1417,9 @@ pub(crate) fn agent_quote_child_main() -> ! {
     /// named §8 obligation. Code 10 is skipped: `emit` already wrote its more specific write-failure
     /// line. Lives HERE and not in `emit`/`quote_child_main_with` BY DESIGN: in the real-subprocess CI
     /// smokes stderr IS the protocol pipe and the parser rejects trailing bytes — a breadcrumb in the
-    /// shared core would corrupt the smoke protocol stream. This entrypoint has zero CI coverage (§8
-    /// pin: production shape is aya-smoke-only); the (4c) aya smoke verifies it.
+    /// shared core would corrupt the smoke protocol stream. This entrypoint stays ZERO-CI by pin (§8:
+    /// production shape is aya-smoke-only); the (4c) `quote_smoke` exercises it in-guest (pending the
+    /// SNP run, see PR).
     fn exit_child(code: i32) -> ! {
         if code != 0 && code != CHILD_EXIT_WRITE_FAILED {
             use std::io::Write as _;

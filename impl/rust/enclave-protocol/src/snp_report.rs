@@ -21,7 +21,9 @@ pub const SNP_MEASUREMENT_LEN: usize = 48;
 pub(crate) const MIN_REPORT_LEN: usize = MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN;
 
 /// configfs-tsm report directory (Linux >= 6.7 with the SNP guest TSM provider loaded).
-const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
+/// pub(crate) for the (4c) `quote_smoke` module, which builds its synthetic stale-entry path and its
+/// `read_dir` cleanliness assert from this const + [`TSM_QUOTE_ENTRY_PREFIX`] (zero path literals).
+pub(crate) const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
 /// Fixed configfs entry name for this enclave's one boot-time report. Since (4a) (cooperative boot
 /// fetch deleted) this fixed entry is EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's —
 /// only `RealTsmFs` via [`fetch_report`] touches it; the quote child self-names `twod-hsm-q-<pid>`

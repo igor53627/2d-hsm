@@ -106,5 +106,8 @@ in
     deriveRootSelftest = false;
     sealRootSource = "file";
     deriveRootPrintCeremony = false;
+    # TASK-7.7 (d-ii)/4c: in-guest quote-smoke oneshot package (disk-image.nix overrides it for the
+    # disk-production-lab-quote-smoke output).
+    quoteSmokePackage = null;
   };
 }

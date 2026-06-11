@@ -27,6 +27,9 @@
   # can seal the signer against it offline). Leaks the root to the serial log — never enable on a
   # shipped image. Default off.
   deriveRootPrintCeremony ? false,
+  # TASK-7.7 (d-ii)/4c: opt-in in-guest quote-smoke oneshot (the lab-only `twod-hsm-quote-smoke`
+  # bin). Default off — only the disk-production-lab-quote-smoke image sets it.
+  quoteSmokePackage ? null,
   ...
 }:
 
@@ -53,6 +56,22 @@ let
       producerAttestationTrustFile
     else
       throw "production guest requires producerAttestationTrustFile (lab: lab-prod-fixtures)";
+  # TASK-7.7 (d-ii)/4c: in-guest journald-ARRIVAL assert for the child breadcrumb (pin (2)
+  # stderr->journald leg). SELF-MATCH GUARD: never echo the breadcrumb literal; no `set -x`.
+  # Attribution note: the child writes on the parent's inherited stream socket, so journald
+  # attributes the line to THIS unit's stream — the grep matches message text only, never the
+  # ident[pid] prefix.
+  journaldAssert = pkgs.writeShellScript "twod-hsm-quote-smoke-journald-assert" ''
+    ${pkgs.systemd}/bin/journalctl --sync 2>/dev/null || true
+    for i in $(seq 1 20); do
+      if ${pkgs.systemd}/bin/journalctl -u twod-hsm-quote-smoke -b --no-pager 2>/dev/null \
+           | grep -qF 'twod-hsm quote child: exit 1'; then
+        echo "twod-hsm-quote-smoke: journald-breadcrumb PASS"; exit 0
+      fi
+      sleep 0.5
+    done
+    echo "twod-hsm-quote-smoke: journald-breadcrumb FAIL"; exit 1
+  '';
 in
 {
   # Mainnet gate (TASK-5 AC#10): a productionMode guest must NOT ship lab attestation
@@ -150,8 +169,9 @@ in
       # AC#4: the enclave fetches the SNP launch measurement via configfs-tsm at boot, which
       # creates and writes /sys/kernel/config/tsm/report/*. Whitelist that subtree read-write so
       # the hardening sandbox (ProtectSystem=strict / ProtectKernelTunables) does not block the
-      # capture and silently force the placeholder fallback. NOTE: needs live validation once the
-      # NixOS guest boots under SNP (TASK-5 AC#5).
+      # capture and silently force the placeholder fallback. Live-validated by the passing
+      # disk-production-lab SNP smoke (TASK-5 AC#5); the twod-hsm-quote-smoke unit below extends
+      # the validation to the /proc/self/exe re-exec spawn shape under the same knobs (TASK-7.7 4c).
       ReadWritePaths = [ "/sys/kernel/config/tsm" ];
     };
     preStart = ''
@@ -199,6 +219,43 @@ in
         StandardError = "journal+console";
       };
     };
+
+  # TASK-7.7 (d-ii)/4c: in-guest quote smoke (production spawn shape + dispatch re-exec + configfs
+  # GC + vsock-lapse + journald breadcrumb). Lab images only (quoteSmokePackage is a debug build of
+  # the release-banned lab-quote-smoke feature). NB systemd runs ExecStartPost only after ExecStart
+  # succeeds — on a bin FAIL the journald-breadcrumb marker is absent, which the host PASS-set
+  # (run-nix-snp-quote-smoke.sh, three greps) catches anyway.
+  systemd.services."twod-hsm-quote-smoke" = lib.mkIf (isProd && quoteSmokePackage != null) {
+    description = "2d-hsm (4c) in-guest quote smoke (TASK-7.7 5b-2b-ii d-ii/4c)";
+    wantedBy = [ "multi-user.target" ]; # standalone diagnostic — deliberately does NOT gate the enclave
+    after = [ "systemd-modules-load.service" "systemd-udev-settle.service" "sys-kernel-config.mount" ];
+    unitConfig.RequiresMountsFor = "/sys/kernel/config";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${quoteSmokePackage}/bin/twod-hsm-quote-smoke"; # bin directly — 5b-2c unit template
+      ExecStartPost = "${journaldAssert}";
+      SyslogIdentifier = "twod-hsm-quote-smoke";
+      StandardOutput = "journal+console"; # markers + breadcrumbs -> journald AND ttyS0
+      StandardError = "journal+console";
+      # PRODUCTION SANDBOX KNOBS (mirror the enclave unit's block above). What this newly validates
+      # is NOT configfs-under-hardening per se (the passing disk-production-lab smoke already
+      # validates that for the enclave unit) but the PRODUCTION SPAWN SHAPE under the knobs:
+      # /proc/self/exe re-exec + child configfs create/write/GC + inherited-stderr->journald with
+      # NoNewPrivileges/ProtectSystem=strict/etc. — the 5b-2c unit SEED.
+      # ESCAPE HATCH (recorded): if a knob blocks a SMOKE-ONLY step (journalctl), relax THAT knob
+      # with an in-file comment; the spawn/configfs legs must stay under the production set.
+      NoNewPrivileges = true;
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      PrivateTmp = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      RestrictSUIDSGID = true;
+      LockPersonality = true;
+      ReadWritePaths = [ "/sys/kernel/config/tsm" ];
+    };
+  };
 
   # TASK-1.1 (sealed-boot loop): derive the pq-seal root from the SNP firmware into a tmpfs file the
   # enclave reads (sealRootSource="snp"). Unlike the selftest, this IS load-bearing — the enclave

@@ -6,15 +6,27 @@ let
   staging = profile == "staging";
   labProd = profile == "production-lab";
   transportSmoke = profile == "production-transport";
-  pname = if staging then "enclave-vsock-staging" else "enclave-vsock";
+  # TASK-7.7 (d-ii)/4c in-guest quote smoke. A SEPARATE derivation is MANDATORY — role isolation:
+  # the producer profiles (production*/staging) pull ml-dsa-65, and a shared feature graph with
+  # agent-gateway trips the `ml-dsa-65 ⊕ agent-gateway` compile_error (lib.rs, vsock §10.2). A
+  # future "consolidate builds" cleanup MUST NOT merge this arm into the producer derivations.
+  quoteSmoke = profile == "quote-smoke";
+  pname =
+    if staging then "enclave-vsock-staging"
+    else if quoteSmoke then "twod-hsm-quote-smoke"
+    else "enclave-vsock";
   buildFeatures =
     if staging then
       [ "staging-vsock" ]
     else if labProd then
       [ "lab-production-vsock" ]
+    else if quoteSmoke then
+      [ "agent-gateway" "vsock-transport" "lab-quote-smoke" ]
     else
       [ "production-vsock" ];
-  debugBuild = staging || labProd || transportSmoke;
+  # quoteSmoke MUST stay a debug build: lab-quote-smoke is release-banned (lib.rs compile_error),
+  # and debug ⇒ TWOD_HSM_STRICT_RELEASE_GUARDS unset ⇒ the ban does not trip (by design).
+  debugBuild = staging || labProd || transportSmoke || quoteSmoke;
 in
 
 rustPlatform.buildRustPackage {
