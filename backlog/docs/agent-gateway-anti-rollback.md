@@ -849,13 +849,25 @@ request golden vector is a 5b-2b test-vector item.
   numbers; (b) on success the getter line incl. `nominal_boot_cost` AND the slack
   (`overall_boot_budget − nominal_boot_cost`) — a zero-slack config validates (`≤` passes) but is
   mis-sized by definition and `level()` says Warn, library logic, test-pinned); the REMAINING 5b-2c
-  obligation is forwarding the Display lines to stderr→journald (mapping `level()` to priority) +
-  ONE smoke assertion that the lines appear; (4) DRIVER-COUNT BINDING — a named,
+  obligations are: forwarding the Display lines to stderr→journald (mapping `level()` to priority) +
+  ONE smoke assertion that the lines appear, AND rendering the returned `ProtocolError` to stderr at
+  err priority — the FATAL paths (validate Err, claim refusal, decide_serve refusal) emit NO event,
+  so the event seam alone under-reports the most severe class (a bin that swallows the Err and only
+  exits non-zero recreates the numberless-refusal anti-pattern). Promotion notes: `AgentBootEvent`
+  AND `BootLogLevel` both get `#[non_exhaustive]` AT PROMOTION TIME (the enums promote together;
+  decide then whether `ready: false` deserves an `Error` level distinct from Warn). Known
+  event-invisible corner (by design today): the Ready-but-gate-refused defense-in-depth arm of
+  `decide_serve` — reachable only via a driver bug — leaves the event stream ending at Info
+  "Ready(...)" while the process refuses; 5b-2c MAY add a serve-decision event as hardening (the
+  refusal Err string is distinct, so the bin's err-priority render above covers triage); (4)
+  DRIVER-COUNT BINDING — a named,
   TEST-BACKED acceptance item: the count passed to `run_boot_anti_rollback_handshake` MUST be
   `budget.max_attempts()` from THE SAME witness instance fed to the transport mint (the witness
-  alone does not bind the count). DISCHARGED at (4b) — by construction (no count input exists on
-  the wired surface; `run_boot_handshake_wired` derives it in-body from the same witness that
-  minted the transport) + the named test `wired_driver_count_is_the_same_witness_max_attempts`;
+  alone does not bind the count). DISCHARGED at (4b) — by construction (no SEPARATE driver-count
+  input exists on the wired surface: the ONE `max_attempts` input is the value `validate()` blesses
+  and the driver receives — `run_boot_handshake_wired` derives it in-body from the same witness that
+  minted the transport, so a second, divergent count is unrepresentable) + the named test
+  `wired_driver_count_is_the_same_witness_max_attempts`;
   residual 5b-2c review check: the bin calls `run_boot_handshake_wired` (the core is
   module-private — structurally unreachable from the bin).
   **(4b) re-scope additions to this bullet:** (a) the 5b-2c `pub` wrapper (`run_agent_gateway_boot`)
@@ -1029,8 +1041,10 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   implementers either reintroduce the forbidden in-fetch write or skip parent-side logging entirely.
   Emission SURFACE decided at (4b): the carrier rides the `AgentBootEvent` sink (a future variant +
   a between-attempts drain call site — additive; `run_boot_handshake_wired` is pub(crate), so
-  signature growth is a contained in-crate diff; the sink's rustdoc structurally confines emission
-  points away from the in-fetch role); the carrier DESIGN itself remains this explicit 5b-2c task
+  signature growth is a contained in-crate diff; the sink's rustdoc PROSE-PINS emission points away
+  from the in-fetch role — the structural fact TODAY is code-positional (the sink is never threaded
+  into driver/producer/transport) and MUST be re-established by construction when the carrier lands);
+  the carrier DESIGN itself remains this explicit 5b-2c task
   and the hard constraints above stand (no in-fetch emission). ALSO record for that implementation: an `ExitStatus` cannot
   distinguish own-SIGKILL from an EXTERNAL SIGKILL (the Linux OOM-killer delivers exactly SIGKILL),
   so any filter silencing the uniform-disposition kill also silences OOM kills — an accepted blind
@@ -1093,9 +1107,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   cfg-lattice reasons) — DISCHARGED at (4b), by construction + the named test (see the (4b) LANDED
   entry below). The parent-side reap
   obligation is RE-SCOPED to 5b-2c with hard constraints (see above — the in-fetch emission was
-  reverted); the 5b-2c bin obligation (the TWO-PHASE config logging — raw triplet pre-validation,
-  getters + slack post-success) and the witness
-  construction from operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a)
+  reverted); the TWO-PHASE config logging is LIBRARY-DISCHARGED at (4b) (the bin only FORWARDS the
+  `AgentBootEvent` lines — see the (4b) LANDED entry), and the witness
+  construction from operator config remains 5b-2c work. Landing (3) does NOT open live serve. (4a)
   cooperative-path deletion — **LANDED (this PR)**: removed `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework: the cooperative `deadline: Option<Instant>` parameter is

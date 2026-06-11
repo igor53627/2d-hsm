@@ -739,7 +739,10 @@ static PROCESS_QUOTE_LEDGER_CLAIMED: std::sync::atomic::AtomicBool =
 /// are module-PRIVATE, so outside this module the producer is the only quote-fetch door — NB the
 /// door's SHAPE is not sealed: [`ExecChildSpawn`]'s fields stay pub(crate) (the smokes build test
 /// shapes), so an in-crate caller could claim THE producer over a custom spawner; shape discipline
-/// rests on (4b) wiring [`Self::production`] + the §8 concrete-type obligation, while the BOUND
+/// rests on the (4b) wired wrapper's in-body `ExecChildSpawn::production()` literal
+/// (`agent_gateway_boot::run_boot_handshake_wired`) + the §8 concrete-type obligation + the (4c)
+/// smoke — [`ValidatedBootBudget::transport_with_spawn`] is the shared mint and ANY NEW CALLER of it
+/// IS A REVIEW FLAG — while the BOUND
 /// itself stays intact for any spawner (every `S` routes through the same orchestration); (iii) the
 /// `ledger` field is private, no method replaces it, and the type deliberately derives neither `Clone`
 /// nor `Default` (a clone would mint a second ledger and fork the budget — treat any later derive as a
@@ -777,8 +780,9 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
     /// bind THE SAME instance to the values the wiring later uses. That binding is
     /// `transport_with_spawn`/`production_transport` for the timeout (structural — the transport is
     /// minted from the witness) and DISCHARGED at (4b) for the driver count:
-    /// `run_boot_handshake_wired` derives it in-body from the same witness (no count input exists
-    /// on the wired surface); test-pinned by `wired_driver_count_is_the_same_witness_max_attempts`.
+    /// `run_boot_handshake_wired` derives it in-body from the same witness (no SEPARATE driver-count
+    /// input exists — the ONE `max_attempts` input is the value `validate()` blesses and the driver
+    /// receives); test-pinned by `wired_driver_count_is_the_same_witness_max_attempts`.
     /// The producer reads NOTHING from it (reading config here would duplicate the driver's config
     /// flow — a second source of truth).
     pub(crate) fn new(_budget: &ValidatedBootBudget, spawn: S) -> Result<Self, ProtocolError> {
@@ -810,8 +814,11 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
 }
 
 impl HardBoundedQuoteProducer<ExecChildSpawn> {
-    /// THE (4b)/5b-2c constructor: the production spawn shape ([`ExecChildSpawn::production`] — the
-    /// `/proc/self/exe` rationale lives THERE, single source) + the process-ledger claim, one call.
+    /// The STANDALONE claim+shape door (test-pinned; the (4b) wired path does NOT call this — it
+    /// constructs the same shape via [`ValidatedBootBudget::transport_with_spawn`] +
+    /// `ExecChildSpawn::production()` inside `run_boot_handshake_wired`): the production spawn shape
+    /// ([`ExecChildSpawn::production`] — the `/proc/self/exe` rationale lives THERE, single source)
+    /// + the process-ledger claim, one call.
     /// Budget-validation-before-claim is enforced BY SIGNATURE ((d-ii)/3 witness — see [`Self::new`]);
     /// the burned-claim WHY stays: only a supervisor restart heals a post-claim config mistake, which
     /// is why the witness exists. The infallible spawner leaves "constructed twice" as the ONLY error
@@ -837,11 +844,25 @@ impl<S: QuoteChildSpawn> crate::agent_boot_relay::BootQuoteProducer for HardBoun
     }
 }
 
+/// Test-side derivation of the nominal product `n·(t+t+ε)` — deliberately a SECOND derivation (not a
+/// call into the production `per_attempt_nominal_cost`) so the budget tests stay an independent check
+/// of the formula, but SINGLE-SOURCED across every consumer: the boundary tests in this module AND
+/// `agent_gateway_boot`'s wired tests (a formula retune is one test-side edit; a drifted-LARGER copy
+/// would silently weaken the ε-pin's positive arm — `validate` accepts any overall ≥ nominal).
+#[cfg(test)]
+pub(crate) fn nominal_product(n: u32, t: Duration) -> Duration {
+    t.checked_add(t)
+        .and_then(|legs| legs.checked_add(QUOTE_ATTEMPT_OVERHEAD))
+        .and_then(|p| p.checked_mul(n))
+        .expect("test arithmetic fits")
+}
+
 /// Test-only: clear the process-ledger claim. Called ONLY from
 /// `crate::agent_dispatch::lock_and_reset_agent_process_globals` (the crate's single reset site, per
-/// its own "a NEW agent process-global adds its reset HERE" pin) and the in-module SERIALIZED claim
-/// tests (the claim test + the production_transport composition test), each restoring the pristine
-/// flag on exit.
+/// its own "a NEW agent process-global adds its reset HERE" pin) and the SERIALIZED claim-touching
+/// tests — in this module (the claim test + the production_transport composition test) AND
+/// `agent_gateway_boot`'s wired tests — each holding the crate lock and restoring the pristine flag
+/// on exit.
 #[cfg(test)]
 pub(crate) fn reset_process_quote_ledger_claim_for_tests() {
     PROCESS_QUOTE_LEDGER_CLAIMED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -973,12 +994,14 @@ impl ValidatedBootBudget {
     /// CLOSED for any valid config (nominal' = n·(2B+ε) > B > t), so no silent acceptance is
     /// reachable — a config-struct wrapper would be mechanism without a reachable failure.
     ///
-    /// The static error strings deliberately carry no numbers (house pattern); the 5b-2c bin's
-    /// TWO-PHASE logging contract (a CHECKED §8 obligation): (a) log the RAW config triplet BEFORE
-    /// calling this — on `Err` there is no witness and no getters, and a numberless fail-closed
-    /// boot must still leave the operator the numbers; (b) on `Ok`, log the getter line incl.
-    /// `nominal_boot_cost` AND the slack (`overall_boot_budget − nominal_boot_cost`; zero slack
-    /// validates but deserves a WARN).
+    /// The static error strings deliberately carry no numbers (house pattern); the TWO-PHASE
+    /// logging contract is LIBRARY-DISCHARGED at (4b): `agent_gateway_boot::run_boot_handshake_core`
+    /// emits the raw-triplet `AgentBootEvent` BEFORE its internal call to this fn (on `Err` there is
+    /// no witness and no getters — a numberless fail-closed boot still leaves the operator the
+    /// numbers) and the validated/slack event after `Ok` (zero slack = Warn). The 5b-2c bin only
+    /// FORWARDS the event lines; it does NOT call this fn directly (witness construction goes
+    /// through `run_boot_handshake_wired`) — any OTHER direct caller takes the logging obligation
+    /// on itself.
     pub(crate) fn validate(
         max_attempts: u32,
         per_leg_timeout: Duration,
@@ -1016,8 +1039,9 @@ impl ValidatedBootBudget {
 
     /// For `run_boot_anti_rollback_handshake` — DISCHARGED at (4b): `run_boot_handshake_wired`
     /// (`agent_gateway_boot`) derives the count in-body from the same witness that minted the
-    /// transport (no count input exists on the wired surface — caller-side drift is
-    /// unrepresentable); test-pinned by `wired_driver_count_is_the_same_witness_max_attempts`.
+    /// transport (no SEPARATE driver-count input exists — the ONE `max_attempts` input is the value
+    /// `validate()` blesses and the driver receives; a second, divergent count is unrepresentable);
+    /// test-pinned by `wired_driver_count_is_the_same_witness_max_attempts`.
     pub(crate) fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -1082,13 +1106,16 @@ impl ValidatedBootBudget {
     /// channel leg stays wiring-enforced in `round_trip_inner`, see the type doc). SCOPE HONESTY:
     /// this binds the producer claim + the TIMEOUT leg structurally; the ATTEMPT COUNT binding is
     /// DISCHARGED at (4b) — `run_boot_handshake_wired` derives the count in-body from the same
-    /// witness (no count input exists on the wired surface; see [`Self::max_attempts`]). The quote
+    /// witness (no SEPARATE driver-count input — the ONE `max_attempts` input is the value
+    /// `validate()` blesses and the driver receives; see [`Self::max_attempts`]). The quote
     /// seam is the CONCRETE [`HardBoundedQuoteProducer`] (default `S = ExecChildSpawn`) per the §8
     /// never-generic-Q obligation; `C` stays the seam trait because a real `VsockBootRelayChannel`
     /// cannot exist in CI — 5b-2c instantiates `C = VsockBootRelayChannel` (§8). ONLY error: the
     /// producer claim refusal — FATAL wiring config, `?`-propagate, never fold into the retryable
-    /// fetch path. Consumed by the (4b) wired core via the shared mint
-    /// [`Self::transport_with_spawn`], of which this is the 2-line production-spawn instantiation.
+    /// fetch path. The STANDALONE one-call composition door — kept so the (d-ii)/3 pins run
+    /// unchanged; its only callers are tests. The (4b) wired path constructs the SAME shape via the
+    /// shared mint [`Self::transport_with_spawn`] + `ExecChildSpawn::production()` inside
+    /// `run_boot_handshake_wired` (this fn is the 2-line production-spawn instantiation of that mint).
     pub(crate) fn production_transport<C: crate::agent_boot_relay::BootRelayChannel>(
         &self,
         channel: C,
@@ -2193,18 +2220,6 @@ mod tests {
             generous(),
         )
         .expect("helper budget must validate")
-    }
-
-    /// Test-side derivation of the nominal product `n·(t+t+ε)` — deliberately a SECOND derivation
-    /// (not a call into the production `per_attempt_nominal_cost`) so the boundary tests stay an
-    /// independent check of the formula, but single-sourced across them: a formula retune is one
-    /// test-side edit, not three drifting copies (the third copy drifting LARGER would silently
-    /// weaken the ε-pin's positive arm — `validate` accepts any overall ≥ nominal).
-    fn nominal_product(n: u32, t: Duration) -> Duration {
-        t.checked_add(t)
-            .and_then(|legs| legs.checked_add(QUOTE_ATTEMPT_OVERHEAD))
-            .and_then(|p| p.checked_mul(n))
-            .expect("test arithmetic fits")
     }
 
     #[test]

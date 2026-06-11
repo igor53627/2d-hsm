@@ -5,7 +5,10 @@
 //! from the SAME witness → `decide_serve` — plus the typed boot-event seam
 //! ([`AgentBootEvent`]/[`BootLogLevel`]) that discharges the §8 two-phase config-logging obligation in
 //! the LIBRARY (content + severity; the 5b-2c bin only forwards Display lines to stderr→journald,
-//! mapping [`AgentBootEvent::level`] to priority).
+//! mapping [`AgentBootEvent::level`] to priority). NB the fatal paths (validate `Err`, claim refusal,
+//! `decide_serve` refusal) emit NO event — the bin MUST also render the returned `ProtocolError` to
+//! stderr at err priority; the event seam alone under-reports the most severe class (§8 (4b)
+//! re-scope item (d)).
 //!
 //! (4b) ships the COMPOSITION, not a serving loop: nothing here is `pub`, there is no listener and no
 //! bin, and live serve remains gated on the TWO-artifact gate — the (4c) in-guest aya smoke + 5b-2c
@@ -15,8 +18,10 @@
 //! allow below.
 //!
 //! Discharged HERE (the two §8 5b-2c preconditions named at (d-ii)/3): the DRIVER-COUNT BINDING (by
-//! construction — no count parameter exists anywhere on this surface; `budget.max_attempts()` is
-//! derived in-body from the same witness that minted the transport; test-backed by
+//! construction — no SEPARATE driver-count input exists; the ONE `max_attempts` input is the value
+//! `validate()` blesses and the driver receives, so a second, divergent count is unrepresentable:
+//! `budget.max_attempts()` is derived in-body from the same witness that minted the transport;
+//! test-backed by
 //! `wired_driver_count_is_the_same_witness_max_attempts`) and the TWO-PHASE LOGGING content+severity
 //! (raw triplet BEFORE validate, getters incl. slack after, zero-slack ⇒ Warn — library logic, each
 //! half test-pinned). Never-generic-Q containment is structural: the generic composition body is
@@ -53,7 +58,9 @@ pub(crate) enum BootLogLevel {
 /// surface once that carrier (a bounded non-blocking buffer drained between attempts) is designed.
 /// 5b-2c promotion note: when this enum goes `pub` for the separate-crate bin, add
 /// `#[non_exhaustive]` AT PROMOTION TIME (no effect in-crate today; the bin's match needs a
-/// catch-all so a future reap-status variant cannot break the bin build).
+/// catch-all so a future reap-status variant cannot break the bin build). The SAME applies to
+/// [`BootLogLevel`] — the two enums promote together; also decide AT PROMOTION whether a non-Ready
+/// outcome (`ready: false`) deserves an `Error` level distinct from Warn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentBootEvent {
     /// Phase (a): the RAW operator triplet, emitted BEFORE `ValidatedBootBudget::validate` — on Err
@@ -80,6 +87,10 @@ pub(crate) enum AgentBootEvent {
     /// structurally unreachable by the operator. `line` is the Debug rendering (NOT a stable
     /// contract — tests pin prefix + substring only, never full content); pre-rendered String so a
     /// later `pub` promotion of this enum cannot drag the pub(crate) driver types with it.
+    /// Secret-content audit: the Debug render carries protocol-PUBLIC anti-rollback state only
+    /// (`AnchorState` = epoch/structural_version/marks digest — no key material by construction);
+    /// any future field added to `AnchorState`/`BootDriverFail` must re-audit this render for
+    /// secret content.
     HandshakeOutcome { ready: bool, line: String },
 }
 
@@ -96,11 +107,17 @@ impl AgentBootEvent {
         }
     }
 
+    /// THE zero-slack classification — the ONE predicate both [`Self::level`] and the Display
+    /// suffix consult (single-source rule: two encodings of one classification would drift).
+    fn is_zero_slack(&self) -> bool {
+        matches!(self, Self::ValidatedBudget { slack, .. } if *slack == Duration::ZERO)
+    }
+
     /// Library-owned severity: zero-slack ValidatedBudget → Warn (validates but mis-sized by
     /// definition, §8); a non-Ready HandshakeOutcome → Warn; everything else Info.
     pub(crate) fn level(&self) -> BootLogLevel {
         match self {
-            Self::ValidatedBudget { slack, .. } if *slack == Duration::ZERO => BootLogLevel::Warn,
+            Self::ValidatedBudget { .. } if self.is_zero_slack() => BootLogLevel::Warn,
             Self::HandshakeOutcome { ready: false, .. } => BootLogLevel::Warn,
             _ => BootLogLevel::Info,
         }
@@ -137,7 +154,8 @@ impl std::fmt::Display for AgentBootEvent {
                      overall_boot_budget={overall_boot_budget:?} \
                      nominal_boot_cost={nominal_boot_cost:?} slack={slack:?}"
                 )?;
-                if *slack == Duration::ZERO {
+                // Single-source rule: the suffix decision is the SAME predicate level() consults.
+                if self.is_zero_slack() {
                     write!(
                         f,
                         " (ZERO SLACK: nominal boot cost equals overall_boot_budget - mis-sized \
@@ -273,9 +291,8 @@ mod tests {
     use super::*;
     use crate::agent_keystore::{AuditRing, FaucetState, KeystoreBody, KeystoreConfig};
     use crate::quote_subprocess::{
-        encode_ok_frame, reset_process_quote_ledger_claim_for_tests, ChildHandle,
+        encode_ok_frame, nominal_product, reset_process_quote_ledger_claim_for_tests, ChildHandle,
         HardBoundedQuoteProducer, QuoteChildSpawn, ReapOutcome, ValidatedBootBudget,
-        QUOTE_ATTEMPT_OVERHEAD,
     };
     use ed25519_dalek::SigningKey;
     use std::cell::Cell;
@@ -330,16 +347,11 @@ mod tests {
         }
     }
 
-    /// Test-side nominal product `n·(t + t + ε)` — derived from `QUOTE_ATTEMPT_OVERHEAD`, never a
-    /// transcribed ms literal (an ε retune moves expectation and production together). Expected
-    /// Display strings below are LITERAL skeletons + `format!("{:?}", derived)` insertions: a wrong
-    /// format string in the lib stays visible while the numbers stay const-derived.
-    fn nominal_product(n: u32, t: Duration) -> Duration {
-        t.checked_add(t)
-            .and_then(|legs| legs.checked_add(QUOTE_ATTEMPT_OVERHEAD))
-            .and_then(|p| p.checked_mul(n))
-            .expect("test arithmetic fits")
-    }
+    // Nominal-product derivation: the SHARED test-side helper `quote_subprocess::nominal_product`
+    // (single-source rule — an ε retune moves expectation and production together). Expected Display
+    // strings below are LITERAL skeletons + `format!("{:?}", derived)` insertions: a wrong format
+    // string in the lib stays visible while the numbers stay const-derived.
+    use crate::quote_subprocess::nominal_product;
 
     /// Echo-correct spawn fake: builds the frame FROM the handed `report_data` — REQUIRED because
     /// the parent echo-verifies the report's embedded report_data against the driver's per-attempt
@@ -493,7 +505,8 @@ mod tests {
         // the observed attempt count. Honesty note: this refusal power is VALUE-level, not
         // instance-level — a wiring that validated a SECOND budget with identical numbers is
         // observationally identical (and harmless); the §8 drift class (different numbers) is what
-        // the no-count-param signature eliminates and this test refuses. The count binds through
+        // the no-SEPARATE-count-input signature eliminates (the ONE max_attempts input is the value
+        // validate() blesses AND the driver receives) and this test refuses. The count binds through
         // BOTH legs: the driver calls `anchor_round_trip` once per attempt and the transport runs
         // producer-then-channel, so echo-succeeding spawn + always-Err channel ⇒ spawns == N AND
         // round_trips == N.
