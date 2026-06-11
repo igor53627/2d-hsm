@@ -348,10 +348,10 @@ mod tests {
     }
 
     // Nominal-product derivation: the SHARED test-side helper `quote_subprocess::nominal_product`
-    // (single-source rule — an ε retune moves expectation and production together). Expected Display
-    // strings below are LITERAL skeletons + `format!("{:?}", derived)` insertions: a wrong format
-    // string in the lib stays visible while the numbers stay const-derived.
-    use crate::quote_subprocess::nominal_product;
+    // (imported in the use-list above; single-source rule — an ε retune moves expectation and
+    // production together). Expected Display strings below are LITERAL skeletons +
+    // `format!("{:?}", derived)` insertions: a wrong format string in the lib stays visible while
+    // the numbers stay const-derived.
 
     /// Echo-correct spawn fake: builds the frame FROM the handed `report_data` — REQUIRED because
     /// the parent echo-verifies the report's embedded report_data against the driver's per-attempt
