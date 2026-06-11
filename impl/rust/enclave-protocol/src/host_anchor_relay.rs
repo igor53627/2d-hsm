@@ -149,7 +149,11 @@ impl AnchorDial for TcpAnchorDial {
                 });
                 break;
             }
-            match std::net::TcpStream::connect_timeout(addr, remaining) {
+            // Floor the per-attempt timeout at 1ms: a sub-millisecond remainder must never round DOWN to a
+            // zero/disabled connect timeout (the "zero-timeout trap" → infinite block). The <1ms slop on the
+            // LAST attempt is negligible vs the connect budget. (is_zero() above already handled exact 0.)
+            let attempt = remaining.max(Duration::from_millis(1));
+            match std::net::TcpStream::connect_timeout(addr, attempt) {
                 Ok(s) => {
                     s.set_nodelay(true)?; // one small frame each way — latency over throughput
                     return Ok(s);
@@ -584,7 +588,8 @@ mod tests {
             }
         }
     }
-    /// Anchor stream that, on Drop, hands its written bytes back to the dial for the verbatim assert.
+    /// Anchor stream that records bytes forwarded to it LIVE inside `write` (via the `sink` reference —
+    /// NOT on Drop; there is no Drop impl), so `dial.last_forwarded` updates as the relay writes.
     struct RecordingAnchorStream<'a> {
         inner: FakeAnchorStream,
         sink: &'a std::cell::RefCell<Vec<u8>>,
@@ -596,11 +601,8 @@ mod tests {
     }
     impl std::io::Write for RecordingAnchorStream<'_> {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            *self.sink.borrow_mut() = {
-                let mut v = self.sink.borrow().clone();
-                v.extend_from_slice(buf);
-                v
-            };
+            // One unambiguous borrow_mut (no clone-per-write, no place/value borrow-ordering subtlety).
+            self.sink.borrow_mut().extend_from_slice(buf);
             self.inner.write(buf)
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -854,11 +856,21 @@ mod tests {
             classify_close(&RelayFault::Pump(ProtocolError::WireProtocol("anchor response too large"))),
             "oversized-anchor-response"
         );
-        // The reads-as-malformed-but-is-timeout case: the deadline-guarded write message contains
-        // "deadline" → pump-timeout (NOT malformed). This is the critical correctness pin.
+        // The reads-as-malformed-but-is-timeout case: a deadline-guarded write returns a WireProtocol
+        // message containing "deadline" → pump-timeout (NOT malformed). The critical correctness pin —
+        // and it pins the EXACT strings the DAEMON's production path (relay_one_pump_until) can emit, NOT
+        // relay_forward_once's "...before anchor write" (which the daemon never calls): the anchor write
+        // goes through relay_round_trip_over_stream ("...before write", agent_boot_relay.rs), and the
+        // enclave write-back goes through deadline_guarded_write ("...before enclave write").
         assert_eq!(
             classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
-                "anchor relay: deadline before anchor write"
+                "anchor relay: deadline before write"
+            ))),
+            "pump-timeout"
+        );
+        assert_eq!(
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "anchor relay: deadline before enclave write"
             ))),
             "pump-timeout"
         );

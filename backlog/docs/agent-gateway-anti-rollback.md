@@ -768,9 +768,14 @@ request golden vector is a 5b-2b test-vector item.
       `recv_timeout` but leaked one thread+fd per truly-wedged connect, bounded by `max_attempts`; that path is
       now removed.)*
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
-      LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
-      because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
-      `relay_forward_once`/`frame_anchor_response` cores directly (it would otherwise duplicate the
+      LIBRARY** whose serial loop, per pump, READS + DECODES the enclave request FIRST (so a malformed
+      frame never burns a TCP connect — the canonical read-decode-before-dial order; see the (b) record),
+      THEN dials the anchor, THEN forwards verbatim by composing the SHARED `pub(crate)` cores
+      (`read_framed_message_with_idle_deadline` + `decode_anchor_boot_request` +
+      `relay_round_trip_over_stream` + `frame_anchor_response` + `deadline_guarded_write`) — NOT by calling
+      `relay_forward_once` (which dials-first / reads internally, the wrong order here). The
+      `host_anchor_relay` bin is a thin caller of the wrapper because a Cargo `[[bin]]` target is a separate
+      crate and CANNOT call those `pub(crate)` cores directly (it would otherwise duplicate the
       framing/decoder and risk codec drift). The wrapper owns the Err→close mapping + operator-triage
       logging (oversize/malformed/timeout) + a **serial accept loop** (one deadline-bounded pump at a time;
       revisit only if concurrent enclave boots need it) — see the host-relay daemon requirement below.
