@@ -849,11 +849,17 @@ request golden vector is a 5b-2b test-vector item.
   numbers; (b) on success the getter line incl. `nominal_boot_cost` AND the slack
   (`overall_boot_budget − nominal_boot_cost`) — a zero-slack config validates (`≤` passes) but is
   mis-sized by definition and `level()` says Warn, library logic, test-pinned); the REMAINING 5b-2c
-  obligations are: forwarding the Display lines to stderr→journald (mapping `level()` to priority) +
-  ONE smoke assertion that the lines appear, AND rendering the returned `ProtocolError` to stderr at
-  err priority — the FATAL paths (validate Err, claim refusal, decide_serve refusal) emit NO event,
-  so the event seam alone under-reports the most severe class (a bin that swallows the Err and only
-  exits non-zero recreates the numberless-refusal anti-pattern). Promotion notes: `AgentBootEvent`
+  obligations are: forwarding the Display lines to stderr→journald (mapping `level()` to priority),
+  AND rendering the returned `ProtocolError` to stderr at err priority (a CHECKED item, not a smoke
+  nicety) — the fatal paths emit no DEDICATED ERROR event (events emitted BEFORE the failure still
+  flow: context, not cause — the per-class event matrix lives in the module doc), so a bin that
+  swallows the Err and only exits non-zero recreates the numberless-refusal anti-pattern. The bin
+  acceptance is split BY PATH (one happy smoke is NOT enough): (i) successful boot — events
+  forwarded at the right priorities; (ii) validation refusal — RawBudgetConfig line + the err-render
+  both appear; (iii) outcome refusal — the ready:false Warn line + the err-render both appear. NB
+  the bin must NOT parse the `HandshakeOutcome` line (the `{outcome:?}` Debug payload is explicitly
+  NOT a stable contract — the stable surface is `ready` + `level()`; a curated Display mapping is a
+  5b-2c option if tooling needs structure). Promotion notes: `AgentBootEvent`
   AND `BootLogLevel` both get `#[non_exhaustive]` AT PROMOTION TIME (the enums promote together;
   decide then whether `ready: false` deserves an `Error` level distinct from Warn). Known
   event-invisible corner (by design today): the Ready-but-gate-refused defense-in-depth arm of
@@ -873,7 +879,11 @@ request golden vector is a 5b-2b test-vector item.
   **(4b) re-scope additions to this bullet:** (a) the 5b-2c `pub` wrapper (`run_agent_gateway_boot`)
   hardcodes `require_real = cfg!(release_build)` — no operator override flag is representable in the
   bin (matches the `decide_serve(outcome, cfg!(release_build))?` sketch above; `require_real` stays
-  parametric only on the pub(crate) wired entry, for both-polarity tests). Staging consequence,
+  parametric only on the pub(crate) wired entry, for both-polarity tests). NB `release_build` is THE
+  CRATE's build.rs-defined custom cfg (PROFILE=release or `TWOD_HSM_STRICT_RELEASE_GUARDS`,
+  registered via `rustc-check-cfg`) — NOT a std flag; the `[[bin]]` shares the crate build.rs so it
+  applies as-is, but a literal copy into a DIFFERENT crate would silently evaluate FALSE (fail-open)
+  without its own build.rs — never move the bin out-of-crate without carrying the cfg. Staging consequence,
   recorded: release-profile builds have NO escape hatch — dev/lab runs use debug builds. (b) When
   `AgentBootEvent` is promoted `pub` for the separate-crate bin, add `#[non_exhaustive]` AT
   PROMOTION TIME and give the bin's match a catch-all arm (a future reap-status variant must not

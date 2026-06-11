@@ -5,10 +5,15 @@
 //! from the SAME witness → `decide_serve` — plus the typed boot-event seam
 //! ([`AgentBootEvent`]/[`BootLogLevel`]) that discharges the §8 two-phase config-logging obligation in
 //! the LIBRARY (content + severity; the 5b-2c bin only forwards Display lines to stderr→journald,
-//! mapping [`AgentBootEvent::level`] to priority). NB the fatal paths (validate `Err`, claim refusal,
-//! `decide_serve` refusal) emit NO event — the bin MUST also render the returned `ProtocolError` to
-//! stderr at err priority; the event seam alone under-reports the most severe class (§8 (4b)
-//! re-scope item (d)).
+//! mapping [`AgentBootEvent::level`] to priority). NB the fatal paths emit no DEDICATED ERROR event
+//! (events emitted BEFORE the failure point still flow — they carry context, not the cause) — the
+//! bin MUST also render the returned `ProtocolError` to stderr at err priority; the event seam alone
+//! under-reports the most severe class (§8 (4b) re-scope item (d)). Event matrix per failure class:
+//! validate `Err` ⇒ RawBudgetConfig only + the Err; claim refusal ⇒ RawBudgetConfig +
+//! ValidatedBudget + the Err; driver FailClosed ⇒ all three events (HandshakeOutcome ready:false
+//! carries the cause at Warn) + the folded Err; Ready-but-gate-refused (driver-bug corner) ⇒ all
+//! three with ready:true + the DISTINCT gate-refusal Err — the one class where the event stream
+//! reads success.
 //!
 //! (4b) ships the COMPOSITION, not a serving loop: nothing here is `pub`, there is no listener and no
 //! bin, and live serve remains gated on the TWO-artifact gate — the (4c) in-guest aya smoke + 5b-2c
@@ -253,7 +258,11 @@ where
 /// analysis (any swapped valid config fails closed) transfers verbatim — why there is no
 /// BootConfig struct; 5b-2c owns operator-config parsing. `require_real` stays parametric HERE for
 /// both-polarity tests; the 5b-2c PUB wrapper hardcodes `cfg!(release_build)` (§8: no production
-/// allowance — an operator override flag must be unrepresentable in the bin).
+/// allowance — an operator override flag must be unrepresentable in the bin). NB `release_build` is
+/// THE CRATE's build.rs-defined custom cfg (set on `PROFILE == "release"` or
+/// `TWOD_HSM_STRICT_RELEASE_GUARDS`, registered via `rustc-check-cfg`) — NOT a std flag; `[[bin]]`
+/// targets share the crate build.rs, so it applies to the 5b-2c bin as-is (a literal copy into a
+/// DIFFERENT crate would silently evaluate false — fail-open — without its own build.rs).
 /// TEST RULE: tests MUST NOT drive this fn past validation/claim — `ExecChildSpawn::production()`
 /// re-execs `/proc/self/exe`, which in a test process is the TEST BINARY with no argv filter (a
 /// full-suite recursive child). Behavioral tests drive `run_boot_handshake_core` with echo fakes.
