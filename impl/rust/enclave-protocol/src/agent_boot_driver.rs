@@ -11,7 +11,8 @@
 //! The driver is generic over a single trait method, [`AnchorBootTransport::anchor_round_trip`], which
 //! is the ONLY thing slice 5b-2 (real SNP / aya validation) must implement: given the public
 //! [`AnchorBootRequest`] (sealed-config `(chain_id, env)`, the fresh `nonce`, and the `report_data`
-//! commitment), fetch an SNP quote committing to `report_data` (via `snp_report::fetch_report`) THEN
+//! commitment), fetch an SNP quote committing to `report_data` (via the killable quote child,
+//! `HardBoundedQuoteProducer`) THEN
 //! relay it + the public challenge to the anchor over the *untrusted host* (an enclave-initiated vsock
 //! round-trip — a genuinely new pre-serve exchange; today's transport is strictly host-initiated) and
 //! return the anchor's signed response **bytes**. Those bytes are UNTRUSTED: the driver hands them
@@ -59,8 +60,8 @@
 //! driver with a mock channel + fake quote). The remaining aya/SNP work is split into ordered,
 //! independently-gated slices (see `agent-gateway-anti-rollback.md` §8): **5b-2b-ii** the `vsock-transport`
 //! leaf (`VsockBootRelayChannel` fresh-connection-per-call/deadline-bounded + host relay daemon).
-//! (`SnpQuoteProducer` = `snp_report::fetch_report_deadline` landed in 5b-2b-i but is COOPERATIVE and
-//! deletion-approved ((d-ii)(4a)); the production quote producer is `HardBoundedQuoteProducer` —
+//! (The cooperative `SnpQuoteProducer`/`fetch_report_deadline` from 5b-2b-i were DELETED in
+//! (d-ii)(4a); the production quote producer is `HardBoundedQuoteProducer` —
 //! (d-ii)/2, `quote_subprocess`, triple-gated.) **5b-2c** the agent-gateway bin + boot
 //! sequencing (set platform root → unseal the agent keystore → `install_agent_keystore` →
 //! `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve);
@@ -91,7 +92,9 @@ pub(crate) struct AnchorBootRequest<'a> {
 
 /// The single platform dependency of the boot driver — slice 5b-2 implements it. One impl, one call
 /// per attempt. The implementation fetches an SNP quote committing to `request.report_data`
-/// (`snp_report::fetch_report`) then relays it — together with the public `(chain_id, env, nonce)` —
+/// (the killable quote child — `HardBoundedQuoteProducer` via `quote_subprocess`;
+/// `snp_report::fetch_report` is exclusively the GET_MEASUREMENT path since (4a)) then relays it —
+/// together with the public `(chain_id, env, nonce)` —
 /// to the anchor over the untrusted host, and returns the anchor's **signed response bytes**. Those
 /// bytes are UNTRUSTED and verified downstream (`boot_reconcile_anti_rollback` strict-decodes +
 /// Ed25519-verifies them against the sealed `anchor_root` and the issued nonce); the seam is a dumb

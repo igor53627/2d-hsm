@@ -22,7 +22,10 @@ pub(crate) const MIN_REPORT_LEN: usize = MEASUREMENT_OFFSET + SNP_MEASUREMENT_LE
 
 /// configfs-tsm report directory (Linux >= 6.7 with the SNP guest TSM provider loaded).
 const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
-/// Fixed configfs entry name for this enclave's one boot-time report.
+/// Fixed configfs entry name for this enclave's one boot-time report. Since (4a) (cooperative boot
+/// fetch deleted) this fixed entry is EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's —
+/// only `RealTsmFs` via [`fetch_report`] touches it; the quote child self-names `twod-hsm-q-<pid>`
+/// (see [`TSM_QUOTE_ENTRY_PREFIX`]). Code MAY rely on this exclusivity (§8 claim flipped TRUE).
 const TSM_ENTRY_NAME: &str = "twod-hsm";
 /// Domain separation for the `report_data` binding (so it is not a bare key hash).
 const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
@@ -136,9 +139,9 @@ pub fn report_data_for_pubkey(pq_pubkey: &[u8]) -> [u8; REPORT_DATA_LEN] {
     h.finalize().into()
 }
 
-/// The configfs-tsm filesystem operations, behind a seam so the deadline + cleanup orchestration in
-/// [`fetch_report_with`] is unit-testable WITHOUT a live `/sys/kernel/config/tsm` (the cleanup-on-timeout
-/// invariant — entry removed even when the deadline fires mid-sequence — is the defect-prone part and the
+/// The configfs-tsm filesystem operations, behind a seam so the cleanup orchestration in
+/// [`fetch_report_with`] is unit-testable WITHOUT a live `/sys/kernel/config/tsm` (the cleanup-on-error
+/// invariant — entry removed even when a step fails mid-sequence — is the defect-prone part and the
 /// only one that leaks a stale configfs entry if wrong). Configfs is touched by exactly TWO code surfaces,
 /// both in this file: [`RealTsmFs`] (the seam ops) and the seam-BYPASSING
 /// [`gc_quote_entries_best_effort`] (child-mode-only orphan sweep — see its doc; §8 forbids it
@@ -220,66 +223,36 @@ impl TsmFs for RealTsmFs {
     }
 }
 
-/// `None` deadline ⇒ unbounded (no check) — the producer `fetch_report` path keeps its historical
-/// unbounded contract. `Some(d)` ⇒ the agent boot-relay path bounds the *gaps* between fs ops.
-fn check_deadline(deadline: Option<std::time::Instant>) -> Result<(), ProtocolError> {
-    if let Some(d) = deadline {
-        if std::time::Instant::now() >= d {
-            return Err(ProtocolError::PqSigningUnavailable("SNP quote fetch deadline exceeded"));
-        }
-    }
-    Ok(())
-}
-
-/// SNP quote fetch over a [`TsmFs`] seam, optionally deadline-bounded. With `Some(deadline)`: fast-paths
-/// a past deadline (no fs touched) and checks the deadline between each configfs step. With `None`: fully
-/// unbounded (the producer path's historical behavior — preserved so this slice does NOT change
-/// GET_MEASUREMENT). On **every** path it **unconditionally cleans up** the entry — the cleanup is the
-/// last statement, so an error or mid-sequence timeout still leaves no stale `twod-hsm` entry. Per-step
-/// checks bound the *gaps* between fs ops; a single in-kernel `read(outblob)` that blocks forever is not
-/// interruptible under `#![forbid(unsafe_code)]` (a hard bound needs a *cancellable boundary* — the
-/// **killable subprocess**, the only sanctioned option per the revised §8 pin ("kernel timeout" was
-/// eliminated: configfs-tsm offers none; a plain worker thread can only abandon a stuck reader) — the
-/// harness LANDED in 5b-2b-ii(d-i) — `quote_subprocess` — the configfs child mode in (d-ii)/1 and the
-/// wired producer type `HardBoundedQuoteProducer` in (d-ii)/2; the stale-clear covers the leak on THIS
-/// cooperative path until its (4a) deletion).
+/// SNP quote fetch over a [`TsmFs`] seam — UNBOUNDED ((4a) deleted the cooperative `Option<Instant>`
+/// deadline plumbing; the hard wall-clock bound is the killable subprocess — `HardBoundedQuoteProducer`
+/// via `quote_subprocess`, per the revised §8 pin: "kernel timeout" was eliminated, a worker thread can
+/// only abandon a stuck reader). On **every** path it **unconditionally cleans up** the entry — the
+/// cleanup is the last statement, so an error mid-sequence still leaves no stale `twod-hsm` entry; the
+/// leading stale-clear covers a previous crashed boot.
 pub(crate) fn fetch_report_with<F: TsmFs>(
     fs: &F,
     report_data: &[u8; REPORT_DATA_LEN],
-    deadline: Option<std::time::Instant>,
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-    // Distinct from the per-step `check_deadline` in the inner fn: this outer guard fires BEFORE the
-    // stale-clear `remove_entry`, so an already-past deadline touches NO fs at all (the "fast path",
-    // pinned by `fetch_past_deadline_fast_path_touches_no_fs`). The inner checks then bound the gaps
-    // between ops. Different message ("already past" vs "exceeded") to localize which guard tripped.
-    if let Some(d) = deadline {
-        if std::time::Instant::now() >= d {
-            return Err(ProtocolError::PqSigningUnavailable("SNP quote fetch deadline already past"));
-        }
-    }
     let entry = format!("{TSM_REPORT_DIR}/{TSM_ENTRY_NAME}");
-    fetch_report_with_at(fs, &entry, report_data, deadline)
+    fetch_report_with_at(fs, &entry, report_data)
 }
 
-/// Entry-path-parameterized core of [`fetch_report_with`] (refactor-only split for 5b-2b-ii(d): the
-/// killable quote CHILD fetches at its own unique self-named `twod-hsm-q-<pid>` path — (d-ii) — while the
-/// producer path keeps the fixed name above; FakeTsmFs ignores entry strings, so the existing sequence
-/// tests pin this split moved nothing). Body unchanged: stale-clear → inner sequence → UNCONDITIONAL
-/// trailing cleanup on every path (incl. timeout). **NB: the past-deadline "touches NO fs" fast-path
-/// stays in the WRAPPER above** — a direct `_at` caller with an already-lapsed `Some(deadline)` still
-/// performs the stale-clear `remove_entry` before the first in-sequence check (recorded narrowing; moot
-/// in practice: the (d-ii) child calls with `None`/unbounded, and the cooperative `Option<Instant>`
-/// plumbing is deletion-approved — any future deadline-bearing direct caller must add its own
-/// fast-path; that (d-ii) deletion makes the narrowing structural: `_at` loses the parameter entirely).
+/// Entry-path-parameterized core of [`fetch_report_with`]: the killable quote CHILD fetches at its own
+/// unique self-named `twod-hsm-q-<pid>` path ((d-ii)) while the producer path keeps the fixed name
+/// above (FakeTsmFs ignores entry strings, so the sequence tests pin both shapes). UNBOUNDED BY
+/// SIGNATURE — (4a) deleted the cooperative `deadline: Option<Instant>` parameter, landing the
+/// previously recorded narrowing as a structural fact: the parent's pipe poll + SIGKILL is the only
+/// bound on the child path; any future deadline-bearing caller must reintroduce its own bounded
+/// variant AND its own fast-path. Body: stale-clear → inner sequence → UNCONDITIONAL trailing cleanup
+/// on every path.
 pub(crate) fn fetch_report_with_at<F: TsmFs>(
     fs: &F,
     entry_path: &str,
     report_data: &[u8; REPORT_DATA_LEN],
-    deadline: Option<std::time::Instant>,
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
     fs.remove_entry(entry_path); // clear any stale entry from a previous crashed boot
-    let result = fetch_report_inner_with(fs, entry_path, report_data, deadline);
-    fs.remove_entry(entry_path); // UNCONDITIONAL cleanup — last statement on every path (incl. timeout)
+    let result = fetch_report_inner_with(fs, entry_path, report_data);
+    fs.remove_entry(entry_path); // UNCONDITIONAL cleanup — last statement on every path
     result
 }
 
@@ -287,13 +260,9 @@ fn fetch_report_inner_with<F: TsmFs>(
     fs: &F,
     entry: &str,
     report_data: &[u8; REPORT_DATA_LEN],
-    deadline: Option<std::time::Instant>,
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-    check_deadline(deadline)?;
     fs.create_entry(entry)?;
-    check_deadline(deadline)?;
     fs.write_inblob(entry, report_data)?;
-    check_deadline(deadline)?;
     let report = fs.read_outblob(entry)?;
     if report.len() < MIN_REPORT_LEN {
         return Err(ProtocolError::PqSigningUnavailable(OUTBLOB_SHORT_MSG));
@@ -305,7 +274,6 @@ fn fetch_report_inner_with<F: TsmFs>(
     if report.len() > MAX_OUTBLOB_LEN {
         return Err(ProtocolError::PqSigningUnavailable(OUTBLOB_OVERSIZE_MSG));
     }
-    check_deadline(deadline)?;
     let cert_chain = fs.read_auxblob(entry);
     Ok((report, cert_chain))
 }
@@ -318,33 +286,12 @@ fn fetch_report_inner_with<F: TsmFs>(
 /// The error path includes "interface absent", so callers on non-SNP/dev hosts can fall back to a
 /// placeholder.
 ///
-/// **Unbounded** (deadline `None`) — this is the producer GET_MEASUREMENT path and keeps its historical
-/// no-timeout contract unchanged (refactor-only over [`fetch_report_with`]); the deadline-bounded variant
-/// for the agent boot relay is [`fetch_report_deadline`], so a wall-clock bound is never silently imposed
-/// on the unrelated producer measurement.
+/// **Unbounded** — the producer GET_MEASUREMENT path keeps its historical no-timeout contract. The
+/// boot-relay quote path does NOT come through here: it is the killable-subprocess
+/// `HardBoundedQuoteProducer` (`quote_subprocess`) — the cooperative deadline-bounded variant
+/// (`fetch_report_deadline`) was deleted in (4a).
 pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-    fetch_report_with(&RealTsmFs, report_data, None)
-}
-
-/// Like [`fetch_report`] but bounded by a caller-supplied absolute `deadline` — the entrypoint the agent
-/// boot-relay quote producer (TASK-7.7 5b-2) calls so the seam's deadline contract is honored.
-///
-/// **`pub(crate)` + `agent-gateway`-gated deliberately** (its only caller is
-/// `agent_boot_relay::SnpQuoteProducer::fetch`, itself `agent-gateway`-only): the deadline here is
-/// best-effort/cooperative — it does NOT hard-bound a wedged in-kernel `read(outblob)`. The cancellable
-/// boundary EXISTS now (`HardBoundedQuoteProducer`, (d-ii)/2 — the producer the serve path will take by
-/// signature), which makes this whole cooperative path deletion-approved ((4a), `SnpQuoteProducer` with
-/// it) — so this MUST NOT be wired into a live serve/boot path from outside the crate.
-/// Crate-private visibility *type-enforces* that obligation (the doc'd "must not wire externally" is now a
-/// compile error, not just prose); the feature gate keeps it from being dead code in the non-agent builds.
-/// The unbounded producer [`fetch_report`] stays `pub` — the legitimate GET_MEASUREMENT path with no
-/// wall-clock contract to violate.
-#[cfg(feature = "agent-gateway")]
-pub(crate) fn fetch_report_deadline(
-    report_data: &[u8; REPORT_DATA_LEN],
-    deadline: std::time::Instant,
-) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-    fetch_report_with(&RealTsmFs, report_data, Some(deadline))
+    fetch_report_with(&RealTsmFs, report_data)
 }
 
 /// Boot-captured SNP attestation: `(launch_measurement, raw_report, cert_chain)`.
@@ -499,20 +446,9 @@ mod tests {
         assert_ne!(a, bare);
     }
 
-    // ---- deadline-aware fetch over the TsmFs seam (TASK-7.7 5b-2; no live configfs needed) ----
+    // ---- fetch orchestration + unconditional cleanup over the TsmFs seam (TASK-7.7 5b-2; no live configfs needed) ----
 
     use std::cell::RefCell;
-    use std::time::{Duration, Instant};
-
-    fn past() -> Instant {
-        // Direct subtraction: on any real monotonic clock `now()` is far past the `Instant` epoch, so this
-        // never overflows — and unlike `checked_sub(..).unwrap_or_else(Instant::now)` it can never silently
-        // yield a NON-past instant that turns a fast-path test into a fluke (greptile P2).
-        Instant::now() - Duration::from_secs(1)
-    }
-    fn future() -> Instant {
-        Instant::now() + Duration::from_secs(60)
-    }
 
     /// Records the ordered sequence of seam calls and is configurable per step.
     struct FakeTsmFs {
@@ -521,10 +457,6 @@ mod tests {
         outblob_err: bool,
         outblob: Vec<u8>,
         auxblob: Vec<u8>,
-        /// If set, `create_entry` busy-waits until `now >= this` before returning — lets a test make the
-        /// deadline lapse *mid-sequence* (after create) deterministically, so the post-create
-        /// `check_deadline` fires and the unconditional cleanup is exercised on the timeout path.
-        create_spin_until: Option<Instant>,
         calls: RefCell<Vec<&'static str>>,
     }
     impl FakeTsmFs {
@@ -535,7 +467,6 @@ mod tests {
                 outblob_err: false,
                 outblob: vec![0xa5; MIN_REPORT_LEN],
                 auxblob: vec![0xc7; 16],
-                create_spin_until: None,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -546,16 +477,6 @@ mod tests {
         }
         fn create_entry(&self, _entry: &str) -> Result<(), ProtocolError> {
             self.calls.borrow_mut().push("create");
-            if let Some(t) = self.create_spin_until {
-                // Sleep (don't burn a core) until the deadline is crossed, so the post-create check trips
-                // deterministically. The caller's generous margin dwarfs any plausible scheduler preemption
-                // between computing the deadline and the outer fast-path check, so the mid-sequence path is
-                // hit reliably even on a loaded CI box.
-                let now = Instant::now();
-                if now < t {
-                    std::thread::sleep(t - now);
-                }
-            }
             if self.create_ok {
                 Ok(())
             } else {
@@ -592,33 +513,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_past_deadline_fast_path_touches_no_fs() {
-        let fs = FakeTsmFs::ok();
-        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(past()));
-        assert_eq!(err_msg(r), "SNP quote fetch deadline already past");
-        assert!(fs.calls.borrow().is_empty(), "no fs op when the deadline is already past");
-    }
-
-    #[test]
     fn fetch_success_returns_report_and_auxblob_and_cleans_up() {
         let fs = FakeTsmFs::ok();
-        let (report, aux) = fetch_report_with(&fs, &[1u8; REPORT_DATA_LEN], Some(future())).unwrap();
+        let (report, aux) = fetch_report_with(&fs, &[1u8; REPORT_DATA_LEN]).unwrap();
         assert_eq!(report.len(), MIN_REPORT_LEN);
         assert_eq!(aux, vec![0xc7; 16]);
         // Pin the FULL orchestration sequence the doc promises (stale-clear → create → write → outblob
-        // → aux → unconditional cleanup), not just the remove count.
-        assert_eq!(
-            *fs.calls.borrow(),
-            vec!["remove", "create", "write", "outblob", "aux", "remove"]
-        );
-    }
-
-    #[test]
-    fn fetch_unbounded_none_deadline_runs_full_sequence() {
-        // The producer path (deadline None): no fast-path, no per-step checks, full success sequence —
-        // proves `fetch_report`'s historical unbounded contract is preserved.
-        let fs = FakeTsmFs::ok();
-        assert!(fetch_report_with(&fs, &[2u8; REPORT_DATA_LEN], None).is_ok());
+        // → aux → unconditional cleanup), not just the remove count. (This is also the producer path's
+        // full-sequence pin — the once-separate None-deadline test became identical when (4a) deleted
+        // the parameter.)
         assert_eq!(
             *fs.calls.borrow(),
             vec!["remove", "create", "write", "outblob", "aux", "remove"]
@@ -629,7 +532,7 @@ mod tests {
     fn fetch_cleans_up_on_create_failure() {
         let mut fs = FakeTsmFs::ok();
         fs.create_ok = false;
-        assert!(fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future())).is_err());
+        assert!(fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]).is_err());
         // create failed, but the unconditional cleanup still ran — exact sequence pins the path.
         assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "remove"]);
     }
@@ -640,7 +543,7 @@ mod tests {
         // outblob/aux are never reached. Pins the stale-entry-leak guard for the write leg too.
         let mut fs = FakeTsmFs::ok();
         fs.write_err = true;
-        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future()));
+        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]);
         assert_eq!(err_msg(r), "fake write fail");
         assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "remove"]);
     }
@@ -649,7 +552,7 @@ mod tests {
     fn fetch_cleans_up_on_outblob_failure() {
         let mut fs = FakeTsmFs::ok();
         fs.outblob_err = true;
-        assert!(fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future())).is_err());
+        assert!(fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]).is_err());
         assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "outblob", "remove"]);
     }
 
@@ -657,31 +560,11 @@ mod tests {
     fn fetch_short_outblob_is_error_and_cleans_up() {
         let mut fs = FakeTsmFs::ok();
         fs.outblob = vec![0u8; MIN_REPORT_LEN - 1]; // one byte short of the ABI minimum
-        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(future()));
+        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]);
         assert_eq!(err_msg(r), "SNP attestation: outblob shorter than ABI minimum");
         assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "outblob", "remove"]);
     }
 
-    #[test]
-    fn fetch_cleans_up_on_mid_sequence_deadline_timeout() {
-        // Deadline is in the future at the outer fast-path check (so create runs), but `create_entry`
-        // busy-waits across it, so the post-create `check_deadline` fires: this exercises the cleanup on a
-        // deadline-lapse *between* fs ops (not just an op-error path). The trailing "remove" proves no
-        // stale entry leaks even when the timeout lands mid-sequence; write/outblob/aux never run.
-        let mut fs = FakeTsmFs::ok();
-        let dl = Instant::now() + Duration::from_millis(50);
-        fs.create_spin_until = Some(dl);
-        let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN], Some(dl));
-        assert_eq!(err_msg(r), "SNP quote fetch deadline exceeded");
-        assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "remove"]);
-    }
-
-    #[test]
-    fn check_deadline_past_err_future_ok_none_ok() {
-        assert!(check_deadline(Some(past())).is_err());
-        assert!(check_deadline(Some(future())).is_ok());
-        assert!(check_deadline(None).is_ok(), "None is unbounded — never errors");
-    }
     /// (d-ii) quote-child naming/GC tests live HERE (not in the triple-gated quote_subprocess) so the
     /// items they exercise are test-used in EVERY agent-gateway combo — no dead-code warnings in the
     /// agent-gateway-only CI lanes.
