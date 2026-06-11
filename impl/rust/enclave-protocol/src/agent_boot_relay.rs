@@ -36,10 +36,10 @@
 //! `VsockBootRelayChannel` (fresh per call, hard-cancellable `connect_bounded` to host CID 2 — LANDED, (a)
 //! PR #54 + (a') PR #56) and the still-open host-side relay daemon (b) (which uses
 //! [`decode_anchor_boot_request`]) — the `vsock-transport`-gated
-//! leaf. (`SnpQuoteProducer` landed HERE in 5b-2b-i — `agent-gateway`-gated + CI-tested, NOT behind
-//! `vsock-transport`; it delegates to the deadline-bounded `snp_report::fetch_report_deadline`. It is
-//! **deletion-approved** ((d-ii)(4a)) — the wired producer is `HardBoundedQuoteProducer`
-//! ((d-ii)/2, `quote_subprocess`, triple-gated; plain-text reference); live wiring is (4b)/5b-2c.) Then
+//! leaf. (The cooperative `SnpQuoteProducer` landed HERE in 5b-2b-i and was DELETED in (d-ii)(4a)
+//! together with `snp_report::fetch_report_deadline` — wiring a cooperative producer is
+//! unrepresentable; the wired producer is `HardBoundedQuoteProducer` ((d-ii)/2, `quote_subprocess`,
+//! triple-gated; plain-text reference); live wiring is (4b)/5b-2c.) Then
 //! **5b-2c** the agent-gateway
 //! bin + boot sequencing; **5b-2d** the sealed-blob source + unseal; **5b-2e** `AdoptForward` raw-marks.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -256,9 +256,8 @@ pub(crate) trait BootRelayChannel {
 
 /// The SNP-quote seam: fetch a quote committing to `report_data`, returning `(report, cert_chain)`. The
 /// PRODUCTION impl is `HardBoundedQuoteProducer` ((d-ii)/2, `quote_subprocess` — see the hard-bound
-/// paragraph below); the in-file [`SnpQuoteProducer`] is the COOPERATIVE impl (deletion-approved, (4a))
-/// delegating to `snp_report::fetch_report_deadline`; the test fake records the `report_data` it was
-/// handed (proving the quote↔nonce binding).
+/// paragraph below; the cooperative `SnpQuoteProducer` was deleted in (4a)); the test fake records the
+/// `report_data` it was handed (proving the quote↔nonce binding).
 ///
 /// **`deadline` bounds the quote fetch's own wall-clock** (`RelayAnchorTransport` gives this leg its own
 /// `timeout` budget, separate from the channel's, so a wedged sev-guest/configfs provider can't starve
@@ -279,10 +278,10 @@ pub(crate) trait BootRelayChannel {
 /// mid-sweep poisons the ledger into unprovable budget accounting; `RefCell` trades the compile-time
 /// proof for a latent runtime borrow panic.
 ///
-/// **Best-effort caveat (now scoped to the cooperative impl only):** [`SnpQuoteProducer`] honors the
-/// deadline *between* configfs steps; a single wedged in-kernel `read(outblob)` is not interruptible
-/// under `#![forbid(unsafe_code)]`. It is deletion-approved ((d-ii)(4a)) and MUST NOT be wired into a
-/// serving path; until (4b)/5b-2c wires the hard producer, this caveat governs the cooperative impl.
+/// **Best-effort caveat — RETIRED in (4a):** the cooperative impl (`SnpQuoteProducer`, honoring the
+/// deadline only *between* configfs steps) is DELETED. A single wedged in-kernel `read(outblob)` is not
+/// interruptible under `#![forbid(unsafe_code)]`, so NO in-process impl can satisfy this trait's
+/// deadline contract — any new impl must deliver a cancellable hard bound (the killable subprocess).
 pub(crate) trait BootQuoteProducer {
     fn fetch(
         &mut self,
@@ -294,8 +293,7 @@ pub(crate) trait BootQuoteProducer {
 /// The concrete [`AnchorBootTransport`] for the 5b-1 driver: compose quote-fetch → request-encode →
 /// channel round-trip, returning the anchor's response bytes verbatim. Monomorphized over the two seams
 /// (no `dyn`); (4b)/5b-2c instantiates it with `Q = HardBoundedQuoteProducer` (plain-text reference —
-/// triple-gated type; the cooperative `SnpQuoteProducer` is deletion-approved, (4a)) and
-/// `C = VsockBootRelayChannel`.
+/// triple-gated type) and `C = VsockBootRelayChannel`.
 ///
 /// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
 /// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2·timeout + ε` wall-clock
@@ -303,8 +301,11 @@ pub(crate) trait BootQuoteProducer {
 /// count bound caps total boot at `max_attempts · (2·timeout + ε)` — the ε term is load-bearing, §8:
 /// the ε-less product is NOT a valid ceiling). The single-budget model is final for 5b-2b; splitting
 /// into distinct `quote_timeout` / `relay_timeout` is deferred to 5b-2c (see §8). The bound is HARD
-/// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); with the deletion-approved
-/// cooperative `SnpQuoteProducer` it is best-effort (which is why that impl must never serve).
+/// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); (4a) deleted the only cooperative
+/// impl (`SnpQuoteProducer`) — SCOPE HONESTLY: that deletes the TYPE, not the CLASS (the trait stays
+/// open and `new` reachable, so an in-crate unbounded shim would still compile); the production door
+/// that names the concrete producer is `ValidatedBootBudget::production_transport`
+/// (quote_subprocess), guarded by the §8 never-generic-Q rule + the (4b) acceptance review.
 pub(crate) struct RelayAnchorTransport<Q: BootQuoteProducer, C: BootRelayChannel> {
     quote: Q,
     channel: C,
@@ -347,9 +348,8 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         // also keeps the `Instant::now() + self.timeout` mints below panic-free via the
         // MAX_PER_LEG_TIMEOUT sanity arm — an in-crate test caller bypassing the budget owns that
         // hazard itself). Wiring it here is (4b), gated on the TWO-artifact live-serve gate ((d) incl.
-        // the (4c) smoke + 5b-2c constructing the budget witness from operator config); until then the
-        // cooperative `SnpQuoteProducer` caveat stays accurate FOR THE COOPERATIVE IMPL ONLY (it
-        // cannot interrupt a wedged in-kernel `read(outblob)` — why a live 5b-2c serve stays gated).
+        // the (4c) smoke + 5b-2c constructing the budget witness from operator config); the cooperative
+        // producer is GONE ((4a)) — nothing best-effort remains wireable.
         // The channel leg IS hard-bounded by its deadline + the socket `SO_*TIMEO`. The driver bounds
         // the attempt COUNT on top.
         let (report, cert_chain) = self
@@ -447,25 +447,6 @@ where
     let response = read_bounded_anchor_response(anchor, deadline)?;
     let wire = frame_anchor_response(&response)?;
     deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
-}
-
-/// The COOPERATIVE [`BootQuoteProducer`] — **deletion-approved, removed in (d-ii)(4a)**: fetch the SNP
-/// quote via configfs-tsm, honoring the deadline **cooperatively** (between-steps). Pure delegation to
-/// [`crate::snp_report::fetch_report_deadline`], which checks the deadline around each configfs op — so
-/// the *gaps* are bounded, but a single wedged in-kernel `read(outblob)` is bounded only by the
-/// killable-subprocess hard bound (`HardBoundedQuoteProducer`, (d-ii)/2 — see the trait doc), NOT by
-/// this deadline; it MUST NOT be wired into a serving path. The real configfs read runs only inside the
-/// SNP guest (aya); off-configfs it returns a prompt interface-absent / deadline error (never a hang in
-/// CI), so even the CI fast-path test is safe.
-pub(crate) struct SnpQuoteProducer;
-impl BootQuoteProducer for SnpQuoteProducer {
-    fn fetch(
-        &mut self,
-        report_data: &[u8; 64],
-        deadline: std::time::Instant,
-    ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-        crate::snp_report::fetch_report_deadline(report_data, deadline)
-    }
 }
 
 /// The production [`BootRelayChannel`] over AF_VSOCK (TASK-7.7 5b-2b-ii(a)). Gated
@@ -1370,13 +1351,6 @@ mod tests {
         wire.extend_from_slice(&[0u8; 4]);
         let mut stream = TestStream::new(wire);
         assert!(relay_round_trip_over_stream(&mut stream, &[0xaa], far_deadline()).is_err());
-    }
-
-    #[test]
-    fn snp_quote_producer_fast_path_errors_no_hang() {
-        // Zero budget (or off-configfs in CI) -> prompt Err, never a hang/panic.
-        let r = SnpQuoteProducer.fetch(&[0u8; 64], near_past());
-        assert!(r.is_err());
     }
 
     #[test]

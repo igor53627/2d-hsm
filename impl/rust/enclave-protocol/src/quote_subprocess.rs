@@ -1,7 +1,8 @@
 //! Killable-subprocess HARD bound for the SNP quote fetch (TASK-7.7 5b-2b-ii(d), slice (d-i)).
 //!
-//! The cooperative deadline in `snp_report::fetch_report_with` cannot interrupt a wedged in-kernel
-//! configfs `read(outblob)` (uninterruptible/D-state — the exact failure (d) exists for). The hard bound
+//! An in-process (cooperative) deadline cannot interrupt a wedged in-kernel configfs `read(outblob)`
+//! (uninterruptible/D-state — the exact failure (d) exists for; the cooperative `snp_report` deadline
+//! path that proved this was deleted in (4a)). The hard bound
 //! moves the fetch into a KILLABLE CHILD PROCESS and makes the **pipe fd** the cancellable boundary: the
 //! parent's only blocking wait is `cancellable_boundary::poll_with_deadline(POLLIN)` on the child's pipe,
 //! and on a lapse the parent SIGKILLs the child and returns retryably. Two structural rules (judge-pinned,
@@ -24,7 +25,9 @@
 //! `fetch_quote_via_child`, so the wedged-read hang is killed at the deadline — no by-signature gate-lie
 //! remains); (d-ii)/3 added [`ValidatedBootBudget`] — gate #2 of the TWO-artifact live-serve gate (the
 //! fail-closed boot-budget check), taken by the producer's constructors as an ordering witness.
-//! Still-open (d-ii): cooperative-path deletion (4a), live wiring (4b), the in-guest aya smoke (4c).
+//! (4a) cooperative-path deletion LANDED (`SnpQuoteProducer`/`fetch_report_deadline`/the
+//! `Option<Instant>` plumbing are gone — a cooperative producer is unrepresentable). Still-open
+//! (d-ii): live wiring (4b), the in-guest aya smoke (4c).
 //!
 //! Consumer-free until (4b)/5b-2c wire it — the module-wide allow is NOT transitional leftovers: under
 //! the CI leaf combo (`vsock-transport,agent-gateway`) this compiles with its only consumer not yet
@@ -1126,18 +1129,18 @@ fn child_err_code(step: FetchStep, err: &ProtocolError) -> u8 {
         FetchStep::CreateEntry => 2,
         FetchStep::WriteInblob => 3,
         FetchStep::ReadOutblob => 4,
-        // Pre-step failure: unreachable with the child's pinned `None` deadline (remove_entry is
-        // infallible; check_deadline(None) never errors — create always records first). A TOTAL fold,
-        // deliberately NOT `unreachable!()`: the child must never panic (a panic = exit 101 with no
-        // frame — the exact undiagnosable ambiguity the frame protocol exists to prevent).
+        // Pre-step failure: unreachable in the child (remove_entry is infallible — create always records
+        // first). A TOTAL fold, deliberately NOT `unreachable!()`: the child must never panic (a panic =
+        // exit 101 with no frame — the exact undiagnosable ambiguity the frame protocol exists to
+        // prevent).
         FetchStep::None => {
             // debug_assert (compiled OUT of the release child — release keeps the total fold to 4,
             // preserving the never-panic rule) makes the prose guard above CHECKED in the deviceless
-            // debug tests: it fires if a fallible pre-create op, a Some deadline, or a tracker
-            // record-after-delegate reordering ever makes this arm reachable.
+            // debug tests: it fires if a fallible pre-create op or a tracker record-after-delegate
+            // reordering ever makes this arm reachable.
             debug_assert!(
                 false,
-                "fetch Err with no step recorded — pinned-None-deadline invariant broken; \
+                "fetch Err with no step recorded — create-records-first invariant broken; \
                  rework child_err_code's step mapping"
             );
             4
@@ -1178,9 +1181,10 @@ fn emit<W: std::io::Write>(out: &mut W, frame: &[u8], ok_code: i32) -> i32 {
 }
 
 /// The testable CORE of the quote child: fetch at the SELF-NAMED unique entry
-/// (`twod-hsm-q-<own pid>`, via [`crate::snp_report::fetch_report_with_at`] — UNBOUNDED `None`
-/// deadline: the parent's pipe poll + SIGKILL is the bound, a cooperative timeout here would be the
-/// exact best-effort theater (d) deletes) → encode ONE frame → single `write_all` → exit code.
+/// (`twod-hsm-q-<own pid>`, via [`crate::snp_report::fetch_report_with_at`] — UNBOUNDED BY SIGNATURE
+/// ((4a) deleted the deadline parameter): the parent's pipe poll + SIGKILL is the bound (a cooperative
+/// child-side timeout was the exact best-effort theater (4a) deleted)) → encode ONE frame → single
+/// `write_all` → exit code.
 /// Returns 0 on success; the ERR code (2..=6) when the fetch failed and the ERR frame was delivered;
 /// [`CHILD_EXIT_WRITE_FAILED`] when any write failed. Generic over the seam + writer so the whole
 /// thing is deviceless-testable (and the real-subprocess smokes drive it through a REAL child over a
@@ -1192,11 +1196,10 @@ pub(crate) fn quote_child_main_with<F: crate::snp_report::TsmFs, W: std::io::Wri
 ) -> i32 {
     let entry_path = crate::snp_report::quote_child_entry_path();
     let tracker = StepTracker { inner: fs, last: std::cell::Cell::new(FetchStep::None) };
-    // NB the `None` deadline is pinned BY CONTRACT until the (d-ii)-4 parameter deletion makes it
-    // structural: the parent's pipe poll + SIGKILL is the ONLY bound (a cooperative child-side timeout
-    // is the best-effort theater §8 deleted). A Some-bearing variant must first rework
-    // child_err_code's step mapping (a mid-sequence lapse would masquerade as the previous step).
-    match crate::snp_report::fetch_report_with_at(&tracker, &entry_path, report_data, None) {
+    // Unbounded BY STRUCTURE ((4a) deleted the deadline parameter): the parent's pipe poll + SIGKILL
+    // is the ONLY bound. Any future deadline-bearing variant must first rework child_err_code's step
+    // mapping (a mid-sequence lapse would masquerade as the previous step).
+    match crate::snp_report::fetch_report_with_at(&tracker, &entry_path, report_data) {
         Ok((report, mut cert_chain)) => {
             // Over-cap cert chain folds to EMPTY (auxblob is best-effort — mirror RealTsmFs's own
             // policy for seam impls that don't cap; failing the whole quote for a chain-size defect
@@ -1823,8 +1826,11 @@ mod tests {
 
     #[test]
     fn fetch_past_deadline_fast_path_no_side_effects() {
-        // Deviceless-CI safety parity with the cooperative producer's fast-path pin (which (d-ii)
-        // deletes): an already-lapsed deadline must error BEFORE any side effect — no spawn, no sweep.
+        // Deviceless-CI safety parity with the cooperative producer's fast-path pin (deleted in (4a) —
+        // THIS is the sole fetch_quote_via_child-LAYER fast-path pin; the trait-path pin is
+        // producer_fetch_is_the_hard_bound_not_a_skeleton arm (b), which uniquely proves
+        // deadline-forwarded-VERBATIM — neither subsumes the other): an already-lapsed deadline must error BEFORE any side
+        // effect — no spawn, no sweep.
         let mut ledger = AbandonedLedger::new();
         let sentinel = FakeHandle::unreapable();
         let reaps = Rc::clone(&sentinel.reaps);
@@ -1832,10 +1838,10 @@ mod tests {
         let spawn = FakeSpawn::new(FakePlan::Silent, false);
         // checked_sub-with-now()-fallback is CORRECT here (and in cancellable_boundary) because the
         // lapse check is remaining_or_lapsed, whose MIN_BOUNDARY_BUDGET floor treats a bare now() as
-        // already-lapsed — the fallback cannot turn this into a NON-past fluke. Contrast
-        // snp_report::tests::past(), which deliberately uses direct subtraction: its consumer
-        // (check_deadline) is a STRICT `now >= d` compare where a now()-fallback could race to a
-        // not-yet-lapsed instant. Two patterns, two lapse semantics — not an inconsistency.
+        // already-lapsed — the fallback cannot turn this into a NON-past fluke.
+        // (The old contrast — snp_report's direct-subtraction past() feeding the strict check_deadline
+        // compare — was deleted with the (4a) cooperative plumbing; the two-patterns note survives only
+        // as: pick the lapse pattern by the CONSUMER's lapse semantics.)
         let past = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);

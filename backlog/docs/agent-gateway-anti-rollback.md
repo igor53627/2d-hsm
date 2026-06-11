@@ -642,7 +642,9 @@ request golden vector is a 5b-2b test-vector item.
   Linux runner — this executes the `cancellable_boundary` unit tests, incl. the poll-lapse and
   connect-predicate pins the (a') coverage notes lean on) — but the `#[ignore]` vsock-device tests still
   never run in CI (those run on aya):
-  - **5b-2b-i DONE — MERGED PR #53 (CI-tested in the default + `agent-gateway` builds, NOT behind `vsock-transport`):**
+  - **5b-2b-i DONE — MERGED PR #53** *(HISTORICAL RECORD as merged — the deadline half described below
+    is GONE since (4a); see the bolded correction at the end of this bullet before acting on any
+    signature/entrypoint named here)* **(CI-tested in the default + `agent-gateway` builds, NOT behind `vsock-transport`):**
     `snp_report` deadline-aware quote fetch via a `TsmFs` fs-seam — `fetch_report_with(fs, report_data,
     deadline: Option<Instant>)` (`Some` ⇒ fast-path past-deadline → no fs + per-step `check_deadline`;
     `None` ⇒ unbounded; **unconditional entry cleanup on every path incl. mid-sequence timeout** so no
@@ -656,7 +658,10 @@ request golden vector is a 5b-2b test-vector item.
     never initiates a write; the blocking `write_all` already in flight still needs the socket's
     `SO_SNDTIMEO`, a 5b-2b-ii obligation) + `SnpQuoteProducer` (delegates to `fetch_report_deadline`, honoring the deadline
     **cooperatively/between-steps only** — a single wedged in-kernel read is bounded by the deferred
-    cancellable-boundary hard-bound, NOT this deadline; see the deadline bullet below). The pure relay/serve
+    cancellable-boundary hard-bound, NOT this deadline; see the deadline bullet below). **(Historical
+    record — the deadline half is GONE: (4a) deleted `fetch_report_deadline`, `SnpQuoteProducer`, the
+    `Option<Instant>` plumbing and its deadline tests; `fetch_report_with(fs, report_data)` is now
+    unbounded-only. The 22-test count is as-of PR #53.)** The pure relay/serve
     port resolution lives in the **gate-free `vsock_addr` module** (NOT `vsock_listen`, which is gated
     `vsock-transport` and now holds only the socket-binding leaf + a re-export of `vsock_listen_addr_from_env`
     for the bins): `DEFAULT_ANCHOR_RELAY_PORT=5001` (`VMADDR_CID_HOST=2`) + `anchor_relay_port_from_env()`
@@ -789,8 +794,10 @@ request golden vector is a 5b-2b test-vector item.
       `vsock-transport` compilation is validated in CI. NOT `staging-vsock,agent-gateway`, which fails the
       `ml-dsa-65 ⊕ agent-gateway` role-isolation `compile_error!` since `staging-vsock` pulls
       `staging-host`→`ml-dsa-65`.
-    - **(d) aya/live-platform tests:** `#[ignore]` acceptance tests (real `fetch_report_deadline` against
-      live configfs incl. no-stale-entry-after-timeout; connect to CID 2) verifying socket-timeout
+    - **(d) aya/live-platform tests:** `#[ignore]` acceptance tests (real quote fetch against live
+      configfs via the killable-subprocess path — `HardBoundedQuoteProducer`, the (4c) smoke; the
+      originally named `fetch_report_deadline` target was deleted in (4a) — incl. no-stale-entry-after-kill
+      via the child-side prefix GC; connect to CID 2) verifying socket-timeout
       enforcement **BEHAVIORALLY** (stalled-peer read times out within budget; prompt connect-failure) AND
       via direct `SO_*TIMEO` getsockopt readback — **the safe readback path EXISTS since the nix `socket`
       feature landed** (`sockopt::ReceiveTimeout`/`SendTimeout`, no `unsafe`/`libc` needed; the
@@ -855,11 +862,16 @@ request golden vector is a 5b-2b test-vector item.
   no longer gates the live serve. **The TWO hard preconditions for a live 5b-2c serve (state:
   gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3 — the REMAINING work on
   both is 5b-2c WIRING: (4b)+(4c) for #1, witness-construction-from-config for #2):**
-  1. **(d) quote bound** — the 5b-2c `pub` wrapper MUST NOT wire `SnpQuoteProducer`/`fetch_report_deadline`
-     into a *serving* path until (d) exists; prefer a structural gate (have (d) introduce a
-     `HardBoundedQuoteProducer` type the wrapper requires by signature, so a build lacking (d) **cannot
-     construct** the serving path — a compile error, not an omittable runtime/`cfg` check). Wiring it sooner
-     reintroduces the wedged-`read(outblob)` boot-hang the cooperative deadline cannot prevent.
+  1. **(d) quote bound** — DISCHARGED STRUCTURALLY in two halves: the structural gate landed ((d-ii)/2
+     `HardBoundedQuoteProducer`, required by signature — a build lacking (d) cannot construct the
+     serving path), and (4a) DELETED `SnpQuoteProducer`/`fetch_report_deadline` outright, so the
+     original "MUST NOT wire the cooperative producer" precondition is now VACUOUS — there is nothing
+     cooperative left to mis-wire (kept as the historical record of why the by-signature gate exists).
+     NB the discharge is CONDITIONAL on the never-generic-Q rule (the (d-ii)/2 LANDED note below):
+     the serve-path signature must name the CONCRETE `HardBoundedQuoteProducer` — a generic
+     `<Q: BootQuoteProducer>` wrapper re-opens the class this deletion closed (the trait stays open;
+     a 5-line in-crate shim over pub `fetch_report` would compile). Enforce BOTH at 5b-2c review.
+     What remains gating live serve is the (4b) wiring + (4c) smoke.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
      (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
@@ -895,28 +907,31 @@ verify+driver+transport composition end-to-end (including the response wire fram
 `driver_ready_through_real_response_framing`), so the accumulation bottoms out here. **In the window where
 5b-2b-i is merged but 5b-2b-ii is not, NO production boot path can hang on a wedged quote fetch — because
 there is no current caller**: the quote producer + relay transport are `#[cfg_attr(not(test),
-allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). The best-effort-deadline
-`fetch_report_deadline` is `pub(crate)` (+ `agent-gateway`-gated), which **prevents any out-of-crate caller
-from reaching it at all** (a compile error). This is a *coarser* guarantee than the (d)-gate, NOT a
-substitute for it: it does NOT type-enforce "no live wire until (d)" — an in-crate 5b-2c wrapper could
-still call it. So the (d)-precondition on that wrapper (below) remains a **checklist obligation**, not a
-compile error. (The unbounded producer `fetch_report` stays `pub` — it has no wall-clock contract to
-violate.)
+allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). That window CLOSED at
+(4a): `fetch_report_deadline` is DELETED (with `SnpQuoteProducer`), so the former "coarser pub(crate)
+guarantee vs. checklist obligation" distinction is moot for the DELETED TYPE — "wire `SnpQuoteProducer`"
+is unrepresentable. SCOPE HONESTLY: the CLASS (an in-crate unbounded `BootQuoteProducer` impl wired into
+`RelayAnchorTransport::new`, e.g. a 5-line shim over the pub `fetch_report`) remains representable —
+the trait is open and `new` stays reachable for fakes; the surviving checklist guards are the
+never-generic-Q rule ((d-ii)/2 note: the serve path names the CONCRETE `HardBoundedQuoteProducer`) +
+the (4b) acceptance review (`RelayAnchorTransport::new`'s own "same residual class" rustdoc). (The
+unbounded producer `fetch_report` stays `pub` — it has no wall-clock contract to violate.)
 
 **5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
 MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
 - **Deadline-aware quote fetch (load-bearing).** `BootQuoteProducer::fetch(report_data, deadline)`'s
-  contract requires honoring `deadline`. **Cooperative/between-steps bound — DONE in 5b-2b-i:**
-  `fetch_report_deadline` (via the `TsmFs` seam) checks `deadline` around each configfs op and runs
-  **unconditional stale-entry cleanup on every path incl. mid-sequence timeout** (the entry dir is fixed
-  `twod-hsm`; cleanup runs as the last statement so the next attempt's `remove_dir`+`create_dir` still
-  works — pinned by `fetch_cleans_up_on_mid_sequence_deadline_timeout`; that cooperative machinery —
-  `SnpQuoteProducer`, `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — is
-  APPROVED FOR DELETION in (d-ii) [user sign-off 2026-06-10], making "wire the cooperative producer
-  anyway" structurally impossible rather than a prose caveat). **Hard wall-clock bound — (d-i) harness
+  contract requires honoring `deadline`. **Cooperative/between-steps bound — DONE in 5b-2b-i and
+  DELETED in (d-ii)(4a) [user sign-off 2026-06-10]:** that cooperative machinery — `SnpQuoteProducer`,
+  `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests (incl. its pin
+  `fetch_cleans_up_on_mid_sequence_deadline_timeout`) — is GONE; "wire the cooperative producer anyway"
+  is now structurally impossible (unrepresentable), not a prose caveat. The unconditional stale-entry
+  cleanup SURVIVES on the unbounded path (fixed `twod-hsm`; cleanup is the last statement) — pinned by
+  the surviving `fetch_cleans_up_on_*` error-leg tests. **Hard wall-clock bound — (d-i) harness
   LANDED (this PR); (d) remains OPEN until (d-ii):** a single in-kernel blocking `read(outblob)` cannot be
-  interrupted under `#![forbid(unsafe_code)]`, so the cooperative deadline is **best-effort, NOT a
-  guaranteed ceiling against a wedged kernel/configfs provider.** A true hard bound needs a **cancellable
+  interrupted under `#![forbid(unsafe_code)]`, so any cooperative deadline WAS best-effort, NOT a
+  guaranteed ceiling against a wedged kernel/configfs provider — which is exactly why (4a) deleted the
+  cooperative path outright (no such deadline exists anymore; the surviving bound is the parent's
+  pipe-poll + SIGKILL). A true hard bound needs a **cancellable
   boundary**, and 5b-2b-ii MUST use a **killable-subprocess** one — **REVISED PIN (was: "(i)/(ii) keep the
   fixed-name clear valid and are preferred"; that claim is FALSE under the exact failure (d) exists for):**
   SIGKILL only *pends* against a child wedged in an uninterruptible (D-state) configfs read — the child
@@ -940,12 +955,13 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   WNOHANG `try_reap` only; bounded ≤10ms reap grace, so ε ≈ ≤12ms/attempt of spawn+kill+reap overhead —
   see the budget invariant below for the explicit `max_attempts · ε` term [user decision 2026-06-10]).
   Production child stderr → **journald (`inherit`)** for kill-storm triage [user decision 2026-06-10].
-  The fixed `twod-hsm` entry becomes EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's **once
-  (d-ii) deletes the cooperative boot fetch** (deletion approved; until then the deletion-approved
-  `fetch_report_deadline` path still uses the fixed name — do not build interim code on the exclusivity). The
-  "unconditional cleanup on every path" invariant is rescoped: it holds in-process and for a SURVIVING
-  child; a killed child structurally cannot clean — next-child/next-boot GC owns that case (configfs is
-  RAM-backed; nothing survives reboot). *(d-i) landed: deviceless killable-subprocess harness
+  The fixed `twod-hsm` entry is now EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's — (4a)
+  deleted the cooperative boot fetch, so the exclusivity is a present structural fact (the former "do
+  not build interim code on the exclusivity" caveat is RETIRED; code MAY rely on it). The
+  "unconditional cleanup on every path" invariant is rescoped: it holds for the in-process producer
+  path (error legs — the in-process timeout leg no longer exists, (4a) deleted the deadline plumbing)
+  and for a SURVIVING child; a killed child structurally cannot clean — next-child/next-boot GC owns
+  that case (configfs is RAM-backed; nothing survives reboot). *(d-i) landed: deviceless killable-subprocess harness
   (`quote_subprocess.rs` — EOF-aware pipe predicate [co-located with the connect predicate in
   `cancellable_boundary`], capped incremental frame codec [the PARSER owns trailing-byte rejection;
   per-drain-window best-effort by design], deadline-bounded
@@ -1028,7 +1044,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   ((d-ii)/3 witness signature) errs only on the claim refusal; the one-call (4b)/5b-2c entry is now
   `ValidatedBootBudget::production_transport`. **NEW 5b-2c obligation:** the serve-path signature must name the
   CONCRETE `HardBoundedQuoteProducer` (default `S = ExecChildSpawn`), NEVER a generic
-  `<Q: BootQuoteProducer>` — a generic wrapper re-opens the cooperative-producer hole (4a) deletes.
+  `<Q: BootQuoteProducer>` — a generic wrapper re-opens the hole (4a) DELETED (any substituted
+  `BootQuoteProducer` impl — the deletion's unrepresentability holds only while the serve path names
+  the concrete type).
   Landing (2) does NOT open live serve (the TWO-artifact gate below is unchanged) and does NOT
   discharge pin (2) below (production-shape runtime stays ZERO-CI; the construction-shape CI test is
   not the discharge — (4c) is). — (3)
@@ -1052,11 +1070,17 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   obligation is RE-SCOPED to 5b-2c with hard constraints (see above — the in-fetch emission was
   reverted); the 5b-2c bin obligation (the TWO-PHASE config logging — raw triplet pre-validation,
   getters + slack post-success) and the witness
-  construction from operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a) cooperative-path deletion — the APPROVED removal of `SnpQuoteProducer`,
+  construction from operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a)
+  cooperative-path deletion — **LANDED (this PR)**: removed `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
-  `fetch_report_with_at` signature rework (drop the cooperative `deadline: Option<Instant>` parameter;
-  the (d-ii) child is the sole surviving caller and fetches unbounded — the rustdoc-pinned "makes the
-  narrowing structural: `_at` loses the parameter entirely" obligation lands here, not later), (4b) live
+  `fetch_report_with_at` signature rework: the cooperative `deadline: Option<Instant>` parameter is
+  GONE from the whole `snp_report` fetch chain (`fetch_report_with`/`_at`/inner); the (d-ii) child is
+  the only caller at a SELF-NAMED entry path, while `_at` remains the SHARED orchestration core under
+  the producer wrapper `fetch_report_with` (stale-clear → sequence → unconditional cleanup serves BOTH
+  paths — a child-specific edit to `_at` changes the producer path too), and the whole chain is now
+  unbounded BY SIGNATURE — the rustdoc-pinned "makes the
+  narrowing structural: `_at` loses the parameter entirely" obligation is DISCHARGED. The
+  fixed-`twod-hsm` exclusivity claim flips TRUE (see the rescoped sentence above), (4b) live
   wiring of `HardBoundedQuoteProducer` into the boot path — GATED on the 5b-2c boot-budget validation
   artifact (the fail-closed constructor check below); the TWO-artifact live-serve gate stands: wiring
   here does NOT open live serve until (4c) completes (d), (4c) the in-guest aya smoke (SNP spike
@@ -1108,8 +1132,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   configfs-tsm. No acceptance item stages a real D-state provider wedge — that arm's only deterministic
   coverage is (1), by design. **This is the live-serve blocker:** 5b-2b-ii(a)/(b) only unblock 5b-2c
   *construction/compilation* (the concrete channel exists); a **live anti-rollback serve path requires (d)**.
-  There is no "wire it live but best-effort" window — the cooperative deadline is best-effort *within* the
-  attempt, but a live serving 5b-2c MUST wait for (d) (the wedged-read hang is otherwise reachable).
+  There is no "wire it live but best-effort" window — (4a) DELETED the cooperative path (nothing
+  best-effort remains to wire); a live serving 5b-2c MUST wait for (d) — (4b) wiring + the (4c) smoke
+  (the wedged-read hang is otherwise reachable).
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
   is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout` + the subprocess overhead ε
   ([`QUOTE_ATTEMPT_OVERHEAD`], as of (d)); total boot ≤ `max_attempts · (2·timeout + ε)`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own

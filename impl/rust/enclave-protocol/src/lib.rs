@@ -173,8 +173,9 @@ mod agent_boot_driver;
 // Agent Gateway anti-rollback boot-relay wire protocol + transport seam (TASK-7.7, slice 5b-2a). The
 // request CBOR codec (MessageType::AgentBootRelay 0x41), the bounded raw-response read, the
 // BootRelayChannel + BootQuoteProducer seams, and RelayAnchorTransport (the concrete
-// `impl AnchorBootTransport`). Pure/CI-testable; the real vsock channel + fetch_report producer + agent
-// bin land in 5b-2b (aya/SNP). UNWIRED (dead-code) until then.
+// `impl AnchorBootTransport`). Pure/CI-testable; the real vsock channel landed in 5b-2b-ii(a)/(c) and
+// the producer that wires is `HardBoundedQuoteProducer` (`quote_subprocess`, (d-ii)/2); the agent bin
+// lands in 5b-2c. UNWIRED (dead-code) until then.
 #[cfg(feature = "agent-gateway")]
 mod agent_boot_relay;
 mod wire;
