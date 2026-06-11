@@ -96,6 +96,17 @@ in
         + "Use a profile that installs a sealed signer.";
     }
     {
+      # TASK-7.7 (d-ii)/4c: the quote-smoke is a DEBUG, release-BANNED lab diagnostic (synthetic
+      # configfs writes, vsock black-hole probing). Make "lab-only" MECHANICAL, not just prose: a
+      # mainnet (productionMode) image must NEVER embed it — fail at eval, not silently ship the
+      # debug smoke into a mainnet build. Only the lab outputs (disk-production-lab-quote-smoke,
+      # productionMode=false) may pass quoteSmokePackage.
+      assertion = quoteSmokePackage == null || !productionMode;
+      message =
+        "twod-hsm: quoteSmokePackage (the (4c) debug quote-smoke) MUST NOT be embedded in a "
+        + "productionMode/mainnet image — it is a lab-only, release-banned diagnostic.";
+    }
+    {
       # Couple the env-gate and the unit-gate: sealRootSource="snp" points the enclave's root file at
       # the tmpfs path the derive oneshot writes, but that oneshot only exists when snpDeriveRootPackage
       # is set. Without it the enclave would read a file nothing writes — fail at eval, not at boot.

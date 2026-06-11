@@ -54,15 +54,18 @@ DISK_LINK="$(twod_hsm_nix_ensure "$FLAKE_DIR" "$DISK_ATTR" "${DISK_ATTR}")"
 SRC_QCOW2="$(twod_hsm_nix_disk_qcow2 "$DISK_LINK")"
 echo "      image: $SRC_QCOW2"
 
-WORK="$(mktemp -u "/tmp/2d-hsm-snp-quote-smoke-XXXXXX.qcow2")"
-LOG="$(mktemp "/tmp/2d-hsm-snp-quote-smoke-XXXXXX.log")"
+# Private 0700 dir (mktemp -d) so the overlay+log paths are NOT attacker-raceable world-writable /tmp
+# names — closes a symlink-TOCTOU on a shared host (defense in depth; this is lab-operator tooling).
+SMOKE_TMP="$(mktemp -d "/tmp/2d-hsm-snp-quote-smoke-XXXXXX")"
+WORK="$SMOKE_TMP/work.qcow2"
+LOG="$SMOKE_TMP/serial.log"
 twod_hsm_make_work_overlay "$SRC_QCOW2" "$WORK"
 
 GUEST_CID="$GUEST_CID" twod_hsm_stop_stale_qemu
 QPID=""
 cleanup() {
   [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null && { kill "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }
-  rm -f "$WORK" "$LOG"
+  rm -rf "$SMOKE_TMP"
 }
 trap cleanup EXIT
 

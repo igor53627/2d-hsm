@@ -913,10 +913,10 @@ request golden vector is a 5b-2b test-vector item.
   gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3, the (4b) wiring landed
   ((d-ii)/4b), the (4c) smoke PASSED on aya (2 SNP runs 2026-06-11, RESULT PASS phases=7) — so
   **gate #1 (d) is now FULLY CLOSED** (the spawn shape ran live; the smoke is a DEBUG build — the
-  release-built agent bin's spawn shape is an explicit 5b-2c residual, recorded below) and live serve waits ONLY on 5b-2c
+  release-built agent bin's spawn shape is an explicit 5b-2c residual, recorded below) and live serve now waits on 5b-2c
   (the `pub` wrapper `run_agent_gateway_boot`, witness-construction-from-operator-config / bin-side
   env-flag parsing, the agent bin, the byte-exact-stdout test RE-TARGETED to the agent bin, the
-  serve loop, the 5b-2c boot-budget validation) + the (b) host-relay daemon for a real anchor):**
+  serve loop, the 5b-2c boot-budget validation) AND the (b) host-relay daemon for a real anchor:**
   1. **(d) quote bound** — DISCHARGED STRUCTURALLY in two halves: the structural gate landed ((d-ii)/2
      `HardBoundedQuoteProducer`, required by signature — a build lacking (d) cannot construct the
      serving path), and (4a) DELETED `SnpQuoteProducer`/`fetch_report_deadline` outright, so the
@@ -928,7 +928,8 @@ request golden vector is a 5b-2b test-vector item.
      a 5-line in-crate shim over pub `fetch_report` would compile). Enforce BOTH at 5b-2c review.
      The (4b) wiring LANDED ((d-ii)/4b, never-generic-Q held: the wired entry is concrete, the
      generic core module-private); the (4c) smoke PASSED on aya (2 SNP runs 2026-06-11, RESULT PASS
-     phases=7) — **this gate (d) is FULLY CLOSED**; live serve waits only on 5b-2c.
+     phases=7) — **this gate (d) is FULLY CLOSED** (debug-smoke spawn shape closed; the release
+     agent-bin spawn shape stays a 5b-2c residual); live serve waits on 5b-2c + the (b) host-relay daemon.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
      (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed

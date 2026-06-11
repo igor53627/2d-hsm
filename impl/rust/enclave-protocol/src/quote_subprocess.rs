@@ -1418,8 +1418,8 @@ pub(crate) fn agent_quote_child_main() -> ! {
     /// line. Lives HERE and not in `emit`/`quote_child_main_with` BY DESIGN: in the real-subprocess CI
     /// smokes stderr IS the protocol pipe and the parser rejects trailing bytes — a breadcrumb in the
     /// shared core would corrupt the smoke protocol stream. This entrypoint stays ZERO-CI by pin (§8:
-    /// production shape is aya-smoke-only); the (4c) `quote_smoke` exercises it in-guest (pending the
-    /// SNP run, see PR).
+    /// production shape is aya-smoke-only); the (4c) `quote_smoke` exercises it in-guest — PASSED on
+    /// aya 2026-06-11 (2 SNP runs, the breadcrumb observed in journald AND on ttyS0).
     fn exit_child(code: i32) -> ! {
         if code != 0 && code != CHILD_EXIT_WRITE_FAILED {
             use std::io::Write as _;
