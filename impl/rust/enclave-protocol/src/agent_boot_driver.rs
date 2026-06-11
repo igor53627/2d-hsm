@@ -93,7 +93,8 @@ pub(crate) struct AnchorBootRequest<'a> {
 /// The single platform dependency of the boot driver — slice 5b-2 implements it. One impl, one call
 /// per attempt. The implementation fetches an SNP quote committing to `request.report_data`
 /// (the killable quote child — `HardBoundedQuoteProducer` via `quote_subprocess`;
-/// `snp_report::fetch_report` is exclusively the GET_MEASUREMENT path since (4a)) then relays it —
+/// `snp_report::fetch_report` was always producer-only; what (4a) flipped is that the fixed
+/// `twod-hsm` entry UNDER it is now exclusively the producer path's) then relays it —
 /// together with the public `(chain_id, env, nonce)` —
 /// to the anchor over the untrusted host, and returns the anchor's **signed response bytes**. Those
 /// bytes are UNTRUSTED and verified downstream (`boot_reconcile_anti_rollback` strict-decodes +

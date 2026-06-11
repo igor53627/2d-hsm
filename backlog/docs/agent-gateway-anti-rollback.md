@@ -642,7 +642,9 @@ request golden vector is a 5b-2b test-vector item.
   Linux runner — this executes the `cancellable_boundary` unit tests, incl. the poll-lapse and
   connect-predicate pins the (a') coverage notes lean on) — but the `#[ignore]` vsock-device tests still
   never run in CI (those run on aya):
-  - **5b-2b-i DONE — MERGED PR #53 (CI-tested in the default + `agent-gateway` builds, NOT behind `vsock-transport`):**
+  - **5b-2b-i DONE — MERGED PR #53** *(HISTORICAL RECORD as merged — the deadline half described below
+    is GONE since (4a); see the bolded correction at the end of this bullet before acting on any
+    signature/entrypoint named here)* **(CI-tested in the default + `agent-gateway` builds, NOT behind `vsock-transport`):**
     `snp_report` deadline-aware quote fetch via a `TsmFs` fs-seam — `fetch_report_with(fs, report_data,
     deadline: Option<Instant>)` (`Some` ⇒ fast-path past-deadline → no fs + per-step `check_deadline`;
     `None` ⇒ unbounded; **unconditional entry cleanup on every path incl. mid-sequence timeout** so no
@@ -865,6 +867,10 @@ request golden vector is a 5b-2b test-vector item.
      serving path), and (4a) DELETED `SnpQuoteProducer`/`fetch_report_deadline` outright, so the
      original "MUST NOT wire the cooperative producer" precondition is now VACUOUS — there is nothing
      cooperative left to mis-wire (kept as the historical record of why the by-signature gate exists).
+     NB the discharge is CONDITIONAL on the never-generic-Q rule (the (d-ii)/2 LANDED note below):
+     the serve-path signature must name the CONCRETE `HardBoundedQuoteProducer` — a generic
+     `<Q: BootQuoteProducer>` wrapper re-opens the class this deletion closed (the trait stays open;
+     a 5-line in-crate shim over pub `fetch_report` would compile). Enforce BOTH at 5b-2c review.
      What remains gating live serve is the (4b) wiring + (4c) smoke.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
      (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
@@ -903,10 +909,13 @@ verify+driver+transport composition end-to-end (including the response wire fram
 there is no current caller**: the quote producer + relay transport are `#[cfg_attr(not(test),
 allow(dead_code))]` and the only intended caller is the 5b-2c bin (not yet built). That window CLOSED at
 (4a): `fetch_report_deadline` is DELETED (with `SnpQuoteProducer`), so the former "coarser pub(crate)
-guarantee vs. checklist obligation" distinction is moot — the only quote-fetch door is
-`HardBoundedQuoteProducer` (module-private orchestration behind it), and "no live wire of a cooperative
-producer" is unrepresentable, not a checklist item. (The unbounded producer `fetch_report` stays `pub` —
-it has no wall-clock contract to violate.)
+guarantee vs. checklist obligation" distinction is moot for the DELETED TYPE — "wire `SnpQuoteProducer`"
+is unrepresentable. SCOPE HONESTLY: the CLASS (an in-crate unbounded `BootQuoteProducer` impl wired into
+`RelayAnchorTransport::new`, e.g. a 5-line shim over the pub `fetch_report`) remains representable —
+the trait is open and `new` stays reachable for fakes; the surviving checklist guards are the
+never-generic-Q rule ((d-ii)/2 note: the serve path names the CONCRETE `HardBoundedQuoteProducer`) +
+the (4b) acceptance review (`RelayAnchorTransport::new`'s own "same residual class" rustdoc). (The
+unbounded producer `fetch_report` stays `pub` — it has no wall-clock contract to violate.)
 
 **5b-2b implementation requirements (pinned after the 5b-2a design matrix — these are the contract 5b-2b
 MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the platform leaves):**
@@ -919,8 +928,10 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   cleanup SURVIVES on the unbounded path (fixed `twod-hsm`; cleanup is the last statement) — pinned by
   the surviving `fetch_cleans_up_on_*` error-leg tests. **Hard wall-clock bound — (d-i) harness
   LANDED (this PR); (d) remains OPEN until (d-ii):** a single in-kernel blocking `read(outblob)` cannot be
-  interrupted under `#![forbid(unsafe_code)]`, so the cooperative deadline is **best-effort, NOT a
-  guaranteed ceiling against a wedged kernel/configfs provider.** A true hard bound needs a **cancellable
+  interrupted under `#![forbid(unsafe_code)]`, so any cooperative deadline WAS best-effort, NOT a
+  guaranteed ceiling against a wedged kernel/configfs provider — which is exactly why (4a) deleted the
+  cooperative path outright (no such deadline exists anymore; the surviving bound is the parent's
+  pipe-poll + SIGKILL). A true hard bound needs a **cancellable
   boundary**, and 5b-2b-ii MUST use a **killable-subprocess** one — **REVISED PIN (was: "(i)/(ii) keep the
   fixed-name clear valid and are preferred"; that claim is FALSE under the exact failure (d) exists for):**
   SIGKILL only *pends* against a child wedged in an uninterruptible (D-state) configfs read — the child
@@ -1064,7 +1075,10 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework: the cooperative `deadline: Option<Instant>` parameter is
   GONE from the whole `snp_report` fetch chain (`fetch_report_with`/`_at`/inner); the (d-ii) child is
-  the sole surviving `_at` caller and fetches unbounded BY SIGNATURE — the rustdoc-pinned "makes the
+  the only caller at a SELF-NAMED entry path, while `_at` remains the SHARED orchestration core under
+  the producer wrapper `fetch_report_with` (stale-clear → sequence → unconditional cleanup serves BOTH
+  paths — a child-specific edit to `_at` changes the producer path too), and the whole chain is now
+  unbounded BY SIGNATURE — the rustdoc-pinned "makes the
   narrowing structural: `_at` loses the parameter entirely" obligation is DISCHARGED. The
   fixed-`twod-hsm` exclusivity claim flips TRUE (see the rescoped sentence above), (4b) live
   wiring of `HardBoundedQuoteProducer` into the boot path — GATED on the 5b-2c boot-budget validation

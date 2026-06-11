@@ -1827,7 +1827,9 @@ mod tests {
     #[test]
     fn fetch_past_deadline_fast_path_no_side_effects() {
         // Deviceless-CI safety parity with the cooperative producer's fast-path pin (deleted in (4a) —
-        // THIS is now the sole fast-path pin): an already-lapsed deadline must error BEFORE any side
+        // THIS is the sole fetch_quote_via_child-LAYER fast-path pin; the trait-path pin is
+        // producer_fetch_is_the_hard_bound_not_a_skeleton arm (b), which uniquely proves
+        // deadline-forwarded-VERBATIM — neither subsumes the other): an already-lapsed deadline must error BEFORE any side
         // effect — no spawn, no sweep.
         let mut ledger = AbandonedLedger::new();
         let sentinel = FakeHandle::unreapable();

@@ -25,7 +25,12 @@ const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
 /// Fixed configfs entry name for this enclave's one boot-time report. Since (4a) (cooperative boot
 /// fetch deleted) this fixed entry is EXCLUSIVELY the unbounded producer/GET_MEASUREMENT path's —
 /// only `RealTsmFs` via [`fetch_report`] touches it; the quote child self-names `twod-hsm-q-<pid>`
-/// (see [`TSM_QUOTE_ENTRY_PREFIX`]). Code MAY rely on this exclusivity (§8 claim flipped TRUE).
+/// (see [`TSM_QUOTE_ENTRY_PREFIX`]). Code MAY rely on this exclusivity (§8 claim flipped TRUE) —
+/// scoped honestly: the prefix-discrimination half is TEST-PINNED (structural), while the
+/// only-`fetch_report`-mints-the-fixed-name half holds by current-caller absence (`fetch_report_with`
+/// is pub(crate) and unconditional): a NEW in-crate caller of `fetch_report_with` re-audits this
+/// exclusivity or forfeits it — two concurrent fixed-entry users would race the leading stale-clear
+/// against each other's in-flight create→write→read on the SAME directory.
 const TSM_ENTRY_NAME: &str = "twod-hsm";
 /// Domain separation for the `report_data` binding (so it is not a bare key hash).
 const REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-snp-report-data-v1";
