@@ -489,6 +489,18 @@ pub(crate) struct VsockBootRelayChannel {
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 use crate::cancellable_boundary::remaining_or_lapsed;
 
+/// The connect-leg deadline-LAPSE triage string (single source, 73ddd5d house pattern): emitted by
+/// `connect_bounded`'s entry-lapse arm and its poll-lapse relabel arm, asserted by the deviceless
+/// relabel test and the (4c) `quote_smoke` vsock-lapse phase. Value frozen by its pin test.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+pub(crate) const VSOCK_CONNECT_LAPSE_MSG: &str = "anchor relay: vsock connect deadline lapsed";
+/// The connect-leg poll-VETO triage string (error-readiness/kernel-`ETIMEDOUT` refusal — the
+/// `connect_poll_succeeded` veto arm). Distinct from the lapse string so the (4c) smoke can
+/// discriminate "our deadline bound fired" from "the kernel timer/RST preempted us". Value frozen
+/// by its pin test.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+pub(crate) const VSOCK_CONNECT_VETO_MSG: &str = "anchor relay: vsock connect failed (poll)";
+
 /// Open a fresh `VsockStream` to `(host_cid, port)`, with a TRUE cancellable connect bound (5b-2b-ii(a')):
 /// a non-blocking `connect` + [`crate::cancellable_boundary::poll_with_deadline`] on `POLLOUT`. On a
 /// deadline lapse the `poll` returns and the `OwnedFd` drops in-scope (closing the fd, aborting the
@@ -503,8 +515,12 @@ use crate::cancellable_boundary::remaining_or_lapsed;
 /// `SO_VM_SOCKETS_CONNECT_TIMEOUT`). A black-holed in-flight connect therefore fails at ~2s with
 /// `sk_err = ETIMEDOUT` → the poll wakes `POLLERR|POLLOUT` → the
 /// [`crate::cancellable_boundary::connect_poll_succeeded`] veto fires — BEFORE our `deadline` whenever
-/// `deadline > ~2s`. The `poll_with_deadline` lapse arm is the binding bound
-/// only for deadlines shorter than the kernel timer (which is also what a real-vsock lapse test must use).
+/// `deadline > ~2s`. The `poll_with_deadline` lapse arm is the binding bound only for deadlines shorter
+/// than the kernel timer. The real-vsock lapse test now lives in `quote_smoke` phase `vsock-lapse`
+/// ((4c), in-guest, 400ms deadline via `connect_bounded_for_smoke` — plain-backtick: that shim is
+/// QUADRUPLE-gated and this doc compiles in lab-quote-smoke-less builds where a link would dangle) —
+/// in-guest is the ONLY place it can live: a HOST-side lapse staging is impossible (host→nonexistent
+/// CID fails synchronously `ENODEV` in `vhost_transport_send_pkt` — no `EINPROGRESS`, no black hole).
 ///
 /// The fd is created `SOCK_NONBLOCK` so the connect can be polled; **after** the connect completes it is
 /// returned to BLOCKING mode (`set_nonblocking(false)`) so the caller's [`DeadlineSocket`]
@@ -528,8 +544,7 @@ fn connect_bounded(
     // hand back a live stream whose lapse is only caught later in `DeadlineSocket::arm_*` — restoring the
     // contract that a lapsed deadline at entry fails fast (and avoiding a wasted socket). The connect-leg
     // relabel keeps lapse triage attributable (the shared helper's string is deliberately subsystem-neutral).
-    remaining_or_lapsed(deadline)
-        .map_err(|_| ProtocolError::WireProtocol("anchor relay: vsock connect deadline lapsed"))?;
+    remaining_or_lapsed(deadline).map_err(|_| ProtocolError::WireProtocol(VSOCK_CONNECT_LAPSE_MSG))?;
 
     // Fresh non-blocking vsock SOCK_STREAM fd. NOT vsock 0.5's `VsockSocket` (that is SOCK_DGRAM).
     let fd = socket(
@@ -557,12 +572,12 @@ fn connect_bounded(
                         // string is matched via the shared const so a reword in the helper can't silently
                         // turn this arm into dead code (also pinned by the deviceless entry-lapse test).
                         ProtocolError::WireProtocol(crate::cancellable_boundary::DEADLINE_LAPSED_MSG) => {
-                            ProtocolError::WireProtocol("anchor relay: vsock connect deadline lapsed")
+                            ProtocolError::WireProtocol(VSOCK_CONNECT_LAPSE_MSG)
                         }
                         other => other,
                     })?;
             if !crate::cancellable_boundary::connect_poll_succeeded(revents) {
-                return Err(ProtocolError::WireProtocol("anchor relay: vsock connect failed (poll)"));
+                return Err(ProtocolError::WireProtocol(VSOCK_CONNECT_VETO_MSG));
             }
         }
         // Any other errno — INCLUDING EINTR — fails immediately (intentional). For a non-blocking AF_VSOCK
@@ -597,6 +612,31 @@ fn connect_bounded(
         .set_nonblocking(false)
         .map_err(|_| ProtocolError::WireProtocol("anchor relay: clear O_NONBLOCK failed"))?;
     Ok(stream)
+}
+
+/// Smoke-only door for the (4c) in-guest vsock-lapse arm (`quote_smoke` phase `vsock-lapse`):
+/// a 1-line forwarder so [`connect_bounded`] itself STAYS module-private. Quadruple-gated — it
+/// cannot exist outside a `lab-quote-smoke` build.
+///
+/// - The (b) host-relay daemon MUST NOT reuse this (nor `connect_bounded`'s sequence): its anchor
+///   leg is TCP→`std::net::TcpStream::connect_timeout` / UDS→`EAGAIN`-not-`EINPROGRESS` — different
+///   connect semantics (§8 "(b) host relay daemon" bullet).
+/// - A HOST-side lapse test is IMPOSSIBLE: host→nonexistent CID fails synchronously `ENODEV` in
+///   `vhost_transport_send_pkt` — no `EINPROGRESS`, no black hole. Only the in-guest
+///   guest→nonexistent-CID probe reaches the genuine in-flight-connect lapse (the guest's virtio
+///   transport queues the REQUEST unconditionally; host vhost_vsock silently FREES packets whose
+///   `dst_cid != 2` — no RST, no RESPONSE). If a future kernel RSTs unknown-CID instead, the probe
+///   FAILS loudly with [`VSOCK_CONNECT_VETO_MSG`]; pre-designed fallbacks: SIGSTOP a second booted
+///   guest and connect to ITS CID (frozen virtqueue = true black hole), or raise
+///   `SO_VM_SOCKETS_CONNECT_TIMEOUT` and keep the deadline under the timer.
+#[cfg(all(target_os = "linux", feature = "vsock-transport",
+          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+pub(crate) fn connect_bounded_for_smoke(
+    cid: u32,
+    port: u32,
+    deadline: std::time::Instant,
+) -> Result<vsock::VsockStream, ProtocolError> {
+    connect_bounded(cid, port, deadline)
 }
 
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
@@ -1554,14 +1594,16 @@ mod vsock_aya_tests {
     /// (af_vsock): the non-blocking connect returns `EINPROGRESS` (the synchronous-`Ok`/`Err` arms are
     /// structurally unreachable for a refusal — `vsock_connect` holds the sock lock and the REQUEST tx is
     /// workqueued), the transport's RST then lands as `sk_err = ECONNRESET`, and the poll wakes *immediately*
-    /// with `POLLERR|POLLOUT` → the `connect_poll_succeeded` veto arm ("vsock connect failed (poll)").
+    /// with `POLLERR|POLLOUT` → the `connect_poll_succeeded` veto arm ([`VSOCK_CONNECT_VETO_MSG`]).
     /// The elapsed bound is BELOW the deadline, so this assert genuinely discriminates prompt refusal
     /// from a deadline-lapse (a lapse would run the full deadline out and fail the bound). It does NOT exercise
     /// the deadline-LAPSE path (a black-holed in-flight connect): that is covered structurally by
-    /// `cancellable_boundary::poll_times_out_when_not_ready` + RAII fd drop; a real-vsock lapse test is
-    /// DEFERRED and must use a deadline **shorter than the kernel's ~2s `VSOCK_DEFAULT_CONNECT_TIMEOUT`**
-    /// (or raise `SO_VM_SOCKETS_CONNECT_TIMEOUT`), else the kernel's `ETIMEDOUT` timer preempts the lapse
-    /// (see the design doc §8).
+    /// `cancellable_boundary::poll_times_out_when_not_ready` + RAII fd drop; the real-vsock lapse test
+    /// now lives in `quote_smoke` phase `vsock-lapse` ((4c), IN-GUEST — guest→nonexistent CID; a
+    /// host-side staging is impossible: host→nonexistent CID fails synchronously `ENODEV` in
+    /// `vhost_transport_send_pkt`, no black hole), with a deadline **shorter than the kernel's ~2s
+    /// `VSOCK_DEFAULT_CONNECT_TIMEOUT`** (400ms), else the kernel's `ETIMEDOUT` timer preempts the
+    /// lapse via the veto arm (see the design doc §8).
     #[test]
     #[ignore]
     fn vsock_channel_connect_failure_is_prompt_and_retryable() {
@@ -1583,7 +1625,7 @@ mod vsock_aya_tests {
             Instant::now() + Duration::from_millis(1000),
         ) {
             Err(ProtocolError::WireProtocol(msg)) => assert_eq!(
-                msg, "anchor relay: vsock connect failed (poll)",
+                msg, VSOCK_CONNECT_VETO_MSG,
                 "a no-listener refusal must be rejected by the poll-veto arm specifically"
             ),
             Err(other) => panic!("expected the poll-veto arm error, got {other:?}"),
@@ -1613,12 +1655,30 @@ mod vsock_aya_tests {
             .unwrap_or_else(Instant::now);
         match connect_bounded(LOOPBACK_CID, 5995, past) {
             Err(ProtocolError::WireProtocol(msg)) => assert_eq!(
-                msg, "anchor relay: vsock connect deadline lapsed",
+                msg, VSOCK_CONNECT_LAPSE_MSG,
                 "entry lapse must carry the connect-leg triage label"
             ),
             Err(other) => panic!("expected relabelled entry-lapse error, got {other:?}"),
             Ok(_) => panic!("a past deadline must fail at entry, not connect"),
         }
+    }
+
+    /// Deviceless literal pin: freezes [`VSOCK_CONNECT_LAPSE_MSG`]'s VALUE. Regression: a reword of
+    /// the const would silently re-key every downstream exact-match consumer (the (4c) smoke's
+    /// lapse-arm discrimination, host-side log greps) without any compile error — the single-source
+    /// refactor moves the drift hazard from "three literals disagree" to "the one literal changes",
+    /// and this pin makes that change loud.
+    #[test]
+    fn vsock_connect_lapse_msg_literal_is_pinned() {
+        assert_eq!(VSOCK_CONNECT_LAPSE_MSG, "anchor relay: vsock connect deadline lapsed");
+    }
+
+    /// Deviceless literal pin: freezes [`VSOCK_CONNECT_VETO_MSG`]'s VALUE (same regression class as
+    /// the lapse pin — the (4c) smoke prints/discriminates this exact string when the kernel
+    /// timer/RST preempts the lapse arm).
+    #[test]
+    fn vsock_connect_veto_msg_literal_is_pinned() {
+        assert_eq!(VSOCK_CONNECT_VETO_MSG, "anchor relay: vsock connect failed (poll)");
     }
 
     /// Direct assertions for the two properties the behavioral tests cannot discriminate: (1) after

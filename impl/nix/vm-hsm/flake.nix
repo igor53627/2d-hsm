@@ -28,6 +28,11 @@
         enclave-production-transport = pkgs.callPackage ./enclave.nix {
           profile = "production-transport";
         };
+        # TASK-7.7 (d-ii)/4c: the lab-only in-guest quote-smoke bin (agent-gateway role; a SEPARATE
+        # derivation from the producer profiles — role-isolation compile_error, see enclave.nix).
+        enclave-quote-smoke = pkgs.callPackage ./enclave.nix {
+          profile = "quote-smoke";
+        };
         # TASK-1.1: SNP firmware-derived pq-seal provisioning root boot helper.
         snp-derive-root = pkgs.callPackage ./snp-derive-root.nix { };
         flakeMeta = {
@@ -119,6 +124,21 @@
         # ceremony script and force-added in the validation worktree; gitignored so it never lands in a
         # real commit). When absent (CI eval), it falls back to the lab fixture so the output still
         # instantiates — but it will NOT unseal at boot until the matching ceremony blob is present.
+        # TASK-7.7 (d-ii)/4c: production-lab image + the in-guest quote-smoke oneshot (validates the
+        # production spawn shape / dispatch re-exec / configfs GC / vsock-lapse / journald breadcrumb
+        # on a real SNP host; see run-nix-snp-quote-smoke.sh). The `*-lab-*` name keeps the generic
+        # launcher's HAS_SIGNER/REQUIRE_REAL auto-derivation convention.
+        diskProductionLabQuoteSmoke = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
+          guestProfile = "production-lab";
+          quoteSmokePackage = enclave-quote-smoke;
+        };
         ceremonySignerPath = ./ceremony-sealed-signer.bin;
         diskProductionLabSnpRooted = import ./disk-image.nix {
           inherit
@@ -138,6 +158,9 @@
       {
         packages = {
           inherit enclave enclave-staging enclave-production-transport measurement-manifest snp-derive-root;
+          # TASK-7.7 (d-ii)/4c quote smoke (lab-only bin + bootable image carrying its oneshot).
+          inherit enclave-quote-smoke;
+          disk-production-lab-quote-smoke = diskProductionLabQuoteSmoke;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;

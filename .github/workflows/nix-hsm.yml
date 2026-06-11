@@ -8,6 +8,7 @@ on:
     branches: [main, 'feat/**']
     paths:
       - 'impl/nix/vm-hsm/**'
+      - 'impl/scripts/aya-sev-snp/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
       - 'impl/rust/pq-seal-manifest/**'
@@ -18,6 +19,7 @@ on:
   pull_request:
     paths:
       - 'impl/nix/vm-hsm/**'
+      - 'impl/scripts/aya-sev-snp/**'
       - 'impl/rust/enclave-protocol/**'
       - 'impl/rust/pq-seal-v1/**'
       - 'impl/rust/pq-seal-manifest/**'
@@ -62,6 +64,16 @@ jobs:
       # `#[ignore]` (runs on aya only) — this runner has no vsock device, so a non-ignored device test fails.
       - name: Agent Gateway vsock boot-relay leaf (compile + run deviceless; #[ignore] aya skipped)
         run: cargo test --features vsock-transport,agent-gateway
+
+      # TASK-7.7 (d-ii)/4c: builds the lab-only smoke bin via required-features and runs (i) the
+      # CARGO_BIN_EXE integration arms (dispatch-first + PROTOCOL-ONLY stdout, byte-exact ERR frames;
+      # deterministic deviceless — see the test header) and (ii) the quote_smoke deadline-window unit
+      # (pins the < ~2s kernel-connect-timer constraint as a CI fact). Additive: the pinned leaf step
+      # above stays byte-identical; this avoids re-running the whole suite under unified features.
+      - name: (4c) quote-smoke bin contract — dispatch-first + PROTOCOL-ONLY stdout (lab-quote-smoke)
+        run: |
+          cargo test --features vsock-transport,agent-gateway,lab-quote-smoke --test twod_hsm_quote_smoke_bin
+          cargo test --features vsock-transport,agent-gateway,lab-quote-smoke --lib quote_smoke
 
       - name: Agent Gateway incl. PROVE_IDENTITY preview (TASK-7.6.3)
         run: cargo test --features agent-prove-identity-preview
