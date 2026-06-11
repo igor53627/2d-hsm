@@ -49,10 +49,11 @@ Requires `./warm-smoke-cache.sh` once (golden disk + cargo binary). Guest bind: 
 | `run-nix-snp-quote-smoke.sh` | `.#disk-production-lab-quote-smoke` | ALL THREE host greps in the serial log: `twod-hsm-quote-smoke: RESULT PASS` (the bin's verdict, `phases=7`), the raw child breadcrumb line on ttyS0 (console tee of the staged ERR(1) child's stderr), and `twod-hsm-quote-smoke: journald-breadcrumb PASS` (the unit's ExecStartPost journald-ARRIVAL assert). Phase expectations: `vsock-lapse` `elapsed_ms` ∈ [`deadline - 25ms slop`, 1500) (the lapse fired at ~399ms — poll(2) whole-ms truncation + single-tick early wake; see `LAPSE_ELAPSED_FLOOR_SLOP`); `quote-1`/`quote-2` `report_len` ≥ **1184** + report_data echo ok + a 96-hex launch measurement (NO cert-chain claim on aya — the provider doesn't populate `auxblob`); `gc-clean` zero `twod-hsm-q-*` residue. ~80s warm boot. |
 | `SEV_MODE=none` + `run-guest-vm.sh` (KVM dry-run, fresh overlay of the same image) | `.#disk-production-lab-quote-smoke` | `PHASE vsock-lapse PASS` + `PHASE breadcrumb PASS`; the configfs phases FAIL by design (no configfs-tsm off SNP) ⇒ `RESULT FAIL`. NB ExecStartPost (the journald assert) is SKIPPED on ExecStart failure — not exercised in the dry-run. |
 
-Status: **PASSED on aya 2026-06-11 — 2 SNP runs, `RESULT PASS phases=7`, all three witnesses, ~80s
-warm boot.** Run 1 surfaced a real test-assertion bug (the lapse fires at 399ms by timer
-granularity, 1ms under the exact 400ms floor) → fixed with `LAPSE_ELAPSED_FLOOR_SLOP`; run 2 (post-fix)
-+ a confirming idempotence run both PASS.
+Status: **PASSED on aya 2026-06-11 — 4 SNP runs total, `RESULT PASS phases=7`, all three witnesses,
+~80s warm boot.** Run 1 surfaced a real test-assertion bug (the lapse fires at 399ms by timer
+granularity, 1ms under the exact 400ms floor) → fixed with `LAPSE_ELAPSED_FLOOR_SLOP`; runs 2–4 (the
+post-floor-slop run, a confirming idempotence run, and a post-hardening run on the final launcher)
+all PASS.
 
 ## Review record (PR #5)
 

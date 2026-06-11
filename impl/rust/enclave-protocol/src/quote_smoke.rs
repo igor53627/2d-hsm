@@ -119,9 +119,13 @@ fn prefixed_residue() -> Result<Vec<String>, String> {
         .map_err(|e| format!("read_dir {TSM_REPORT_DIR} failed: {e}"))?;
     let mut residue = Vec::new();
     for entry in entries {
-        let Ok(entry) = entry else { continue };
+        // Surface a read error, never skip it: a swallowed DirEntry fault could hide a stale
+        // twod-hsm-q-* entry and turn gc-clean into a false residue=0 PASS (review finding).
+        let entry = entry.map_err(|e| format!("read_dir entry under {TSM_REPORT_DIR} failed: {e}"))?;
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+        let Some(name) = name.to_str() else {
+            return Err(format!("non-UTF-8 entry name under {TSM_REPORT_DIR} (cannot rule out a stale prefix entry)"));
+        };
         if name.starts_with(TSM_QUOTE_ENTRY_PREFIX) {
             residue.push(name.to_string());
         }
@@ -173,8 +177,12 @@ fn phase_vsock_lapse() -> Result<String, String> {
 /// residue-only and cannot tell "swept a real orphan" from "nothing was there").
 fn phase_gc_seed() -> Result<String, String> {
     let path = synthetic_stale_entry_path();
+    // AlreadyExists is FINE: a leftover from a prior run/restart (configfs is RAM-backed, so only a
+    // same-boot re-run can hit this) is itself a valid foreign orphan for the next child's prefix GC
+    // to sweep — the goal is "the entry is staged", reached either way.
     match std::fs::create_dir(&path) {
         Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(format!("mkdir {path} failed: {e}")),
     }
     if !std::path::Path::new(&path).is_dir() {
