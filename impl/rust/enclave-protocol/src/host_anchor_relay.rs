@@ -42,9 +42,11 @@ use std::time::Duration;
 
 /// Per-pump HEAD-OF-LINE bound (NOT the boot bound — the enclave owns `max_attempts·(2·timeout+ε)`;
 /// this daemon carries NO ε, NO producer, NO budget arithmetic). Prevents a wedged pump from blocking
-/// the serial loop forever. One absolute `Instant` minted AFTER connect spans the whole framed pump,
-/// and both legs' `SO_RCVTIMEO`/`SO_SNDTIMEO` are armed to this. Sized to comfortably cover a single
-/// boot-relay round-trip to a LAN anchor.
+/// the serial loop forever. One absolute `Instant` minted at PUMP ENTRY — i.e. BEFORE the enclave read
+/// (the natural consequence of reading the request before connecting) — spans the whole framed pump
+/// (enclave-read + connect + anchor-forward + write-back); the connect leg is ADDITIONALLY clamped to
+/// `min(connect_budget(), remaining-deadline)`. Both legs' `SO_RCVTIMEO`/`SO_SNDTIMEO` are armed to this.
+/// Sized to comfortably cover a single boot-relay round-trip to a LAN anchor.
 const PUMP_BUDGET: Duration = Duration::from_secs(10);
 
 /// Divisor deriving the connect budget from [`PUMP_BUDGET`] — the §8 "connect/socket budget DERIVED

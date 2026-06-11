@@ -874,6 +874,36 @@ request golden vector is a 5b-2b test-vector item.
           and the duplicated golden-frame literals are single-sourced at the `agent_boot_relay` module
           root (shared by both test modules — no silent drift between the freeze and the sibling
           forwarder). The relay-can-tamper "finding" was REFUTED (by design — the enclave Ed25519-verifies).
+        - **Full-Matrix reconciliation (PR #64, 8 cells codex/claude-code/gemini/grok × security/design —
+          ZERO new code bugs; both prior fixes confirmed landed):** the only actionable items were doc
+          reconciliations, applied here:
+          - **Canonical pump order = read-decode-BEFORE-dial.** The implementation reads+decodes the
+            enclave request FIRST, then dials (so a malformed frame never burns a TCP connect; deviceless
+            test 2 pins dial-never-called). This is the AUTHORITATIVE order — it OVERRIDES any "dial-first"
+            §-numbered prose in the pre-merge scratch design (which the code's `DEVIATION FROM DESIGN §3c`
+            comment records as internally inconsistent). 5b-2c (and any UDS dialer) MUST follow read-decode-
+            before-dial, not dial-first.
+          - **`PUMP_BUDGET` deadline is minted at PUMP ENTRY (before the enclave read), NOT "after
+            connect".** The stale const docstring ("minted AFTER connect") flagged by codex+claude is fixed
+            in code; the absolute deadline spans enclave-read + connect + forward + write-back, with connect
+            additionally clamped to `min(connect_budget(), remaining-deadline)`.
+          - **`anchor_endpoint_from_env` is DAEMON-STARTUP-ONLY.** The bounded-resolve "fail-closed → exit
+            1" guarantee relies on the BIN exiting the process on the returned Err; the library fn itself
+            only returns the error (and the abandoned `getaddrinfo` worker thread dies with the process). A
+            long-lived in-process caller that swallows the Err + retries against a wedged resolver would
+            leak a thread per attempt — out of scope (the bin is the only caller, one-shot at startup).
+          - **Head-of-line worst case is ~2×PUMP_BUDGET, not PUMP_BUDGET.** A write-back that begins at
+            `deadline − ε` is bounded only by `SO_SNDTIMEO` (= PUMP_BUDGET = 10 s) — Risk #3's additive
+            socket-timeout tail. The concurrency/accept-backlog follow-up trigger must be sized against
+            ~2×PUMP_BUDGET per wedged pump, not the nominal 10 s.
+          - **`relay ⊇ anchor` differential test now OWNED by TASK-21** (was "tracked SEPARATELY" with no
+            id) — lands with 5b-2c when a concrete anchor endpoint exists to model.
+          - **Orchestration-drift seam (Low, accepted):** `relay_one_pump_until` re-implements
+            `relay_forward_once`'s sequencing (it must, to insert the dial + distinct `AnchorConnect`
+            classification between decode and forward) but reuses the SAME guard/codec cores
+            (`deadline_guarded_write`, `relay_round_trip_over_stream`, `frame_anchor_response`). OBLIGATION:
+            a future per-leg-guard hardening of `relay_forward_once` must be mirrored into the pump (the two
+            share guarantees, not the function body).
     - **(c) feature-build CI — DONE PR #54 (upgraded in PR #55):** originally `cargo test --no-run
       --features vsock-transport,agent-gateway` on the ubuntu (Linux) `rust-test` job; since PR #55 the
       `--no-run` is dropped — CI now compiles the channel + the `#[ignore]` aya tests AND **runs the
