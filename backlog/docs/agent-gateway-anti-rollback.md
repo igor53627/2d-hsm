@@ -844,7 +844,36 @@ request golden vector is a 5b-2b test-vector item.
           acceptance test pass (Linux CI under `agent-gateway,vsock-transport`); the real-vsock-loopback
           aya test (bind-CID `CID_ANY` reality) stays `#[ignore]`, landing with 5b-2c bring-up.
         - **Status:** (b) landed; **live serve now gated on 5b-2c ALONE** (the other live gate).
-          Concurrency + accept-backlog limits = the named §8 follow-up.
+          Concurrency + accept-backlog DEPTH limits = the named §8 follow-up.
+        - **xhigh-review hardening (pre-merge, PR #64 — 6 real findings, all fixed):** the review caught
+          four runtime/robustness gaps in the as-first-written (b) code, now fixed:
+          1. **Connect leg was N×budget, not one budget.** `TcpAnchorDial::dial` applied the FULL
+             `connect_budget()` to EACH resolved address, so a multi-A / dual-stack black-holing anchor
+             multiplied the head-of-line bound to `N·2.5s` (and past `PUMP_BUDGET` for N≥5). FIX: `dial`
+             now takes an ABSOLUTE `connect_deadline = min(now + connect_budget(), pump_deadline)` and
+             tries each addr against the REMAINING budget — cumulative connect across ALL addrs is one
+             `connect_budget()` AND never overruns the pump deadline. (This is what the "wedged-bounded
+             HERE, never on the loop" claim always intended.)
+          2. **Accept-loop tight-spin under fd exhaustion.** A persistent immediate `accept(2)` error
+             (EMFILE/ENFILE — accept fails without draining the backlog) made the bare log+continue peg a
+             core + flood stderr. FIX: an `ACCEPT_ERROR_BACKOFF` (50 ms) sleep caps the retry rate;
+             NEVER-DIE still holds. The accept-error arm + pump path are now ONE shared `handle_accepted`
+             body (the prod `Infallible` loop and the `#[cfg(test)]` finite twin can't drift the guard).
+          3. **Unbounded blocking DNS at startup.** `anchor_endpoint_from_env` called `to_socket_addrs`
+             (blocking `getaddrinfo`) with no cap BEFORE the bind/`Listening` log — a wedged resolver hung
+             the daemon INVISIBLY (defeating fail-closed startup). FIX: a bounded resolver thread
+             (`ANCHOR_RESOLVE_BUDGET` = 8 s) → a clean named error → exit 1 instead of a silent hang.
+          4. **Write-back not deadline-guarded like the core.** The final enclave write used bare
+             `write_all`/`flush` instead of the reused `relay_forward_once`'s `deadline_guarded_write`, so
+             a write begun past a lapsed deadline was bounded only by `SO_SNDTIMEO` (10 s). FIX: the
+             write-back now goes through the SAME `deadline_guarded_write` (now `pub(crate)`) — core-
+             symmetric; the per-pump bound holds on the last leg too.
+          Plus two test-quality fixes: the misnamed `deadline_lapsed_pump` (it tested an EMPTY-response
+          EOF, NOT a lapse) is split into `empty_anchor_response_closes_never_synth` + a GENUINE
+          `lapsed_deadline_pump_never_synth` (deadline injected via a new `relay_one_pump_until` seam);
+          and the duplicated golden-frame literals are single-sourced at the `agent_boot_relay` module
+          root (shared by both test modules — no silent drift between the freeze and the sibling
+          forwarder). The relay-can-tamper "finding" was REFUTED (by design — the enclave Ed25519-verifies).
     - **(c) feature-build CI — DONE PR #54 (upgraded in PR #55):** originally `cargo test --no-run
       --features vsock-transport,agent-gateway` on the ubuntu (Linux) `rust-test` job; since PR #55 the
       `--no-run` is dropped — CI now compiles the channel + the `#[ignore]` aya tests AND **runs the

@@ -27,7 +27,8 @@
 //! cross-component sync OBLIGATION (Risk #1 in the design), not a present fact.
 
 use crate::agent_boot_relay::{
-    decode_anchor_boot_request, frame_anchor_response, relay_round_trip_over_stream,
+    deadline_guarded_write, decode_anchor_boot_request, frame_anchor_response,
+    relay_round_trip_over_stream,
 };
 use crate::vsock_addr::{self, DEFAULT_VSOCK_CID};
 use crate::vsock_listen;
@@ -67,6 +68,13 @@ fn connect_budget() -> Duration {
     derived.max(CONNECT_BUDGET_MIN)
 }
 
+/// Backoff before the next `accept(2)` after an accept ERROR. Under fd exhaustion (EMFILE/ENFILE) the
+/// kernel fails accept IMMEDIATELY WITHOUT draining the pending backlog entry, so a bare log+continue
+/// would tight-spin a core + flood stderr until fds free elsewhere. A short sleep caps the retry rate;
+/// NEVER-DIE still holds (the daemon keeps serving, it just doesn't busy-loop). Accept errors are rare
+/// for AF_VSOCK, so this never delays the steady state — it is cheap insurance against the spin.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
 // ---------------------------------------------------------------------------------------------------
 // The AnchorDial seam — the transport quarantine (design §2).
 // ---------------------------------------------------------------------------------------------------
@@ -92,9 +100,12 @@ fn connect_budget() -> Duration {
 ///     UDS would be its OWN impl, never folded into the loop.
 pub(crate) trait AnchorDial {
     type Stream: std::io::Read + std::io::Write;
-    /// Connect with a HARD upper bound. `connect_timeout` is a derived fraction of the per-pump budget
-    /// (the §8 shared-source rule), never a separate operator knob.
-    fn dial(&self, connect_timeout: Duration) -> std::io::Result<Self::Stream>;
+    /// Connect with a HARD upper bound expressed as an ABSOLUTE `connect_deadline`: the impl tries each
+    /// resolved address against the budget REMAINING until that instant, so the CUMULATIVE connect across
+    /// ALL addresses is bounded by ONE connect budget (never N×budget for a multi-A/dual-stack name) and
+    /// never overruns the caller's whole-pump deadline. The deadline is derived from a fraction of the
+    /// per-pump budget (the §8 shared-source rule), never a separate operator knob.
+    fn dial(&self, connect_deadline: std::time::Instant) -> std::io::Result<Self::Stream>;
     /// Operator-facing endpoint label for the startup log (no secrets — a host:port).
     fn endpoint_display(&self) -> String;
 }
@@ -118,12 +129,25 @@ pub(crate) struct TcpAnchorDial {
 impl AnchorDial for TcpAnchorDial {
     type Stream = std::net::TcpStream;
 
-    fn dial(&self, connect_timeout: Duration) -> std::io::Result<std::net::TcpStream> {
-        // Try each resolved addr; std connect_timeout does the whole nonblock→poll→SO_ERROR→restore
-        // dance internally and returns a BLOCKING stream. NO nix, NO unsafe, NO poll-sequence copy.
+    fn dial(&self, connect_deadline: std::time::Instant) -> std::io::Result<std::net::TcpStream> {
+        // Try each resolved addr against the budget REMAINING until the shared connect deadline — so the
+        // CUMULATIVE connect across ALL addrs is bounded by ONE connect budget (a multi-A / dual-stack
+        // black-holing anchor can NOT multiply the head-of-line bound to N×budget) and never overruns the
+        // whole-pump deadline. std connect_timeout does the whole nonblock→poll→SO_ERROR→restore dance
+        // internally and returns a BLOCKING stream. NO nix, NO unsafe, NO poll-sequence copy.
         let mut last: Option<std::io::Error> = None;
         for addr in &self.addrs {
-            match std::net::TcpStream::connect_timeout(addr, connect_timeout) {
+            let remaining = connect_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                // Connect budget spent across prior addrs (or the pump deadline already lapsed). Surface a
+                // TimedOut so classify_close labels it "anchor-connect-timeout". (connect_timeout(0) itself
+                // errors — we must never call it with a zero Duration, hence the break.)
+                last.get_or_insert_with(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "anchor connect budget exhausted")
+                });
+                break;
+            }
+            match std::net::TcpStream::connect_timeout(addr, remaining) {
                 Ok(s) => {
                     s.set_nodelay(true)?; // one small frame each way — latency over throughput
                     return Ok(s);
@@ -278,25 +302,41 @@ fn emit_log(ev: &RelayEvent) {
 // ---------------------------------------------------------------------------------------------------
 
 /// One enclave↔anchor pump. ONE absolute pump deadline spans enclave-read + connect + anchor-forward +
-/// write-back; connect is ADDITIONALLY bounded by [`connect_budget`] (the head-of-line guard against a
-/// black-holing anchor — §8: NOT covered by the cores' in-fn deadline, which operates on already-
-/// connected streams). Both legs' `SO_RCVTIMEO`/`SO_SNDTIMEO` are armed to [`PUMP_BUDGET`] (the in-fn
-/// guards only bound *initiating* a write; an in-flight blocking write is bounded only by `SO_SNDTIMEO`
-/// — the cores' docstring mandate). Once-per-pump arming is sufficient (the pump is ONE round-trip; a
-/// syscall starting late overruns by at most one socket-timeout — Risk #3 exact-bound caveat).
+/// write-back; the connect leg is ADDITIONALLY capped by [`connect_budget`] AND clamped to the remaining
+/// pump deadline (`min` of the two) — so connect is the head-of-line guard against a black-holing anchor
+/// (§8: NOT covered by the cores' in-fn deadline, which operates on already-connected streams) yet can
+/// never push the pump past PUMP_BUDGET, even for a MULTI-ADDRESS endpoint (the cumulative connect across
+/// ALL resolved addrs is one connect_budget, never N×). Both legs' `SO_RCVTIMEO`/`SO_SNDTIMEO` are armed
+/// to [`PUMP_BUDGET`] (the in-fn guards only bound *initiating* a write; an in-flight blocking write is
+/// bounded only by `SO_SNDTIMEO` — the cores' docstring mandate). Once-per-pump arming is sufficient (the
+/// pump is ONE round-trip; a syscall starting late overruns by at most one socket-timeout — Risk #3).
 fn relay_one_pump<E, D>(enclave: &mut E, dial: &D) -> Result<(), RelayFault>
 where
     E: std::io::Read + std::io::Write,
     D: AnchorDial,
     D::Stream: ArmAnchorTimeouts,
 {
-    // One absolute deadline for the WHOLE pump. Minting it up front (vs the design's "after connect")
-    // is the natural consequence of reading the enclave frame before connecting — and is correct: the
-    // connect is INDEPENDENTLY hard-bounded by `connect_budget()` below regardless, and the whole pump
-    // is head-of-line-bounded by PUMP_BUDGET. Reuses the SAME `read_framed_message_with_idle_deadline`
-    // the enclave's encoder pairs with (4-byte BE len, bounded by MAX_MESSAGE_SIZE).
-    let deadline = std::time::Instant::now() + PUMP_BUDGET;
+    // One absolute deadline for the WHOLE pump. Minting it up front (vs the design's "after connect") is
+    // the natural consequence of reading the enclave frame before connecting — and is correct: the
+    // connect below is clamped to BOTH connect_budget() AND this deadline, and the whole pump is
+    // head-of-line-bounded by PUMP_BUDGET.
+    relay_one_pump_until(enclave, dial, std::time::Instant::now() + PUMP_BUDGET)
+}
 
+/// [`relay_one_pump`] with the pump `deadline` INJECTED — the one piece of pump nondeterminism, factored
+/// out so the deviceless suite can drive a GENUINELY-lapsed deadline (test `lapsed_deadline_pump_*`)
+/// rather than only the EOF/empty-response path. Production always enters via [`relay_one_pump`]
+/// (deadline = now + PUMP_BUDGET); nothing else constructs a deadline.
+fn relay_one_pump_until<E, D>(
+    enclave: &mut E,
+    dial: &D,
+    deadline: std::time::Instant,
+) -> Result<(), RelayFault>
+where
+    E: std::io::Read + std::io::Write,
+    D: AnchorDial,
+    D::Stream: ArmAnchorTimeouts,
+{
     // 1. Read the enclave request frame, then DECODE-VALIDATE it BEFORE dialing — reject a malformed
     //    request before spending a TCP connect (defense-in-depth; test 2 pins dial-never-called).
     //    Both the reader and the decoder are the verbatim `pub(crate)` cores (no codec dup).
@@ -305,8 +345,12 @@ where
     decode_anchor_boot_request(&frame).map_err(RelayFault::Pump)?;
 
     // 2. Request is well-formed → dial the anchor under the hard connect bound (distinct AnchorConnect
-    //    classification — tests 3/4). A black-holing anchor is wedged-bounded HERE, never on the loop.
-    let mut anchor = dial.dial(connect_budget()).map_err(RelayFault::AnchorConnect)?;
+    //    classification — tests 3/4). The connect leg shares ONE budget across ALL resolved addrs
+    //    (connect_budget(), the §8 derived sub-budget) AND never overruns the pump deadline — min() of
+    //    the two — so a black-holing anchor (even multi-A / dual-stack) is wedged-bounded HERE to
+    //    ≤ connect_budget(), never on the loop and never past PUMP_BUDGET.
+    let connect_deadline = (std::time::Instant::now() + connect_budget()).min(deadline);
+    let mut anchor = dial.dial(connect_deadline).map_err(RelayFault::AnchorConnect)?;
 
     // 3. Arm SO_RCVTIMEO/SO_SNDTIMEO on the anchor leg (the enclave leg is armed at the concrete
     //    boundary in run_host_anchor_relay — design §3d). Arm failure folds into AnchorConnect (close).
@@ -319,13 +363,16 @@ where
     let response = relay_round_trip_over_stream(&mut anchor, &frame, deadline).map_err(RelayFault::Pump)?;
 
     // 5. Frame the response with the SHARED `frame_anchor_response` writer (so writer↔reader can't drift
-    //    on BE/prefix) and write it back to the enclave. This is the ONLY enclave write anywhere — on
-    //    EVERY fault above the fn returned Err BEFORE reaching here, so the enclave stream received ZERO
-    //    anchor-looking bytes (the never-synth behavioral invariant; tests 2/5/6/9). The write-back is
-    //    bounded by the enclave socket's armed SO_SNDTIMEO (set at the §3d concrete boundary).
+    //    on BE/prefix) and write it back to the enclave via the SAME `deadline_guarded_write` the reused
+    //    `relay_forward_once` core uses for this identical leg — so a budget that lapsed during the
+    //    round-trip never even INITIATES the enclave write (core-symmetric; the per-pump bound the rest of
+    //    the function maintains now holds on the last leg too, not just SO_SNDTIMEO). This is the ONLY
+    //    enclave write anywhere — on EVERY fault above the fn returned Err BEFORE reaching here, so the
+    //    enclave stream received ZERO anchor-looking bytes (the never-synth behavioral invariant; tests
+    //    2/5/6/9 + lapsed_deadline_pump_never_synth).
     let wire = frame_anchor_response(&response).map_err(RelayFault::Pump)?;
-    enclave.write_all(&wire).map_err(|e| RelayFault::Pump(ProtocolError::Io(e)))?;
-    enclave.flush().map_err(|e| RelayFault::Pump(ProtocolError::Io(e)))?;
+    deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
+        .map_err(RelayFault::Pump)?;
     Ok(())
 }
 
@@ -345,8 +392,31 @@ where
     }
 }
 
+/// Handle ONE accepted item — the body BOTH the production `Infallible` loop and the `#[cfg(test)]`
+/// finite twin share, so the accept-error backoff + the pump path are the SAME statements (no `cfg(test)`
+/// drift, and the EMFILE/ENFILE anti-spin guard can't be added to one loop but forgotten in the other).
+/// `Ok` → pump+log; `Err` → log + bounded [`ACCEPT_ERROR_BACKOFF`] (so a persistent immediate accept
+/// error can't tight-spin a core). RAII: the accepted `enclave` (and the anchor inside the pump) drop at
+/// this fn's return — Err→close, the next accept starts a fresh frame (no desync; never-synth holds).
+fn handle_accepted<E, D>(accepted: std::io::Result<E>, dial: &D)
+where
+    E: std::io::Read + std::io::Write,
+    D: AnchorDial,
+    D::Stream: ArmAnchorTimeouts,
+{
+    match accepted {
+        Ok(mut enclave) => pump_one_and_log(&mut enclave, dial),
+        Err(e) => {
+            emit_log(&RelayEvent::AcceptError { kind: e.kind() });
+            // EMFILE/ENFILE fails accept(2) IMMEDIATELY without draining the backlog → a bare continue
+            // would busy-loop. Back off to cap the retry rate; the daemon still NEVER dies.
+            std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
-// The serial accept loop (design §3b) + the cfg(test) finite twin. Both loop the SAME pump_one_and_log
+// The serial accept loop (design §3b) + the cfg(test) finite twin. Both loop the SAME `handle_accepted`
 // body — no drift. The pub loop's `Infallible` return documents AT THE TYPE LEVEL that it never
 // returns Ok (per-connection faults never escape); the production VsockListener::incoming() is
 // infinite so the `for` never exits.
@@ -366,16 +436,7 @@ where
     D::Stream: ArmAnchorTimeouts,
 {
     for accepted in incoming {
-        let mut enclave = match accepted {
-            Ok(s) => s,
-            Err(e) => {
-                emit_log(&RelayEvent::AcceptError { kind: e.kind() });
-                continue;
-            }
-        };
-        pump_one_and_log(&mut enclave, dial);
-        // RAII: `enclave` (and the anchor inside relay_one_pump) drop HERE — Err→close, fresh accept
-        // starts a fresh frame (no desync; never-synth holds).
+        handle_accepted(accepted, dial);
     }
     // VsockListener::incoming() never yields None, so this is genuinely unreachable in production. The
     // finite-test driver (drive_relay_loop_finite) loops the SAME body and returns (), so the type-level
@@ -461,7 +522,7 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::os::unix::net::UnixStream;
 
-    /// The finite-iterator test twin (§3b / §7): loops the SAME `pump_one_and_log` body as
+    /// The finite-iterator test twin (§3b / §7): loops the SAME `handle_accepted` body as
     /// `serve_anchor_relay_loop` but returns `()` when a FINITE iterator drains — so `Infallible` stays
     /// truthful (the prod iterator is infinite) WITHOUT an `unreachable!` ever being reached in tests.
     fn drive_relay_loop_finite<I, E, D>(incoming: I, dial: &D)
@@ -472,14 +533,7 @@ mod tests {
         D::Stream: ArmAnchorTimeouts,
     {
         for accepted in incoming {
-            let mut enclave = match accepted {
-                Ok(s) => s,
-                Err(e) => {
-                    emit_log(&RelayEvent::AcceptError { kind: e.kind() });
-                    continue;
-                }
-            };
-            pump_one_and_log(&mut enclave, dial);
+            handle_accepted(accepted, dial);
         }
     }
 
@@ -555,7 +609,7 @@ mod tests {
 
     impl<'a> AnchorDial for &'a FakeAnchorDial {
         type Stream = RecordingAnchorStream<'a>;
-        fn dial(&self, _t: Duration) -> std::io::Result<RecordingAnchorStream<'a>> {
+        fn dial(&self, _deadline: std::time::Instant) -> std::io::Result<RecordingAnchorStream<'a>> {
             self.dials.set(self.dials.get() + 1);
             self.last_forwarded.borrow_mut().clear();
             match self.acts.borrow_mut().pop_front() {
@@ -818,23 +872,44 @@ mod tests {
         );
     }
 
-    // 9. deadline_lapsed_pump — Regression: a near-past pump deadline → pump errs, NO enclave bytes
-    //    written, loop continues. Driven by a fake anchor whose read STALLS so the in-fn deadline check
-    //    fires before any write-back. (We assert never-synth + survival.)
+    // 9. empty_anchor_response_closes_never_synth — Regression: a VALID request but an EMPTY anchor
+    //    response → read_bounded_anchor_response hits immediate EOF on the 4-byte len prefix → pump errs,
+    //    NO enclave bytes written, loop continues. (never-synth + survival on the peer-closed path. This
+    //    does NOT exercise a deadline lapse — the genuine lapse is test 9b below.)
     #[test]
-    fn deadline_lapsed_pump() {
-        // A valid request but the anchor's response read blocks until EOF with no bytes → the
-        // read_bounded_anchor_response hits EOF → Err (close). The enclave sees ZERO bytes back.
+    fn empty_anchor_response_closes_never_synth() {
+        // A valid request but the anchor returns zero bytes → read_exact of the 4-byte len prefix hits
+        // immediate EOF → Err (close). The enclave sees ZERO bytes back.
         let req = test_golden_request_frame();
         let (e1, mut p1) = enclave_pair_with(&req);
-        // Empty response cursor → read_exact of the 4-byte len prefix hits immediate EOF → Err.
         let dial = FakeAnchorDial::new(vec![DialAct::Ok(Vec::new())]);
         drive_relay_loop_finite(vec![Ok(e1)].into_iter(), &&dial);
         let mut got = Vec::new();
         let _ = p1.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = p1.read_to_end(&mut got);
-        assert!(got.is_empty(), "lapsed/failed pump writes nothing back; got {got:?}");
+        assert!(got.is_empty(), "empty/failed anchor response writes nothing back; got {got:?}");
         assert_eq!(dial.dials.get(), 1);
+    }
+
+    // 9b. lapsed_deadline_pump_never_synth — Regression: a GENUINELY-lapsed pump deadline (injected via
+    //     relay_one_pump_until — the prod deadline `now + PUMP_BUDGET` can't be coerced into the past
+    //     inside a deviceless test) faults the pump with ZERO bytes written back, EVEN THOUGH the anchor
+    //     is reachable and would return a perfectly-valid response. Pins never-synth on the deadline-lapse
+    //     path: the budget guard (not a bad anchor) is the SOLE reason for the close.
+    #[test]
+    fn lapsed_deadline_pump_never_synth() {
+        let req = test_golden_request_frame();
+        let (mut relay_side, mut p1) = enclave_pair_with(&req);
+        let dial = FakeAnchorDial::new(vec![DialAct::Ok(canned_framed_response())]);
+        // An already-past deadline → the enclave read / connect tripwire fires before any write-back.
+        let past = std::time::Instant::now() - Duration::from_secs(1);
+        let fault = relay_one_pump_until(&mut relay_side, &&dial, past);
+        assert!(fault.is_err(), "a lapsed pump deadline must fault the pump");
+        // never-synth on the lapse path: ZERO bytes reached the enclave.
+        let mut got = Vec::new();
+        let _ = p1.set_read_timeout(Some(Duration::from_millis(200)));
+        let _ = p1.read_to_end(&mut got);
+        assert!(got.is_empty(), "lapsed-deadline pump writes nothing back (never-synth); got {got:?}");
     }
 
     // 11. golden_vector_reuse — Regression: the daemon forwards the CANONICAL frozen production request

@@ -112,16 +112,57 @@ pub fn anchor_endpoint_from_env() -> Result<Vec<std::net::SocketAddr>, String> {
             ))
         }
     };
-    let addrs: Vec<std::net::SocketAddr> = raw
-        .to_socket_addrs()
-        .map_err(|e| {
-            format!("{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) is not a resolvable host:port: {e}")
-        })?
-        .collect();
+    let addrs = resolve_host_port_bounded(&raw, ANCHOR_RESOLVE_BUDGET)?;
     if addrs.is_empty() {
         return Err(format!("{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) resolved to zero addresses"));
     }
     Ok(addrs)
+}
+
+/// Hard wall-clock cap on the blocking `getaddrinfo` at daemon startup. A wedged / black-holing resolver
+/// must NOT silently hang the daemon BEFORE it binds + logs `Listening` — that would defeat the whole
+/// fail-closed startup contract (a clean non-zero exit, never an invisible stall). Generous against a
+/// HEALTHY resolver (glibc's own resolv.conf timeout × attempts is already seconds); a hard ceiling
+/// against a pathological / hung NSS source that `getaddrinfo` itself would never time out.
+const ANCHOR_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Resolve `host:port` via `to_socket_addrs` (blocking `getaddrinfo`) under a HARD wall-clock cap, so a
+/// wedged resolver fails CLOSED (a named error → the bin prints it + exits 1) instead of hanging the
+/// daemon forever before it ever binds. The resolve runs on a detached worker thread; if it overruns
+/// `budget` we abandon it (a `getaddrinfo` that never returns dies with the process on the fail-closed
+/// exit below — acceptable for a one-shot startup resolve) and return a timeout error. An IP literal
+/// resolves synchronously, well within any budget — so the IP path is unaffected.
+fn resolve_host_port_bounded(
+    raw: &str,
+    budget: std::time::Duration,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let owned = raw.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("anchor-resolve".into())
+        .spawn(move || {
+            // Map the io::Error to a String so the Result crosses the channel (io::Error is not Send-
+            // restricted, but a String keeps the worker self-contained + the receiver dependency-free).
+            let _ = tx.send(
+                owned
+                    .to_socket_addrs()
+                    .map(|it| it.collect::<Vec<_>>())
+                    .map_err(|e| e.to_string()),
+            );
+        })
+        .map_err(|e| format!("{TWOD_HSM_ANCHOR_ENDPOINT}: could not spawn resolver thread: {e}"))?;
+    match rx.recv_timeout(budget) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(format!(
+            "{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) is not a resolvable host:port: {e}"
+        )),
+        // Timeout OR the worker dropped the sender without sending (shouldn't happen) — both fail closed.
+        Err(_) => Err(format!(
+            "{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) did not resolve within {}s — failing closed (resolver \
+             wedged?)",
+            budget.as_secs()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +268,27 @@ mod tests {
             let addrs = anchor_endpoint_from_env().expect("legacy name resolves");
             assert!(addrs.iter().any(|a| a.to_string() == "127.0.0.1:7000"));
         });
+    }
+
+    // --- TASK-7.7 5b-2b-ii(b) review-fix: the bounded resolver (no env — the IP path resolves
+    // synchronously, well within the budget; a wedged real DNS can't be simulated deterministically, so
+    // we pin the fast path + the budget-arg plumbing, which is what guards the fail-closed startup).
+
+    #[test]
+    fn resolve_host_port_bounded_ip_literal_within_budget() {
+        // An IP literal does NO network DNS, so it returns immediately regardless of the (tiny) budget —
+        // proving the bounded wrapper does not regress the IP path and threads the budget through.
+        let addrs =
+            resolve_host_port_bounded("127.0.0.1:7100", std::time::Duration::from_secs(5)).unwrap();
+        assert!(addrs.iter().any(|a| a.to_string() == "127.0.0.1:7100"));
+    }
+
+    #[test]
+    fn resolve_host_port_bounded_rejects_unparseable() {
+        // A missing port is unresolvable → the worker's getaddrinfo errors fast → bounded Err (NOT a
+        // timeout, NOT a hang) naming the var. Distinguishes the resolve-error arm from the timeout arm.
+        let err = resolve_host_port_bounded("not-a-host-port", std::time::Duration::from_secs(5))
+            .unwrap_err();
+        assert!(err.contains(TWOD_HSM_ANCHOR_ENDPOINT), "err must name the var: {err}");
     }
 }

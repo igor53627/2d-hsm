@@ -379,7 +379,7 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
 /// maps to the always-retryable `AnchorTransportError`, so `VsockBootRelayChannel` MUST map ALL
 /// `ProtocolError` from these cores to a retryable transport close — do NOT key terminal-vs-retryable off
 /// the `ProtocolError` variant (else a timeout becomes a terminal `VerifyMalformed`, burning the budget).
-fn deadline_guarded_write<W: std::io::Write>(
+pub(crate) fn deadline_guarded_write<W: std::io::Write>(
     stream: &mut W,
     bytes: &[u8],
     deadline: std::time::Instant,
@@ -737,22 +737,39 @@ const ENV: &str = "testnet";
 #[cfg(test)]
 const CHAIN: u64 = 11565;
 
+// Canonical golden INPUTS (TASK-7.7 5b-2b-ii(0)) — the SINGLE SOURCE, `#[cfg(test)] pub(crate)` at module
+// root so BOTH this module's `tests` submodule AND the `host_anchor_relay` sibling test module share ONE
+// definition (a sibling `mod tests`-private const is not reachable cross-module, hence module root). Fixed,
+// fully-documented inputs (see boot_relay_anchor_handshake_v1.json): report_data is DERIVED
+// (anchor_handshake_report_data), so the only free inputs are these. quote_report/cert_chain are opaque
+// frame-format filler (NOT a valid attestation — the quote does not embed this report_data). Editing ANY of
+// them requires regenerating the .bin via `regen_boot_relay_golden_vector`.
+#[cfg(test)]
+pub(crate) const GOLDEN_NONCE: [u8; 32] = [0x33; 32];
+#[cfg(test)]
+pub(crate) fn golden_quote() -> Vec<u8> {
+    vec![0xa5; 100]
+}
+#[cfg(test)]
+pub(crate) fn golden_cert() -> Vec<u8> {
+    vec![0xc7; 8]
+}
+
 /// Test-only cross-module helper (TASK-7.7 5b-2b-ii(b)): the canonical, decoder-valid boot-relay
 /// request frame the host-relay daemon forwards. `pub(crate)` so the `host_anchor_relay` sibling test
 /// module drives the SAME canonical request this module's golden-vector tests freeze (no re-encode, no
-/// drift). Mirrors the `golden_request_frame` test fn (same inputs as the frozen golden vector).
+/// drift) — built from the single-source [`GOLDEN_NONCE`]/[`golden_quote`]/[`golden_cert`] above.
 #[cfg(test)]
 pub(crate) fn test_golden_request_frame() -> Vec<u8> {
     use crate::agent_anchor::anchor_handshake_report_data;
-    let nonce = [0x33u8; 32];
-    let rd = anchor_handshake_report_data(CHAIN, ENV, &nonce);
+    let rd = anchor_handshake_report_data(CHAIN, ENV, &GOLDEN_NONCE);
     let req = AnchorBootRequest {
         chain_id: CHAIN,
         environment_identifier: ENV,
-        nonce,
+        nonce: GOLDEN_NONCE,
         report_data: rd,
     };
-    encode_anchor_boot_request(&vec![0xa5; 100], &vec![0xc7; 8], &req).unwrap()
+    encode_anchor_boot_request(&golden_quote(), &golden_cert(), &req).unwrap()
 }
 
 /// Test-only cross-module helper (TASK-7.7 5b-2b-ii(b)): the FROZEN canonical request golden vector
@@ -966,30 +983,10 @@ mod tests {
     }
 
     // ---- 5b-2b-ii(0): canonical AgentBootRelay request golden vector ----
-
-    // Fixed, fully-documented inputs (see boot_relay_anchor_handshake_v1.json). report_data is DERIVED
-    // (anchor_handshake_report_data), so the only free inputs are these. quote_report/cert_chain are opaque
-    // frame-format filler (NOT a valid attestation — the quote does not embed this report_data).
-    const GOLDEN_NONCE: [u8; 32] = [0x33; 32];
-    fn golden_quote() -> Vec<u8> {
-        vec![0xa5; 100]
-    }
-    fn golden_cert() -> Vec<u8> {
-        vec![0xc7; 8]
-    }
-    fn golden_request_frame() -> Vec<u8> {
-        let rd = anchor_handshake_report_data(CHAIN, ENV, &GOLDEN_NONCE);
-        let req = AnchorBootRequest {
-            chain_id: CHAIN,
-            environment_identifier: ENV,
-            nonce: GOLDEN_NONCE,
-            report_data: rd,
-        };
-        encode_anchor_boot_request(&golden_quote(), &golden_cert(), &req).unwrap()
-    }
-
-    const BOOT_RELAY_GOLDEN: &[u8] =
-        include_bytes!("../testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin");
+    // The inputs (GOLDEN_NONCE / golden_quote / golden_cert), the canonical frame
+    // (test_golden_request_frame), and the frozen .bin (test_boot_relay_golden_frame) are the module-root
+    // SINGLE SOURCE, pulled here via `use super::*` and shared with the host_anchor_relay sibling tests —
+    // no per-module duplication, so the freeze below can't silently drift from the sibling forwarder.
 
     /// REGEN (manual): `cargo test --features agent-gateway regen_boot_relay_golden_vector -- --ignored
     /// --nocapture`, then commit the .bin. This is the documented regeneration mechanism: the Elixir
@@ -999,7 +996,7 @@ mod tests {
     #[test]
     #[ignore]
     fn regen_boot_relay_golden_vector() {
-        let frame = golden_request_frame();
+        let frame = test_golden_request_frame();
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin"
@@ -1010,17 +1007,17 @@ mod tests {
 
     #[test]
     fn boot_relay_golden_vector_is_byte_exact_and_round_trips() {
-        let frame = golden_request_frame();
+        let frame = test_golden_request_frame();
         // (1) BYTE-EXACT freeze vs the committed golden — catches ANY encoder drift (key order, non-shortest
         // integers, length-prefix changes) that the lenient decoder would silently round-trip through.
         assert_eq!(
             frame.as_slice(),
-            BOOT_RELAY_GOLDEN,
+            test_boot_relay_golden_frame(),
             "AgentBootRelay frame must be byte-exact vs the golden vector; if the wire format changed \
              intentionally, regen via `regen_boot_relay_golden_vector` and bump the doc/json"
         );
         // (2) decode(golden) yields exactly the inputs.
-        let d = decode_anchor_boot_request(BOOT_RELAY_GOLDEN).unwrap();
+        let d = decode_anchor_boot_request(test_boot_relay_golden_frame()).unwrap();
         assert_eq!(d.chain_id, CHAIN);
         assert_eq!(d.environment_identifier, ENV);
         assert_eq!(d.nonce, GOLDEN_NONCE);
@@ -1031,7 +1028,7 @@ mod tests {
         // of these — key order, shortest-form ints, bstr length prefixes). This pins the format by
         // hand-audit, not just "encode matches a possibly-buggy-encoder-emitted golden". Payload (after the
         // 4-byte BE len + version + type frame header) is the integer-keyed CBOR map:
-        let framed = crate::decode_message(BOOT_RELAY_GOLDEN).unwrap();
+        let framed = crate::decode_message(test_boot_relay_golden_frame()).unwrap();
         assert_eq!(framed.msg_type, crate::MessageType::AgentBootRelay);
         let p = framed.payload.as_slice();
         // map(7), key1=ver shortest uint 1, key2, chain_id 11565 canonical 2-byte (0x19 0x2D 0x2D), key3:
