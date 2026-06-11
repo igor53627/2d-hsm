@@ -105,6 +105,12 @@ mod cancellable_boundary;
 mod quote_subprocess;
 #[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
 pub use quote_subprocess::agent_quote_child_dispatch;
+// Agent Gateway (4b) boot wiring (TASK-7.7 5b-2b-ii (d-ii)/4b): the wired boot-handshake composition
+// (`run_boot_handshake_wired`) + the typed boot-event seam. Triple-gated like `quote_subprocess` — the
+// cfg intersection of its dependencies (`ValidatedBootBudget`/`HardBoundedQuoteProducer`), never wider
+// (§8 hard rule). Crate-private, NO pub export: live serve stays gated on (4c) + 5b-2c.
+#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+mod agent_gateway_boot;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",

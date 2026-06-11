@@ -842,17 +842,60 @@ request golden vector is a 5b-2b test-vector item.
   `production()` constructor error is FATAL wiring-time config (must be `?`-propagated; funneling any
   construction error through the fetch-path retryable fold would spin the attempt budget on a permanent
   refusal — construction-fatal and fetch-retryable deliberately share `ProtocolError`, position is the
-  discriminator: a sub-slice (3) hazard to keep visible); (3) CONFIG LOGGING — a CHECKED 5b-2c task
-  item with a smoke/integration assertion, not a prose nicety (the artifact's static error strings
-  deliberately carry no numbers — house anti-oracle pattern — so without this line a fail-closed
-  boot is numberless and undebuggable). Scope precisely: (a) BEFORE validation, log the RAW config
-  triplet (the getters exist only on success — a failed validate() must still leave the operator the
-  numbers); (b) on success, log the getter line incl. `nominal_boot_cost` AND the slack
+  discriminator: a sub-slice (3) hazard to keep visible); (3) CONFIG LOGGING — content + severity
+  are LIBRARY-DISCHARGED at (4b) (`AgentBootEvent` Display + `level()`: (a) the RAW config triplet
+  emitted BEFORE validation — the getters exist only on success, and the static error strings carry
+  no numbers (house anti-oracle pattern), so a failed validate() still leaves the operator the
+  numbers; (b) on success the getter line incl. `nominal_boot_cost` AND the slack
   (`overall_boot_budget − nominal_boot_cost`) — a zero-slack config validates (`≤` passes) but is
-  mis-sized by definition and deserves a WARN-level line; (4) DRIVER-COUNT BINDING — a named,
+  mis-sized by definition and `level()` says Warn, library logic, test-pinned); the REMAINING 5b-2c
+  obligations are: forwarding the Display lines to stderr→journald (mapping `level()` to priority),
+  AND rendering the returned `ProtocolError` to stderr at err priority (a CHECKED item, not a smoke
+  nicety) — the fatal paths emit no DEDICATED ERROR event (events emitted BEFORE the failure still
+  flow: context, not cause — the per-class event matrix lives in the module doc), so a bin that
+  swallows the Err and only exits non-zero recreates the numberless-refusal anti-pattern. The bin
+  acceptance is split BY PATH (one happy smoke is NOT enough): (i) successful boot — events
+  forwarded at the right priorities; (ii) validation refusal — RawBudgetConfig line + the err-render
+  both appear; (iii) outcome refusal — the ready:false Warn line + the err-render both appear. NB
+  the bin must NOT parse the `HandshakeOutcome` line (the `{outcome:?}` Debug payload is explicitly
+  NOT a stable contract — the stable surface is `ready` + `level()`; a curated Display mapping is a
+  5b-2c option if tooling needs structure). SINK CONTRACT (compact 8473): the sink is
+  infallible-synchronous by design (no error channel for logging — classification stays CLOSED);
+  the bin's closure MUST be non-panicking bounded best-effort (`let _ = writeln!`, never
+  `eprintln!`) — a sink panic after the claim burns the process claim (fail-closed, restart heals),
+  and blocking affects only the pre/post-handshake edges (the sink is never threaded into the
+  deadline-bounded fetch). `production_transport` is `#[cfg(test)]` since this fix round — the
+  standalone door's test-only status is structural, not prose. Promotion notes: `AgentBootEvent`
+  AND `BootLogLevel` both get `#[non_exhaustive]` AT PROMOTION TIME (the enums promote together;
+  decide then whether `ready: false` deserves an `Error` level distinct from Warn). Known
+  event-invisible corner (by design today): the Ready-but-gate-refused defense-in-depth arm of
+  `decide_serve` — reachable only via a driver bug — leaves the event stream ending at Info
+  "Ready(...)" while the process refuses; 5b-2c MAY add a serve-decision event as hardening (the
+  refusal Err string is distinct, so the bin's err-priority render above covers triage); (4)
+  DRIVER-COUNT BINDING — a named,
   TEST-BACKED acceptance item: the count passed to `run_boot_anti_rollback_handshake` MUST be
-  `budget.max_attempts()` from THE SAME witness instance fed to `production_transport` (the witness
-  alone does not bind the count — the 4b test must refuse the drift).
+  `budget.max_attempts()` from THE SAME witness instance fed to the transport mint (the witness
+  alone does not bind the count). DISCHARGED at (4b) — by construction (no SEPARATE driver-count
+  input exists on the wired surface: the ONE `max_attempts` input is the value `validate()` blesses
+  and the driver receives — `run_boot_handshake_wired` derives it in-body from the same witness that
+  minted the transport, so a second, divergent count is unrepresentable) + the named test
+  `wired_driver_count_is_the_same_witness_max_attempts`;
+  residual 5b-2c review check: the bin calls `run_boot_handshake_wired` (the core is
+  module-private — structurally unreachable from the bin).
+  **(4b) re-scope additions to this bullet:** (a) the 5b-2c `pub` wrapper (`run_agent_gateway_boot`)
+  hardcodes `require_real = cfg!(release_build)` — no operator override flag is representable in the
+  bin (matches the `decide_serve(outcome, cfg!(release_build))?` sketch above; `require_real` stays
+  parametric only on the pub(crate) wired entry, for both-polarity tests). NB `release_build` is THE
+  CRATE's build.rs-defined custom cfg (PROFILE=release or `TWOD_HSM_STRICT_RELEASE_GUARDS`,
+  registered via `rustc-check-cfg`) — NOT a std flag; the `[[bin]]` shares the crate build.rs so it
+  applies as-is, but a literal copy into a DIFFERENT crate would silently evaluate FALSE (fail-open)
+  without its own build.rs — never move the bin out-of-crate without carrying the cfg. Staging consequence,
+  recorded: release-profile builds have NO escape hatch — dev/lab runs use debug builds. (b) When
+  `AgentBootEvent` is promoted `pub` for the separate-crate bin, add `#[non_exhaustive]` AT
+  PROMOTION TIME and give the bin's match a catch-all arm (a future reap-status variant must not
+  break the bin build; no effect in-crate today). (c) The remaining bin obligations are unchanged:
+  manifest + `required-features`, dispatch-first + the byte-exact-stdout integration test,
+  RPATH/static deployment, no in-process whole-handshake retry, unseal sequencing supplying `body`.
   **Dependency order:** *construction/compilation* is unblocked once 5b-2b-ii(a)/(b) land (the
   concrete `VsockBootRelayChannel`); a **live anti-rollback serve path is blocked on 5b-2b-ii(d) AND the
   boot-budget gate** — TWO gates, both now ENFORCEABLE artifacts that LANDED ((d-ii)/2 + (d-ii)/3, not
@@ -860,8 +903,9 @@ request golden vector is a 5b-2b test-vector item.
   below, and live serve stays closed until that work completes.
   (a') = the cancellable hard CONNECT bound is now **DONE (PR #56)**, so the connect leg
   no longer gates the live serve. **The TWO hard preconditions for a live 5b-2c serve (state:
-  gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3 — the REMAINING work on
-  both is 5b-2c WIRING: (4b)+(4c) for #1, witness-construction-from-config for #2):**
+  gate #1's artifact landed (d-ii)/2, gate #2's artifact landed (d-ii)/3, the (4b) wiring landed
+  ((d-ii)/4b) — the REMAINING work: (4c) for #1, witness-construction-from-operator-config
+  (bin-side env/flag parsing) for #2):**
   1. **(d) quote bound** — DISCHARGED STRUCTURALLY in two halves: the structural gate landed ((d-ii)/2
      `HardBoundedQuoteProducer`, required by signature — a build lacking (d) cannot construct the
      serving path), and (4a) DELETED `SnpQuoteProducer`/`fetch_report_deadline` outright, so the
@@ -871,7 +915,8 @@ request golden vector is a 5b-2b test-vector item.
      the serve-path signature must name the CONCRETE `HardBoundedQuoteProducer` — a generic
      `<Q: BootQuoteProducer>` wrapper re-opens the class this deletion closed (the trait stays open;
      a 5-line in-crate shim over pub `fetch_report` would compile). Enforce BOTH at 5b-2c review.
-     What remains gating live serve is the (4b) wiring + (4c) smoke.
+     The (4b) wiring LANDED ((d-ii)/4b, never-generic-Q held: the wired entry is concrete, the
+     generic core module-private); what remains gating live serve is the (4c) smoke.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
      (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
@@ -880,9 +925,9 @@ request golden vector is a 5b-2b test-vector item.
      artifact EXISTS ((d-ii)/3): `quote_subprocess::ValidatedBootBudget`** — checked-arithmetic
      fail-closed constructor, taken by the producer's constructors as an ordering witness
      (validation-before-claim by signature); the REMAINING gate-#2 obligation is 5b-2c constructing it
-     from operator config (and the TWO-PHASE logging obligation — raw triplet before validation,
-     getters + slack after success; see the bin preconditions above).
-     Both gates stay required; live serve opens only at (4b) wiring + the (4c) smoke.
+     from operator config (bin-side env/flag parsing — the TWO-PHASE logging half is
+     LIBRARY-DISCHARGED at (4b), see precondition (3) above; the bin only forwards the lines).
+     Both gates stay required; live serve opens only at the (4c) smoke + 5b-2c.
 
   *Satisfied precondition (no longer gating, listed for audit):* **(a') connect bound — DONE (PR #56).**
   [`connect_bounded`] is a non-blocking connect + `poll_with_deadline(POLLOUT)` cancellable hard bound:
@@ -1009,7 +1054,14 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   genuinely non-blocking channel — and the carrier itself is an EXPLICIT 5b-2c design task (e.g. a
   bounded in-memory status buffer the fetch appends to non-blockingly and the bin drains between
   attempts), followed by bin-level emission + smoke verification: without a named carrier design,
-  implementers either reintroduce the forbidden in-fetch write or skip parent-side logging entirely. ALSO record for that implementation: an `ExitStatus` cannot
+  implementers either reintroduce the forbidden in-fetch write or skip parent-side logging entirely.
+  Emission SURFACE decided at (4b): the carrier rides the `AgentBootEvent` sink (a future variant +
+  a between-attempts drain call site — additive; `run_boot_handshake_wired` is pub(crate), so
+  signature growth is a contained in-crate diff; the sink's rustdoc PROSE-PINS emission points away
+  from the in-fetch role — the structural fact TODAY is code-positional (the sink is never threaded
+  into driver/producer/transport) and MUST be re-established by construction when the carrier lands);
+  the carrier DESIGN itself remains this explicit 5b-2c task
+  and the hard constraints above stand (no in-fetch emission). ALSO record for that implementation: an `ExitStatus` cannot
   distinguish own-SIGKILL from an EXTERNAL SIGKILL (the Linux OOM-killer delivers exactly SIGKILL),
   so any filter silencing the uniform-disposition kill also silences OOM kills — an accepted blind
   spot to document, not paper over ("crashes must not be swallowed" cannot be promised for the
@@ -1042,7 +1094,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   the parent/child frame halves across versions, which a `current_exe()` PATH would race; matches the
   (d-i) seam pin verbatim); `HardBoundedQuoteProducer::production(&ValidatedBootBudget) -> Result`
   ((d-ii)/3 witness signature) errs only on the claim refusal; the one-call (4b)/5b-2c entry is now
-  `ValidatedBootBudget::production_transport`. **NEW 5b-2c obligation:** the serve-path signature must name the
+  `agent_gateway_boot::run_boot_handshake_wired`; its mint is the ONE shared body
+  `ValidatedBootBudget::transport_with_spawn`, which `production_transport` instantiates with the
+  production spawn shape (pins unchanged). **NEW 5b-2c obligation:** the serve-path signature must name the
   CONCRETE `HardBoundedQuoteProducer` (default `S = ExecChildSpawn`), NEVER a generic
   `<Q: BootQuoteProducer>` — a generic wrapper re-opens the hole (4a) DELETED (any substituted
   `BootQuoteProducer` impl — the deletion's unrepresentability holds only while the serve path names
@@ -1066,11 +1120,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   fallback), and **the driver-count binding is a named, TEST-BACKED (4b) acceptance item: the count
   passed to `run_boot_anti_rollback_handshake` MUST be `budget.max_attempts()` from THE SAME witness
   instance, and the (4b) test must refuse the drift** (the driver keeps its raw-u32 signature for
-  cfg-lattice reasons). The parent-side reap
+  cfg-lattice reasons) — DISCHARGED at (4b), by construction + the named test (see the (4b) LANDED
+  entry below). The parent-side reap
   obligation is RE-SCOPED to 5b-2c with hard constraints (see above — the in-fetch emission was
-  reverted); the 5b-2c bin obligation (the TWO-PHASE config logging — raw triplet pre-validation,
-  getters + slack post-success) and the witness
-  construction from operator config remain 5b-2c work. Landing (3) does NOT open live serve. (4a)
+  reverted); the TWO-PHASE config logging is LIBRARY-DISCHARGED at (4b) (the bin only FORWARDS the
+  `AgentBootEvent` lines — see the (4b) LANDED entry), and the witness
+  construction from operator config remains 5b-2c work. Landing (3) does NOT open live serve. (4a)
   cooperative-path deletion — **LANDED (this PR)**: removed `SnpQuoteProducer`,
   `fetch_report_deadline`, the `Option<Instant>` plumbing and its deadline tests — INCLUDING the
   `fetch_report_with_at` signature rework: the cooperative `deadline: Option<Instant>` parameter is
@@ -1081,8 +1136,46 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   unbounded BY SIGNATURE — the rustdoc-pinned "makes the
   narrowing structural: `_at` loses the parameter entirely" obligation is DISCHARGED. The
   fixed-`twod-hsm` exclusivity claim flips TRUE (see the rescoped sentence above), (4b) live
-  wiring of `HardBoundedQuoteProducer` into the boot path — GATED on the 5b-2c boot-budget validation
-  artifact (the fail-closed constructor check below); the TWO-artifact live-serve gate stands: wiring
+  wiring of `HardBoundedQuoteProducer` into the boot path — **LANDED ((d-ii)/4b)**: new triple-gated
+  module `agent_gateway_boot` (cfg = the dependency intersection, never wider) with the pub(crate)
+  CONCRETE wired entry `run_boot_handshake_wired` over a module-PRIVATE generic core
+  (`run_boot_handshake_core`), the typed boot-event seam `AgentBootEvent`/`BootLogLevel`
+  (library-owned `level()`), and the `ValidatedBootBudget` additions `transport_with_spawn` (the ONE
+  shared producer+transport mint; `production_transport` = its production-spawn instantiation, pins
+  unchanged) + `slack()` (log-only saturating_sub — the "checked NOT saturating" rule targets budget
+  PRODUCTS, not a log difference of validated fields). Sequence: raw-triplet event →
+  `validate` (`?`) → validated event (incl. slack) → mint (`?`) → driver with
+  `budget.max_attempts()` INLINE → `HandshakeOutcome` event → `decide_serve`. Named-item
+  discharges, each test-backed: DRIVER-COUNT BINDING discharged BY CONSTRUCTION (no count parameter
+  exists anywhere on the new surface; the count is derived in-body from the SAME witness local that
+  minted the transport) + the named test `wired_driver_count_is_the_same_witness_max_attempts`
+  (spawns == round_trips == config N through BOTH legs; honesty note: its refusal power is
+  VALUE-level, not instance-level — a second validate() with identical numbers is observationally
+  identical and harmless; the §8 drift class (different numbers) is what the signature eliminates
+  and the test refuses); TWO-PHASE LOGGING content+severity LIBRARY-discharged (`AgentBootEvent`
+  Display + `level()`; zero-slack Warn is library logic) — tests
+  `boot_events_raw_triplet_before_validate_on_refusal` (phase (a): the raw event is the operator's
+  only numbers copy in a fail-closed boot),
+  `wired_wrapper_emits_validated_getters_and_slack_before_the_claim` (phase (b), emitted BEFORE the
+  claim; doubles as proof the wrapper constructs the CONCRETE process-claiming producer — a
+  generic-Q shim claims nothing), `boot_events_zero_slack_is_warn_and_still_boots` (zero slack
+  validates AND warns); ONE-handshake-per-process pinned AT THE WIRING by
+  `wired_second_call_refuses_via_permanent_claim_before_any_attempt` (claim refusal is FATAL
+  position — post-validate, pre-driver, no attempt spent); the full composition + install-on-Fresh
+  provenance by `wired_boot_ready_installs_binding_and_serves_with_real_gate` (require_real=true).
+  Never-generic-Q HELD: the wired path names the concrete producer via the single mint; the generic
+  core is module-private; generic-`S` is INSIDE the (4a)-closed class, not a reopening ((d-ii)/2's
+  own "default `S = ExecChildSpawn`" wording: every `S` runs under the same pipe-poll → SIGKILL →
+  ledger orchestration; `<Q: BootQuoteProducer>` substitutes the BOUND ITSELF, `S` cannot — its only
+  non-test impl is `ExecChildSpawn`). Serve NOT opened: nothing `pub`, no bin, no listener,
+  dead-code-allowed until 5b-2c; the TWO-artifact gate stands. The `HandshakeOutcome` event is the
+  ONE scope-add beyond the named items — the boot-log carrier of the `BootDriverFail` cause that
+  `decide_serve` deliberately folds to its uniform refusal string (without it (4b) would wire the
+  exact numberless-refusal anti-pattern the two-phase item exists to prevent; drops cleanly if
+  contested). The Display lines become a de-facto operator interface — journald tooling is tracked
+  at the 5b-2c smoke. The production wrapper's one-line spawn VALUE
+  (`ExecChildSpawn::production()`) stays (4c)'s checked item: production spawn-shape runtime remains
+  ZERO-CI, pin (2) below NOT discharged. The TWO-artifact live-serve gate stands: wiring
   here does NOT open live serve until (4c) completes (d), (4c) the in-guest aya smoke (SNP spike
   2026-06-10: `.#disk-production-lab` boot+configfs PASS in ~80s warm — the guest path is alive; test
   delivery = lab profile + test-binary oneshot printing to ttyS0) — acceptance EXPLICITLY includes

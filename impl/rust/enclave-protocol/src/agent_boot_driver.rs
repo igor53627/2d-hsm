@@ -299,7 +299,10 @@ pub(crate) fn agent_anti_rollback_serve_gate(
 /// even a driver bug returning `Ready` without an installed binding fails closed in production). The
 /// unsafe "handshake → gate → serve without an outcome branch" wiring is therefore unrepresentable.
 /// Returns the verified [`AnchorState`](crate::agent_anchor::AnchorState) on success (for the boot log /
-/// audit). (The standalone [`agent_anti_rollback_serve_gate`] remains for the deployment that never runs
+/// audit). At (4b) the in-crate caller is `agent_gateway_boot::run_boot_handshake_core` (plain
+/// backticks — that module is triple-gated, this file agent-gateway-gated, so a rustdoc link would
+/// dangle in agent-gateway-without-vsock builds); the 5b-2c bin reaches it through the wired entry.
+/// (The standalone [`agent_anti_rollback_serve_gate`] remains for the deployment that never runs
 /// the handshake at all — anti-rollback not wired — where there is no `BootDriverOutcome` to branch on.)
 pub(crate) fn decide_serve(
     outcome: BootDriverOutcome,
