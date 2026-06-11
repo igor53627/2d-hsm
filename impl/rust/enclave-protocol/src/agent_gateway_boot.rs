@@ -183,6 +183,12 @@ impl std::fmt::Display for AgentBootEvent {
 // struct is deliberately REJECTED (see the wrapper doc's transposition note) — the allow is cheaper
 // than mechanism without a reachable failure.
 #[allow(clippy::too_many_arguments)]
+// SINK CONTRACT (§8 (4b) re-scope; compact 8473): `emit` is infallible-synchronous BY DESIGN — the
+// library has no error channel for logging and must not gain one (classification stays CLOSED). The
+// 5b-2c bin's closure MUST therefore be non-panicking bounded best-effort (the `let _ = writeln!`
+// house pattern — NEVER eprintln!, which panics on broken stderr): a PANIC in the sink after the
+// claim burns the process claim (fail-closed, supervisor restart heals), and a BLOCKING sink delays
+// only the pre/post-handshake edges (the sink is never threaded into the deadline-bounded fetch).
 fn run_boot_handshake_core<S, C>(
     max_attempts: u32,
     per_leg_timeout: Duration,

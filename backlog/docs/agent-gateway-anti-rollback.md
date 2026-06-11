@@ -859,7 +859,13 @@ request golden vector is a 5b-2b test-vector item.
   both appear; (iii) outcome refusal — the ready:false Warn line + the err-render both appear. NB
   the bin must NOT parse the `HandshakeOutcome` line (the `{outcome:?}` Debug payload is explicitly
   NOT a stable contract — the stable surface is `ready` + `level()`; a curated Display mapping is a
-  5b-2c option if tooling needs structure). Promotion notes: `AgentBootEvent`
+  5b-2c option if tooling needs structure). SINK CONTRACT (compact 8473): the sink is
+  infallible-synchronous by design (no error channel for logging — classification stays CLOSED);
+  the bin's closure MUST be non-panicking bounded best-effort (`let _ = writeln!`, never
+  `eprintln!`) — a sink panic after the claim burns the process claim (fail-closed, restart heals),
+  and blocking affects only the pre/post-handshake edges (the sink is never threaded into the
+  deadline-bounded fetch). `production_transport` is `#[cfg(test)]` since this fix round — the
+  standalone door's test-only status is structural, not prose. Promotion notes: `AgentBootEvent`
   AND `BootLogLevel` both get `#[non_exhaustive]` AT PROMOTION TIME (the enums promote together;
   decide then whether `ready: false` deserves an `Error` level distinct from Warn). Known
   event-invisible corner (by design today): the Ready-but-gate-refused defense-in-depth arm of

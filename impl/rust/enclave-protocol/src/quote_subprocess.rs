@@ -1112,10 +1112,12 @@ impl ValidatedBootBudget {
     /// never-generic-Q obligation; `C` stays the seam trait because a real `VsockBootRelayChannel`
     /// cannot exist in CI — 5b-2c instantiates `C = VsockBootRelayChannel` (§8). ONLY error: the
     /// producer claim refusal — FATAL wiring config, `?`-propagate, never fold into the retryable
-    /// fetch path. The STANDALONE one-call composition door — kept so the (d-ii)/3 pins run
-    /// unchanged; its only callers are tests. The (4b) wired path constructs the SAME shape via the
-    /// shared mint [`Self::transport_with_spawn`] + `ExecChildSpawn::production()` inside
-    /// `run_boot_handshake_wired` (this fn is the 2-line production-spawn instantiation of that mint).
+    /// fetch path. TEST-ONLY since (4b) — `#[cfg(test)]` makes the standalone status STRUCTURAL
+    /// (compact 8473): its only callers are the (d-ii)/3 pins, which run unchanged; the LIVE boot
+    /// path constructs the SAME shape via the shared mint [`Self::transport_with_spawn`] +
+    /// `ExecChildSpawn::production()` inside `run_boot_handshake_wired` (this fn is the 2-line
+    /// production-spawn instantiation of that mint, kept as the pins' fixture).
+    #[cfg(test)]
     pub(crate) fn production_transport<C: crate::agent_boot_relay::BootRelayChannel>(
         &self,
         channel: C,
