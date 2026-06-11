@@ -75,6 +75,12 @@ pub(crate) const LAPSE_PROBE_DEADLINE: Duration = Duration::from_millis(400);
 /// Upper elapsed bound for the lapse arm — far below 2s so a kernel-timer preemption can never be
 /// misread as a slow-but-passing lapse.
 const LAPSE_ELAPSED_CEILING: Duration = Duration::from_millis(1_500);
+/// Lower-bound slop below [`LAPSE_PROBE_DEADLINE`]: `poll(2)` takes a whole-millisecond timeout, so
+/// `remaining_or_lapsed` truncates `399.x ms → 399 ms` and the kernel can wake up to one tick early —
+/// a 400ms deadline legitimately lapses at 399ms (observed on the aya guest, 4c first run). 25ms is
+/// generous against 2-vCPU-guest scheduler jitter yet still ~15× above a prompt-refusal (~0–1ms), so
+/// the lapse stays unambiguously attributed to OUR deadline, never a kernel RST/ENODEV.
+const LAPSE_ELAPSED_FLOOR_SLOP: Duration = Duration::from_millis(25);
 /// SNP `ATTESTATION_REPORT` ABI floor (Milan/Genoa/Turin) for a REAL-quote claim.
 /// `MIN_REPORT_LEN` (= 192, `snp_report`) is the PARSE floor — too weak for this assert.
 const REAL_REPORT_MIN_LEN: usize = 1_184;
@@ -126,19 +132,24 @@ fn prefixed_residue() -> Result<Vec<String>, String> {
 /// Phase 1 — `vsock-lapse` (goal v; the §8 black-hole checked residual): connect to the black-hole
 /// CID under a 400ms deadline; PASS iff the error is the lapse-arm const EXACTLY (the veto string
 /// means the kernel timer/RST preempted us = the staging assumption broke = FAIL printing the
-/// observed string) AND elapsed lands in `[LAPSE_PROBE_DEADLINE, LAPSE_ELAPSED_CEILING)`.
+/// observed string) AND elapsed lands in
+/// `[LAPSE_PROBE_DEADLINE - LAPSE_ELAPSED_FLOOR_SLOP, LAPSE_ELAPSED_CEILING)` (the floor slop absorbs
+/// the whole-millisecond `poll(2)` truncation + single-tick early wake — see the slop const).
 fn phase_vsock_lapse() -> Result<String, String> {
     let start = Instant::now();
     let r = connect_bounded_for_smoke(BLACK_HOLE_CID, BLACK_HOLE_PORT, start + LAPSE_PROBE_DEADLINE);
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis();
+    let floor = LAPSE_PROBE_DEADLINE - LAPSE_ELAPSED_FLOOR_SLOP;
     match r {
         Ok(_) => Err(format!(
             "connect to the black-hole CID unexpectedly SUCCEEDED elapsed_ms={elapsed_ms}"
         )),
         Err(ProtocolError::WireProtocol(msg)) if msg == VSOCK_CONNECT_LAPSE_MSG => {
-            if elapsed < LAPSE_PROBE_DEADLINE {
-                return Err(format!("lapse arm fired BEFORE the deadline elapsed_ms={elapsed_ms}"));
+            if elapsed < floor {
+                return Err(format!(
+                    "lapse arm fired implausibly early (< deadline - slop) elapsed_ms={elapsed_ms}"
+                ));
             }
             if elapsed >= LAPSE_ELAPSED_CEILING {
                 return Err(format!(
@@ -368,6 +379,17 @@ mod tests {
         assert!(
             LAPSE_ELAPSED_CEILING < Duration::from_secs(2),
             "elapsed ceiling must stay under the ~2s kernel connect timer"
+        );
+        // The floor slop must leave the floor comfortably ABOVE a prompt refusal (~0–1ms) yet not
+        // exceed the deadline itself — so a real lapse is attributed to OUR deadline, never a kernel
+        // RST/ENODEV.
+        assert!(
+            LAPSE_ELAPSED_FLOOR_SLOP < LAPSE_PROBE_DEADLINE,
+            "floor slop must not swallow the whole deadline (a prompt refusal must still FAIL)"
+        );
+        assert!(
+            LAPSE_PROBE_DEADLINE - LAPSE_ELAPSED_FLOOR_SLOP >= Duration::from_millis(100),
+            "floor must stay well above a prompt-refusal (~0–1ms) so the lapse is unambiguous"
         );
     }
 }
