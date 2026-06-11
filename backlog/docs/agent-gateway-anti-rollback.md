@@ -679,7 +679,10 @@ request golden vector is a 5b-2b test-vector item.
     rule's load-bearing intent is **keep (b) daemon fault-semantics out of the vsock-integration PR** —
     preserved: (b) is still open. PR #54 co-landed (0)+(a)+(c) because (0) is a test-only frozen vector and
     (c) is a one-line CI guard for (a) — neither is a separate review surface from the channel; (b) was NOT
-    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') DONE (PR #56); (b), (d) open.**
+    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') DONE (PR #56); (d) DONE (in-guest quote smoke
+    PASS, `run_boot_handshake_wired` landed); (b) host-relay daemon LANDED (`run_host_anchor_relay` +
+    `twod-hsm-host-anchor-relay` bin — see the (b) decision record below). Live serve now gated on
+    5b-2c ALONE.**
     - **(0) canonical golden vector — DONE PR #54 (BLOCKS (a)+(b)):** committed
       `testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin` (+ `.json` manifest with a
       hand-auditable byte breakdown); the agent-gateway CI test asserts byte-exact `encode==golden` AND
@@ -794,6 +797,54 @@ request golden vector is a 5b-2b test-vector item.
       under the serial loop a slow/wedged pump delays every queued boot by ≤ (per-pump deadline + socket +
       connect timeouts); those bounds are what keep it tolerable — concurrency (and accept-backlog limits)
       is the named follow-up trigger if many enclaves boot at once.
+      - **(b) LANDED — decision record (TASK-7.7 5b-2b-ii(b)):** shipped `pub fn run_host_anchor_relay()
+        -> Result<Infallible, Box<dyn Error>>` (lib, triple-gated `linux ∩ vsock-transport ∩
+        agent-gateway`) + the thin `twod-hsm-host-anchor-relay` bin (`required-features =
+        ["agent-gateway","vsock-transport"]` — NOT `lab-quote-smoke`, NOT
+        `production-vsock`/`staging-vsock`: those pull `ml-dsa-65` → the role-isolation `compile_error!`).
+        The daemon binds AF_VSOCK `VMADDR_CID_ANY` on the relay port, accepts SERIALLY, and per pump
+        reads+decodes the enclave request FIRST, then dials the anchor, then forwards verbatim via the
+        `pub(crate)` cores — close-on-any-fault, NEVER synthesizes bytes, NEVER dies.
+        - **Anchor transport = TCP** via `std::net::TcpStream::connect_timeout` (the whole
+          nonblock→poll→`SO_ERROR`→restore-blocking dance is internal — no `nix`, no `unsafe`, clean under
+          `#![forbid(unsafe_code)]`; NOT `connect_bounded`'s vsock poll-sequence). Isolated behind a
+          one-method `AnchorDial` trait. **UDS deferred** behind that trait, with the
+          **`EAGAIN`-not-`EINPROGRESS`** hazard recorded ON THE TRAIT DOC: a future UDS impl must treat a
+          would-block `EAGAIN` as a retryable per-pump fail-fast, must NOT copy `connect_bounded`'s
+          `EINPROGRESS`→`poll(POLLOUT)` finish sequence, and must keep the `getsockopt(SO_ERROR)` +
+          `set_nonblocking(false)` restore a naive copy drops. UDS is documented, NOT built (one TCP impl
+          ships — the seam advertises forward-compat the code does not exercise; stated plainly, no
+          structural over-claim).
+        - **Env knob** `TWOD_HSM_ANCHOR_ENDPOINT` (+ legacy `2D_HSM_ANCHOR_ENDPOINT`) = a `host:port`
+          string, **NO default** — a missing/empty value is a fail-closed boot error naming the var (never
+          a silent localhost guess; §8 profile-uniformity). Resolved ONCE at startup via `to_socket_addrs`
+          (DNS names work) into a `Vec<SocketAddr>` (the dialer tries each); per-pump dials never re-do
+          DNS. The resolver `anchor_endpoint_from_env()` lives gate-free in `vsock_addr.rs` so its
+          fail-closed/resolve logic is CI-tested in the default/agent-gateway build (no vsock dep).
+        - **Budget — single source, NO new operator knob.** `PUMP_BUDGET` (10 s) is a **HEAD-OF-LINE
+          bound** (prevents a wedged pump blocking the serial loop), NOT the boot bound — the enclave owns
+          `max_attempts·(2·timeout+ε)`; the daemon carries NO ε, NO producer, NO budget arithmetic. The
+          connect timeout + `SO_RCVTIMEO`/`SO_SNDTIMEO` are DERIVED from `PUMP_BUDGET` (a floored fraction),
+          never separate knobs. HONEST coordination caveat: "same source" means matching consts sized to
+          the same boot-handshake envelope, NOT a shared runtime value (different process — the daemon does
+          not receive the enclave's per-leg timeout over the wire).
+        - **`relay ⊇ anchor` leniency = a cross-component sync OBLIGATION, not a claimed fact.** With a
+          SEPARATE external anchor, the relay-side `decode_anchor_boot_request` must stay at least as
+          lenient as the anchor's acceptance — else a request the anchor WOULD honor becomes a relay
+          Err→retryable close that silently burns the enclave's attempt budget toward a FALSE terminal. The
+          5b-2b-ii(0) golden vector freezes only the CANONICAL request (production path safe); the broader
+          superset is defense-in-depth NOT regression-protected. Differential/property tests vs the real
+          anchor tracked SEPARATELY.
+        - **Never-synth is BEHAVIORAL, not structural:** enforced by RAII close + the absence of any
+          error-path write (the response write-back is the ONLY enclave write, reached only on full
+          success). Deviceless tests assert ZERO anchor-looking bytes reach the enclave on every fault
+          class. **Never-die:** every per-connection fault = log (`let _ = writeln!`, NEVER `eprintln!`,
+          which panics on broken stderr and would kill the serial daemon) + close + serve next; the only
+          `run_host_anchor_relay` exits are the STARTUP config/bind faults. Deviceless tests 1-11 + the bin
+          acceptance test pass (Linux CI under `agent-gateway,vsock-transport`); the real-vsock-loopback
+          aya test (bind-CID `CID_ANY` reality) stays `#[ignore]`, landing with 5b-2c bring-up.
+        - **Status:** (b) landed; **live serve now gated on 5b-2c ALONE** (the other live gate).
+          Concurrency + accept-backlog limits = the named §8 follow-up.
     - **(c) feature-build CI — DONE PR #54 (upgraded in PR #55):** originally `cargo test --no-run
       --features vsock-transport,agent-gateway` on the ubuntu (Linux) `rust-test` job; since PR #55 the
       `--no-run` is dropped — CI now compiles the channel + the `#[ignore]` aya tests AND **runs the

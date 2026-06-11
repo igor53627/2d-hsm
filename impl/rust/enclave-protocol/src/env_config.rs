@@ -27,6 +27,11 @@ pub const LEGACY_HSM_VSOCK_PORT: &str = "2D_HSM_VSOCK_PORT";
 pub const TWOD_HSM_ANCHOR_RELAY_PORT: &str = "TWOD_HSM_ANCHOR_RELAY_PORT";
 pub const LEGACY_HSM_ANCHOR_RELAY_PORT: &str = "2D_HSM_ANCHOR_RELAY_PORT";
 
+// TASK-7.7 5b-2b-ii(b): the UNTRUSTED host relay's upstream anchor endpoint (host:port). NO default
+// — a missing anchor is a fail-closed boot error, never a silent localhost guess. Host-side only.
+pub const TWOD_HSM_ANCHOR_ENDPOINT: &str = "TWOD_HSM_ANCHOR_ENDPOINT";
+pub const LEGACY_HSM_ANCHOR_ENDPOINT: &str = "2D_HSM_ANCHOR_ENDPOINT";
+
 pub const TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str = "TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
 pub const LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str = "2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
 

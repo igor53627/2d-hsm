@@ -737,6 +737,34 @@ const ENV: &str = "testnet";
 #[cfg(test)]
 const CHAIN: u64 = 11565;
 
+/// Test-only cross-module helper (TASK-7.7 5b-2b-ii(b)): the canonical, decoder-valid boot-relay
+/// request frame the host-relay daemon forwards. `pub(crate)` so the `host_anchor_relay` sibling test
+/// module drives the SAME canonical request this module's golden-vector tests freeze (no re-encode, no
+/// drift). Mirrors the `golden_request_frame` test fn (same inputs as the frozen golden vector).
+#[cfg(test)]
+pub(crate) fn test_golden_request_frame() -> Vec<u8> {
+    use crate::agent_anchor::anchor_handshake_report_data;
+    let nonce = [0x33u8; 32];
+    let rd = anchor_handshake_report_data(CHAIN, ENV, &nonce);
+    let req = AnchorBootRequest {
+        chain_id: CHAIN,
+        environment_identifier: ENV,
+        nonce,
+        report_data: rd,
+    };
+    encode_anchor_boot_request(&vec![0xa5; 100], &vec![0xc7; 8], &req).unwrap()
+}
+
+/// Test-only cross-module helper (TASK-7.7 5b-2b-ii(b)): the FROZEN canonical request golden vector
+/// (`boot_relay_anchor_handshake_v1.frame.bin`, the 5b-2b-ii(0) artifact). `pub(crate)` so the
+/// `host_anchor_relay` sibling test proves the daemon forwards the canonical PRODUCTION request
+/// verbatim (golden_vector_reuse). Byte-identical to [`test_golden_request_frame`] (pinned by this
+/// module's `boot_relay_golden_vector_is_byte_exact_and_round_trips`).
+#[cfg(test)]
+pub(crate) fn test_boot_relay_golden_frame() -> &'static [u8] {
+    include_bytes!("../testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
