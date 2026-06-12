@@ -1093,7 +1093,9 @@ request golden vector is a 5b-2b test-vector item.
     / `_PER_LEG_TIMEOUT_MS` / `_OVERALL_BUDGET_MS` (+ legacy); overall is DERIVE-BY-DEFAULT
     (`max_attempts·(2·per_leg + 1000ms margin) + 2000ms`, saturating, ≫ the real ε so it always clears
     `validate()`'s nominal≤overall) but an operator may widen it. Parse+default ONLY — `validate()` is the
-    sole band judge. CI-tested on darwin (gate-free, 5 unit tests).
+    sole band judge. CI-tested on darwin (gate-free, 6 unit tests incl. a non-UTF-8 fail-closed case). A
+    gated TRIPWIRE test (`boot_derive_margin_covers_quote_attempt_overhead`) pins the 1000ms margin ≥ the
+    real ε so a future ε growth can't silently push the DEFAULT-config boot below `validate()`'s floor.
   - NEW `[[bin]] twod-hsm-agent-gateway` (`required-features=[agent-gateway,vsock-transport]` — NOT
     production-vsock/staging-vsock [ml-dsa-65 role-isolation] NOT lab-quote-smoke [release-banned]): the
     2-statement dispatch-first main (`agent_quote_child_dispatch()` FIRST, then `run_agent_gateway_boot`),
@@ -1102,8 +1104,24 @@ request golden vector is a 5b-2b test-vector item.
     (re-targeted to the agent bin): marker-set/report_data-absent → stdout == `[0xA2,0x01]` byte-exact +
     exit 1 (dispatch-first proven — any stdout write before dispatch fails it) + a fail-closed-startup arm
     (no marker → `boot_configure_agent_seal_root` stub → exit 1 naming the root, stdout empty).
-  - Validation: aya `agent-gateway,vsock-transport` 428 lib + 2 bin-integration PASS (incl. the dispatch-
-    first byte-exact); darwin agent-gateway 338 (gated module out, budget parser in); no new warnings.
+  - Validation: aya `agent-gateway,vsock-transport` 429 lib + 2 bin-integration PASS (incl. the dispatch-
+    first byte-exact); darwin agent-gateway (gated module out, budget parser in); no new warnings.
+  - **Full-Matrix reconciliation (PR #66, 6 cells codex/claude-code/grok × security+design; gemini
+    infra-down NOTED):** ZERO fail-open / ordering / dispatch defects (the install-AFTER-`Ready`,
+    borrow-then-move, require_real hardcode, and dispatch-first byte-exact all passed). Applied: (1) xhigh
+    + matrix — the budget env-helpers swallowed `Err(NotUnicode)` → now fail closed naming the var
+    (matching var_twod's contract); (2) claude design Medium — the anchor-relay-port `map_err` now surfaces
+    its SPECIFIC reason (a relay==serve PORT COLLISION names the conflicting serve var) before the static
+    error, same as the budget path; (3) claude design Low — the ε tripwire test above. The codex design
+    "High" (irreversible handshake/claim before the always-failing serve stub) is DOCUMENTED, not a code
+    change: the 5b handshake is VERIFY-ONLY (no anchor-side mutation — the bump+ack is slice 6), and the
+    producer claim + binding + installed keystore are process-VOLATILE, so a post-`Ready` serve-stub exit is
+    a CLEAN supervisor restart (no persistent half-boot). In CI/lab WITHOUT a real anchor the wrapper
+    fail-closes at root/unseal long before `Ready`; a working-anchor DEPLOY of the skeleton would crash-loop,
+    which is why the serve loop lands in 5b-2c-ii BEFORE any live-anchor deploy (the skeleton is not for one).
+    NB the serve port (`vsock_listen_addr_from_env`) is already load-bearing at boot via the relay≠serve
+    collision check, even though the serve loop is a stub this slice. The positional budget tuple (no config
+    struct) is the DELIBERATE §8 transposition-fails-closed discipline (run_boot_handshake_wired doc), kept.
     **5b-2c-ii = the agent 0x40 serve loop** (replaces the stub); **5b-2c-iii = aya SNP live smoke**
     (DEBUG-build first — production live-serve still needs the attested host-vsock keystore-source slice).
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated

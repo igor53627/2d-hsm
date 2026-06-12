@@ -335,9 +335,13 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
     // (D) construct the concrete channel internally (the bin can't reach VsockBootRelayChannel::new).
     //     The boot-relay DIAL target is host CID 2 on the anchor relay port (distinct from the serve
     //     listen port — anchor_relay_port_from_env validates relay != serve).
-    let relay_port = crate::vsock_addr::anchor_relay_port_from_env().map_err(|_| {
+    let relay_port = crate::vsock_addr::anchor_relay_port_from_env().map_err(|msg| {
+        // Surface the parser's SPECIFIC reason (a relay==serve PORT COLLISION names the conflicting
+        // serve var + value; or port==0 / parse / non-UTF-8) before the static ProtocolError — same as
+        // the budget path; a generic message would point the operator at the wrong var.
+        let _ = writeln!(std::io::stderr(), "[err] agent boot: {msg}");
         ProtocolError::PqSigningUnavailable(
-            "agent boot: invalid anchor relay port (TWOD_HSM_ANCHOR_RELAY_PORT)",
+            "agent boot: invalid anchor relay port (see prior log line)",
         )
     })?;
     let channel = crate::agent_boot_relay::VsockBootRelayChannel::new(
@@ -381,6 +385,16 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
 /// (`vsock_listen_addr_from_env`, distinct from the relay DIAL port), accept, and route each frame to
 /// `handle_agent_gateway_frame`. 5b-2c-i ships a FAIL-CLOSED stub (an agent that boots-then-refuses to
 /// serve is fail-closed, NEVER fail-open); 5b-2c-ii replaces it with the real loop.
+///
+/// POST-`Ready` SEMANTICS (5b-2c-i skeleton — codex design review): if the handshake reaches `Ready` (needs
+/// a real anchor + a wired keystore source), the wrapper installs the keystore then hits this stub `Err` and
+/// the process EXITS. That is SAFE, not a corrupt half-boot: the 5b handshake is VERIFY-ONLY (no anchor-side
+/// mutation — the freshness_epoch bump+ack is slice 6), and the producer claim + the anti-rollback binding +
+/// the installed keystore are ALL process-VOLATILE (lost on exit) → a clean supervisor restart, no persistent
+/// state. In CI/lab WITHOUT a real anchor the wrapper fail-closes far earlier (at
+/// `boot_configure_agent_seal_root` / unseal), so `Ready` is never reached. A working-anchor DEPLOY of the
+/// skeleton would crash-loop (boot→Ready→refuse→restart) — which is exactly why the serve loop lands in
+/// 5b-2c-ii BEFORE any such deploy; the skeleton is not for a live-anchor environment.
 fn run_agent_serve_loop() -> Result<std::convert::Infallible, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
         "agent boot: serve loop not yet wired (5b-2c-ii) — refusing to serve (fail-closed)",
@@ -408,6 +422,20 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
+
+    /// TRIPWIRE: the gate-free 5b-2c derive-by-default per-attempt margin MUST stay ≥ the real per-attempt
+    /// ε (`QUOTE_ATTEMPT_OVERHEAD`) — else a DEFAULT-config boot derives an overall budget below the
+    /// `nominal = max_attempts·(2·per_leg + ε)` floor `ValidatedBootBudget::validate` enforces, failing
+    /// closed silently on the OUT-OF-BOX config. The parser is gate-free and can't reference the gated ε,
+    /// so this pin lives here (mirrors the `QUOTE_ATTEMPT_OVERHEAD ≥ REAP_GRACE` pin in `quote_subprocess`).
+    #[test]
+    fn boot_derive_margin_covers_quote_attempt_overhead() {
+        assert!(
+            u128::from(crate::env_config::BOOT_DERIVE_PER_ATTEMPT_MARGIN_MS)
+                >= crate::quote_subprocess::QUOTE_ATTEMPT_OVERHEAD.as_millis(),
+            "derive-by-default margin must stay ≥ the per-attempt ε so the default budget clears validate()"
+        );
+    }
 
     const ENV: &str = "testnet";
     const CHAIN: u64 = 11565;

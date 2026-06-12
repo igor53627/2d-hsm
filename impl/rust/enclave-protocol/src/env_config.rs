@@ -84,7 +84,9 @@ const DEFAULT_BOOT_PER_LEG_TIMEOUT_MS: u64 = 5_000;
 /// real per-attempt ε (`quote_subprocess::QUOTE_ATTEMPT_OVERHEAD` ≈ 12 ms), so a derive-by-default
 /// overall always clears `validate()`'s `nominal = max_attempts·(2·per_leg + ε) ≤ overall` with
 /// comfortable headroom WITHOUT this gate-free parser referencing the gated ε.
-const BOOT_DERIVE_PER_ATTEMPT_MARGIN_MS: u64 = 1_000;
+// pub(crate) so the gated `agent_gateway_boot` test can pin it ≥ the real per-attempt ε
+// (`quote_subprocess::QUOTE_ATTEMPT_OVERHEAD`), which this gate-free parser cannot reference directly.
+pub(crate) const BOOT_DERIVE_PER_ATTEMPT_MARGIN_MS: u64 = 1_000;
 /// Flat slack added on top of the derived per-attempt sum.
 const BOOT_DERIVE_SLACK_MS: u64 = 2_000;
 
