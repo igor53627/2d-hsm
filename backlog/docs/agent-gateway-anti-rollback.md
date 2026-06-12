@@ -1169,8 +1169,11 @@ request golden vector is a 5b-2b test-vector item.
     error-only classifier test left the positive half unguarded, so a flipped/dropped `!` re-opening the
     slowloris hole would have passed every test); the pump calls it; the producer keeps its byte-identical
     inline copy (convergence = the named follow-up). (2) `ACCEPT_ERROR_BACKOFF` PROMOTED to a single
-    `pub const` in `enclave_serve.rs` (was duplicated verbatim in `agent_gateway_boot` + `host_anchor_relay` —
-    a silent-drift surface). (3) a wrong-type / bad-version pump Err is now logged CALMLY at `[info]` via
+    `pub const` in `enclave_serve.rs` — was duplicated verbatim in `agent_gateway_boot` + `host_anchor_relay`
+    (a silent-drift surface). BOTH loops now `use` the shared const: the agent loop in cbbd918, the (b)
+    host-anchor relay in the matrix-fix commit (the cbbd918 doc OVERCLAIMED "single source" while the relay
+    still carried its own copy — caught by the roborev claude-code DESIGN cell as a spec↔code contradiction;
+    now the claim is REAL). (3) a wrong-type / bad-version pump Err is now logged CALMLY at `[info]` via
     `is_peer_protocol_reject` (the CLOSE-SILENTLY policy an UNAUTHENTICATED peer trips pre-auth was a `[warn]`
     flood lever; genuine IO faults stay `[warn]`). (4) the per-stream SO_*TIMEO arming moved to a
     `prepare`-seam threaded through `handle_agent_accepted`/`serve_agent_loop`/the finite twin (mirrors the
@@ -1183,7 +1186,37 @@ request golden vector is a 5b-2b test-vector item.
     SNP-validated producer this slice): the redundant per-frame `decode_message(&reply)` re-parse + the owning
     payload-Vec alloc (efficiency) — fix it for BOTH the pump AND the producer together via a handler that
     returns `(frame, is_error)`. The real wall-clock 300s idle expiry stays an aya 5b-2c-iii smoke obligation
-    (deviceless can't drive a true timer).
+    (deviceless can't drive a true timer). NAMED follow-up (gemini PR #67 medium, greptile P2 both REPLIED +
+    RESOLVED; greptile's "idle dead path / 300s teardown" REFUTED — success bodies are key1=Bytes/Array, NOT
+    `{1:Integer,2:Text}`, so they DO reset idle, pinned by the new `reply_extends_idle_on_success_not_on_error`
+    test): **uniform serve-loop accept-error CLASSIFICATION** — `handle_agent_accepted`'s genuine-`accept(2)`
+    `Err` arm currently backs off `ACCEPT_ERROR_BACKOFF` UNCONDITIONALLY; only EMFILE/ENFILE (os 23/24) actually
+    busy-spin (accept fails without draining the backlog), so ECONNABORTED/EINTR need no backoff. Defer rather
+    than narrow ONLY the agent loop, because the (b) host-anchor relay accept loop uses the IDENTICAL
+    unconditional backoff — fix BOTH together so they never drift (cbbd918 already consolidated the const).
+  - **Full Matrix (8 cells) outcome.** codex/claude-code/grok × {security,design} ran; the 2 **gemini cells
+    FAILED (infra-down — consistent, NOTED not silently dropped)**. grok security = "No issues"; grok design =
+    Pass. Two recurring Medium themes, both addressed:
+    - **(spec↔code contradiction — FIXED in code)** the `ACCEPT_ERROR_BACKOFF` "single source" claim — the
+      relay was converted to the shared const (item (2) above); the matrix-fix commit makes the doc true.
+    - **(serial single-client monopolization — TRUST BOUNDARY recorded, control deferred)** codex + claude-code
+      (both lenses) flag that `reply_resets_idle` extends the 300s idle budget on EVERY *successful* reply, so
+      one client issuing cheap successful `0x40` frames at any interval < `SESSION_IDLE_TIMEOUT` holds the sole
+      SERIAL slot forever and starves all other clients — the cbbd918 hardening closes the *erroring*-frame
+      slowloris but NOT the *success*-frame monopolization. **TRUST BOUNDARY (now explicit, was the reviewers'
+      ask):** the agent serve vsock port is reached by the (untrusted) SNP HOST; availability *against the host*
+      is a NON-GOAL because the host already controls VM scheduling/CPU/teardown — it can DoS the enclave
+      trivially regardless of any in-enclave cap (claude-code-security rates this Medium-not-High for exactly
+      this reason). The EXPLOITABLE case is a future deployment where the host gateway MULTIPLEXES many
+      INDEPENDENT untrusted clients onto one shared serve loop. **Therefore the named `concurrent-capped`
+      follow-up is a BLOCKING PRECONDITION before any multi-tenant-multiplexed serving** (not "if multi-client"
+      hand-wave): its acceptance = a per-connection bound that survives the success-reset (absolute
+      `MAX_SESSION_LIFETIME` from `accepted_at`, independent of idle reset) + a max-frames-per-connection cap +
+      an adversarial "a steady stream of successful frames cannot monopolize / starve a second client" test.
+      The interim single-client (host-only) deployment is safe under the trust boundary above.
+    - **(low) live-timer obligation** → add the real 300s wall-clock idle-expiry round-trip as an EXPLICIT
+      checklisted acceptance item for the 5b-2c-iii aya/SNP smoke (deviceless can't drive a true timer), not
+      just prose. compact consolidated the matrix; CI green.
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
   `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
