@@ -164,6 +164,15 @@ name = "twod-hsm-quote-smoke"
 path = "src/bin/twod_hsm_quote_smoke.rs"
 required-features = ["agent-gateway", "vsock-transport", "lab-quote-smoke"]
 
+# (b) host-relay daemon (TASK-7.7 5b-2b-ii(b)). The GENUINE intersection: agent-gateway ∩
+# vsock-transport — NOT lab-quote-smoke (the relay carries no quote/smoke surface), NOT
+# production-vsock/staging-vsock (both pull ml-dsa-65 → the role-isolation compile_error in lib.rs, so
+# the relay's features can't accidentally pull the producer role).
+[[bin]]
+name = "twod-hsm-host-anchor-relay"
+path = "src/bin/host_anchor_relay.rs"
+required-features = ["agent-gateway", "vsock-transport"]
+
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 
 [[example]]

@@ -130,6 +130,15 @@ mod quote_smoke;
 #[cfg(all(target_os = "linux", feature = "vsock-transport",
           feature = "agent-gateway", feature = "lab-quote-smoke"))]
 pub use quote_smoke::run_quote_smoke;
+/// (b) host-relay daemon (TASK-7.7 5b-2b-ii(b)) — untrusted host process bridging the SNP guest to the
+/// external anchor over TCP. Triple-gated: the cfg-INTERSECTION of the vsock leaf
+/// (`linux`+`vsock-transport`) and the agent-gateway cores (`relay_forward_once` lives in the
+/// agent-gateway-gated `agent_boot_relay`). NEVER wider. Same intersection-gate discipline as
+/// `quote_subprocess`/`agent_gateway_boot`.
+#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+mod host_anchor_relay;
+#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+pub use host_anchor_relay::run_host_anchor_relay;
 #[cfg(any(
     feature = "test-support",
     feature = "staging-host",

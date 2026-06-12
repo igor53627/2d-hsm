@@ -8,9 +8,11 @@
 //! port validation (the bind/socket leaf stays in `vsock_listen`).
 
 use crate::env_config::{
-    var_twod, LEGACY_HSM_ANCHOR_RELAY_PORT, LEGACY_HSM_VSOCK_CID, LEGACY_HSM_VSOCK_PORT,
-    TWOD_HSM_ANCHOR_RELAY_PORT, TWOD_HSM_VSOCK_CID, TWOD_HSM_VSOCK_PORT,
+    var_twod, LEGACY_HSM_ANCHOR_ENDPOINT, LEGACY_HSM_ANCHOR_RELAY_PORT, LEGACY_HSM_VSOCK_CID,
+    LEGACY_HSM_VSOCK_PORT, TWOD_HSM_ANCHOR_ENDPOINT, TWOD_HSM_ANCHOR_RELAY_PORT, TWOD_HSM_VSOCK_CID,
+    TWOD_HSM_VSOCK_PORT,
 };
+use std::net::ToSocketAddrs;
 
 /// Default bind CID: `VMADDR_CID_ANY` (guest accepts connections on any assigned guest CID).
 pub const DEFAULT_VSOCK_CID: u32 = 4_294_967_295;
@@ -93,6 +95,76 @@ pub fn anchor_relay_port_from_env() -> Result<u32, String> {
     validate_relay_port(port, serve_vsock_port_from_env()?)
 }
 
+/// Resolve the UNTRUSTED host relay's upstream anchor endpoint (TASK-7.7 5b-2b-ii(b)) from
+/// `TWOD_HSM_ANCHOR_ENDPOINT` (legacy `2D_HSM_ANCHOR_ENDPOINT`). REQUIRED — no default; a missing or
+/// empty value is a fail-closed boot error naming the var (never a silent localhost guess; §8
+/// profile-uniformity). Resolves DNS via `to_socket_addrs`, returning the addr LIST so the dialer can
+/// try each. Gate-free + std-only so it is CI-tested without the vsock dep (the pure-layer convention
+/// this module exists for — same home + shape as [`anchor_relay_port_from_env`]). The connect-timeout
+/// + per-pump socket budget are DERIVED daemon-side from the per-leg Duration, NOT a separate knob.
+pub fn anchor_endpoint_from_env() -> Result<Vec<std::net::SocketAddr>, String> {
+    let raw = match var_twod(TWOD_HSM_ANCHOR_ENDPOINT, LEGACY_HSM_ANCHOR_ENDPOINT) {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            return Err(format!(
+                "{TWOD_HSM_ANCHOR_ENDPOINT} (or legacy {LEGACY_HSM_ANCHOR_ENDPOINT}) must be set to \
+                 the external anchor host:port (no default — fail-closed)"
+            ))
+        }
+    };
+    let addrs = resolve_host_port_bounded(&raw, ANCHOR_RESOLVE_BUDGET)?;
+    if addrs.is_empty() {
+        return Err(format!("{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) resolved to zero addresses"));
+    }
+    Ok(addrs)
+}
+
+/// Hard wall-clock cap on the blocking `getaddrinfo` at daemon startup. A wedged / black-holing resolver
+/// must NOT silently hang the daemon BEFORE it binds + logs `Listening` — that would defeat the whole
+/// fail-closed startup contract (a clean non-zero exit, never an invisible stall). Generous against a
+/// HEALTHY resolver (glibc's own resolv.conf timeout × attempts is already seconds); a hard ceiling
+/// against a pathological / hung NSS source that `getaddrinfo` itself would never time out.
+const ANCHOR_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Resolve `host:port` via `to_socket_addrs` (blocking `getaddrinfo`) under a HARD wall-clock cap, so a
+/// wedged resolver fails CLOSED (a named error → the bin prints it + exits 1) instead of hanging the
+/// daemon forever before it ever binds. The resolve runs on a detached worker thread; if it overruns
+/// `budget` we abandon it (a `getaddrinfo` that never returns dies with the process on the fail-closed
+/// exit below — acceptable for a one-shot startup resolve) and return a timeout error. An IP literal
+/// resolves synchronously, well within any budget — so the IP path is unaffected.
+fn resolve_host_port_bounded(
+    raw: &str,
+    budget: std::time::Duration,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let owned = raw.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("anchor-resolve".into())
+        .spawn(move || {
+            // Map the io::Error to a String so the Result crosses the channel (io::Error is not Send-
+            // restricted, but a String keeps the worker self-contained + the receiver dependency-free).
+            let _ = tx.send(
+                owned
+                    .to_socket_addrs()
+                    .map(|it| it.collect::<Vec<_>>())
+                    .map_err(|e| e.to_string()),
+            );
+        })
+        .map_err(|e| format!("{TWOD_HSM_ANCHOR_ENDPOINT}: could not spawn resolver thread: {e}"))?;
+    match rx.recv_timeout(budget) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(format!(
+            "{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) is not a resolvable host:port: {e}"
+        )),
+        // Timeout OR the worker dropped the sender without sending (shouldn't happen) — both fail closed.
+        Err(_) => Err(format!(
+            "{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) did not resolve within {}s — failing closed (resolver \
+             wedged?)",
+            budget.as_secs()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +192,103 @@ mod tests {
         assert_eq!(validate_vsock_listen_addr(3, 5000).unwrap(), (3, 5000));
         assert!(validate_vsock_listen_addr(0, 5000).is_err());
         assert!(validate_vsock_listen_addr(3, 0).is_err());
+    }
+
+    // --- TASK-7.7 5b-2b-ii(b) test 10: anchor_endpoint_from_env (gate-free; runs in the DEFAULT /
+    // agent-gateway CI build — no vsock dep). Serializes env mutation via a module-local lock: this
+    // resolver is the SOLE consumer of TWOD_HSM_ANCHOR_ENDPOINT / 2D_HSM_ANCHOR_ENDPOINT, so a local
+    // guard fully serializes access to those two vars (no cross-module env race). Regression: the
+    // no-default fail-closed contract + the to_socket_addrs DNS resolution path.
+
+    /// Serializes the env-mutating test below (the only one touching these two vars).
+    static ANCHOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold the lock, clear BOTH var names, run `body`, then clear again so no sibling inherits.
+    fn with_anchor_env_cleared<R>(body: impl FnOnce() -> R) -> R {
+        let _g = ANCHOR_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(TWOD_HSM_ANCHOR_ENDPOINT);
+        std::env::remove_var(LEGACY_HSM_ANCHOR_ENDPOINT);
+        let r = body();
+        std::env::remove_var(TWOD_HSM_ANCHOR_ENDPOINT);
+        std::env::remove_var(LEGACY_HSM_ANCHOR_ENDPOINT);
+        r
+    }
+
+    #[test]
+    fn anchor_endpoint_from_env_fail_closed_unset_and_empty() {
+        with_anchor_env_cleared(|| {
+            // UNSET → fail-closed Err naming the var (no default, no silent localhost).
+            let err = anchor_endpoint_from_env().unwrap_err();
+            assert!(err.contains(TWOD_HSM_ANCHOR_ENDPOINT), "err must name the var: {err}");
+            assert!(err.contains("fail-closed"), "err must state fail-closed: {err}");
+            // EMPTY is treated as unset (same fail-closed branch) — never a localhost guess.
+            std::env::set_var(TWOD_HSM_ANCHOR_ENDPOINT, "");
+            assert!(anchor_endpoint_from_env().is_err());
+        });
+    }
+
+    #[test]
+    fn anchor_endpoint_from_env_resolves_ipv4_literal() {
+        with_anchor_env_cleared(|| {
+            std::env::set_var(TWOD_HSM_ANCHOR_ENDPOINT, "127.0.0.1:9999");
+            let addrs = anchor_endpoint_from_env().expect("ip literal resolves");
+            assert!(!addrs.is_empty());
+            assert!(
+                addrs.iter().any(|a| a.to_string() == "127.0.0.1:9999"),
+                "must contain the literal addr: {addrs:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn anchor_endpoint_from_env_localhost_dns_resolves() {
+        with_anchor_env_cleared(|| {
+            // A DNS name resolves via to_socket_addrs (localhost is universally resolvable in CI).
+            std::env::set_var(TWOD_HSM_ANCHOR_ENDPOINT, "localhost:9999");
+            let addrs = anchor_endpoint_from_env().expect("localhost resolves via DNS");
+            assert!(!addrs.is_empty(), "localhost must resolve to >=1 addr");
+            assert!(addrs.iter().all(|a| a.port() == 9999));
+        });
+    }
+
+    #[test]
+    fn anchor_endpoint_from_env_rejects_unparseable() {
+        with_anchor_env_cleared(|| {
+            // No port → not a resolvable host:port → Err (NOT a silent default).
+            std::env::set_var(TWOD_HSM_ANCHOR_ENDPOINT, "not-a-host-port");
+            assert!(anchor_endpoint_from_env().is_err());
+        });
+    }
+
+    #[test]
+    fn anchor_endpoint_from_env_legacy_name_accepted() {
+        with_anchor_env_cleared(|| {
+            // Legacy 2D_HSM_ANCHOR_ENDPOINT is honored when the canonical name is unset.
+            std::env::set_var(LEGACY_HSM_ANCHOR_ENDPOINT, "127.0.0.1:7000");
+            let addrs = anchor_endpoint_from_env().expect("legacy name resolves");
+            assert!(addrs.iter().any(|a| a.to_string() == "127.0.0.1:7000"));
+        });
+    }
+
+    // --- TASK-7.7 5b-2b-ii(b) review-fix: the bounded resolver (no env — the IP path resolves
+    // synchronously, well within the budget; a wedged real DNS can't be simulated deterministically, so
+    // we pin the fast path + the budget-arg plumbing, which is what guards the fail-closed startup).
+
+    #[test]
+    fn resolve_host_port_bounded_ip_literal_within_budget() {
+        // An IP literal does NO network DNS, so it returns immediately regardless of the (tiny) budget —
+        // proving the bounded wrapper does not regress the IP path and threads the budget through.
+        let addrs =
+            resolve_host_port_bounded("127.0.0.1:7100", std::time::Duration::from_secs(5)).unwrap();
+        assert!(addrs.iter().any(|a| a.to_string() == "127.0.0.1:7100"));
+    }
+
+    #[test]
+    fn resolve_host_port_bounded_rejects_unparseable() {
+        // A missing port is unresolvable → the worker's getaddrinfo errors fast → bounded Err (NOT a
+        // timeout, NOT a hang) naming the var. Distinguishes the resolve-error arm from the timeout arm.
+        let err = resolve_host_port_bounded("not-a-host-port", std::time::Duration::from_secs(5))
+            .unwrap_err();
+        assert!(err.contains(TWOD_HSM_ANCHOR_ENDPOINT), "err must name the var: {err}");
     }
 }

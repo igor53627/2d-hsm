@@ -679,7 +679,10 @@ request golden vector is a 5b-2b test-vector item.
     rule's load-bearing intent is **keep (b) daemon fault-semantics out of the vsock-integration PR** —
     preserved: (b) is still open. PR #54 co-landed (0)+(a)+(c) because (0) is a test-only frozen vector and
     (c) is a one-line CI guard for (a) — neither is a separate review surface from the channel; (b) was NOT
-    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') DONE (PR #56); (b), (d) open.**
+    bundled. Status: **(0)+(a)+(c) DONE (PR #54); (a') DONE (PR #56); (d) DONE (in-guest quote smoke
+    PASS, `run_boot_handshake_wired` landed); (b) host-relay daemon LANDED (`run_host_anchor_relay` +
+    `twod-hsm-host-anchor-relay` bin — see the (b) decision record below). Live serve now gated on
+    5b-2c ALONE.**
     - **(0) canonical golden vector — DONE PR #54 (BLOCKS (a)+(b)):** committed
       `testvectors/agent-gateway/boot_relay_anchor_handshake_v1.frame.bin` (+ `.json` manifest with a
       hand-auditable byte breakdown); the agent-gateway CI test asserts byte-exact `encode==golden` AND
@@ -765,9 +768,14 @@ request golden vector is a 5b-2b test-vector item.
       `recv_timeout` but leaked one thread+fd per truly-wedged connect, bounded by `max_attempts`; that path is
       now removed.)*
     - **(b) host relay daemon:** a feature-gated **`pub fn run_host_anchor_relay(...)` wrapper in the
-      LIBRARY** that loops `relay_forward_once`, with the `host_anchor_relay` bin a thin caller of it —
-      because a Cargo `[[bin]]` target is a separate crate and CANNOT call the `pub(crate)`
-      `relay_forward_once`/`frame_anchor_response` cores directly (it would otherwise duplicate the
+      LIBRARY** whose serial loop, per pump, READS + DECODES the enclave request FIRST (so a malformed
+      frame never burns a TCP connect — the canonical read-decode-before-dial order; see the (b) record),
+      THEN dials the anchor, THEN forwards verbatim by composing the SHARED `pub(crate)` cores
+      (`read_framed_message_with_idle_deadline` + `decode_anchor_boot_request` +
+      `relay_round_trip_over_stream` + `frame_anchor_response` + `deadline_guarded_write`) — NOT by calling
+      `relay_forward_once` (which dials-first / reads internally, the wrong order here). The
+      `host_anchor_relay` bin is a thin caller of the wrapper because a Cargo `[[bin]]` target is a separate
+      crate and CANNOT call those `pub(crate)` cores directly (it would otherwise duplicate the
       framing/decoder and risk codec drift). The wrapper owns the Err→close mapping + operator-triage
       logging (oversize/malformed/timeout) + a **serial accept loop** (one deadline-bounded pump at a time;
       revisit only if concurrent enclave boots need it) — see the host-relay daemon requirement below.
@@ -794,6 +802,113 @@ request golden vector is a 5b-2b test-vector item.
       under the serial loop a slow/wedged pump delays every queued boot by ≤ (per-pump deadline + socket +
       connect timeouts); those bounds are what keep it tolerable — concurrency (and accept-backlog limits)
       is the named follow-up trigger if many enclaves boot at once.
+      - **(b) LANDED — decision record (TASK-7.7 5b-2b-ii(b)):** shipped `pub fn run_host_anchor_relay()
+        -> Result<Infallible, Box<dyn Error>>` (lib, triple-gated `linux ∩ vsock-transport ∩
+        agent-gateway`) + the thin `twod-hsm-host-anchor-relay` bin (`required-features =
+        ["agent-gateway","vsock-transport"]` — NOT `lab-quote-smoke`, NOT
+        `production-vsock`/`staging-vsock`: those pull `ml-dsa-65` → the role-isolation `compile_error!`).
+        The daemon binds AF_VSOCK `VMADDR_CID_ANY` on the relay port, accepts SERIALLY, and per pump
+        reads+decodes the enclave request FIRST, then dials the anchor, then forwards verbatim via the
+        `pub(crate)` cores — close-on-any-fault, NEVER synthesizes bytes, NEVER dies.
+        - **Anchor transport = TCP** via `std::net::TcpStream::connect_timeout` (the whole
+          nonblock→poll→`SO_ERROR`→restore-blocking dance is internal — no `nix`, no `unsafe`, clean under
+          `#![forbid(unsafe_code)]`; NOT `connect_bounded`'s vsock poll-sequence). Isolated behind a
+          one-method `AnchorDial` trait. **UDS deferred** behind that trait, with the
+          **`EAGAIN`-not-`EINPROGRESS`** hazard recorded ON THE TRAIT DOC: a future UDS impl must treat a
+          would-block `EAGAIN` as a retryable per-pump fail-fast, must NOT copy `connect_bounded`'s
+          `EINPROGRESS`→`poll(POLLOUT)` finish sequence, and must keep the `getsockopt(SO_ERROR)` +
+          `set_nonblocking(false)` restore a naive copy drops. UDS is documented, NOT built (one TCP impl
+          ships — the seam advertises forward-compat the code does not exercise; stated plainly, no
+          structural over-claim).
+        - **Env knob** `TWOD_HSM_ANCHOR_ENDPOINT` (+ legacy `2D_HSM_ANCHOR_ENDPOINT`) = a `host:port`
+          string, **NO default** — a missing/empty value is a fail-closed boot error naming the var (never
+          a silent localhost guess; §8 profile-uniformity). Resolved ONCE at startup via `to_socket_addrs`
+          (DNS names work) into a `Vec<SocketAddr>` (the dialer tries each); per-pump dials never re-do
+          DNS. The resolver `anchor_endpoint_from_env()` lives gate-free in `vsock_addr.rs` so its
+          fail-closed/resolve logic is CI-tested in the default/agent-gateway build (no vsock dep).
+        - **Budget — single source, NO new operator knob.** `PUMP_BUDGET` (10 s) is a **HEAD-OF-LINE
+          bound** (prevents a wedged pump blocking the serial loop), NOT the boot bound — the enclave owns
+          `max_attempts·(2·timeout+ε)`; the daemon carries NO ε, NO producer, NO budget arithmetic. The
+          connect timeout + `SO_RCVTIMEO`/`SO_SNDTIMEO` are DERIVED from `PUMP_BUDGET` (a floored fraction),
+          never separate knobs. HONEST coordination caveat: "same source" means matching consts sized to
+          the same boot-handshake envelope, NOT a shared runtime value (different process — the daemon does
+          not receive the enclave's per-leg timeout over the wire).
+        - **`relay ⊇ anchor` leniency = a cross-component sync OBLIGATION, not a claimed fact.** With a
+          SEPARATE external anchor, the relay-side `decode_anchor_boot_request` must stay at least as
+          lenient as the anchor's acceptance — else a request the anchor WOULD honor becomes a relay
+          Err→retryable close that silently burns the enclave's attempt budget toward a FALSE terminal. The
+          5b-2b-ii(0) golden vector freezes only the CANONICAL request (production path safe); the broader
+          superset is defense-in-depth NOT regression-protected. Differential/property tests vs the real
+          anchor tracked SEPARATELY.
+        - **Never-synth is BEHAVIORAL, not structural:** enforced by RAII close + the absence of any
+          error-path write (the response write-back is the ONLY enclave write, reached only on full
+          success). Deviceless tests assert ZERO anchor-looking bytes reach the enclave on every fault
+          class. **Never-die:** every per-connection fault = log (`let _ = writeln!`, NEVER `eprintln!`,
+          which panics on broken stderr and would kill the serial daemon) + close + serve next; the only
+          `run_host_anchor_relay` exits are the STARTUP config/bind faults. Deviceless tests 1-11 + the bin
+          acceptance test pass (Linux CI under `agent-gateway,vsock-transport`); the real-vsock-loopback
+          aya test (bind-CID `CID_ANY` reality) stays `#[ignore]`, landing with 5b-2c bring-up.
+        - **Status:** (b) landed; **live serve now gated on 5b-2c ALONE** (the other live gate).
+          Concurrency + accept-backlog DEPTH limits = the named §8 follow-up.
+        - **xhigh-review hardening (pre-merge, PR #64 — 6 real findings, all fixed):** the review caught
+          four runtime/robustness gaps in the as-first-written (b) code, now fixed:
+          1. **Connect leg was N×budget, not one budget.** `TcpAnchorDial::dial` applied the FULL
+             `connect_budget()` to EACH resolved address, so a multi-A / dual-stack black-holing anchor
+             multiplied the head-of-line bound to `N·2.5s` (and past `PUMP_BUDGET` for N≥5). FIX: `dial`
+             now takes an ABSOLUTE `connect_deadline = min(now + connect_budget(), pump_deadline)` and
+             tries each addr against the REMAINING budget — cumulative connect across ALL addrs is one
+             `connect_budget()` AND never overruns the pump deadline. (This is what the "wedged-bounded
+             HERE, never on the loop" claim always intended.)
+          2. **Accept-loop tight-spin under fd exhaustion.** A persistent immediate `accept(2)` error
+             (EMFILE/ENFILE — accept fails without draining the backlog) made the bare log+continue peg a
+             core + flood stderr. FIX: an `ACCEPT_ERROR_BACKOFF` (50 ms) sleep caps the retry rate;
+             NEVER-DIE still holds. The accept-error arm + pump path are now ONE shared `handle_accepted`
+             body (the prod `Infallible` loop and the `#[cfg(test)]` finite twin can't drift the guard).
+          3. **Unbounded blocking DNS at startup.** `anchor_endpoint_from_env` called `to_socket_addrs`
+             (blocking `getaddrinfo`) with no cap BEFORE the bind/`Listening` log — a wedged resolver hung
+             the daemon INVISIBLY (defeating fail-closed startup). FIX: a bounded resolver thread
+             (`ANCHOR_RESOLVE_BUDGET` = 8 s) → a clean named error → exit 1 instead of a silent hang.
+          4. **Write-back not deadline-guarded like the core.** The final enclave write used bare
+             `write_all`/`flush` instead of the reused `relay_forward_once`'s `deadline_guarded_write`, so
+             a write begun past a lapsed deadline was bounded only by `SO_SNDTIMEO` (10 s). FIX: the
+             write-back now goes through the SAME `deadline_guarded_write` (now `pub(crate)`) — core-
+             symmetric; the per-pump bound holds on the last leg too.
+          Plus two test-quality fixes: the misnamed `deadline_lapsed_pump` (it tested an EMPTY-response
+          EOF, NOT a lapse) is split into `empty_anchor_response_closes_never_synth` + a GENUINE
+          `lapsed_deadline_pump_never_synth` (deadline injected via a new `relay_one_pump_until` seam);
+          and the duplicated golden-frame literals are single-sourced at the `agent_boot_relay` module
+          root (shared by both test modules — no silent drift between the freeze and the sibling
+          forwarder). The relay-can-tamper "finding" was REFUTED (by design — the enclave Ed25519-verifies).
+        - **Full-Matrix reconciliation (PR #64, 8 cells codex/claude-code/gemini/grok × security/design —
+          ZERO new code bugs; both prior fixes confirmed landed):** the only actionable items were doc
+          reconciliations, applied here:
+          - **Canonical pump order = read-decode-BEFORE-dial.** The implementation reads+decodes the
+            enclave request FIRST, then dials (so a malformed frame never burns a TCP connect; deviceless
+            test 2 pins dial-never-called). This is the AUTHORITATIVE order — it OVERRIDES any "dial-first"
+            §-numbered prose in the pre-merge scratch design (which the code's `DEVIATION FROM DESIGN §3c`
+            comment records as internally inconsistent). 5b-2c (and any UDS dialer) MUST follow read-decode-
+            before-dial, not dial-first.
+          - **`PUMP_BUDGET` deadline is minted at PUMP ENTRY (before the enclave read), NOT "after
+            connect".** The stale const docstring ("minted AFTER connect") flagged by codex+claude is fixed
+            in code; the absolute deadline spans enclave-read + connect + forward + write-back, with connect
+            additionally clamped to `min(connect_budget(), remaining-deadline)`.
+          - **`anchor_endpoint_from_env` is DAEMON-STARTUP-ONLY.** The bounded-resolve "fail-closed → exit
+            1" guarantee relies on the BIN exiting the process on the returned Err; the library fn itself
+            only returns the error (and the abandoned `getaddrinfo` worker thread dies with the process). A
+            long-lived in-process caller that swallows the Err + retries against a wedged resolver would
+            leak a thread per attempt — out of scope (the bin is the only caller, one-shot at startup).
+          - **Head-of-line worst case is ~2×PUMP_BUDGET, not PUMP_BUDGET.** A write-back that begins at
+            `deadline − ε` is bounded only by `SO_SNDTIMEO` (= PUMP_BUDGET = 10 s) — Risk #3's additive
+            socket-timeout tail. The concurrency/accept-backlog follow-up trigger must be sized against
+            ~2×PUMP_BUDGET per wedged pump, not the nominal 10 s.
+          - **`relay ⊇ anchor` differential test now OWNED by TASK-21** (was "tracked SEPARATELY" with no
+            id) — lands with 5b-2c when a concrete anchor endpoint exists to model.
+          - **Orchestration-drift seam (Low, accepted):** `relay_one_pump_until` re-implements
+            `relay_forward_once`'s sequencing (it must, to insert the dial + distinct `AnchorConnect`
+            classification between decode and forward) but reuses the SAME guard/codec cores
+            (`deadline_guarded_write`, `relay_round_trip_over_stream`, `frame_anchor_response`). OBLIGATION:
+            a future per-leg-guard hardening of `relay_forward_once` must be mirrored into the pump (the two
+            share guarantees, not the function body).
     - **(c) feature-build CI — DONE PR #54 (upgraded in PR #55):** originally `cargo test --no-run
       --features vsock-transport,agent-gateway` on the ubuntu (Linux) `rust-test` job; since PR #55 the
       `--no-run` is dropped — CI now compiles the channel + the `#[ignore]` aya tests AND **runs the
