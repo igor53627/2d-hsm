@@ -30,6 +30,7 @@ use crate::agent_boot_relay::{
     deadline_guarded_write, decode_anchor_boot_request, frame_anchor_response,
     relay_round_trip_over_stream,
 };
+use crate::enclave_serve::ACCEPT_ERROR_BACKOFF;
 use crate::vsock_addr::{self, DEFAULT_VSOCK_CID};
 use crate::vsock_listen;
 use crate::ProtocolError;
@@ -70,12 +71,9 @@ fn connect_budget() -> Duration {
     derived.max(CONNECT_BUDGET_MIN)
 }
 
-/// Backoff before the next `accept(2)` after an accept ERROR. Under fd exhaustion (EMFILE/ENFILE) the
-/// kernel fails accept IMMEDIATELY WITHOUT draining the pending backlog entry, so a bare log+continue
-/// would tight-spin a core + flood stderr until fds free elsewhere. A short sleep caps the retry rate;
-/// NEVER-DIE still holds (the daemon keeps serving, it just doesn't busy-loop). Accept errors are rare
-/// for AF_VSOCK, so this never delays the steady state — it is cheap insurance against the spin.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+// Accept-error backoff (EMFILE/ENFILE anti-spin) is the SINGLE SHARED
+// `crate::enclave_serve::ACCEPT_ERROR_BACKOFF` (imported above) — the SAME value the agent serve loop
+// uses, so the two serial accept loops can never silently diverge. See its doc for the rationale.
 
 // ---------------------------------------------------------------------------------------------------
 // The AnchorDial seam — the transport quarantine (design §2).

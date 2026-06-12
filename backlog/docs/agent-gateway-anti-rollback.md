@@ -1124,6 +1124,106 @@ request golden vector is a 5b-2b test-vector item.
     struct) is the DELIBERATE §8 transposition-fails-closed discipline (run_boot_handshake_wired doc), kept.
     **5b-2c-ii = the agent 0x40 serve loop** (replaces the stub); **5b-2c-iii = aya SNP live smoke**
     (DEBUG-build first — production live-serve still needs the attested host-vsock keystore-source slice).
+
+  **5b-2c-ii LANDED (the agent 0x40 serve loop — replaces the fail-closed stub).** Decision (Design WF,
+  all 3 judges): **SERIAL** accept loop (mirror the SNP-validated (b) host-relay), NOT thread-per-connection —
+  every keystore mutation already serializes on the `INSTALLED_KEYSTORE` Mutex inside
+  `handle_agent_gateway_frame` (lock held across `seal_body`), so concurrency buys NOTHING; serial is strictly
+  safer (NO shared `EnclaveState` mutex → the producer's `process::exit(1)`-on-poison hazard is structurally
+  ABSENT, NOT swallowed; no panic=abort dependency). Concurrent-capped = a NAMED follow-up (trigger: the
+  upstream gateway multiplexing many independent slow clients).
+  - NEW `pub fn serve_framed_pump<S, H>(stream, handle_frame, idle_timeout)` in `enclave_serve.rs` — the
+    generic per-connection frame-pump KERNEL extracted from `serve_framed_connection`'s body (break taxonomy
+    EOF/timeout/oversize→close + idle-reset-on-NON-error via `is_wire_error_payload`) MINUS the EnclaveState
+    lock / attestation / `process::exit`. ONE caller (the agent) this slice; the producer
+    `serve_framed_connection` stays BYTE-IDENTICAL (convergence onto the kernel = a NAMED §8 follow-up — do
+    NOT perturb the SNP-validated producer). CRITICAL: the idle-reset predicate is `is_wire_error_payload`
+    (wire.rs, pub) NOT `decode_agent_error_code` (which is `#[cfg(test)]`-gated → would not compile in prod).
+  - In `agent_gateway_boot.rs`: `agent_serve_one_frame` (decode → REQUIRE `MessageType::AgentGateway` → a
+    NON-0x40 frame returns Err → CLOSE-SILENTLY [human decision: strictly fail-closed, zero bytes back, never
+    synthesizes an agent body for a misrouted type] → `handle_agent_gateway_frame(&payload)` →
+    `encode_message(AgentGateway, body)`); `handle_agent_accepted` (the shared accepted-item body +
+    `ACCEPT_ERROR_BACKOFF=50ms` + `let _=writeln!` never eprintln!); `serve_agent_loop<I,S> → Infallible`
+    (serial, mirrors `serve_anchor_relay_loop`); `run_agent_serve_loop` REPLACES the stub —
+    `vsock_listen_addr_from_env` (DISTINCT serve port; relay≠serve already validated boot-step-D) → `bind_vsock_listener`
+    → arm SO_*TIMEO per stream → `serve_agent_loop`. Bind faults FATAL (fail-closed); bind branch
+    aya/SNP-pinned (UnixStream pairs have no CID).
+  - Reused VERBATIM: `handle_agent_gateway_frame` (the whole per-frame 0x40 compute — holds the keystore
+    Mutex, poison-recovers, ALWAYS returns a 0x40..=0x46-band body), the framing primitives
+    (`read_framed_message_with_idle_deadline` = oversize MessageTooLarge-before-alloc + slowloris bound;
+    `write_framed_message`; `decode_message`/`encode_message`; `MessageType::AgentGateway`),
+    `bind_vsock_listener`/`configure_vsock_session_timeouts`, `SESSION_IDLE_TIMEOUT` (300s), the (b)
+    never-die/Infallible-divergence/finite-cfg(test)-twin discipline.
+  - Validation: aya `agent-gateway,vsock-transport` 438 lib (+8 deviceless serve tests: 0x40 round-trip→0x40
+    reply no-panic, wrong-type closes-silently zero-bytes, oversize/EOF clean close, multi-frame, close-and-
+    continue, accept-backoff, agent-error idle-reset classification) + 2 bin-integration; darwin default +
+    agent-gateway (the gate-free kernel) 339; no new warnings. The success-body COMPUTE is covered by
+    agent_dispatch's own PUBLIC_IDENTITY tests; the serve loop's job is transport+reframe. **NEXT 5b-2c-iii =
+    aya SNP live smoke** (DEBUG build; a real 0x40 round-trip over vsock from the host) — production live-serve
+    still needs the attested host-vsock keystore-source slice. NAMED follow-ups: producer-convergence onto
+    `serve_framed_pump`; concurrent-capped (if multi-client).
+  - **xhigh review-max applied (22 raw→19 survived→+3 sweep→15 findings; ZERO runtime correctness bugs — all
+    hardening / log-taxonomy / test-adequacy / cleanup / efficiency).** Fixes landed: (1) the idle-reset rule
+    is EXTRACTED to `pub(crate) fn reply_resets_idle(reply)` in `enclave_serve.rs` (the SUCCESS-extends + the
+    ERROR-does-not directions are now both DETERMINISTICALLY unit-testable without a wall-clock expiry — the
+    error-only classifier test left the positive half unguarded, so a flipped/dropped `!` re-opening the
+    slowloris hole would have passed every test); the pump calls it; the producer keeps its byte-identical
+    inline copy (convergence = the named follow-up). (2) `ACCEPT_ERROR_BACKOFF` PROMOTED to a single
+    `pub const` in `enclave_serve.rs` — was duplicated verbatim in `agent_gateway_boot` + `host_anchor_relay`
+    (a silent-drift surface). BOTH loops now `use` the shared const: the agent loop in cbbd918, the (b)
+    host-anchor relay in the matrix-fix commit (the cbbd918 doc OVERCLAIMED "single source" while the relay
+    still carried its own copy — caught by the roborev claude-code DESIGN cell as a spec↔code contradiction;
+    now the claim is REAL). (3) a wrong-type / bad-version pump Err is now logged CALMLY at `[info]` via
+    `is_peer_protocol_reject` (the CLOSE-SILENTLY policy an UNAUTHENTICATED peer trips pre-auth was a `[warn]`
+    flood lever; genuine IO faults stay `[warn]`). (4) the per-stream SO_*TIMEO arming moved to a
+    `prepare`-seam threaded through `handle_agent_accepted`/`serve_agent_loop`/the finite twin (mirrors the
+    producer's `run_incoming_accept_loop` `prepare_connection`) — an arm failure is now labeled "stream setup
+    failed" (NOT mislabeled "accept error"), skipped WITHOUT backoff (not fd pressure), AND deviceless-testable.
+    NEW deviceless tests: `reply_extends_idle_on_success_not_on_error`, `serve_pump_respects_expired_idle_deadline`
+    (ZERO idle budget → break-before-read), `serve_loop_stream_setup_failure_skips_and_continues`.
+    Re-validation: aya `agent-gateway,vsock-transport` **441 lib (438+3) + 2 bin-integration, 0 failed, clippy
+    clean**; darwin gate-free 92 lib green. DEFERRED to the producer-convergence follow-up (do NOT perturb the
+    SNP-validated producer this slice): the redundant per-frame `decode_message(&reply)` re-parse + the owning
+    payload-Vec alloc (efficiency) — fix it for BOTH the pump AND the producer together via a handler that
+    returns `(frame, is_error)`. The real wall-clock 300s idle expiry stays an aya 5b-2c-iii smoke obligation
+    (deviceless can't drive a true timer). NAMED follow-up (gemini PR #67 medium, greptile P2 both REPLIED +
+    RESOLVED; greptile's "idle dead path / 300s teardown" REFUTED — success bodies are key1=Bytes/Array, NOT
+    `{1:Integer,2:Text}`, so they DO reset idle, pinned by the new `reply_extends_idle_on_success_not_on_error`
+    test): **uniform serve-loop accept-error CLASSIFICATION** — `handle_agent_accepted`'s genuine-`accept(2)`
+    `Err` arm currently backs off `ACCEPT_ERROR_BACKOFF` UNCONDITIONALLY; only EMFILE/ENFILE (os 23/24) actually
+    busy-spin (accept fails without draining the backlog), so ECONNABORTED/EINTR need no backoff. Defer rather
+    than narrow ONLY the agent loop, because the (b) host-anchor relay accept loop uses the IDENTICAL
+    unconditional backoff — fix BOTH together so they never drift (cbbd918 already consolidated the const).
+  - **Full Matrix (8 cells) outcome.** codex/claude-code/grok × {security,design} ran; the 2 **gemini cells
+    FAILED (infra-down — consistent, NOTED not silently dropped)**. grok security = "No issues"; grok design =
+    Pass. Two recurring Medium themes, both addressed:
+    - **(spec↔code contradiction — FIXED in code)** the `ACCEPT_ERROR_BACKOFF` "single source" claim — the
+      relay was converted to the shared const (item (2) above); the matrix-fix commit makes the doc true.
+    - **(serial single-client monopolization — TRUST BOUNDARY recorded, control deferred)** codex + claude-code
+      (both lenses) flag that `reply_resets_idle` extends the 300s idle budget on EVERY *successful* reply, so
+      one client issuing cheap successful `0x40` frames at any interval < `SESSION_IDLE_TIMEOUT` holds the sole
+      SERIAL slot forever and starves all other clients — the cbbd918 hardening closes the *erroring*-frame
+      slowloris but NOT the *success*-frame monopolization. **TRUST BOUNDARY (now explicit, was the reviewers'
+      ask):** the agent serve vsock port is reached by the (untrusted) SNP HOST; availability *against the host*
+      is a NON-GOAL because the host already controls VM scheduling/CPU/teardown — it can DoS the enclave
+      trivially regardless of any in-enclave cap (claude-code-security rates this Medium-not-High for exactly
+      this reason). The EXPLOITABLE case is a future deployment where the host gateway MULTIPLEXES many
+      INDEPENDENT untrusted clients onto one shared serve loop. **Therefore the named `concurrent-capped`
+      follow-up is a BLOCKING PRECONDITION before any multi-tenant-multiplexed serving** (not "if multi-client"
+      hand-wave): its acceptance = a per-connection bound that survives the success-reset (absolute
+      `MAX_SESSION_LIFETIME` from `accepted_at`, independent of idle reset) + a max-frames-per-connection cap +
+      an adversarial "a steady stream of successful frames cannot monopolize / starve a second client" test.
+      The interim single-client (host-only) deployment is safe under the trust boundary above.
+    - **(low — FIXED) incomplete calm-close classification** (surfaced by `roborev compact` re-verify): the
+      original `is_peer_protocol_reject` caught only `WireProtocol`+`InvalidVersion`, so other peer-controlled
+      pre-auth decode rejects (`UnknownMessageType`, a sub-header `Io(UnexpectedEof)` short frame) still hit the
+      `[warn]` arm — the same flood-lever class as fix (3), left half-done. Extended to ALL peer decode/route
+      rejects (the only `UnexpectedEof` reaching the arm is a peer's short frame; mid-frame read EOF breaks to
+      `Ok`; write faults are `BrokenPipe`/`ConnectionReset`), pinned by the new
+      `peer_protocol_rejects_are_calm_genuine_faults_are_not` unit test.
+    - **(low) live-timer obligation** → add the real 300s wall-clock idle-expiry round-trip as an EXPLICIT
+      checklisted acceptance item for the 5b-2c-iii aya/SNP smoke (deviceless can't drive a true timer), not
+      just prose. compact consolidated the matrix (job 8558); the const contradiction VERIFIED-fixed; CI green.
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
   `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
