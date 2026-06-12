@@ -82,6 +82,12 @@ reference-seal-v1-root = ["ml-dsa-65"]
 platform-provisioning-from-file = ["ml-dsa-65"]
 # Lab prod guest: install sealed blob from `TWOD_HSM_PQ_SEALED_SIGNER_FILE` after platform root (debug only).
 lab-pq-seal-from-file = ["ml-dsa-65"]
+# Lab/integration AGENT profile (TASK-7.7 5b-2d): source the sealed agent keystore (pq-agent-keystore-v1)
+# from `TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE` + an agent file provisioning root at boot. Base is
+# `agent-gateway` (NOT ml-dsa-65 — the role-isolation-exclusive producer feature). Debug/integration builds
+# ONLY — release-banned by a compile_error in lib.rs (mirrors lab-pq-seal-from-file). The production
+# host-vsock install/restore source is a deferred slice.
+lab-agent-keystore-from-file = ["agent-gateway"]
 # Public NIST test-vector keypair — `cargo test` only (see vsock spec §2.1).
 reference-test-key = ["ml-dsa-65", "reference-seal-v1-root", "pq-seal-provisioning"]
 # (4c) in-guest quote smoke surface — lab/debug images only, release-banned in lib.rs; opens NO

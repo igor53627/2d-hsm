@@ -36,6 +36,7 @@ cd ../2d && mix run --no-start \
 | `identity_proof_v1.{json,preimage.bin,signing_hash.bin}` | EIP-191-style identity-proof preimage layout (`0x19 ‖ len(label) ‖ label ‖ chain_id ‖ len(env_id) ‖ env_id ‖ key_ref ‖ pubkey ‖ address ‖ verifier_nonce`; variable-length fields are 1-byte length-prefixed) and its `keccak256` hash. Layout owned by TASK-7.1 AC#15; final non-collision proof owned by TASK-7.3. |
 | `keys.json` | TEST-ONLY keypairs showing one unified secp256k1 account in **both** address encodings (eth `0x…` and TRON `T…`). |
 | `domain_separation.json` | The 3-way disjointness witnesses (below). |
+| `agent_keystore_genesis_v2.{sealed.bin,json}` | **TASK-7.7 5b-2d** frozen v2 genesis `pq-agent-keystore-v1` blob: a deterministic-nonce seal (`seal_keystore_with_nonce`) of a minimal valid genesis body (`structural_version=1`, `strict_recovery_counter=0`, no entries/counters) over the committed reference provisioning root + the agent placeholder measurement. Consumed by the `boot_agent_keystore` deterministic from-disk loader test (`tests/agent_keystore_boot_loader.rs`) + the in-source byte-exact freeze. Re-installable (`blob_len <= MAX_KEYSTORE_BLOB_SIZE`). **TEST KEYS ONLY.** Regen: `cargo test --features agent-gateway,lab-agent-keystore-from-file regen_agent_genesis_golden_vector -- --ignored --nocapture` (re-mint the `.json` sidecar in the same commit on any `format_version`/body-layout change). |
 
 ## 3-way domain separation (AC#15)
 

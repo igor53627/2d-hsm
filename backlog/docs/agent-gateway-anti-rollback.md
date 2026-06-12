@@ -1067,7 +1067,59 @@ request golden vector is a 5b-2b test-vector item.
   wedged connect ATTEMPT**, worst case `max_attempts` simultaneous leaked thread+fd per boot (driver
   `max_attempts`, ceiling 64) until kernel-reaped, × restart count across boots. (a') removes the leak
   entirely, so no boot-attempt backoff/cap is needed on the connect leg for fd-table safety.)*
-- **5b-2d — sealed-blob source + unseal sequencing** (where the agent sealed keystore comes from at boot).
+- **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
+  `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
+  - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
+    a PURE source→unseal→return seam. It reads the sealed blob + the enclave measurement, resolves the
+    provisioning root, and calls the SHARED `agent_keystore::unseal_body` VERBATIM (length → magic
+    `2DAGTKS\0` → `format_version==2` BEFORE decrypt → measurement-binding → strict whole-buffer CBOR →
+    `validate()` incl. `structural_version!=0`). It does **NOT** install (the 5b-2c bin owns
+    `install_agent_keystore` + the move-vs-borrow order: the handshake BORROWS `&body`, install MOVES it +
+    retains the measurement for re-seal; `install_agent_keystore` returns `bool` and **false** —
+    overwrite/empty-meas/poison — is FATAL for 5b-2c) and does **NOT** set the root.
+  - `boot_configure_agent_seal_root() -> Result<(), ProtocolError>` — the thin agent root-step (the
+    `ml-dsa-65`-only `platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root` is unavailable to
+    the agent build), calling the SHARED `seal_root::set_pq_seal_v1_provisioning_root` so `resolve` succeeds
+    standalone. Sharing the root mechanism does NOT weaken isolation (distinct domain-separated KDFs).
+  - **SECURITY boundary:** the seam enforces ONLY the structural/seal invariant; it MUST NOT judge
+    freshness/anti-rollback — a rolled-back-but-valid blob unseals + installs, then the handshake `reconcile`
+    (NOT this module) catches it. Structurally enforced: the module use-list imports NO
+    `agent_anchor`/`agent_boot`/`reconcile`/`marks`/`AdoptForward`/`AnchorState` symbol (grep-checkable);
+    AdoptForward + re-seal-forward stay strictly 5b-2e. Honors `MAX_KEYSTORE_BLOB_SIZE` (re-installable).
+  - **NEW SURFACE (house rule):** feature `lab-agent-keystore-from-file = ["agent-gateway"]` (base
+    `agent-gateway`, NOT `ml-dsa-65` — the role-isolation-exclusive producer feature; a NEW
+    `compile_error!` in `lib.rs` mirrors the `lab-pq-seal-from-file` release-ban). NEW env var
+    `TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE` (+ `2D_HSM_*` alias, read **RAW** — a sealed binary blob is never
+    newline-trimmed). The lab root REUSES `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` (one shared platform-root
+    mechanism); the lab measurement REUSES `TWOD_HSM_ENCLAVE_MEASUREMENT_FILE` (text override) with a
+    DISTINCT agent placeholder const `AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT` fallback (cross-role
+    hygiene vs the producer placeholder). The production (non-lab) arms are documented fail-closed stubs.
+  - **ERROR TYPE:** returns `ProtocolError::PqSigningUnavailable` (NO new variant — `protocol_error_to_wire_body`
+    is the only exhaustive `ProtocolError` match; a new variant is a wire-facing public-enum widening with
+    zero caller benefit). Observability via DISTINCT `agent keystore:`-prefixed coarse labels (wire code 2,
+    reason-distinguishable from a producer-signer); the `KeystoreError`→label mapper is WILDCARD-FREE (one
+    arm per the 17 variants → a future 18th variant is a COMPILE error, not a silent fail-open).
+  - **GENESIS GOLDEN:** committed `testvectors/agent-gateway/agent_keystore_genesis_v2.{sealed.bin,json}`
+    (deterministic-nonce `seal_keystore_with_nonce` over the committed reference root + the agent
+    placeholder; `structural_version=1`, `strict_recovery_counter=0`, no entries/counters; both required,
+    no serde default; `format_version=2` hard, no v1 reader; blob 3998 B ≤ `MAX_KEYSTORE_BLOB_SIZE`). An
+    in-source byte-exact freeze + a from-disk integration test (`tests/agent_keystore_boot_loader.rs`) both
+    consume the same bytes — any encoder/layout drift flips BOTH; regen via `#[ignore]
+    regen_agent_genesis_golden_vector` (re-mint the `.json` in the same commit on a `format_version` bump).
+  - **TESTING TRAP (pinned):** `resolve_provisioning_root` has a `cfg(test)`/`reference-seal-v1-root`
+    reference-root fallback (`seal_root.rs`) that MASKS a naive root-not-set Err under `cargo test` — the
+    negative ordering case is pinned via the production-stub path (a non-lab build where blob/measurement
+    sourcing Errs first), NOT a naive unset-root assertion. An agent-side test guard resets the seal-root
+    global + the keystore slot + the env under one process-globals Mutex.
+  - **Validation:** darwin agent-gateway WITH `lab-agent-keystore-from-file` (16 module tests + the from-disk
+    integration test) AND WITHOUT (6 feature-independent + the production fail-closed stub test) green;
+    clippy clean; release-build + the lab feature fails to compile (release-ban).
+  - **DEFERS:** the production host-vsock install/restore wire envelope (its own slice; the framing is still
+    PROVISIONAL); the real attested 48-byte SNP launch measurement (production derives it from the SNP
+    report, not the placeholder); the 5b-2c bin wiring (install ordering, false-is-fatal, a real production
+    root hook); AdoptForward/re-seal (5b-2e). A per-role agent root env var was rejected as a wider diff
+    (the shared `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` is correct — distinct KDF domains; flagged for reviewer
+    sign-off).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
   `hash(adopted)==marks_digest` seed + re-seal/persistence.
