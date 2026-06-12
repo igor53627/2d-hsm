@@ -55,6 +55,59 @@ granularity, 1ms under the exact 400ms floor) → fixed with `LAPSE_ELAPSED_FLOO
 post-floor-slop run, a confirming idempotence run, and a post-hardening run on the final launcher)
 all PASS.
 
+## Agent-gateway live smoke (TASK-7.7 5b-2c-iii)
+
+| Script | Flake disk | Pass signals |
+|--------|------------|--------------|
+| `run-nix-snp-agent-smoke.sh` | `.#disk-production-lab-agent-gateway` | R1–R4 all hold (see the script header): anchor stub + relay up BEFORE qemu; serial-log boot evidence (raw + validated budget events, `[info] boot handshake outcome:` BEFORE the serve marker — the install-AFTER-Ready order observable; relay `pump ok` + anchor `signed response`); the host client's **`RESULT PASS phases=5`** (count-anchored); witnesses: in-guest `journald-serve PASS`, the calm `[info] ... closed connection (` non-0x40 close, the POSITIVE `[info] ... connection closed cleanly` idle close, and NO `connection fault`. |
+| `run-kvm-agent-refusal.sh` (SEV_MODE=none, NO relay/anchor) | same image | **EXPECTED REFUSAL — a first-class run, never a skip**: `[warn] boot handshake outcome:` + `[err] agent-gateway boot failed:` + ≥2 `boot budget config (raw, pre-validate)` lines (restart evidence — supervision restarts, NO in-process retry) + NO `serving on vsock`. |
+
+### 5b-2c-iii acceptance checklist (explicit; check off with run evidence)
+
+- [ ] **Core:** a real 0x40 PUBLIC_IDENTITY round-trip over vsock from the host against the DEBUG
+  `twod-hsm-agent-gateway` bin on a real SEV-SNP launch (client phase `public-identity`, byte-exact
+  against the minted smoke fixture).
+- [ ] **The real 300 s wall-clock idle expiry** (the doc-pinned item deviceless tests cannot drive):
+  client phase `idle-expiry` PASS with `elapsed_ms` ∈ **[298 000, 332 000)** — floor = 300 s − 2 s
+  slop (NEVER an exact floor — the (d-ii) 399 ms lesson), ceiling = 300 s + the 30 s `SO_RCVTIMEO`
+  read-arm tick + 2 s slop (the close lands at the first read-wake ≥ the deadline). At least one
+  FULL-WINDOW `RESULT PASS phases=5` run; `PASS-DEV phases=4` (skip-idle) never satisfies this.
+- [ ] **Expected-error + close taxonomy live:** `identity-unknown-keyref` (exact 0x42),
+  `non-agent-close` (zero reply bytes + the calm `[info]` close), `post-expiry-liveness` (the
+  SERIAL loop serves the next client).
+- [ ] **Bin logging acceptance split BY PATH:** (i) the happy boot above; (ii) validation-refusal +
+  (iii) outcome-refusal — both pinned deviceless in `tests/twod_hsm_agent_gateway_bin.rs` (CI) AND
+  (iii) E2E via `run-kvm-agent-refusal.sh` with restart evidence.
+- [ ] **Canonical boot order observable in logs:** root → unseal → budget (raw, validated) → relay
+  channel → handshake (`decide_serve` inside) → install-AFTER-Ready → serve.
+- [ ] **aya `#[ignore]` composition test green on aya:** `relay_real_vsock_loopback_with_lab_anchor`
+  (real CID_ANY bind + shipped relay pump + the REAL lab anchor stub; discharges the bind-CID-ANY
+  reality item, seeds TASK-21).
+
+### Residuals recorded, NOT discharged by this smoke
+
+- **Release-bin spawn shape** — this smoke is DEBUG by mechanical necessity
+  (`lab-agent-keystore-from-file` is release-banned); the release-built agent bin's spawn shape
+  stays the explicit 5b-2c residual (owned by the production keystore-source slice).
+- **Placeholder measurement** — the smoke keystore is sealed under
+  `AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT`; the attested 48-byte SNP launch measurement is the
+  deferred production keystore-source slice (binding itself is deviceless-pinned at unseal).
+- **Anchor-side AMD cert-chain verification** — the lab stub is match-only on the embedded
+  `report_data` (guest security never depends on anchor-side policy).
+- **Single-client serial serving** — deliberate; the serve-port peer is the untrusted SNP host
+  (availability-vs-host is a NON-GOAL). Concurrent-capped + `MAX_SESSION_LIFETIME` + a starvation
+  test remain the BLOCKING PRECONDITION for any multi-tenant-multiplexed serving. The smoke must
+  NOT be turned into a multi-client test.
+
+### aya run-book note (bites every time)
+
+Validate from a **detached worktree** (`git fetch origin <branch>` — the aya clone has a restricted
+refspec, `origin/main` is not a local ref — then `git worktree add --detach <dir> <sha>`). If you
+apply local patches instead, **`git add -A` before any flake build**: the git-flake eval ignores
+untracked files and silently builds stale sources. First SNP run after a fixture/source change:
+force a clean image build (delete the out-link — the smoke-cache stale-stamp adoption hazard,
+`smoke-cache-lib.sh` `twod_hsm_nix_outlink_hit`/stamp adoption path).
+
 ## Review record (PR #5)
 
 - **Reduced matrix:** roborev 6890–6892
