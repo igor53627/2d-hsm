@@ -293,6 +293,101 @@ pub(crate) fn run_boot_handshake_wired<C: crate::agent_boot_relay::BootRelayChan
     )
 }
 
+/// (5b-2c) The agent-gateway serve-bin boot entrypoint — the SOLE `pub` bridge across the bin/lib
+/// boundary (every wired type it composes is `pub(crate)` in this crate-private module, unreachable
+/// from a separate-crate `[[bin]]`). Sequences the §8 boot: agent provisioning root → unseal the agent
+/// keystore (5b-2d) → parse the operator budget → construct the concrete `VsockBootRelayChannel` → ONE
+/// wired handshake → install the keystore AFTER `Ready` → SERVE. `require_real` is HARDCODED
+/// `cfg!(release_build)` (§8: no operator override; `release_build` is THIS crate's build.rs cfg — a
+/// copy out-of-crate evaluates false ⇒ fail-OPEN). Returns `Result<Infallible, ProtocolError>`: `Ok` is
+/// unconstructible (the serve loop diverges); `Err` is the FATAL boot/install/startup class. ONE
+/// handshake per process — on any failure the bin EXITS for supervisor restart (the producer claim is
+/// permanent; NO in-process retry). The emit sink is WRAPPER-INTERNAL (keeps `AgentBootEvent`
+/// `pub(crate)`): best-effort `let _ = writeln!` (NEVER `eprintln!` — a sink panic after the claim burns
+/// it), mapping `level()` to a journald priority tag; the returned `ProtocolError` is ALSO rendered at
+/// err (the event seam emits no dedicated error event).
+pub fn run_agent_gateway_boot() -> Result<std::convert::Infallible, ProtocolError> {
+    use std::io::Write as _;
+    run_agent_gateway_boot_inner().inspect_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] agent-gateway boot failed: {e}");
+    })
+}
+
+fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolError> {
+    use std::io::Write as _;
+    // (A) agent provisioning root FIRST (install-once).
+    crate::boot_agent_keystore::boot_configure_agent_seal_root()?;
+    // (B) PURE source→unseal→return — does NOT install, does NOT judge freshness (the handshake's
+    //     reconcile does, on &body, BEFORE install).
+    let (body, measurement) = crate::boot_agent_keystore::unseal_agent_keystore_at_boot()?;
+    // (C) operator-config → budget triplet (validate() PARAM ORDER; parse + derive-by-default only —
+    //     ValidatedBootBudget::validate inside the handshake is the sole fail-closed band judge).
+    let (max_attempts, per_leg_timeout, overall_boot_budget) =
+        crate::env_config::boot_budget_config_from_env().map_err(|_| {
+            ProtocolError::PqSigningUnavailable(
+                "agent boot: invalid boot-budget config (TWOD_HSM_BOOT_MAX_ATTEMPTS / \
+                 _PER_LEG_TIMEOUT_MS / _OVERALL_BUDGET_MS must be integers)",
+            )
+        })?;
+    // (D) construct the concrete channel internally (the bin can't reach VsockBootRelayChannel::new).
+    //     The boot-relay DIAL target is host CID 2 on the anchor relay port (distinct from the serve
+    //     listen port — anchor_relay_port_from_env validates relay != serve).
+    let relay_port = crate::vsock_addr::anchor_relay_port_from_env().map_err(|_| {
+        ProtocolError::PqSigningUnavailable(
+            "agent boot: invalid anchor relay port (TWOD_HSM_ANCHOR_RELAY_PORT)",
+        )
+    })?;
+    let channel = crate::agent_boot_relay::VsockBootRelayChannel::new(
+        crate::vsock_addr::VMADDR_CID_HOST,
+        relay_port,
+    );
+    // (E) wrapper-internal best-effort emit sink (decision: keeps AgentBootEvent pub(crate)). NEVER
+    //     eprintln!; maps level() to a journald-style priority tag.
+    let mut emit = |ev: AgentBootEvent| {
+        let _ = writeln!(std::io::stderr(), "[{}] {ev}", boot_log_priority(ev.level()));
+    };
+    // (F) ONE wired handshake; decide_serve is INSIDE; &body is BORROWED here. require_real HARDCODED.
+    let _ready: crate::agent_anchor::AnchorState = run_boot_handshake_wired(
+        max_attempts,
+        per_leg_timeout,
+        overall_boot_budget,
+        channel,
+        &body,
+        cfg!(release_build),
+        &mut emit,
+    )?;
+    // (G) install the keystore LAST (MOVES body). false (overwrite / empty-measurement / poison) is
+    //     FATAL — abort, never log-and-serve (install-AFTER-Ready: a stale-but-valid keystore is never
+    //     written to the process-global before the freshness gate).
+    if !crate::agent_dispatch::install_agent_keystore(body, &measurement) {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "agent boot: install_agent_keystore returned false (already installed / empty \
+             measurement) — fatal",
+        ));
+    }
+    // (H) SERVE the agent 0x40 command loop. Diverges (Ok never constructed). 5b-2c-i ships a
+    //     fail-closed stub; 5b-2c-ii implements the real bind+accept+pump.
+    run_agent_serve_loop()
+}
+
+/// (5b-2c-i STUB → 5b-2c-ii) The agent 0x40 serve loop: bind the agent vsock listener
+/// (`vsock_listen_addr_from_env`, distinct from the relay DIAL port), accept, and route each frame to
+/// `handle_agent_gateway_frame`. 5b-2c-i ships a FAIL-CLOSED stub (an agent that boots-then-refuses to
+/// serve is fail-closed, NEVER fail-open); 5b-2c-ii replaces it with the real loop.
+fn run_agent_serve_loop() -> Result<std::convert::Infallible, ProtocolError> {
+    Err(ProtocolError::PqSigningUnavailable(
+        "agent boot: serve loop not yet wired (5b-2c-ii) — refusing to serve (fail-closed)",
+    ))
+}
+
+/// Map the library boot-log severity to a journald-style priority tag for the wrapper's stderr sink.
+fn boot_log_priority(level: BootLogLevel) -> &'static str {
+    match level {
+        BootLogLevel::Info => "info",
+        BootLogLevel::Warn => "warn",
+    }
+}
+
 // TEST RULE (restated from `HardBoundedQuoteProducer::new` — uniform here): EVERY test holds
 // `crate::agent_dispatch::lock_and_reset_agent_process_globals()` for its WHOLE body (the reset
 // clears claim + binding + challenge + keystore), and tests that re-claim leave the flag pristine

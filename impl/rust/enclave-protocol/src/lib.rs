@@ -126,9 +126,15 @@ pub use quote_subprocess::agent_quote_child_dispatch;
 // Agent Gateway (4b) boot wiring (TASK-7.7 5b-2b-ii (d-ii)/4b): the wired boot-handshake composition
 // (`run_boot_handshake_wired`) + the typed boot-event seam. Triple-gated like `quote_subprocess` — the
 // cfg intersection of its dependencies (`ValidatedBootBudget`/`HardBoundedQuoteProducer`), never wider
-// (§8 hard rule). Crate-private, NO pub export: live serve stays gated on (4c) + 5b-2c.
+// (§8 hard rule). (5b-2c) NOW EXPORTS the sole `pub` boot bridge `run_agent_gateway_boot` — every other
+// wired type stays `pub(crate)`; the bin reaches ONLY this entrypoint.
 #[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
 mod agent_gateway_boot;
+// (5b-2c) The agent-gateway serve-bin boot entrypoint — MUST live in-crate (the wired types it composes
+// are crate-private) and stay under the SAME triple gate, NEVER wider; require_real hardcodes
+// cfg!(release_build) (THIS crate's build.rs cfg — a copy out-of-crate fails OPEN).
+#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+pub use agent_gateway_boot::run_agent_gateway_boot;
 // (4c) in-guest quote smoke (TASK-7.7 5b-2b-ii (d-ii)/4c). QUADRUPLE-gated: the triple gate of the
 // consumed items (`quote_subprocess`/`agent_boot_relay` vsock leaves) ∩ the bare `lab-quote-smoke`
 // marker — narrower than every consumed item, never wider (§8 hard rule). NOT the 5b-2c serve
