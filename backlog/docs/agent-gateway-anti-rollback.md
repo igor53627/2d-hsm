@@ -1075,6 +1075,55 @@ request golden vector is a 5b-2b test-vector item.
   wedged connect ATTEMPT**, worst case `max_attempts` simultaneous leaked thread+fd per boot (driver
   `max_attempts`, ceiling 64) until kernel-reaped, × restart count across boots. (a') removes the leak
   entirely, so no boot-attempt backoff/cap is needed on the connect leg for fd-table safety.)*
+
+  **5b-2c-i LANDED (boot wrapper + budget config + bin skeleton; serve STUBBED fail-closed).** The
+  WALL-crossing + boot sequencing, split off so the serve-loop design doesn't block it:
+  - NEW `pub fn run_agent_gateway_boot() -> Result<Infallible, ProtocolError>` IN `agent_gateway_boot.rs`
+    (the SOLE `pub` bridge — every wired type stays `pub(crate)`; triple-gated, `pub use` in lib.rs):
+    `boot_configure_agent_seal_root()?` → `unseal_agent_keystore_at_boot()?` (5b-2d) → parse budget →
+    `VsockBootRelayChannel::new(VMADDR_CID_HOST, anchor_relay_port_from_env()?)` →
+    `run_boot_handshake_wired(.., &body, cfg!(release_build), &mut emit)?` (decide_serve INSIDE; `&body`
+    BORROWED; require_real HARDCODED) → `install_agent_keystore(body, &measurement)` LAST (false=FATAL,
+    install-AFTER-`Ready`) → `run_agent_serve_loop()` (5b-2c-i STUB = fail-closed Err; 5b-2c-ii replaces).
+    The emit sink is WRAPPER-INTERNAL (decision: keeps `AgentBootEvent` `pub(crate)` — no promotion);
+    `let _ = writeln!` NEVER `eprintln!`; the returned `ProtocolError` is rendered at err (the event seam
+    emits no dedicated error event). ONE handshake/process — no in-process retry.
+  - NEW gate-free `env_config::boot_budget_config_from_env() -> (u32, Duration, Duration)` in
+    `validate()` PARAM ORDER (positional, no config struct). Three env knobs `TWOD_HSM_BOOT_MAX_ATTEMPTS`
+    / `_PER_LEG_TIMEOUT_MS` / `_OVERALL_BUDGET_MS` (+ legacy); overall is DERIVE-BY-DEFAULT
+    (`max_attempts·(2·per_leg + 1000ms margin) + 2000ms`, saturating, ≫ the real ε so it always clears
+    `validate()`'s nominal≤overall) but an operator may widen it. Parse+default ONLY — `validate()` is the
+    sole band judge. CI-tested on darwin (gate-free, 6 unit tests incl. a non-UTF-8 fail-closed case). A
+    gated TRIPWIRE test (`boot_derive_margin_covers_quote_attempt_overhead`) pins the 1000ms margin ≥ the
+    real ε so a future ε growth can't silently push the DEFAULT-config boot below `validate()`'s floor.
+  - NEW `[[bin]] twod-hsm-agent-gateway` (`required-features=[agent-gateway,vsock-transport]` — NOT
+    production-vsock/staging-vsock [ml-dsa-65 role-isolation] NOT lab-quote-smoke [release-banned]): the
+    2-statement dispatch-first main (`agent_quote_child_dispatch()` FIRST, then `run_agent_gateway_boot`),
+    non-linux stub exit 2, `Ok(Infallible)` unreachable → exit 1 on the FATAL Err (lib already rendered).
+  - NEW `tests/twod_hsm_agent_gateway_bin.rs` DISCHARGES the §8 byte-exact-stdout acceptance item
+    (re-targeted to the agent bin): marker-set/report_data-absent → stdout == `[0xA2,0x01]` byte-exact +
+    exit 1 (dispatch-first proven — any stdout write before dispatch fails it) + a fail-closed-startup arm
+    (no marker → `boot_configure_agent_seal_root` stub → exit 1 naming the root, stdout empty).
+  - Validation: aya `agent-gateway,vsock-transport` 429 lib + 2 bin-integration PASS (incl. the dispatch-
+    first byte-exact); darwin agent-gateway (gated module out, budget parser in); no new warnings.
+  - **Full-Matrix reconciliation (PR #66, 6 cells codex/claude-code/grok × security+design; gemini
+    infra-down NOTED):** ZERO fail-open / ordering / dispatch defects (the install-AFTER-`Ready`,
+    borrow-then-move, require_real hardcode, and dispatch-first byte-exact all passed). Applied: (1) xhigh
+    + matrix — the budget env-helpers swallowed `Err(NotUnicode)` → now fail closed naming the var
+    (matching var_twod's contract); (2) claude design Medium — the anchor-relay-port `map_err` now surfaces
+    its SPECIFIC reason (a relay==serve PORT COLLISION names the conflicting serve var) before the static
+    error, same as the budget path; (3) claude design Low — the ε tripwire test above. The codex design
+    "High" (irreversible handshake/claim before the always-failing serve stub) is DOCUMENTED, not a code
+    change: the 5b handshake is VERIFY-ONLY (no anchor-side mutation — the bump+ack is slice 6), and the
+    producer claim + binding + installed keystore are process-VOLATILE, so a post-`Ready` serve-stub exit is
+    a CLEAN supervisor restart (no persistent half-boot). In CI/lab WITHOUT a real anchor the wrapper
+    fail-closes at root/unseal long before `Ready`; a working-anchor DEPLOY of the skeleton would crash-loop,
+    which is why the serve loop lands in 5b-2c-ii BEFORE any live-anchor deploy (the skeleton is not for one).
+    NB the serve port (`vsock_listen_addr_from_env`) is already load-bearing at boot via the relay≠serve
+    collision check, even though the serve loop is a stub this slice. The positional budget tuple (no config
+    struct) is the DELIBERATE §8 transposition-fails-closed discipline (run_boot_handshake_wired doc), kept.
+    **5b-2c-ii = the agent 0x40 serve loop** (replaces the stub); **5b-2c-iii = aya SNP live smoke**
+    (DEBUG-build first — production live-serve still needs the attested host-vsock keystore-source slice).
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
   `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —

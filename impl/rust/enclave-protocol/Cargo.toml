@@ -179,6 +179,16 @@ name = "twod-hsm-host-anchor-relay"
 path = "src/bin/host_anchor_relay.rs"
 required-features = ["agent-gateway", "vsock-transport"]
 
+# TASK-7.7 5b-2c: the agent-gateway AF_VSOCK serve bin (anti-rollback profile). EXACTLY
+# [agent-gateway, vsock-transport] — NOT production-vsock/staging-vsock (would pull ml-dsa-65 → the
+# role-isolation compile_error) and NOT lab-quote-smoke (release-banned). A LAB boot additionally needs
+# lab-agent-keystore-from-file (the only wired keystore source today); the production attested host-vsock
+# source is a deferred slice.
+[[bin]]
+name = "twod-hsm-agent-gateway"
+path = "src/bin/agent_gateway_vsock.rs"
+required-features = ["agent-gateway", "vsock-transport"]
+
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 
 [[example]]
