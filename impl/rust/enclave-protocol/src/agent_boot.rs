@@ -64,8 +64,13 @@ pub(crate) enum BootAntiRollbackOutcome {
     /// arm that installs. The carried `AnchorState` gives 5b the authoritative `epoch` +
     /// `structural_version` to re-seal to; its `marks_digest` is a non-invertible hash (it decides the
     /// reconcile and authenticates the raw marks), so the *actual* marks to seed come from that signed
-    /// channel, NOT from this outcome. Until that channel exists, `AdoptForward` is fail-closed (§8).
-    AdoptForwardRequired(crate::agent_anchor::AnchorState),
+    /// channel, NOT from this outcome. The carried `nonce` is the SAME single-use freshness nonce this
+    /// attempt consumed — 5b binds the raw-marks message to it (§E2/D4), so the slot is already retired
+    /// (single-use preserved) yet the marks channel verifies against the exact nonce this attempt used.
+    AdoptForwardRequired {
+        state: crate::agent_anchor::AnchorState,
+        nonce: [u8; crate::agent_anchor::DIGEST_LEN],
+    },
     /// This invocation did not newly configure custody — the caller MUST NOT proceed (abort / don't
     /// serve). No `FailClosed` arm constructs or installs a NEW binding. On a clean boot the gate
     /// therefore stays blocked (const-init `None`). **One nuance:** `BindingInstall` means a *prior*
@@ -136,17 +141,22 @@ pub(crate) fn boot_reconcile_anti_rollback(
     response_bytes: &[u8],
     body: &crate::agent_keystore::KeystoreBody,
 ) -> BootAntiRollbackOutcome {
-    // 1. Verify the response against the outstanding challenge (take-before-verify ⇒ the nonce is
-    //    retired on every outcome) and the sealed config.
-    let state = match crate::agent_challenge::verify_outstanding_response(response_bytes, &body.config)
-    {
+    // 1. CONSUME the outstanding challenge FIRST (take-before-verify ⇒ the nonce is retired on every
+    //    outcome, single-use is structural), holding the nonce VALUE so the AdoptForward arm can bind
+    //    the raw-marks message to the SAME nonce (§E2/D4). This is the exact two-step decomposition of
+    //    `verify_outstanding_response` (consume → verify_anchor_response_bytes), so the freshness
+    //    behavior is byte-identical — it is NOT a non-consuming peek (the slot is genuinely retired
+    //    before any verify; the `agent_challenge` module-doc prohibition is honored). The nonce is a
+    //    fresh-per-restart CSPRNG draw the host cannot predict, and a replayed `(nonce, response)` after
+    //    this attempt finds an empty slot (`NoChallenge`).
+    let challenge = match crate::agent_challenge::consume_outstanding_challenge() {
+        Some(c) => c,
+        None => return BootAntiRollbackOutcome::FailClosed(BootFailReason::NoChallenge),
+    };
+    let nonce = *challenge.nonce();
+    let state = match crate::agent_anchor::verify_anchor_response_bytes(response_bytes, &nonce, &body.config) {
         Ok(s) => s,
-        Err(crate::agent_challenge::ChallengeVerifyError::NoOutstandingChallenge) => {
-            return BootAntiRollbackOutcome::FailClosed(BootFailReason::NoChallenge);
-        }
-        Err(crate::agent_challenge::ChallengeVerifyError::Anchor(e)) => {
-            return BootAntiRollbackOutcome::FailClosed(map_anchor_error(e));
-        }
+        Err(e) => return BootAntiRollbackOutcome::FailClosed(map_anchor_error(e)),
     };
 
     // 2. Recompute the local counter/spend marks digest from the sealed body.
@@ -173,12 +183,111 @@ pub(crate) fn boot_reconcile_anti_rollback(
             }
         }
         crate::agent_anchor::ReconcileDecision::AdoptForward { .. } => {
-            BootAntiRollbackOutcome::AdoptForwardRequired(state)
+            // Carry the consumed nonce VALUE out so 5b's marks fetch binds to the SAME single-use nonce.
+            BootAntiRollbackOutcome::AdoptForwardRequired { state, nonce }
         }
         crate::agent_anchor::ReconcileDecision::FailClosed(r) => {
             BootAntiRollbackOutcome::FailClosed(map_fail_reason(r))
         }
     }
+}
+
+/// Why executing an `AdoptForward` (the 5b-2e raw-marks adopt) failed closed. Each cause is a terminal
+/// refusal of the adopt — the boot must NOT serve rollback-sensitive frames on any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptForwardFail {
+    /// The raw-marks message did not verify (signature / scope / nonce / epoch) vs the sealed config.
+    MarksVerify(crate::agent_anchor::MarksError),
+    /// The authenticated marks payload was not strict-canonical / wrong shape / over-cap.
+    MarksDecode,
+    /// **THE security boundary:** the host-relayed raw marks, re-hashed via the production digest path,
+    /// did NOT equal the anchor's signed `state.marks_digest`. A forged (large-but-`≥-local`) marks set
+    /// fails here — the `≥`-belt would have admitted it.
+    HashMismatch,
+    /// Defense-in-depth belt (AFTER the hash gate): a surface that is `< local` (a non-monotone adopt).
+    /// Unreachable for a genuine anchor high-water; a free tripwire if the hash path were ever weakened.
+    BeltRegression,
+    /// The seeded candidate body failed `validate()` (env-fold / caps / field lengths).
+    Seed,
+}
+
+/// Execute an `AdoptForward`: verify the host-relayed `anchor_root`-signed raw-marks message, decode it
+/// strictly, build a candidate body seeded from it, and — THE SECURITY GATE — require the candidate's
+/// `compute_local_marks_digest()` (the EXACT production digest path) to equal the anchor's signed
+/// `state.marks_digest` **byte-for-byte**. Returns the authenticated, epoch-advanced candidate body for
+/// the driver to re-run reconcile against (it will reconcile `Fresh` and install). On ANY failure
+/// returns `Err` and the caller seeds/installs NOTHING (the original body is untouched — `body` is
+/// borrowed, the candidate is a local clone).
+///
+/// `nonce` is the SAME single-use freshness nonce this attempt consumed (carried out of
+/// `boot_reconcile_anti_rollback`); the marks message must echo it (anti-splice). `state` is the
+/// verified freshness `AnchorState` — its `epoch` is the re-seal target and its `marks_digest` is the
+/// gate's authority.
+///
+/// **Why forgery is structurally dead & drift-proof:** the gate computes the digest via the *same*
+/// `KeystoreBody::compute_local_marks_digest` the local body and the anchor co-sign use (no second
+/// digest impl to drift); over a re-built candidate (clone + overwrite-4-surfaces → canonical
+/// re-encode), so only the *canonical* form's digest can match (a non-canonical-but-decodable inner
+/// payload re-canonicalizes to a different digest → rejected); the `≥`-belt is *additional*, never the
+/// gate. A host supplying arbitrarily-large-but-`≥-local` marks produces a candidate whose digest `≠
+/// state.marks_digest` (the anchor signed the genuine digest) → `HashMismatch`.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 4/8; the driver execute arm lands in commit 6
+pub(crate) fn execute_adopt_forward(
+    marks_bytes: &[u8],
+    body: &crate::agent_keystore::KeystoreBody,
+    state: &crate::agent_anchor::AnchorState,
+    nonce: &[u8; crate::agent_anchor::DIGEST_LEN],
+) -> Result<crate::agent_keystore::KeystoreBody, AdoptForwardFail> {
+    // 1. Verify the marks message: Ed25519 vs sealed anchor_root, same scope + same nonce + same epoch.
+    let marks_payload =
+        crate::agent_anchor::verify_marks_response_bytes(marks_bytes, nonce, state.epoch, &body.config)
+            .map_err(AdoptForwardFail::MarksVerify)?;
+    // 2. Strict-decode the INNER marks payload (canonical, capped at MAX_COUNTER_ENTRIES, scope_class<=255,
+    //    no depth-slack) — never trust the inner bstr's bytes, only its canonical decode.
+    let decoded = crate::agent_cbor::strict_decode_marks_payload(
+        &marks_payload,
+        crate::agent_keystore::MAX_COUNTER_ENTRIES,
+    )
+    .map_err(|_| AdoptForwardFail::MarksDecode)?;
+    // 3. Build a CANDIDATE = clone local + overwrite EXACTLY the 4 marks surfaces (env from config) +
+    //    freshness_epoch = state.epoch; validate(). The original `body` is untouched.
+    let mut candidate = body.clone();
+    candidate.seed_marks_forward(&decoded, state.epoch).map_err(|_| AdoptForwardFail::Seed)?;
+    // 4. THE GATE — recompute via the production digest path, byte-compare. Fail-closed, no install.
+    if candidate.compute_local_marks_digest() != state.marks_digest {
+        return Err(AdoptForwardFail::HashMismatch);
+    }
+    // 5. Defense-in-depth BELT — never the gate (the gate is the SHA3 equality above). Can never reject
+    //    a genuine anchor high-water; a free tripwire if the hash path were ever weakened.
+    if !marks_dominate_local(&decoded, body) {
+        return Err(AdoptForwardFail::BeltRegression);
+    }
+    Ok(candidate)
+}
+
+/// Defense-in-depth: every adopted marks surface is `>= local`. Counter rows match by
+/// `(authority, scope_class, scope_target)` — a local row absent from (or lowered by) the anchor's
+/// authoritative high-water is a regression; both spends + the recovery counter must not decrease.
+/// (`[u8; 32]` compares lexicographically == big-endian-u256 numeric order.) Belt-only — NEVER the gate.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 4/8
+fn marks_dominate_local(
+    decoded: &crate::agent_cbor::DecodedMarks,
+    body: &crate::agent_keystore::KeystoreBody,
+) -> bool {
+    for local in &body.counters {
+        let adopted = decoded.rows.iter().find(|r| {
+            r.authority == local.authority
+                && r.scope_class == local.scope_class
+                && r.scope_target == local.scope_target
+        });
+        match adopted {
+            Some(r) if r.highest_accepted_counter >= local.highest_accepted_counter => {}
+            _ => return false, // dropped or lowered a local counter row
+        }
+    }
+    decoded.cumulative_native_spend >= body.faucet.cumulative_native_spend
+        && decoded.lifetime_spend >= body.faucet.lifetime_spend
+        && decoded.strict_recovery_counter >= body.strict_recovery_counter
 }
 
 /// Flatten a verify-stage [`crate::agent_anchor::AnchorError`] into a [`BootFailReason`]. Wildcard-free
@@ -308,7 +417,7 @@ mod tests {
         // compared on the Greater+same-structural arm.
         let resp = issue_and_sign(&anchor_key(), 6, 2, [0x00; 32]);
         match boot_reconcile_anti_rollback(&resp, &body) {
-            BootAntiRollbackOutcome::AdoptForwardRequired(st) => {
+            BootAntiRollbackOutcome::AdoptForwardRequired { state: st, .. } => {
                 assert_eq!(st.epoch, 6);
                 // structural_version is load-bearing: 5b re-seals forward to the carried state, so a
                 // swapped/wrong value here would mis-seed the body.
@@ -490,7 +599,7 @@ mod tests {
         let r = issue_and_sign(&anchor_key(), 6, 2, [0x00; 32]);
         assert!(matches!(
             boot_reconcile_anti_rollback(&r, &body),
-            BootAntiRollbackOutcome::AdoptForwardRequired(_)
+            BootAntiRollbackOutcome::AdoptForwardRequired { .. }
         ));
         assert!(!is_anti_rollback_configured());
 
@@ -526,5 +635,180 @@ mod tests {
             BootAntiRollbackOutcome::FailClosed(BootFailReason::VerifyMalformed)
         ));
         assert!(!is_anti_rollback_configured(), "no non-Fresh arm ever installs the binding");
+    }
+
+    // ---- 5b-2e execute_adopt_forward: the hash-equality gate (commit 4/8) ----
+
+    use sha3::{Digest as _, Sha3_256};
+
+    const ADOPT_NONCE: [u8; 32] = [0x7c; 32];
+
+    /// Hand-build a canonical (sorted) marks payload from sorted single rows + spends + recovery.
+    fn marks_payload(
+        rows: &[([u8; 32], u8, &[u8], u64)],
+        cum: [u8; 32],
+        life: [u8; 32],
+        rec: u64,
+    ) -> Vec<u8> {
+        use crate::agent_capability::{put_bytes, put_uint};
+        let mut o = Vec::new();
+        put_uint(&mut o, 5, 4);
+        put_uint(&mut o, 0, 1);
+        put_uint(&mut o, 4, rows.len() as u64);
+        for (auth, sc, tgt, ctr) in rows {
+            put_uint(&mut o, 4, 4);
+            put_bytes(&mut o, auth);
+            put_uint(&mut o, 0, u64::from(*sc));
+            put_bytes(&mut o, tgt);
+            put_uint(&mut o, 0, *ctr);
+        }
+        put_uint(&mut o, 0, 2);
+        put_bytes(&mut o, &cum);
+        put_uint(&mut o, 0, 3);
+        put_bytes(&mut o, &life);
+        put_uint(&mut o, 0, 4);
+        put_uint(&mut o, 0, rec);
+        o
+    }
+
+    fn digest_of(payload: &[u8]) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(crate::agent_keystore::MARKS_DOMAIN);
+        h.update(payload);
+        h.finalize().into()
+    }
+
+    fn anchor_state(epoch: u64, structural_version: u64, marks_digest: [u8; 32]) -> crate::agent_anchor::AnchorState {
+        crate::agent_anchor::AnchorState {
+            epoch,
+            structural_version,
+            marks_digest,
+            chain_height: None,
+            chain_block_hash: None,
+        }
+    }
+
+    fn signed_marks(epoch: u64, payload: Vec<u8>) -> Vec<u8> {
+        crate::agent_anchor::test_signed_marks_response_bytes(
+            &anchor_key(), CHAIN, ENV, epoch, ADOPT_NONCE, payload,
+        )
+    }
+
+    #[test]
+    fn execute_adopt_forward_accepts_genuine_marks() {
+        let _g = test_lock();
+        let body = test_body(5, 2);
+        // Genuine marks the anchor committed to: D = hash(P). The marks message carries P, signed by the
+        // anchor, echoing the SAME nonce + the AnchorState epoch.
+        let p = marks_payload(&[([0x11; 32], 0, b"x", 5)], [0xaa; 32], [0xbb; 32], 1);
+        let state = anchor_state(6, 2, digest_of(&p));
+        let marks = signed_marks(6, p.clone());
+        let candidate = execute_adopt_forward(&marks, &body, &state, &ADOPT_NONCE)
+            .expect("genuine marks adopt");
+        assert_eq!(candidate.freshness_epoch, 6, "candidate advanced to the anchor epoch");
+        assert_eq!(candidate.structural_version, 2, "structural_version unchanged");
+        assert_eq!(
+            candidate.compute_local_marks_digest(),
+            state.marks_digest,
+            "the seeded candidate now reconciles Fresh against the anchor digest"
+        );
+    }
+
+    #[test]
+    fn execute_adopt_forward_rejects_forged_marks_the_belt_would_admit() {
+        // THE HEADLINE. The anchor committed to D = hash(GENUINE small marks). A malicious host relays a
+        // VALIDLY-SIGNED marks message carrying FORGED marks — arbitrarily large counter + spend, every
+        // surface >= local (so the >= belt would ADMIT it) — but hash(forged) != D. The hash-equality
+        // gate fail-closes: NO seed, NO install. There is NO >= path that bypasses the gate.
+        let _g = test_lock();
+        let body = test_body(5, 2);
+        let genuine = marks_payload(&[([0x11; 32], 0, b"x", 5)], [0x00; 32], [0x00; 32], 0);
+        let state = anchor_state(6, 2, digest_of(&genuine)); // D = hash(genuine)
+        // forged: counter 9_999_999, max spend, recovery huge — all >= local, but a DIFFERENT payload.
+        let forged = marks_payload(
+            &[([0x11; 32], 0, b"x", 9_999_999)],
+            [0xff; 32],
+            [0xff; 32],
+            1_000_000,
+        );
+        assert_ne!(digest_of(&forged), state.marks_digest, "forged marks hash != the committed digest");
+        let marks = signed_marks(6, forged); // validly anchor-signed, correct nonce + epoch
+        assert_eq!(
+            execute_adopt_forward(&marks, &body, &state, &ADOPT_NONCE),
+            Err(AdoptForwardFail::HashMismatch),
+            "the hash gate rejects forged-but->=-local marks the belt would have admitted"
+        );
+        assert!(!is_anti_rollback_configured(), "no binding installed on the forged-marks path");
+    }
+
+    #[test]
+    fn execute_adopt_forward_belt_rejects_non_monotone_below_hash_gate() {
+        // hash(P) == D (gate passes), but P lowers a local counter (5 < local 1000) → the belt trips.
+        let _g = test_lock();
+        let mut body = test_body(5, 2);
+        body.counters = vec![crate::agent_keystore::CounterEntry {
+            authority: [0x11; 32],
+            environment_identifier: ENV.to_string(),
+            scope_class: 0,
+            scope_target: b"x".to_vec(),
+            highest_accepted_counter: 1000,
+        }];
+        let p = marks_payload(&[([0x11; 32], 0, b"x", 5)], [0; 32], [0; 32], 0); // 5 < 1000
+        let state = anchor_state(6, 2, digest_of(&p));
+        let marks = signed_marks(6, p);
+        assert_eq!(
+            execute_adopt_forward(&marks, &body, &state, &ADOPT_NONCE),
+            Err(AdoptForwardFail::BeltRegression)
+        );
+    }
+
+    #[test]
+    fn execute_adopt_forward_rejects_wrong_nonce_scope_epoch_and_signer() {
+        let _g = test_lock();
+        let body = test_body(5, 2);
+        let p = marks_payload(&[([0x11; 32], 0, b"x", 5)], [0; 32], [0; 32], 0);
+        let state = anchor_state(6, 2, digest_of(&p));
+        let good = signed_marks(6, p.clone());
+        // wrong nonce echo (the marks message was for ADOPT_NONCE; the gate is called with another)
+        assert_eq!(
+            execute_adopt_forward(&good, &body, &state, &[0x00; 32]),
+            Err(AdoptForwardFail::MarksVerify(crate::agent_anchor::MarksError::NonceMismatch))
+        );
+        // wrong epoch: marks signed for epoch 99, but state.epoch is 6 → EpochMismatch
+        let wrong_epoch = signed_marks(99, p.clone());
+        assert_eq!(
+            execute_adopt_forward(&wrong_epoch, &body, &state, &ADOPT_NONCE),
+            Err(AdoptForwardFail::MarksVerify(crate::agent_anchor::MarksError::EpochMismatch))
+        );
+        // wrong signer
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let forged_sig = crate::agent_anchor::test_signed_marks_response_bytes(&other, CHAIN, ENV, 6, ADOPT_NONCE, p);
+        assert_eq!(
+            execute_adopt_forward(&forged_sig, &body, &state, &ADOPT_NONCE),
+            Err(AdoptForwardFail::MarksVerify(crate::agent_anchor::MarksError::SignatureInvalid))
+        );
+    }
+
+    #[test]
+    fn boot_reconcile_carries_the_consumed_nonce_on_adopt_forward() {
+        // The nonce threaded out of boot_reconcile is the SAME one the freshness leg consumed — pinned
+        // so the marks-fetch (commit 6) binds to it. And single-use is preserved: a second reconcile with
+        // no fresh challenge finds NoChallenge (the slot was retired).
+        let _g = test_lock();
+        let body = test_body(5, 2);
+        let nonce = *issue_challenge(CHAIN, ENV).unwrap().nonce();
+        let resp = crate::agent_anchor::test_signed_response_bytes(&anchor_key(), CHAIN, ENV, 6, 2, [0; 32], nonce);
+        match boot_reconcile_anti_rollback(&resp, &body) {
+            BootAntiRollbackOutcome::AdoptForwardRequired { state, nonce: out } => {
+                assert_eq!(state.epoch, 6);
+                assert_eq!(out, nonce, "the carried nonce is the consumed freshness nonce");
+            }
+            other => panic!("expected AdoptForwardRequired, got {other:?}"),
+        }
+        // single-use: the slot is empty now → a replay finds NoChallenge.
+        assert_eq!(
+            boot_reconcile_anti_rollback(&resp, &body),
+            BootAntiRollbackOutcome::FailClosed(BootFailReason::NoChallenge)
+        );
     }
 }

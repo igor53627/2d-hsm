@@ -242,7 +242,9 @@ pub(crate) fn run_boot_anti_rollback_handshake(
             // §8: no anchor_root-signed raw-marks channel exists yet, so adopting forward would risk
             // seeding forged marks. Fail closed (terminal), returned immediately — never retried (a
             // continuously-advancing anchor must not spin the loop to exhaustion).
-            crate::agent_boot::BootAntiRollbackOutcome::AdoptForwardRequired(state) => {
+            crate::agent_boot::BootAntiRollbackOutcome::AdoptForwardRequired { state, .. } => {
+                // 5b-2e commit 6 replaces this terminal arm with the marks-fetch + execute_adopt_forward
+                // + re-run path; until then AdoptForward stays terminal (the nonce is carried but unused).
                 return BootDriverOutcome::FailClosed(BootDriverFail::AdoptForwardUnsupported(state));
             }
             // Every reconcile fail reason is TERMINAL: host-reachable verify verdicts are NOT retried
