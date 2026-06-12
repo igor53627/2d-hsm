@@ -1124,6 +1124,44 @@ request golden vector is a 5b-2b test-vector item.
     struct) is the DELIBERATE §8 transposition-fails-closed discipline (run_boot_handshake_wired doc), kept.
     **5b-2c-ii = the agent 0x40 serve loop** (replaces the stub); **5b-2c-iii = aya SNP live smoke**
     (DEBUG-build first — production live-serve still needs the attested host-vsock keystore-source slice).
+
+  **5b-2c-ii LANDED (the agent 0x40 serve loop — replaces the fail-closed stub).** Decision (Design WF,
+  all 3 judges): **SERIAL** accept loop (mirror the SNP-validated (b) host-relay), NOT thread-per-connection —
+  every keystore mutation already serializes on the `INSTALLED_KEYSTORE` Mutex inside
+  `handle_agent_gateway_frame` (lock held across `seal_body`), so concurrency buys NOTHING; serial is strictly
+  safer (NO shared `EnclaveState` mutex → the producer's `process::exit(1)`-on-poison hazard is structurally
+  ABSENT, NOT swallowed; no panic=abort dependency). Concurrent-capped = a NAMED follow-up (trigger: the
+  upstream gateway multiplexing many independent slow clients).
+  - NEW `pub fn serve_framed_pump<S, H>(stream, handle_frame, idle_timeout)` in `enclave_serve.rs` — the
+    generic per-connection frame-pump KERNEL extracted from `serve_framed_connection`'s body (break taxonomy
+    EOF/timeout/oversize→close + idle-reset-on-NON-error via `is_wire_error_payload`) MINUS the EnclaveState
+    lock / attestation / `process::exit`. ONE caller (the agent) this slice; the producer
+    `serve_framed_connection` stays BYTE-IDENTICAL (convergence onto the kernel = a NAMED §8 follow-up — do
+    NOT perturb the SNP-validated producer). CRITICAL: the idle-reset predicate is `is_wire_error_payload`
+    (wire.rs, pub) NOT `decode_agent_error_code` (which is `#[cfg(test)]`-gated → would not compile in prod).
+  - In `agent_gateway_boot.rs`: `agent_serve_one_frame` (decode → REQUIRE `MessageType::AgentGateway` → a
+    NON-0x40 frame returns Err → CLOSE-SILENTLY [human decision: strictly fail-closed, zero bytes back, never
+    synthesizes an agent body for a misrouted type] → `handle_agent_gateway_frame(&payload)` →
+    `encode_message(AgentGateway, body)`); `handle_agent_accepted` (the shared accepted-item body +
+    `ACCEPT_ERROR_BACKOFF=50ms` + `let _=writeln!` never eprintln!); `serve_agent_loop<I,S> → Infallible`
+    (serial, mirrors `serve_anchor_relay_loop`); `run_agent_serve_loop` REPLACES the stub —
+    `vsock_listen_addr_from_env` (DISTINCT serve port; relay≠serve already validated boot-step-D) → `bind_vsock_listener`
+    → arm SO_*TIMEO per stream → `serve_agent_loop`. Bind faults FATAL (fail-closed); bind branch
+    aya/SNP-pinned (UnixStream pairs have no CID).
+  - Reused VERBATIM: `handle_agent_gateway_frame` (the whole per-frame 0x40 compute — holds the keystore
+    Mutex, poison-recovers, ALWAYS returns a 0x40..=0x46-band body), the framing primitives
+    (`read_framed_message_with_idle_deadline` = oversize MessageTooLarge-before-alloc + slowloris bound;
+    `write_framed_message`; `decode_message`/`encode_message`; `MessageType::AgentGateway`),
+    `bind_vsock_listener`/`configure_vsock_session_timeouts`, `SESSION_IDLE_TIMEOUT` (300s), the (b)
+    never-die/Infallible-divergence/finite-cfg(test)-twin discipline.
+  - Validation: aya `agent-gateway,vsock-transport` 438 lib (+8 deviceless serve tests: 0x40 round-trip→0x40
+    reply no-panic, wrong-type closes-silently zero-bytes, oversize/EOF clean close, multi-frame, close-and-
+    continue, accept-backoff, agent-error idle-reset classification) + 2 bin-integration; darwin default +
+    agent-gateway (the gate-free kernel) 339; no new warnings. The success-body COMPUTE is covered by
+    agent_dispatch's own PUBLIC_IDENTITY tests; the serve loop's job is transport+reframe. **NEXT 5b-2c-iii =
+    aya SNP live smoke** (DEBUG build; a real 0x40 round-trip over vsock from the host) — production live-serve
+    still needs the attested host-vsock keystore-source slice. NAMED follow-ups: producer-convergence onto
+    `serve_framed_pump`; concurrent-capped (if multi-client).
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
   `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
