@@ -306,6 +306,13 @@ pub(crate) fn run_boot_handshake_wired<C: crate::agent_boot_relay::BootRelayChan
 /// `pub(crate)`): best-effort `let _ = writeln!` (NEVER `eprintln!` — a sink panic after the claim burns
 /// it), mapping `level()` to a journald priority tag; the returned `ProtocolError` is ALSO rendered at
 /// err (the event seam emits no dedicated error event).
+///
+/// ERROR CARRIER (convention, not a precise type): all boot/config/install failures here are carried as
+/// `ProtocolError::PqSigningUnavailable` — the established agent fail-closed variant since 5b-2d, an
+/// intentional `&'static str` carrier. A dedicated `BootConfig`/`BootInstall` variant is deliberately NOT
+/// added (it would widen the exhaustive `protocol_error_to_wire_body` mapper for zero caller benefit — the
+/// bin renders the string and exits, it never branches on the variant). The rendered STRING is the operator
+/// surface; do NOT semantically match on the variant for these boot errors.
 pub fn run_agent_gateway_boot() -> Result<std::convert::Infallible, ProtocolError> {
     use std::io::Write as _;
     run_agent_gateway_boot_inner().inspect_err(|e| {

@@ -92,12 +92,16 @@ const BOOT_DERIVE_SLACK_MS: u64 = 2_000;
 
 fn env_u32_or(primary: &str, legacy: &str, default: u32) -> Result<u32, String> {
     match var_twod(primary, legacy) {
-        Ok(s) if !s.is_empty() => s.parse::<u32>().map_err(|_| format!("{primary} must be a u32")),
+        // Name BOTH the canonical + legacy var (var_twod reads either) so an operator who set the
+        // deprecated 2D_HSM_* alias gets a diagnostic naming the var they actually set.
+        Ok(s) if !s.is_empty() => s
+            .parse::<u32>()
+            .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u32")),
         // Unset or empty → default. A SET-but-non-UTF-8 value is a misconfiguration — surface it
         // (fail closed), matching var_twod's documented contract + the sibling env_u32_twod; never
         // silently default over a corrupt env value.
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(_) => Err(format!("{primary} must be valid UTF-8")),
+        Err(_) => Err(format!("{primary} (or legacy {legacy}) must be valid UTF-8")),
     }
 }
 
@@ -105,9 +109,9 @@ fn env_u64_or(primary: &str, legacy: &str, default: u64) -> Result<u64, String> 
     match var_twod(primary, legacy) {
         Ok(s) if !s.is_empty() => s
             .parse::<u64>()
-            .map_err(|_| format!("{primary} must be a u64 (milliseconds)")),
+            .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u64 (milliseconds)")),
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(_) => Err(format!("{primary} must be valid UTF-8")),
+        Err(_) => Err(format!("{primary} (or legacy {legacy}) must be valid UTF-8")),
     }
 }
 
@@ -146,14 +150,22 @@ pub fn boot_budget_config_from_env(
         TWOD_HSM_BOOT_OVERALL_BUDGET_MS,
         LEGACY_HSM_BOOT_OVERALL_BUDGET_MS,
     ) {
-        Ok(s) if !s.is_empty() => s
-            .parse::<u64>()
-            .map_err(|_| format!("{TWOD_HSM_BOOT_OVERALL_BUDGET_MS} must be a u64 (milliseconds)"))?,
+        Ok(s) if !s.is_empty() => s.parse::<u64>().map_err(|_| {
+            format!(
+                "{TWOD_HSM_BOOT_OVERALL_BUDGET_MS} (or legacy {LEGACY_HSM_BOOT_OVERALL_BUDGET_MS}) \
+                 must be a u64 (milliseconds)"
+            )
+        })?,
         // Unset or empty → derive-by-default; a set-but-non-UTF-8 value fails closed (see env_u*_or).
         Ok(_) | Err(std::env::VarError::NotPresent) => {
             derive_overall_budget_ms(max_attempts, per_leg_ms)
         }
-        Err(_) => return Err(format!("{TWOD_HSM_BOOT_OVERALL_BUDGET_MS} must be valid UTF-8")),
+        Err(_) => {
+            return Err(format!(
+                "{TWOD_HSM_BOOT_OVERALL_BUDGET_MS} (or legacy {LEGACY_HSM_BOOT_OVERALL_BUDGET_MS}) \
+                 must be valid UTF-8"
+            ))
+        }
     };
     Ok((
         max_attempts,
