@@ -47,7 +47,7 @@ RELAY_PORT="${RELAY_PORT:-5001}"
 ANCHOR_LISTEN="${ANCHOR_LISTEN:-127.0.0.1:5003}"
 # Boot-to-Ready budget (cached image build + boot + possible early crash-loop cycles).
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-300}"
-# Client budget: 4 fast phases + the 300–332 s idle window + margin.
+# Client budget: 4 fast phases + the idle window (ceiling = IDLE_EXPIRY_CEILING_MS, 340 s) + margin.
 CLIENT_TIMEOUT_SEC="${CLIENT_TIMEOUT_SEC:-600}"
 SKIP_IDLE="${TWOD_HSM_AGENT_SMOKE_SKIP_IDLE:-0}"
 
@@ -216,9 +216,14 @@ grep -aq 'twod-hsm-agent-smoke: journald-serve PASS' "$LOG" || { echo "[FAIL] R4
 # C3's calm peer-protocol-reject close (the non-0x40 probe) — [info], never a [warn] flood lever.
 grep -aq '\[info\] agent gateway: closed connection (' "$LOG" || { echo "[FAIL] R4: the calm non-0x40 close line is missing" >&2; R4_PASS=0; }
 if [[ "$SKIP_IDLE" != "1" ]]; then
-  # C4's clean idle close, asserted POSITIVELY (a close-taxonomy regression must not hide behind
-  # the client's window assert).
-  grep -aq '\[info\] agent gateway: connection closed cleanly' "$LOG" || { echo "[FAIL] R4: the clean idle-close line is missing" >&2; R4_PASS=0; }
+  # Presence of the clean-close taxonomy line. NOTE (honest scope): the pump logs this on EVERY
+  # clean close — the fast phases C1/C2/C5 each close cleanly too — so this is a generic
+  # clean-close PRESENCE check, NOT an idle-specific witness. The idle-expiry is proven by C4's
+  # `elapsed_ms` ∈ the window (the client's own assert, the primary gate); this line only guards
+  # the close-TAXONOMY (clean vs fault vs peer-reject), ensuring the idle close lands on the
+  # `closed cleanly` arm rather than `connection fault`. A truly idle-specific marker would need a
+  # distinct serve-side log line (named follow-up, not added here to avoid perturbing the pump).
+  grep -aq '\[info\] agent gateway: connection closed cleanly' "$LOG" || { echo "[FAIL] R4: the clean-close taxonomy line is missing" >&2; R4_PASS=0; }
 fi
 if grep -aq 'agent gateway: connection fault' "$LOG"; then
   echo "[FAIL] R4: an unexpected connection fault was logged" >&2; R4_PASS=0

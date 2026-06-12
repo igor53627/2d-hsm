@@ -111,6 +111,17 @@ mod refusal_arms {
     /// quote child fails off-SNP (no configfs-tsm) BEFORE any vsock dial ⇒ retryable ⇒ exhausted ⇒
     /// a non-Ready outcome. Pins the byte-offset ORDER raw → validated → `[warn]` outcome →
     /// `[err]` render, stdout EMPTY, exit 1 (supervisor restart; NO in-process retry).
+    ///
+    /// CANNOT-HANG (why `.output()` is safe here, matching arms (a)/(b)): this is a HOST-side cargo
+    /// test, and the boot's FIRST per-attempt step is the SNP quote fetch via configfs-tsm — which
+    /// requires an SNP GUEST. On any test host (CI ubuntu, or aya's HOST userspace) `/sys/kernel/
+    /// config/tsm/report` does not exist, so the quote fetch fails on the single attempt
+    /// (MAX_ATTEMPTS=1) and the boot fail-closes and EXITS before the serve loop is ever reachable
+    /// (reaching serve would additionally require a Ready outcome = a valid anchor-signed response,
+    /// impossible without the matching lab stub on the relay path). So the child always terminates
+    /// and `.output()` returns. (A general bounded-spawn wrapper for ALL bin-test arms — so a future
+    /// arm that COULD serve can't wedge CI — is a named test-harness follow-up, applied uniformly,
+    /// not bolted onto this one arm.)
     #[test]
     fn arm_iii_outcome_refusal_logs_warn_outcome_then_err_render_in_order() {
         let out = lab_boot_bin()
