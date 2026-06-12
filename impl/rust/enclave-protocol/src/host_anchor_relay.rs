@@ -960,14 +960,18 @@ mod tests {
     /// Run: `cargo test --features agent-gateway,vsock-transport \
     ///       relay_real_vsock_loopback_with_lab_anchor -- --ignored` (on aya).
     /// Triage: a FAILURE binding/accepting can mean `vsock_loopback` is not loaded (`modprobe
-    /// vsock_loopback`) or a stray listener on port 5997 (`ss --vsock`).
+    /// vsock_loopback`) or a stray listener on port 5994 (`ss --vsock`).
     #[test]
     #[ignore]
     fn relay_real_vsock_loopback_with_lab_anchor() {
         use crate::agent_boot_relay::BootRelayChannel as _;
         /// vsock loopback CID (`VMADDR_CID_LOCAL`; requires the `vsock_loopback` module).
         const LOOPBACK_CID: u32 = 1;
-        const RELAY_TEST_PORT: u32 = 5997; // 5999/5998 are taken by the agent_boot_relay aya tests
+        // The `agent_boot_relay` aya `#[ignore]` tests already bind/connect 5995–5999 on this CID
+        // (5999/5996/5997 bind, 5998/5995 connect); libtest runs `--ignored` in PARALLEL, so pick a
+        // DISTINCT port BELOW that band — a shared port EADDRINUSE-flakes the second binder. 5994 is
+        // free; do not move into 5995–5999.
+        const RELAY_TEST_PORT: u32 = 5994;
         let deadline = || std::time::Instant::now() + Duration::from_secs(5);
 
         // 1. The REAL lab anchor stub pump on TCP loopback (one connection, test thread).

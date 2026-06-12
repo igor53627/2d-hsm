@@ -196,7 +196,10 @@ else
   fi
 fi
 echo "      R3 client phases OK"
-grep -a 'twod-hsm-agent-smoke: PHASE ' "$CLIENT_LOG" | sed 's/^/        /'
+# Diagnostic echo of the per-phase lines. `|| true`: this is the lone grep on the SUCCESS path under
+# `set -euo pipefail` — R3 already passed, so a no-match here (a future client that emits RESULT
+# without per-PHASE lines) must NOT abort an already-green run via pipefail+errexit.
+grep -a 'twod-hsm-agent-smoke: PHASE ' "$CLIENT_LOG" | sed 's/^/        /' || true
 
 # R4 witnesses (bounded wait for the in-guest journald witness oneshot + the close-taxonomy lines).
 for _ in $(seq 1 30); do

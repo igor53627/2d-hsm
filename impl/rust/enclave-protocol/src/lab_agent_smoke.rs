@@ -383,10 +383,16 @@ pub fn run_lab_anchor_stub() -> Result<std::convert::Infallible, crate::Protocol
 /// against an exact 400 ms floor).
 pub(crate) const IDLE_EXPIRY_FLOOR_MS: u128 = 298_000;
 /// Idle-expiry acceptance ceiling: `SESSION_IDLE_TIMEOUT` + the per-stream 30 s `SO_RCVTIMEO` read
-/// arm + 2 s slop. The +30 s term is STRUCTURAL, not generosity: the serve pump re-checks the idle
-/// deadline only when the blocking read wakes, so the close lands at the first 30 s tick ≥ the
-/// deadline. Pinned against the real consts by `idle_expiry_window_bounds_are_sane`.
-pub(crate) const IDLE_EXPIRY_CEILING_MS: u128 = 332_000;
+/// arm + 10 s load slop. The +30 s term is STRUCTURAL, not generosity: the serve pump re-checks the
+/// idle deadline only when the blocking read wakes, so the close lands at the first 30 s tick ≥ the
+/// deadline. CRITICAL: `SESSION_IDLE_TIMEOUT` (300 s) is an EXACT multiple of the 30 s read arm, so
+/// the deadline falls on a read BOUNDARY — the close is bimodal between ~300 s (the 10th read's
+/// post-check sees ≥ deadline) and ~330 s (a sub-second-early `SO_RCVTIMEO` return makes the 10th
+/// post-check see < deadline, forcing an 11th full tick). Recorded aya runs hit the ~300 s mode
+/// (≈301.8 s), but the ~330 s mode is one early read-return away, so the ceiling MUST clear 330 s
+/// with real headroom for the final tick's jitter under load — 10 s, not the original 2 s (which
+/// left a load-jitter false-RED at the 330 s mode). Pinned by `idle_expiry_window_bounds_are_sane`.
+pub(crate) const IDLE_EXPIRY_CEILING_MS: u128 = 340_000;
 /// The read timeout the CONNECTOR must arm on idle-phase streams: strictly above the window
 /// ceiling, so the EOF measurement can never be cut short by a socket timeout misread as a close.
 pub const SMOKE_CLIENT_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
@@ -942,9 +948,22 @@ mod tests {
             idle_ms - IDLE_EXPIRY_FLOOR_MS >= 1_000,
             "floor slop must be a real margin, not an exact floor"
         );
+        // The ceiling must clear the STRUCTURAL worst case (idle + one full read-arm tick) with real
+        // load-jitter headroom — NOT a hair over it. Because idle_ms is an exact multiple of the read
+        // arm, the close is bimodal at ~idle and ~idle+tick (see the IDLE_EXPIRY_CEILING_MS doc); a
+        // ceiling that only just exceeds idle+tick (the original +2 s) leaves a load-jitter false-RED
+        // at the upper mode. Require ≥ 8 s of headroom above idle+tick.
         assert!(
-            idle_ms + read_arm_ms < IDLE_EXPIRY_CEILING_MS,
-            "ceiling must clear idle + the 30s read-arm tick"
+            IDLE_EXPIRY_CEILING_MS >= idle_ms + read_arm_ms + 8_000,
+            "ceiling must clear idle + the 30s read-arm tick by a real load-jitter margin"
+        );
+        // The idle timeout being an EXACT multiple of the read arm is what makes the close bimodal —
+        // pin that precondition so a future READ_TIMEOUT/SESSION_IDLE_TIMEOUT change that breaks the
+        // alignment re-reviews this window rather than silently shifting the modes.
+        assert_eq!(
+            idle_ms % read_arm_ms,
+            0,
+            "the bimodal-close reasoning assumes idle is an exact multiple of the read arm"
         );
         assert!(
             SMOKE_CLIENT_IDLE_READ_TIMEOUT.as_millis() >= IDLE_EXPIRY_CEILING_MS,
