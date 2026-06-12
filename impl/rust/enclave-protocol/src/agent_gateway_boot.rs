@@ -412,8 +412,9 @@ fn is_peer_protocol_reject(e: &ProtocolError) -> bool {
 /// closes the connection with ZERO bytes back (CLOSE-SILENTLY — strictly fail-closed; never synthesizes an
 /// agent-band body for a misrouted type; [`handle_agent_gateway_frame`] is only ever called on a
 /// verified-0x40 frame). A reply body that won't fit the wire (`MessageTooLarge` from `encode_message`) is
-/// likewise a close-fault.
-fn agent_serve_one_frame(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+/// likewise a close-fault. `pub(crate)` (the `reply_resets_idle` precedent): the 5b-2c-iii lab smoke's
+/// client↔serve cross-validation test drives the SHIPPED type-guard + reframe glue, not a replica.
+pub(crate) fn agent_serve_one_frame(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let decoded = crate::decode_message(frame)?;
     if decoded.msg_type != crate::MessageType::AgentGateway {
         return Err(ProtocolError::WireProtocol(

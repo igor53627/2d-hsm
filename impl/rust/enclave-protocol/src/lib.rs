@@ -256,6 +256,13 @@ mod agent_boot_relay;
 // lanes, and under the release-banned `lab-agent-smoke` feature for the host-side lab bins.
 #[cfg(all(feature = "agent-gateway", any(test, feature = "lab-agent-smoke")))]
 mod lab_agent_smoke;
+// The lab smoke bins reach ONLY these three items (the quote_smoke `pub use` precedent); every
+// other lab item stays `pub(crate)`. Exported only under the release-banned feature — a cfg(test)
+// build keeps the module fully private.
+#[cfg(all(feature = "agent-gateway", feature = "lab-agent-smoke"))]
+pub use lab_agent_smoke::{
+    run_agent_smoke_client, run_lab_anchor_stub, SMOKE_CLIENT_IDLE_READ_TIMEOUT,
+};
 mod wire;
 
 use serde::{Deserialize, Serialize};

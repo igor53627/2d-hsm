@@ -194,6 +194,20 @@ name = "twod-hsm-agent-gateway"
 path = "src/bin/agent_gateway_vsock.rs"
 required-features = ["agent-gateway", "vsock-transport"]
 
+# 5b-2c-iii lab anchor stub (TASK-7.7). TCP-only host tooling — deliberately NO vsock-transport
+# (darwin-buildable; the relay is the vsock side). TEST KEYS ONLY; lab-agent-smoke is release-banned.
+[[bin]]
+name = "twod-hsm-lab-anchor"
+path = "src/bin/twod_hsm_lab_anchor.rs"
+required-features = ["agent-gateway", "lab-agent-smoke"]
+
+# 5b-2c-iii host-side 0x40 smoke client (TASK-7.7). Dials the guest agent serve port over AF_VSOCK
+# (linux-only at runtime; non-linux main exits 2). NOT production-vsock/staging-vsock (role isolation).
+[[bin]]
+name = "twod-hsm-agent-smoke-client"
+path = "src/bin/twod_hsm_agent_smoke_client.rs"
+required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke"]
+
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 
 [[example]]

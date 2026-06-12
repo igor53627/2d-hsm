@@ -137,6 +137,479 @@ pub(crate) fn smoke_sealed_blob() -> Vec<u8> {
     .expect("smoke body seals")
 }
 
+// ---------------------------------------------------------------------------------------------
+// Lab anchor stub — the TCP endpoint `twod-hsm-host-anchor-relay` dials during the smoke's boot
+// handshake. Serial accept, one pump per connection, never dies (mirrors the relay's loop
+// discipline). It composes the crate's OWN codec ends — `decode_anchor_boot_request`,
+// `test_signed_response_bytes` (the single reference response builder), `frame_anchor_response` —
+// so the stub structurally cannot drift from what the guest's `verify_anchor_response_bytes`
+// accepts; the conformance tests below pin exactly that, deviceless.
+// ---------------------------------------------------------------------------------------------
+
+/// Stub listen address env (host loopback TCP; the relay's `TWOD_HSM_ANCHOR_ENDPOINT` points here).
+pub(crate) const TWOD_HSM_LAB_ANCHOR_LISTEN: &str = "TWOD_HSM_LAB_ANCHOR_LISTEN";
+/// Default stub listen address (relay=5001 vsock, agent serve=5002 vsock, stub=5003 TCP loopback).
+pub(crate) const LAB_ANCHOR_DEFAULT_LISTEN: &str = "127.0.0.1:5003";
+/// Sealed smoke-keystore blob path env (REQUIRED, no default, fail-closed).
+pub(crate) const TWOD_HSM_LAB_ANCHOR_KEYSTORE_FILE: &str = "TWOD_HSM_LAB_ANCHOR_KEYSTORE_FILE";
+/// 32-byte provisioning-root path env (REQUIRED, no default, fail-closed).
+pub(crate) const TWOD_HSM_LAB_ANCHOR_SEAL_ROOT_FILE: &str = "TWOD_HSM_LAB_ANCHOR_SEAL_ROOT_FILE";
+
+/// Whole-pump I/O budget per accepted connection (read request + sign + write response). Generous
+/// against the guest's per-leg default (5 s) while still bounding a black-holing peer.
+const STUB_PUMP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `let _ = writeln!` NEVER `eprintln!` (a broken-stderr panic must not kill the stub) — the (b)
+/// relay house rule.
+fn stub_log(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "twod-hsm-lab-anchor: {args}");
+}
+
+/// The startup fixture↔seed pairing assert: the verifying key derived from [`LAB_ANCHOR_TEST_SEED`]
+/// must BE the unsealed body's `anchor_root`. A stale/mismatched fixture fails loudly HERE at stub
+/// start — never as a mystery `SignatureInvalid` inside the guest on aya.
+pub(crate) fn lab_anchor_root_matches(body: &KeystoreBody) -> Result<(), crate::ProtocolError> {
+    let derived = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED)
+        .verifying_key()
+        .to_bytes();
+    if body.config.anchor_root != derived {
+        return Err(crate::ProtocolError::PqSigningUnavailable(
+            "lab anchor: keystore anchor_root does not match LAB_ANCHOR_TEST_SEED \
+             (stale or mismatched smoke fixture) — refusing to start",
+        ));
+    }
+    Ok(())
+}
+
+/// One stub pump: read the full `0x41` frame (the relay forwards it VERBATIM, 6-byte header
+/// included), validate it with the crate's OWN request decoder (version/type/lengths/`report_data`
+/// cleartext binding), guard the scope against the provisioned keystore, match-only-check the
+/// embedded quote `report_data`, then answer with the reference-built signed freshness response
+/// framed by the shared writer. Every `Err` is a fault-close with ZERO bytes written back (every
+/// write happens after all checks). Returns the echoed nonce prefix for the log line.
+///
+/// MATCH-ONLY quote policy (recorded non-goal): the stub checks `report[0x50..0x90] == key 5` and
+/// performs NO AMD cert-chain verification — guest-side security never depends on anchor-side
+/// policy (the guest verifies the RESPONSE signature against its sealed root); this check exists
+/// only to catch a producer wiring bug live instead of silently signing over garbage.
+pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
+    conn: &mut S,
+    body: &KeystoreBody,
+    signing_key: &ed25519_dalek::SigningKey,
+    deadline: std::time::Instant,
+) -> Result<[u8; 8], crate::ProtocolError> {
+    let frame = crate::read_framed_message_with_idle_deadline(conn, Some(deadline))?;
+    let req = crate::agent_boot_relay::decode_anchor_boot_request(&frame)?;
+    if req.chain_id != body.config.twod_chain_id
+        || req.environment_identifier != body.config.environment_identifier
+    {
+        return Err(crate::ProtocolError::WireProtocol(
+            "lab anchor: request scope does not match the provisioned smoke keystore",
+        ));
+    }
+    let embedded = crate::snp_report::report_data_from_report(&req.quote_report)?;
+    if embedded != req.report_data {
+        return Err(crate::ProtocolError::WireProtocol(
+            "lab anchor: embedded quote report_data does not match the request binding",
+        ));
+    }
+    // The anchor's authoritative state IS the provisioned body's state (epoch/structural/marks all
+    // derived from the unsealed fixture via the crate's own digest), so the guest's reconcile lands
+    // on `Fresh` — pinned deviceless by `stub_response_passes_guest_verify_path`.
+    let response = crate::agent_anchor::test_signed_response_bytes(
+        signing_key,
+        req.chain_id,
+        &req.environment_identifier,
+        body.freshness_epoch,
+        body.structural_version,
+        body.compute_local_marks_digest(),
+        req.nonce,
+    );
+    let wire = crate::agent_boot_relay::frame_anchor_response(&response)?;
+    crate::agent_boot_relay::deadline_guarded_write(
+        conn,
+        &wire,
+        deadline,
+        "lab anchor: deadline before response write",
+    )?;
+    let mut nonce8 = [0u8; 8];
+    nonce8.copy_from_slice(&req.nonce[..8]);
+    Ok(nonce8)
+}
+
+/// Env-driven lab anchor stub entrypoint (the `twod-hsm-lab-anchor` bin's sole call). Fail-closed
+/// startup: required file envs (capped reads, exact root length), unseal under the placeholder
+/// measurement, the seed↔`anchor_root` pairing assert — THEN bind + the never-dying serial loop
+/// (per-connection faults are logged + closed; accept errors back off [`ACCEPT_ERROR_BACKOFF`]).
+/// `Ok` is unconstructible.
+pub fn run_lab_anchor_stub() -> Result<std::convert::Infallible, crate::ProtocolError> {
+    use crate::enclave_serve::ACCEPT_ERROR_BACKOFF;
+    // NotPresent → default; NotUnicode → fail closed naming the var (the env_config contract).
+    let listen = match std::env::var(TWOD_HSM_LAB_ANCHOR_LISTEN) {
+        Ok(s) => s,
+        Err(std::env::VarError::NotPresent) => LAB_ANCHOR_DEFAULT_LISTEN.to_string(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::ProtocolError::PqSigningUnavailable(
+                "lab anchor: TWOD_HSM_LAB_ANCHOR_LISTEN is not valid UTF-8",
+            ))
+        }
+    };
+    let require_path = |var: &str, missing: &'static str| -> Result<std::path::PathBuf, crate::ProtocolError> {
+        match std::env::var_os(var) {
+            Some(v) => Ok(std::path::PathBuf::from(v)),
+            None => Err(crate::ProtocolError::PqSigningUnavailable(missing)),
+        }
+    };
+    let root_path = require_path(
+        TWOD_HSM_LAB_ANCHOR_SEAL_ROOT_FILE,
+        "lab anchor: TWOD_HSM_LAB_ANCHOR_SEAL_ROOT_FILE is required (no default)",
+    )?;
+    let blob_path = require_path(
+        TWOD_HSM_LAB_ANCHOR_KEYSTORE_FILE,
+        "lab anchor: TWOD_HSM_LAB_ANCHOR_KEYSTORE_FILE is required (no default)",
+    )?;
+    let root_bytes = crate::boot_input::read_boot_file_capped(
+        &root_path,
+        32,
+        "lab anchor: cannot read the seal-root file",
+    )?;
+    let root: [u8; 32] = root_bytes.as_slice().try_into().map_err(|_| {
+        crate::ProtocolError::PqSigningUnavailable("lab anchor: seal root must be exactly 32 bytes")
+    })?;
+    let blob = crate::boot_input::read_boot_file_capped(
+        &blob_path,
+        crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE,
+        "lab anchor: cannot read the sealed keystore file",
+    )?;
+    let body = crate::agent_keystore::unseal_body(
+        &blob,
+        &root,
+        AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+    )
+    .map_err(|e| {
+        stub_log(format_args!("keystore unseal failed: {e:?}"));
+        crate::ProtocolError::PqSigningUnavailable(
+            "lab anchor: sealed keystore unseal failed (see prior log line)",
+        )
+    })?;
+    lab_anchor_root_matches(&body)?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED);
+    let listener = std::net::TcpListener::bind(&listen).map_err(|e| {
+        stub_log(format_args!("bind {listen} failed: {e}"));
+        crate::ProtocolError::PqSigningUnavailable("lab anchor: TCP bind failed (see prior log line)")
+    })?;
+    stub_log(format_args!("listening on {listen}"));
+    for accepted in listener.incoming() {
+        let mut conn = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                stub_log(format_args!("fault (accept: {})", e.kind()));
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                continue;
+            }
+        };
+        // SO_*TIMEO arming so the pump deadline is actually enforceable against a stalled peer
+        // (the read_framed/deadline_guarded helpers re-check between syscalls, not inside one).
+        if conn.set_read_timeout(Some(STUB_PUMP_BUDGET)).is_err()
+            || conn.set_write_timeout(Some(STUB_PUMP_BUDGET)).is_err()
+        {
+            stub_log(format_args!("fault (stream setup failed)"));
+            continue;
+        }
+        let deadline = std::time::Instant::now() + STUB_PUMP_BUDGET;
+        match lab_anchor_pump_one(&mut conn, &body, &signing_key, deadline) {
+            Ok(nonce8) => {
+                let mut hex8 = String::with_capacity(16);
+                for b in nonce8 {
+                    hex8.push_str(&format!("{b:02x}"));
+                }
+                stub_log(format_args!("signed response (nonce8={hex8})"));
+            }
+            Err(e) => stub_log(format_args!("fault ({e})")),
+        }
+    }
+    unreachable!("TcpListener::incoming() never terminates")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Host-side 0x40 smoke client core — generic over the stream (the bin supplies a vsock connector;
+// the deviceless cross-validation drives it over UnixStream pairs against the REAL shipped serve
+// glue). Expectations derive from `smoke_body()` IN-CRATE: zero env plumbing, zero sidecar parsing,
+// no drift surface between the fixture and what the client asserts.
+// ---------------------------------------------------------------------------------------------
+
+/// Idle-expiry acceptance floor: `SESSION_IDLE_TIMEOUT` − 2 s slop. NEVER an exact floor — the
+/// (d-ii) run-1 lesson (a poll(2) whole-millisecond truncation produced a legitimate 399 ms lapse
+/// against an exact 400 ms floor).
+pub(crate) const IDLE_EXPIRY_FLOOR_MS: u128 = 298_000;
+/// Idle-expiry acceptance ceiling: `SESSION_IDLE_TIMEOUT` + the per-stream 30 s `SO_RCVTIMEO` read
+/// arm + 2 s slop. The +30 s term is STRUCTURAL, not generosity: the serve pump re-checks the idle
+/// deadline only when the blocking read wakes, so the close lands at the first 30 s tick ≥ the
+/// deadline. Pinned against the real consts by `idle_expiry_window_bounds_are_sane`.
+pub(crate) const IDLE_EXPIRY_CEILING_MS: u128 = 332_000;
+/// The read timeout the CONNECTOR must arm on idle-phase streams: strictly above the window
+/// ceiling, so the EOF measurement can never be cut short by a socket timeout misread as a close.
+pub const SMOKE_CLIENT_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
+
+/// Per-round-trip reply deadline for the non-idle phases (server replies immediately; generous).
+const SMOKE_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build the strict-canonical 0x40 inner envelope `{1: version, 2: opcode, 3: domain,
+/// 4: request_id, 6?: key_ref}` with the SAME canonical encoders the dispatch decoder requires
+/// (shortest-form ints, ascending keys) — `strict_decode_map` rejects anything else.
+fn smoke_envelope(opcode: u8, request_id: &[u8], key_ref: Option<&[u8; 32]>) -> Vec<u8> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    let mut p = Vec::with_capacity(96);
+    put_uint(&mut p, 5, if key_ref.is_some() { 5 } else { 4 });
+    put_uint(&mut p, 0, 1);
+    put_uint(&mut p, 0, u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION));
+    put_uint(&mut p, 0, 2);
+    put_uint(&mut p, 0, u64::from(opcode));
+    put_uint(&mut p, 0, 3);
+    put_text(&mut p, crate::agent_dispatch::COMMAND_DOMAIN);
+    put_uint(&mut p, 0, 4);
+    put_bytes(&mut p, request_id);
+    if let Some(kr) = key_ref {
+        put_uint(&mut p, 0, 6);
+        put_bytes(&mut p, kr);
+    }
+    p
+}
+
+/// One framed 0x40 round-trip: write the request frame, read + decode the reply frame, require the
+/// 0x40 type, return the decoded CBOR body map.
+fn smoke_round_trip<S: std::io::Read + std::io::Write>(
+    conn: &mut S,
+    envelope: &[u8],
+) -> Result<Vec<(ciborium::value::Value, ciborium::value::Value)>, String> {
+    let frame = crate::encode_message(crate::MessageType::AgentGateway, envelope)
+        .map_err(|e| format!("encode: {e}"))?;
+    conn.write_all(&frame).and_then(|()| conn.flush()).map_err(|e| format!("write: {e}"))?;
+    let deadline = std::time::Instant::now() + SMOKE_REPLY_DEADLINE;
+    let reply = crate::read_framed_message_with_idle_deadline(conn, Some(deadline))
+        .map_err(|e| format!("read reply: {e}"))?;
+    let decoded = crate::decode_message(&reply).map_err(|e| format!("decode reply: {e}"))?;
+    if decoded.msg_type != crate::MessageType::AgentGateway {
+        return Err(format!("reply type {:?} is not AgentGateway", decoded.msg_type));
+    }
+    let mut cursor = std::io::Cursor::new(decoded.payload.as_slice());
+    let value: ciborium::value::Value =
+        ciborium::de::from_reader(&mut cursor).map_err(|e| format!("reply body CBOR: {e}"))?;
+    match value {
+        ciborium::value::Value::Map(m) => Ok(m),
+        _ => Err("reply body is not a CBOR map".to_string()),
+    }
+}
+
+fn map_bytes(m: &[(ciborium::value::Value, ciborium::value::Value)], key: u64) -> Option<&[u8]> {
+    use crate::agent_cbor::{as_bytes, map_get};
+    map_get(m, key).and_then(as_bytes)
+}
+
+fn map_u64(m: &[(ciborium::value::Value, ciborium::value::Value)], key: u64) -> Option<u64> {
+    use crate::agent_cbor::{as_u64, map_get};
+    map_get(m, key).and_then(as_u64)
+}
+
+/// The expected PUBLIC_IDENTITY success body, asserted byte-exact against `smoke_body()`'s minted
+/// entry (request key 6 = [`SMOKE_KEY_REF`]; reply keys per §10.4).
+fn assert_public_identity_success(
+    m: &[(ciborium::value::Value, ciborium::value::Value)],
+) -> Result<(), String> {
+    use crate::agent_cbor::map_get;
+    use ciborium::value::Value;
+    let keypair = crate::secp256k1::Keypair::from_secret_bytes(&SMOKE_SECRET_SCALAR)
+        .expect("SMOKE_SECRET_SCALAR is valid");
+    if map_bytes(m, 1) != Some(keypair.public_key_uncompressed().as_slice()) {
+        return Err("key 1 (pubkey) mismatch".into());
+    }
+    if map_bytes(m, 2) != Some(keypair.eth_address().as_slice()) {
+        return Err("key 2 (eth address) mismatch".into());
+    }
+    match map_get(m, 3) {
+        Some(Value::Text(t)) if *t == keypair.tron_address() => {}
+        _ => return Err("key 3 (tron address) mismatch".into()),
+    }
+    if map_bytes(m, 4) != Some(SMOKE_KEY_REF.as_slice()) {
+        return Err("key 4 (key_ref echo) mismatch".into());
+    }
+    // AgentTransferK1 purpose code = 1; backend_version = the agent protocol version (1).
+    if map_u64(m, 5) != Some(1) {
+        return Err("key 5 (purpose code) mismatch".into());
+    }
+    if map_u64(m, 6) != Some(u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION)) {
+        return Err("key 6 (backend_version) mismatch".into());
+    }
+    Ok(())
+}
+
+/// PUBLIC_IDENTITY opcode (2) — the dispatch enum is the authority; transcribed as a local const so
+/// the client core never imports the whole opcode surface.
+const OPCODE_PUBLIC_IDENTITY: u8 = 2;
+/// The deterministic error for an unknown 32-byte key_ref: `AGENT_KEY_PURPOSE_MISMATCH` (0x42).
+const EXPECTED_UNKNOWN_KEYREF_CODE: u64 = 0x42;
+
+/// Drain a connection expecting an EOF close with ZERO bytes received. Returns elapsed-to-EOF.
+/// Any received byte, any socket-timeout (`TimedOut`/`WouldBlock` — the connector's read timeout
+/// fired before the server closed) or any other IO error is a failure with the cause named.
+fn read_expect_silent_eof<S: std::io::Read>(conn: &mut S) -> Result<std::time::Duration, String> {
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 256];
+    loop {
+        match conn.read(&mut buf) {
+            Ok(0) => return Ok(start.elapsed()),
+            Ok(n) => return Err(format!("expected silent close, received {n} unexpected bytes")),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Err(format!(
+                    "connector read timeout fired before the server closed (after {} ms) — \
+                     arm a read timeout above the expected close",
+                    start.elapsed().as_millis()
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A peer RST surfaces as ConnectionReset on some stacks — the connection IS closed and
+            // no bytes were delivered; treat as the close observation, not a failure.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(start.elapsed()),
+            Err(e) => return Err(format!("read during close-wait failed: {e}")),
+        }
+    }
+}
+
+/// The 5b-2c-iii host-side smoke client core. `connect` opens a FRESH stream per phase (the serial
+/// server closes per-connection; stale-reply isolation); `skip_idle` drops the 300 s wall-clock
+/// phase for fast iteration runs and emits the structurally-unmatchable `RESULT PASS-DEV phases=4`
+/// token (the official grep accepts ONLY `RESULT PASS phases=5`). Marker grammar mirrors the (d-ii)
+/// quote smoke: `twod-hsm-agent-smoke: PHASE <name> PASS|FAIL <detail>` then one terminal RESULT
+/// line; first failure stops the run. Returns `true` iff every executed phase passed.
+pub fn run_agent_smoke_client<S, C, W>(mut connect: C, skip_idle: bool, sink: &mut W) -> bool
+where
+    S: std::io::Read + std::io::Write,
+    C: FnMut() -> std::io::Result<S>,
+    W: std::io::Write,
+{
+    let mut mark = |args: std::fmt::Arguments<'_>| {
+        let _ = writeln!(sink, "twod-hsm-agent-smoke: {args}");
+    };
+    let mut phases_passed: u32 = 0;
+    // Each closure returns Ok(detail) / Err(detail); phase names are the runner's grep anchors.
+    macro_rules! phase {
+        ($name:expr, $body:expr) => {{
+            let outcome: Result<String, String> = (|| $body)();
+            match outcome {
+                Ok(detail) => {
+                    mark(format_args!("PHASE {} PASS {detail}", $name));
+                    phases_passed += 1;
+                }
+                Err(detail) => {
+                    mark(format_args!("PHASE {} FAIL {detail}", $name));
+                    mark(format_args!("RESULT FAIL phase={}", $name));
+                    return false;
+                }
+            }
+        }};
+    }
+
+    // C1: the core acceptance — a real 0x40 PUBLIC_IDENTITY success round-trip.
+    phase!("public-identity", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let m = smoke_round_trip(
+            &mut conn,
+            &smoke_envelope(OPCODE_PUBLIC_IDENTITY, b"smoke-c1", Some(&SMOKE_KEY_REF)),
+        )?;
+        assert_public_identity_success(&m)?;
+        Ok("pubkey/eth/tron/key_ref/purpose/backend all byte-exact".to_string())
+    });
+
+    // C2: the expected-error shape stays live-pinned (deterministic 0x42 for an unknown key_ref).
+    phase!("identity-unknown-keyref", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let unknown = [0xee_u8; 32];
+        let m = smoke_round_trip(
+            &mut conn,
+            &smoke_envelope(OPCODE_PUBLIC_IDENTITY, b"smoke-c2", Some(&unknown)),
+        )?;
+        match (map_u64(&m, 1), map_get_text(&m, 2)) {
+            (Some(code), Some(reason)) if code == EXPECTED_UNKNOWN_KEYREF_CODE && reason.starts_with("agent: ") => {
+                Ok(format!("code=0x{code:02x}"))
+            }
+            (code, reason) => Err(format!(
+                "expected {{1: 0x42, 2: \"agent: …\"}}, got code={code:?} reason={reason:?}"
+            )),
+        }
+    });
+
+    // C3: the 0x40-only listener closes a non-0x40 frame SILENTLY (zero reply bytes).
+    phase!("non-agent-close", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let probe = crate::encode_message(crate::MessageType::GetMeasurement, &[])
+            .map_err(|e| format!("encode probe: {e}"))?;
+        conn.write_all(&probe).and_then(|()| conn.flush()).map_err(|e| format!("write: {e}"))?;
+        let elapsed = read_expect_silent_eof(&mut conn)?;
+        Ok(format!("silent close after {} ms, zero bytes", elapsed.as_millis()))
+    });
+
+    // C4: the real 300 s wall-clock idle expiry (the checklisted acceptance item deviceless tests
+    // cannot drive). One SUCCESS frame arms the idle budget; then silence until the server closes.
+    if skip_idle {
+        mark(format_args!(
+            "PHASE idle-expiry SKIPPED dev-iteration run (TWOD_HSM_AGENT_SMOKE_SKIP_IDLE)"
+        ));
+    } else {
+        phase!("idle-expiry", {
+            let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+            let m = smoke_round_trip(
+                &mut conn,
+                &smoke_envelope(OPCODE_PUBLIC_IDENTITY, b"smoke-c4", Some(&SMOKE_KEY_REF)),
+            )?;
+            assert_public_identity_success(&m)?;
+            // Clock starts AFTER the success reply is fully read (that reply reset the idle budget).
+            let elapsed = read_expect_silent_eof(&mut conn)?;
+            let ms = elapsed.as_millis();
+            if (IDLE_EXPIRY_FLOOR_MS..IDLE_EXPIRY_CEILING_MS).contains(&ms) {
+                Ok(format!("elapsed_ms={ms}"))
+            } else {
+                Err(format!(
+                    "elapsed_ms={ms} outside [{IDLE_EXPIRY_FLOOR_MS},{IDLE_EXPIRY_CEILING_MS})"
+                ))
+            }
+        });
+    }
+
+    // C5: the SERIAL loop serves the next client after the idle close (post-expiry liveness).
+    phase!("post-expiry-liveness", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let m = smoke_round_trip(
+            &mut conn,
+            &smoke_envelope(OPCODE_PUBLIC_IDENTITY, b"smoke-c5", Some(&SMOKE_KEY_REF)),
+        )?;
+        assert_public_identity_success(&m)?;
+        Ok("second success round-trip on a fresh connection".to_string())
+    });
+
+    if skip_idle {
+        // Structurally unmatchable by the official `RESULT PASS phases=5([^0-9]|$)` grep: a dev
+        // iteration run can never masquerade as the checklisted full-window PASS.
+        mark(format_args!("RESULT PASS-DEV phases={phases_passed}"));
+    } else {
+        mark(format_args!("RESULT PASS phases={phases_passed}"));
+    }
+    true
+}
+
+fn map_get_text(
+    m: &[(ciborium::value::Value, ciborium::value::Value)],
+    key: u64,
+) -> Option<&str> {
+    match crate::agent_cbor::map_get(m, key) {
+        Some(ciborium::value::Value::Text(t)) => Some(t.as_str()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +747,279 @@ mod tests {
             Some(keypair.tron_address().as_str()),
             "tron_address drift"
         );
+    }
+
+    // ---- lab anchor stub conformance (deviceless; the drift-unrepresentable pins) ----
+
+    fn test_request_frame(body: &KeystoreBody, nonce: [u8; 32]) -> Vec<u8> {
+        test_request_frame_for_scope(
+            body.config.twod_chain_id,
+            &body.config.environment_identifier,
+            nonce,
+            None,
+        )
+    }
+
+    /// Build a valid 0x41 request frame for `(chain, env, nonce)`. `quote_override` lets a test
+    /// supply a quote whose EMBEDDED report_data deliberately mismatches the (always-correct)
+    /// cleartext binding at key 5.
+    fn test_request_frame_for_scope(
+        chain_id: u64,
+        env: &str,
+        nonce: [u8; 32],
+        quote_override: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let report_data =
+            crate::agent_anchor::anchor_handshake_report_data(chain_id, env, &nonce);
+        let quote = quote_override.unwrap_or_else(|| {
+            let mut q = vec![0u8; 0x50];
+            q.extend_from_slice(&report_data);
+            q
+        });
+        let req = crate::agent_boot_driver::AnchorBootRequest {
+            chain_id,
+            environment_identifier: env,
+            nonce,
+            report_data,
+        };
+        crate::agent_boot_relay::encode_anchor_boot_request(&quote, &[], &req)
+            .expect("test request encodes")
+    }
+
+    /// Drive ONE real stub pump over an in-memory stream pair: write `request_frame` into the
+    /// peer end, run [`lab_anchor_pump_one`], return (pump result, every byte the stub wrote back).
+    fn drive_stub_pump(
+        body: &KeystoreBody,
+        request_frame: &[u8],
+    ) -> (Result<[u8; 8], crate::ProtocolError>, Vec<u8>) {
+        use std::io::{Read as _, Write as _};
+        let (mut stub_end, mut peer_end) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        for s in [&stub_end, &peer_end] {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        }
+        peer_end.write_all(request_frame).and_then(|()| peer_end.flush()).expect("write request");
+        let key = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let outcome = lab_anchor_pump_one(&mut stub_end, body, &key, deadline);
+        drop(stub_end); // close-on-fault / close-after-response either way → peer sees EOF
+        let mut written_back = Vec::new();
+        let _ = peer_end.read_to_end(&mut written_back);
+        (outcome, written_back)
+    }
+
+    #[test]
+    fn stub_response_passes_guest_verify_path() {
+        // THE conformance pin: the stub's exact wire bytes, read back through the relay-side
+        // bounded reader, must verify through the REAL guest path (strict-canonical decode +
+        // Ed25519 against the smoke fixture's sealed anchor_root + scope + nonce echo) and land
+        // reconcile == Fresh. Makes "the anchor stub can't reach Ready" unrepresentable pre-aya.
+        let body = smoke_body();
+        let nonce = [0xab_u8; 32];
+        let (outcome, written_back) = drive_stub_pump(&body, &test_request_frame(&body, nonce));
+        outcome.expect("stub pump succeeds on a conformant request");
+        let raw = crate::agent_boot_relay::read_bounded_anchor_response(
+            &mut std::io::Cursor::new(written_back),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("stub framed the response with the shared 4-byte BE prefix writer");
+        assert!(raw.len() <= crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN);
+        let state =
+            crate::agent_anchor::verify_anchor_response_bytes(&raw, &nonce, &body.config)
+                .expect("stub response passes the REAL guest verify path");
+        assert_eq!(
+            crate::agent_anchor::reconcile(
+                body.freshness_epoch,
+                body.structural_version,
+                &body.compute_local_marks_digest(),
+                &state,
+            ),
+            crate::agent_anchor::ReconcileDecision::Fresh,
+            "anchor state derived from the provisioned body must reconcile Fresh"
+        );
+    }
+
+    #[test]
+    fn stub_signs_per_request_nonce_distinct() {
+        // Pins the canned-response impossibility as a deviceless fact: two requests with distinct
+        // nonces yield DISTINCT signed bodies, each verifying ONLY against its own nonce.
+        let body = smoke_body();
+        let (n1, n2) = ([0x01_u8; 32], [0x02_u8; 32]);
+        let mut raws = Vec::new();
+        for nonce in [n1, n2] {
+            let (outcome, written) = drive_stub_pump(&body, &test_request_frame(&body, nonce));
+            outcome.expect("pump ok");
+            let raw = crate::agent_boot_relay::read_bounded_anchor_response(
+                &mut std::io::Cursor::new(written),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            raws.push(raw);
+        }
+        assert_ne!(raws[0], raws[1], "distinct nonces must produce distinct signed responses");
+        assert!(crate::agent_anchor::verify_anchor_response_bytes(&raws[0], &n1, &body.config).is_ok());
+        assert!(matches!(
+            crate::agent_anchor::verify_anchor_response_bytes(&raws[0], &n2, &body.config),
+            Err(crate::agent_anchor::AnchorError::NonceMismatch)
+        ));
+    }
+
+    #[test]
+    fn stub_rejects_non_0x41_and_garbage_with_zero_bytes() {
+        // Fail-closed close-silently: every reject path returns Err BEFORE any write.
+        let body = smoke_body();
+        // A well-formed frame of the WRONG type (0x40).
+        let wrong_type =
+            crate::encode_message(crate::MessageType::AgentGateway, &[0x01]).unwrap();
+        // A short/garbage byte string (sub-header).
+        let garbage = vec![0x00, 0x01, 0x02];
+        for bad in [wrong_type, garbage] {
+            let (outcome, written_back) = drive_stub_pump(&body, &bad);
+            assert!(outcome.is_err(), "stub must reject the malformed/misrouted frame");
+            assert!(
+                written_back.is_empty(),
+                "reject must write ZERO bytes back (close-silently)"
+            );
+        }
+    }
+
+    #[test]
+    fn stub_rejects_scope_mismatch_with_zero_bytes() {
+        // A request whose cleartext binding is self-consistent but for a DIFFERENT scope than the
+        // provisioned keystore: decode passes, the stub's scope guard must fault-close.
+        let body = smoke_body();
+        let frame = test_request_frame_for_scope(9999, "some-other-env", [0xcd_u8; 32], None);
+        let (outcome, written_back) = drive_stub_pump(&body, &frame);
+        assert!(matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("scope")));
+        assert!(written_back.is_empty());
+    }
+
+    #[test]
+    fn stub_rejects_embedded_quote_mismatch_with_zero_bytes() {
+        // Key 5 carries the CORRECT binding but the quote's embedded report_data (offset 0x50)
+        // does not match it — the match-only quote policy must fault-close, zero bytes back.
+        let body = smoke_body();
+        let frame = test_request_frame_for_scope(
+            body.config.twod_chain_id,
+            &body.config.environment_identifier,
+            [0xef_u8; 32],
+            Some(vec![0u8; 0x90]), // embedded report_data = zeros ≠ the key-5 binding
+        );
+        let (outcome, written_back) = drive_stub_pump(&body, &frame);
+        assert!(matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("report_data")));
+        assert!(written_back.is_empty());
+    }
+
+    #[test]
+    fn stub_misconfig_fails_closed() {
+        // A keystore whose anchor_root does NOT pair with LAB_ANCHOR_TEST_SEED (the genesis-style
+        // [0xa3;32] literal) must be refused at startup — never a mystery SignatureInvalid on aya.
+        let mut body = smoke_body();
+        body.config.anchor_root = [0xa3; 32];
+        assert!(lab_anchor_root_matches(&body).is_err());
+        assert!(lab_anchor_root_matches(&smoke_body()).is_ok());
+    }
+
+    // ---- idle-expiry window (C4) bounds ----
+
+    #[test]
+    fn idle_expiry_window_bounds_are_sane() {
+        // Mirrors quote_smoke's lapse_probe_deadline_is_inside_binding_window discipline: the C4
+        // acceptance window must bracket the REAL consts — floor strictly below SESSION_IDLE_TIMEOUT
+        // (never an exact floor; the 399 ms run-1 lesson) and ceiling strictly above
+        // SESSION_IDLE_TIMEOUT + the per-stream 30 s SO_RCVTIMEO read arm (the close lands at the
+        // first read-wake tick ≥ the idle deadline). The connector's idle read-timeout must clear
+        // the whole window so a socket timeout can never masquerade as the close.
+        let idle_ms = crate::enclave_serve::SESSION_IDLE_TIMEOUT.as_millis();
+        let read_arm_ms = crate::enclave_serve::READ_TIMEOUT.as_millis();
+        assert!(IDLE_EXPIRY_FLOOR_MS < idle_ms, "floor must be strictly below the idle timeout");
+        assert!(
+            idle_ms - IDLE_EXPIRY_FLOOR_MS >= 1_000,
+            "floor slop must be a real margin, not an exact floor"
+        );
+        assert!(
+            idle_ms + read_arm_ms < IDLE_EXPIRY_CEILING_MS,
+            "ceiling must clear idle + the 30s read-arm tick"
+        );
+        assert!(
+            SMOKE_CLIENT_IDLE_READ_TIMEOUT.as_millis() >= IDLE_EXPIRY_CEILING_MS,
+            "connector idle read-timeout must be at or above the window ceiling"
+        );
+    }
+
+    // ---- client ↔ serve cross-validation (fresh pair per phase; skip_idle — no wall clocks) ----
+
+    /// Run the client core's deviceless phases (C1/C2/C3/C5; skip_idle) against `router` served by
+    /// the REAL `serve_framed_pump` kernel over UnixStream pairs — a fresh pair per phase, exactly
+    /// the serial server's per-connection shape. Returns (client verdict, captured marker log).
+    fn run_client_against_router(
+        router: fn(&[u8]) -> Result<Vec<u8>, crate::ProtocolError>,
+    ) -> (bool, String) {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        assert!(crate::agent_dispatch::install_agent_keystore(
+            smoke_body(),
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT
+        ));
+        let connect = move || -> std::io::Result<std::os::unix::net::UnixStream> {
+            let (client, mut server) = std::os::unix::net::UnixStream::pair()?;
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            client.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            // Short per-syscall read timeout: the pump's idle re-check wakes on it (prod arms 30 s).
+            server.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+            server.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            std::thread::spawn(move || {
+                let _ = crate::enclave_serve::serve_framed_pump(
+                    &mut server,
+                    router,
+                    std::time::Duration::from_secs(2),
+                );
+            });
+            Ok(client)
+        };
+        let mut sink = Vec::new();
+        let ok = run_agent_smoke_client(connect, true, &mut sink);
+        (ok, String::from_utf8_lossy(&sink).into_owned())
+    }
+
+    /// REPLICA of `agent_gateway_boot::agent_serve_one_frame` for the darwin-runnable copy of the
+    /// cross-validation (that module is linux+vsock gated). CLEARLY LABELED: the LINUX test below,
+    /// which drives the SHIPPED `pub(crate)` glue, is the BINDING one; this copy exists so local
+    /// darwin iteration still exercises the full client path.
+    fn replica_agent_serve_one_frame(frame: &[u8]) -> Result<Vec<u8>, crate::ProtocolError> {
+        let decoded = crate::decode_message(frame)?;
+        if decoded.msg_type != crate::MessageType::AgentGateway {
+            return Err(crate::ProtocolError::WireProtocol(
+                "replica: non-0x40 frame on the agent listener",
+            ));
+        }
+        let body = crate::agent_dispatch::handle_agent_gateway_frame(&decoded.payload);
+        crate::encode_message(crate::MessageType::AgentGateway, &body)
+    }
+
+    #[test]
+    fn client_phases_pass_against_replica_router() {
+        let (ok, log) = run_client_against_router(replica_agent_serve_one_frame);
+        assert!(ok, "client phases failed:\n{log}");
+        assert!(log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"), "log:\n{log}");
+        assert!(log.contains("PHASE public-identity PASS"), "log:\n{log}");
+        assert!(log.contains("PHASE identity-unknown-keyref PASS"), "log:\n{log}");
+        assert!(log.contains("PHASE non-agent-close PASS"), "log:\n{log}");
+        assert!(log.contains("PHASE post-expiry-liveness PASS"), "log:\n{log}");
+        assert!(!log.contains("RESULT PASS phases="), "PASS-DEV must not match the official token");
+    }
+
+    /// The BINDING cross-validation: the client core against the SHIPPED 0x40 type-guard + reframe
+    /// glue (`agent_gateway_boot::agent_serve_one_frame`, now `pub(crate)`) through the real serve
+    /// kernel. Runs in the CI ubuntu vsock-transport lane and on aya; compiled out on darwin (the
+    /// module is linux+vsock gated).
+    #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+    #[test]
+    fn client_phases_pass_against_shipped_serve_glue() {
+        let (ok, log) =
+            run_client_against_router(crate::agent_gateway_boot::agent_serve_one_frame);
+        assert!(ok, "client phases failed against the SHIPPED glue:\n{log}");
+        assert!(log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"), "log:\n{log}");
     }
 
     /// REGEN (manual): `cargo test --features agent-gateway,lab-agent-smoke \
