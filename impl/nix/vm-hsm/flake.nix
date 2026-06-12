@@ -33,6 +33,11 @@
         enclave-quote-smoke = pkgs.callPackage ./enclave.nix {
           profile = "quote-smoke";
         };
+        # TASK-7.7 5b-2c-iii: the DEBUG agent-gateway serve bin (agent-gateway role; SEPARATE
+        # derivation — role isolation, see enclave.nix; lab keystore file source, release-banned).
+        enclave-agent-gateway = pkgs.callPackage ./enclave.nix {
+          profile = "agent-gateway";
+        };
         # TASK-1.1: SNP firmware-derived pq-seal provisioning root boot helper.
         snp-derive-root = pkgs.callPackage ./snp-derive-root.nix { };
         flakeMeta = {
@@ -139,6 +144,21 @@
           guestProfile = "production-lab";
           quoteSmokePackage = enclave-quote-smoke;
         };
+        # TASK-7.7 5b-2c-iii: production-lab image + the agent-gateway serve unit (the aya SNP live
+        # smoke target: boot-to-Ready against the host relay + lab anchor stub, then the host 0x40
+        # client phases; see run-nix-snp-agent-smoke.sh). The `*-lab-*` name keeps the generic
+        # launcher's auto-derivation convention (the quote-smoke precedent).
+        diskProductionLabAgentGateway = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
+          guestProfile = "production-lab";
+          agentGatewayPackage = enclave-agent-gateway;
+        };
         ceremonySignerPath = ./ceremony-sealed-signer.bin;
         diskProductionLabSnpRooted = import ./disk-image.nix {
           inherit
@@ -161,6 +181,10 @@
           # TASK-7.7 (d-ii)/4c quote smoke (lab-only bin + bootable image carrying its oneshot).
           inherit enclave-quote-smoke;
           disk-production-lab-quote-smoke = diskProductionLabQuoteSmoke;
+          # TASK-7.7 5b-2c-iii agent-gateway live smoke (DEBUG serve bin + bootable image carrying
+          # its long-running unit + journald witness).
+          inherit enclave-agent-gateway;
+          disk-production-lab-agent-gateway = diskProductionLabAgentGateway;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;

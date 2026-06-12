@@ -75,6 +75,23 @@ jobs:
           cargo test --features vsock-transport,agent-gateway,lab-quote-smoke --test twod_hsm_quote_smoke_bin
           cargo test --features vsock-transport,agent-gateway,lab-quote-smoke --lib quote_smoke
 
+      # TASK-7.7 5b-2c-iii: the lab smoke surface — the in-crate lab module (anchor-stub conformance
+      # against the REAL guest verify path; the client cross-validation against the SHIPPED 0x40
+      # serve glue) and BOTH lab host bins (the anchor stub + the vsock smoke client; required-
+      # features keeps them out of every other lane). Additive targeted steps (the (4c) discipline):
+      # the pinned leaf step above stays byte-identical — the lab module's tests also run there
+      # under cfg(test) as normal crate growth; this step pins the FEATURE-ON build + the bins.
+      - name: 5b-2c-iii lab smoke surface — stub/client cores + bins (lab-agent-smoke)
+        run: |
+          cargo test --features vsock-transport,agent-gateway,lab-agent-smoke --lib lab_agent_smoke
+          cargo build --features vsock-transport,agent-gateway,lab-agent-smoke --bin twod-hsm-lab-anchor --bin twod-hsm-agent-smoke-client
+
+      # TASK-7.7 5b-2c-iii: the agent-bin refusal arms (ii) validation-refusal + (iii) outcome-
+      # refusal (the doc-pinned acceptance split BY PATH), deviceless — off-SNP the quote child
+      # fails BEFORE any dial. Runs the existing arms (a)/(b) too (same integration file).
+      - name: 5b-2c-iii agent-bin refusal arms (ii)+(iii) (lab-agent-keystore-from-file)
+        run: cargo test --features vsock-transport,agent-gateway,lab-agent-keystore-from-file --test twod_hsm_agent_gateway_bin
+
       - name: Agent Gateway incl. PROVE_IDENTITY preview (TASK-7.6.3)
         run: cargo test --features agent-prove-identity-preview
 
@@ -180,6 +197,11 @@ jobs:
           # + the ceremony print image. Eval only; the end-to-end boot ceremony runs on aya.
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-snp-rooted.drvPath
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-print-ceremony.drvPath
+          # TASK-7.7: the (4c) quote-smoke image (makes the nixos-module.nix eval-regression claim
+          # TRUE — it was previously asserted but not wired here) + the 5b-2c-iii agent-gateway
+          # smoke image (exercises the lab-only eval asserts' PASS side on every CI run).
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-quote-smoke.drvPath
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-gateway.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).

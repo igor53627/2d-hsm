@@ -29,6 +29,10 @@
   # TASK-7.7 (d-ii)/4c: opt-in in-guest quote-smoke oneshot (the lab-only twod-hsm-quote-smoke bin;
   # see nixos-module.nix). Default off — only disk-production-lab-quote-smoke sets it.
   quoteSmokePackage ? null,
+  # TASK-7.7 5b-2c-iii: opt-in agent-gateway serve unit (the DEBUG twod-hsm-agent-gateway bin with
+  # the lab keystore file source; see nixos-module.nix). Default off — only
+  # disk-production-lab-agent-gateway sets it.
+  agentGatewayPackage ? null,
 }:
 
 let
@@ -51,7 +55,7 @@ let
     inherit system;
     specialArgs = profile.specialArgs // {
       snpDeriveRootPackage = snp-derive-root;
-      inherit deriveRootSelftest sealRootSource deriveRootPrintCeremony quoteSmokePackage;
+      inherit deriveRootSelftest sealRootSource deriveRootPrintCeremony quoteSmokePackage agentGatewayPackage;
     };
     modules = [
       ./nixos-module.nix

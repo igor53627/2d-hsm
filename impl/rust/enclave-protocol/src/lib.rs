@@ -76,6 +76,16 @@ compile_error!(
     "`lab-quote-smoke` is the (4c) in-guest smoke surface — debug/lab builds only, never release"
 );
 
+// 5b-2c-iii live-smoke surface (TASK-7.7): the lab anchor stub (TEST-KEYS-ONLY Ed25519 seed in
+// source) + the host-side 0x40 smoke-client cores + the minted smoke keystore fixture — lab/debug
+// HOST tooling only, never a production binary surface. Hard-ban from release (mirrors
+// lab-quote-smoke).
+#[cfg(all(release_build, feature = "lab-agent-smoke"))]
+compile_error!(
+    "`lab-agent-smoke` (5b-2c-iii lab anchor stub + smoke client; TEST KEYS ONLY) is for \
+     debug/lab builds only, never release"
+);
+
 // AGENT_K1_PROVE_IDENTITY signing is non-collision-unproven against EIP-2718 typed txs until the
 // 2D type-0x19 reservation merges (2D PR #144 / vsock spec §10.8). Hard-ban it from release builds.
 #[cfg(all(release_build, feature = "agent-prove-identity-preview"))]
@@ -240,6 +250,19 @@ mod agent_boot_driver;
 // lands in 5b-2c. UNWIRED (dead-code) until then.
 #[cfg(feature = "agent-gateway")]
 mod agent_boot_relay;
+// 5b-2c-iii lab SNP live-smoke surface (TASK-7.7): the TEST-KEYS-ONLY minted smoke keystore +
+// (follow-on commits of the slice) the lab anchor stub + host-side 0x40 smoke-client cores.
+// Compiles under cfg(test) so the freeze/cross-validation tests run in the normal agent-gateway
+// lanes, and under the release-banned `lab-agent-smoke` feature for the host-side lab bins.
+#[cfg(all(feature = "agent-gateway", any(test, feature = "lab-agent-smoke")))]
+mod lab_agent_smoke;
+// The lab smoke bins reach ONLY these three items (the quote_smoke `pub use` precedent); every
+// other lab item stays `pub(crate)`. Exported only under the release-banned feature — a cfg(test)
+// build keeps the module fully private.
+#[cfg(all(feature = "agent-gateway", feature = "lab-agent-smoke"))]
+pub use lab_agent_smoke::{
+    run_agent_smoke_client, run_lab_anchor_stub, SMOKE_CLIENT_IDLE_READ_TIMEOUT,
+};
 mod wire;
 
 use serde::{Deserialize, Serialize};
