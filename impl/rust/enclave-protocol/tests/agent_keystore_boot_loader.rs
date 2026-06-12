@@ -9,7 +9,9 @@
 #![cfg(all(feature = "agent-gateway", feature = "lab-agent-keystore-from-file"))]
 
 use enclave_protocol::env_config::{
-    TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_PQ_SEAL_V1_ROOT_FILE,
+    LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
+    LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE, TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
+    TWOD_HSM_ENCLAVE_MEASUREMENT_FILE, TWOD_HSM_PQ_SEAL_V1_ROOT_FILE,
 };
 use enclave_protocol::{
     boot_configure_agent_seal_root, unseal_agent_keystore_at_boot,
@@ -18,6 +20,20 @@ use enclave_protocol::{
 
 #[test]
 fn deterministic_golden_loader_unseals_committed_blob() {
+    // Clean slate: as a separate crate we can't call the lib's #[cfg(test)] env reset, and the measurement
+    // var is SHARED with the producer flow — an AMBIENT TWOD_HSM_ENCLAVE_MEASUREMENT_FILE (or its legacy
+    // alias) would override the placeholder fallback the golden was sealed under (-> MeasurementMismatch ->
+    // a spurious failure). Scrub the measurement vars (relied-upon absence) + the vars we set.
+    for k in [
+        TWOD_HSM_ENCLAVE_MEASUREMENT_FILE,
+        LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
+        TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
+        LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE,
+        TWOD_HSM_PQ_SEAL_V1_ROOT_FILE,
+        LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE,
+    ] {
+        std::env::remove_var(k);
+    }
     // The committed genesis blob is sealed under the reference provisioning root + the agent placeholder
     // measurement (see boot_agent_keystore::tests). Set the root explicitly (no cfg(test) fallback here).
     let root: &[u8; 32] = include_bytes!("../testvectors/seal_v1_provisioning_root.bin");

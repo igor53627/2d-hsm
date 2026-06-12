@@ -571,6 +571,32 @@ mod tests {
         assert_eq!(body, genesis_body());
     }
 
+    #[test]
+    fn agent_genesis_golden_sidecar_matches_blob() {
+        // The descriptive `.json` sidecar is documentation, consumed by no runtime path — so couple its
+        // recorded sha256/len to the committed `.sealed.bin` HERE, else a future regen that updates the
+        // blob but forgets the manual `.json` re-mint ships a stale, self-contradicting sidecar with green
+        // CI. (The byte-exact freeze couples only the in-source mint to the blob, not the sidecar.)
+        use sha2::{Digest, Sha256};
+        let blob: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
+        let sidecar =
+            include_str!("../testvectors/agent-gateway/agent_keystore_genesis_v2.json");
+        let mut sha = String::with_capacity(64);
+        for b in Sha256::digest(blob) {
+            sha.push_str(&format!("{b:02x}"));
+        }
+        assert!(
+            sidecar.contains(&sha),
+            "sidecar blob_sha256 drifted from the committed blob — re-mint the .json; expected {sha}"
+        );
+        assert!(
+            sidecar.contains(&format!("\"blob_len_bytes\": {}", blob.len())),
+            "sidecar blob_len_bytes drifted from the committed blob ({})",
+            blob.len()
+        );
+    }
+
     /// REGEN (manual): `cargo test --features agent-gateway,lab-agent-keystore-from-file \
     /// regen_agent_genesis_golden_vector -- --ignored --nocapture`, then commit the `.sealed.bin`.
     /// Mirrors `agent_boot_relay::regen_boot_relay_golden_vector`. A deliberate `format_version` /
