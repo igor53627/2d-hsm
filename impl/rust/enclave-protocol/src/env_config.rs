@@ -91,7 +91,11 @@ const BOOT_DERIVE_SLACK_MS: u64 = 2_000;
 fn env_u32_or(primary: &str, legacy: &str, default: u32) -> Result<u32, String> {
     match var_twod(primary, legacy) {
         Ok(s) if !s.is_empty() => s.parse::<u32>().map_err(|_| format!("{primary} must be a u32")),
-        _ => Ok(default),
+        // Unset or empty → default. A SET-but-non-UTF-8 value is a misconfiguration — surface it
+        // (fail closed), matching var_twod's documented contract + the sibling env_u32_twod; never
+        // silently default over a corrupt env value.
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(format!("{primary} must be valid UTF-8")),
     }
 }
 
@@ -100,7 +104,8 @@ fn env_u64_or(primary: &str, legacy: &str, default: u64) -> Result<u64, String> 
         Ok(s) if !s.is_empty() => s
             .parse::<u64>()
             .map_err(|_| format!("{primary} must be a u64 (milliseconds)")),
-        _ => Ok(default),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(format!("{primary} must be valid UTF-8")),
     }
 }
 
@@ -142,7 +147,11 @@ pub fn boot_budget_config_from_env(
         Ok(s) if !s.is_empty() => s
             .parse::<u64>()
             .map_err(|_| format!("{TWOD_HSM_BOOT_OVERALL_BUDGET_MS} must be a u64 (milliseconds)"))?,
-        _ => derive_overall_budget_ms(max_attempts, per_leg_ms),
+        // Unset or empty → derive-by-default; a set-but-non-UTF-8 value fails closed (see env_u*_or).
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            derive_overall_budget_ms(max_attempts, per_leg_ms)
+        }
+        Err(_) => return Err(format!("{TWOD_HSM_BOOT_OVERALL_BUDGET_MS} must be valid UTF-8")),
     };
     Ok((
         max_attempts,
@@ -228,6 +237,32 @@ mod boot_budget_tests {
         clear();
         std::env::set_var(TWOD_HSM_BOOT_PER_LEG_TIMEOUT_MS, "x");
         assert!(boot_budget_config_from_env().is_err());
+        clear();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_value_fails_closed_not_silently_defaulted() {
+        use std::os::unix::ffi::OsStrExt;
+        let _g = BUDGET_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        // A set-but-non-UTF-8 value (e.g. a mis-encoded systemd EnvironmentFile) must FAIL CLOSED naming
+        // the var (var_twod's contract) — NOT silently fall back to the default budget.
+        std::env::set_var(
+            TWOD_HSM_BOOT_MAX_ATTEMPTS,
+            std::ffi::OsStr::from_bytes(&[0xff, 0xfe]),
+        );
+        let err = boot_budget_config_from_env().unwrap_err();
+        assert!(
+            err.contains(TWOD_HSM_BOOT_MAX_ATTEMPTS) && err.contains("UTF-8"),
+            "non-UTF-8 must fail closed naming the var: {err}"
+        );
+        clear();
+        std::env::set_var(
+            TWOD_HSM_BOOT_OVERALL_BUDGET_MS,
+            std::ffi::OsStr::from_bytes(&[0xff]),
+        );
+        assert!(boot_budget_config_from_env().is_err(), "non-UTF-8 overall must fail closed");
         clear();
     }
 }

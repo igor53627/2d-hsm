@@ -323,10 +323,13 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
     // (C) operator-config → budget triplet (validate() PARAM ORDER; parse + derive-by-default only —
     //     ValidatedBootBudget::validate inside the handshake is the sole fail-closed band judge).
     let (max_attempts, per_leg_timeout, overall_boot_budget) =
-        crate::env_config::boot_budget_config_from_env().map_err(|_| {
+        crate::env_config::boot_budget_config_from_env().map_err(|msg| {
+            // Render the parser's SPECIFIC per-var message (which var, why) at err — the static
+            // ProtocolError can't carry the dynamic String (&'static str), so surface it here or the
+            // operator gets a generic refusal naming all three vars.
+            let _ = writeln!(std::io::stderr(), "[err] agent boot: {msg}");
             ProtocolError::PqSigningUnavailable(
-                "agent boot: invalid boot-budget config (TWOD_HSM_BOOT_MAX_ATTEMPTS / \
-                 _PER_LEG_TIMEOUT_MS / _OVERALL_BUDGET_MS must be integers)",
+                "agent boot: invalid boot-budget config (see prior log line)",
             )
         })?;
     // (D) construct the concrete channel internally (the bin can't reach VsockBootRelayChannel::new).
@@ -344,7 +347,11 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
     // (E) wrapper-internal best-effort emit sink (decision: keeps AgentBootEvent pub(crate)). NEVER
     //     eprintln!; maps level() to a journald-style priority tag.
     let mut emit = |ev: AgentBootEvent| {
-        let _ = writeln!(std::io::stderr(), "[{}] {ev}", boot_log_priority(ev.level()));
+        let priority = match ev.level() {
+            BootLogLevel::Info => "info",
+            BootLogLevel::Warn => "warn",
+        };
+        let _ = writeln!(std::io::stderr(), "[{priority}] {ev}");
     };
     // (F) ONE wired handshake; decide_serve is INSIDE; &body is BORROWED here. require_real HARDCODED.
     let _ready: crate::agent_anchor::AnchorState = run_boot_handshake_wired(
@@ -378,14 +385,6 @@ fn run_agent_serve_loop() -> Result<std::convert::Infallible, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
         "agent boot: serve loop not yet wired (5b-2c-ii) — refusing to serve (fail-closed)",
     ))
-}
-
-/// Map the library boot-log severity to a journald-style priority tag for the wrapper's stderr sink.
-fn boot_log_priority(level: BootLogLevel) -> &'static str {
-    match level {
-        BootLogLevel::Info => "info",
-        BootLogLevel::Warn => "warn",
-    }
 }
 
 // TEST RULE (restated from `HardBoundedQuoteProducer::new` — uniform here): EVERY test holds
