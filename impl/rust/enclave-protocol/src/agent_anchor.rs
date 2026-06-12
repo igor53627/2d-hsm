@@ -339,8 +339,11 @@ pub(crate) fn anchor_handshake_report_data(
 
 /// Test-only: build the canonically-encoded, validly-signed (non-chain-bound) anchor freshness
 /// response bytes a conformant anchor would send for `signing_key` + these fields. `pub(crate)` so the
-/// freshness-challenge slice's tests can drive `verify_outstanding_response` end-to-end.
-#[cfg(test)]
+/// freshness-challenge slice's tests can drive `verify_outstanding_response` end-to-end. Under the
+/// release-banned `lab-agent-smoke` feature this is ALSO the 5b-2c-iii lab anchor stub's REFERENCE
+/// response builder — the single source of the response wire shape, so the stub structurally cannot
+/// drift from what [`verify_anchor_response`] accepts.
+#[cfg(any(test, feature = "lab-agent-smoke"))]
 pub(crate) fn test_signed_response_bytes(
     signing_key: &ed25519_dalek::SigningKey,
     chain_id: u64,

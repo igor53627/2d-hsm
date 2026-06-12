@@ -88,6 +88,11 @@ lab-pq-seal-from-file = ["ml-dsa-65"]
 # ONLY — release-banned by a compile_error in lib.rs (mirrors lab-pq-seal-from-file). The production
 # host-vsock install/restore source is a deferred slice.
 lab-agent-keystore-from-file = ["agent-gateway"]
+# Lab 5b-2c-iii SNP live-smoke surface (TASK-7.7): the TEST-KEYS-ONLY minted smoke keystore fixture,
+# the lab anchor stub and the host-side 0x40 smoke-client cores. Debug/lab HOST tooling only —
+# release-banned by a compile_error in lib.rs (mirrors lab-quote-smoke). Opens NO serve surface and
+# is NEVER a guest-bin feature (the guest runs the real twod-hsm-agent-gateway bin).
+lab-agent-smoke = ["agent-gateway"]
 # Public NIST test-vector keypair — `cargo test` only (see vsock spec §2.1).
 reference-test-key = ["ml-dsa-65", "reference-seal-v1-root", "pq-seal-provisioning"]
 # (4c) in-guest quote smoke surface — lab/debug images only, release-banned in lib.rs; opens NO
