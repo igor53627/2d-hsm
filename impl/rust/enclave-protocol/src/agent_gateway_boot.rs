@@ -388,9 +388,18 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
     run_agent_serve_loop()
 }
 
-/// Backoff after an accept error to cap an EMFILE/ENFILE busy-spin (same value/rationale as the (b)
-/// host-relay daemon: accept(2) then fails immediately without draining the backlog).
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// A pump `Err` that is a PROTOCOL-LEVEL reject of PEER input — the deliberate CLOSE-SILENTLY cases an
+/// UNAUTHENTICATED peer can trip BEFORE any keystore auth (a non-0x40 misroute → `WireProtocol`; a bad
+/// version byte → `InvalidVersion`) — vs a genuine local/transport fault (IO write break, reset). The
+/// former are logged CALMLY (info) so they are not an attacker-controllable WARN-flood lever (the producer
+/// path folds wrong-type into an Ok error-reply and never warns); genuine faults stay at warn. Read-side
+/// EOF / idle-timeout / oversize already break to `Ok` inside the pump, so they never reach this arm.
+fn is_peer_protocol_reject(e: &ProtocolError) -> bool {
+    matches!(
+        e,
+        ProtocolError::WireProtocol(_) | ProtocolError::InvalidVersion { .. }
+    )
+}
 
 /// THE agent serve port is 0x40-ONLY: decode the frame, REQUIRE `MessageType::AgentGateway`, route to the
 /// reusable per-frame handler, and reframe the reply as 0x40. A NON-0x40 frame returns `Err` → the pump
@@ -412,31 +421,47 @@ fn agent_serve_one_frame(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
 }
 
 /// THE one accepted-item body shared by the prod serial loop AND the `#[cfg(test)]` finite twin (no
-/// `cfg(test)` drift). `Ok` → run the per-connection [`crate::enclave_serve::serve_framed_pump`] (close +
-/// log on fault); `Err` → log + bounded [`ACCEPT_ERROR_BACKOFF`] (EMFILE/ENFILE anti-spin). RAII: the
-/// connection drops at return on every path. `let _ = writeln!` NEVER `eprintln!` (a broken-stderr panic
-/// must not kill serving). Never panics, never returns a fatal.
-fn handle_agent_accepted<S>(accepted: std::io::Result<S>)
+/// `cfg(test)` drift). Three DISTINCT outcomes, never a fatal, never a panic:
+/// - accept(2) itself failed (`Err`) → log "accept error" + bounded [`crate::enclave_serve::ACCEPT_ERROR_BACKOFF`]
+///   (EMFILE/ENFILE anti-spin: accept fails WITHOUT draining the backlog, so a bare continue tight-spins).
+/// - accept(2) succeeded but per-stream `prepare` (SO_*TIMEO arming) failed → log "stream setup failed" and
+///   skip WITHOUT backoff (this is NOT fd pressure; mirrors the producer's `prepare_connection` seam so an
+///   arm fault is never MISLABELED as an accept fault, and the seam is deviceless-testable).
+/// - served: run the per-connection [`crate::enclave_serve::serve_framed_pump`]; a clean close / a CALM
+///   peer-protocol reject ([`is_peer_protocol_reject`]) / a genuine fault are logged at info/info/warn.
+/// RAII drops the connection on every path. `let _ = writeln!` NEVER `eprintln!` (a broken-stderr panic must
+/// not kill serving).
+fn handle_agent_accepted<S, P>(accepted: std::io::Result<S>, prepare: &mut P)
 where
     S: std::io::Read + std::io::Write,
+    P: FnMut(&mut S) -> Result<(), ProtocolError>,
 {
     use std::io::Write as _;
-    match accepted {
-        Ok(mut conn) => match crate::enclave_serve::serve_framed_pump(
-            &mut conn,
-            agent_serve_one_frame,
-            crate::enclave_serve::SESSION_IDLE_TIMEOUT,
-        ) {
-            Ok(()) => {
-                let _ = writeln!(std::io::stderr(), "[info] agent gateway: connection closed cleanly");
-            }
-            Err(e) => {
-                let _ = writeln!(std::io::stderr(), "[warn] agent gateway: connection fault ({e}); closed");
-            }
-        },
+    let mut conn = match accepted {
+        Ok(conn) => conn,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "[warn] agent gateway: accept error ({}); skipping", e.kind());
-            std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+            std::thread::sleep(crate::enclave_serve::ACCEPT_ERROR_BACKOFF);
+            return;
+        }
+    };
+    if let Err(e) = prepare(&mut conn) {
+        let _ = writeln!(std::io::stderr(), "[warn] agent gateway: stream setup failed ({e}); skipping");
+        return;
+    }
+    match crate::enclave_serve::serve_framed_pump(
+        &mut conn,
+        agent_serve_one_frame,
+        crate::enclave_serve::SESSION_IDLE_TIMEOUT,
+    ) {
+        Ok(()) => {
+            let _ = writeln!(std::io::stderr(), "[info] agent gateway: connection closed cleanly");
+        }
+        Err(e) if is_peer_protocol_reject(&e) => {
+            let _ = writeln!(std::io::stderr(), "[info] agent gateway: closed connection ({e})");
+        }
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "[warn] agent gateway: connection fault ({e}); closed");
         }
     }
 }
@@ -447,15 +472,17 @@ where
 /// [`handle_agent_gateway_frame`] regardless of thread count, and there is NO shared `EnclaveState` mutex, so
 /// the producer's `process::exit(1)`-on-poison hazard is STRUCTURALLY ABSENT. Concurrent-capped is a NAMED §8
 /// follow-up (triggered only if the upstream gateway ever multiplexes many independent slow clients).
+/// `prepare` is the per-stream setup seam (prod arms SO_*TIMEO; the finite twin injects no-op / forced-fail).
 /// Diverges: the prod `VsockListener::incoming()` is infinite so the `for` never exits; the finite
 /// `#[cfg(test)]` twin loops the SAME `handle_agent_accepted` body and returns `()`.
-fn serve_agent_loop<I, S>(incoming: I) -> std::convert::Infallible
+fn serve_agent_loop<I, S, P>(incoming: I, mut prepare: P) -> std::convert::Infallible
 where
     I: Iterator<Item = std::io::Result<S>>,
     S: std::io::Read + std::io::Write,
+    P: FnMut(&mut S) -> Result<(), ProtocolError>,
 {
     for accepted in incoming {
-        handle_agent_accepted(accepted);
+        handle_agent_accepted(accepted, &mut prepare);
     }
     unreachable!("VsockListener::incoming() never terminates")
 }
@@ -482,19 +509,16 @@ fn run_agent_serve_loop() -> Result<std::convert::Infallible, ProtocolError> {
         ProtocolError::PqSigningUnavailable("agent serve: vsock bind failed (see prior log line)")
     })?;
     let _ = writeln!(std::io::stderr(), "[info] agent gateway: serving on vsock CID {cid} port {port}");
-    // Arm SO_RCVTIMEO/SO_SNDTIMEO per accepted stream (READ 30s / WRITE 120s); the serve loop's idle bound
-    // (SESSION_IDLE_TIMEOUT, 300s) is separate. A per-stream arm failure folds to a per-connection accept Err
-    // (logged + skipped by handle_agent_accepted), never fatal.
-    let armed = listener.incoming().map(|r| {
-        r.and_then(|mut s| {
-            crate::vsock_listen::configure_vsock_session_timeouts(&mut s)?;
-            Ok(s)
-        })
-    });
+    // Per-stream setup seam: arm SO_RCVTIMEO/SO_SNDTIMEO (READ 30s / WRITE 120s) on each accepted stream
+    // (the serve loop's idle bound, SESSION_IDLE_TIMEOUT 300s, is separate). A setup failure is logged as a
+    // STREAM-SETUP fault (NOT an accept fault) and skipped per-connection by handle_agent_accepted, never
+    // fatal — mirrors the producer's `run_incoming_accept_loop` prepare_connection seam.
     // Never returns Ok: the loop diverges (incoming() is infinite). The Ok wrapper documents at the type
     // level that serve never returns Ok; the divergence makes it unreachable.
     #[allow(unreachable_code)]
-    Ok(serve_agent_loop(armed))
+    Ok(serve_agent_loop(listener.incoming(), |s| {
+        crate::vsock_listen::configure_vsock_session_timeouts(s).map_err(ProtocolError::from)
+    }))
 }
 
 // TEST RULE (restated from `HardBoundedQuoteProducer::new` — uniform here): EVERY test holds
@@ -1070,14 +1094,23 @@ mod tests {
 
     /// Finite twin (§3b): loops the SAME handle_agent_accepted body as serve_agent_loop but returns () when a
     /// FINITE iterator drains — so Infallible stays truthful WITHOUT unreachable! ever firing under test.
-    fn drive_agent_serve_finite<I, S>(incoming: I)
+    /// Threads the SAME per-stream `prepare` seam serve_agent_loop runs (no `cfg(test)` drift).
+    fn drive_agent_serve_finite<I, S, P>(incoming: I, mut prepare: P)
     where
         I: Iterator<Item = std::io::Result<S>>,
         S: std::io::Read + std::io::Write,
+        P: FnMut(&mut S) -> Result<(), ProtocolError>,
     {
         for accepted in incoming {
-            handle_agent_accepted(accepted);
+            handle_agent_accepted(accepted, &mut prepare);
         }
+    }
+
+    /// No-op per-stream setup for the deviceless twin: the prod arm seam (`configure_vsock_session_timeouts`)
+    /// is vsock-only, so most tests inject this; the setup-FAILURE path is covered explicitly by
+    /// `serve_loop_stream_setup_failure_skips_and_continues`.
+    fn no_prepare<S>(_: &mut S) -> Result<(), ProtocolError> {
+        Ok(())
     }
 
     #[test]
@@ -1193,7 +1226,7 @@ mod tests {
         let (good, mut good_peer) = UnixStream::pair().unwrap();
         (&good_peer).write_all(&agent_frame(&[0xff, 0xff])).unwrap();
         good_peer.shutdown(std::net::Shutdown::Write).unwrap();
-        drive_agent_serve_finite(vec![Ok(bad), Ok(good)].into_iter());
+        drive_agent_serve_finite(vec![Ok(bad), Ok(good)].into_iter(), no_prepare);
         assert_eq!(read_reply(&mut good_peer).msg_type, crate::MessageType::AgentGateway);
     }
 
@@ -1208,7 +1241,7 @@ mod tests {
         // accepted connection still serves.
         let incoming: Vec<std::io::Result<UnixStream>> =
             vec![Err(std::io::Error::from_raw_os_error(24)), Ok(good)];
-        drive_agent_serve_finite(incoming.into_iter());
+        drive_agent_serve_finite(incoming.into_iter(), no_prepare);
         assert_eq!(read_reply(&mut good_peer).msg_type, crate::MessageType::AgentGateway);
     }
 
@@ -1223,6 +1256,88 @@ mod tests {
         assert!(
             crate::is_wire_error_payload(&err_body),
             "an agent-error body must be wire-error-classified (no idle reset)"
+        );
+    }
+
+    /// END-TO-END the pump's idle-reset DECISION (`reply_resets_idle`) in BOTH directions over real framed
+    /// replies — the ERROR-only classifier test above pins one half; this pins that a SUCCESS reply EXTENDS
+    /// the budget. Without the positive half, a regression that flipped/dropped the kernel's `!` (resetting
+    /// idle on errors — re-opening the slowloris hole) would pass every other test. (A future agent SUCCESS
+    /// body shaped `{1:Integer, 2:Text}` would now FAIL here loudly, not regress silently.)
+    #[test]
+    fn reply_extends_idle_on_success_not_on_error() {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        install_serving_state();
+        // ERROR reply (a garbage 0x40 → the agent error band `{1:Integer, 2:Text}`) must NOT extend idle.
+        let err_frame = agent_frame(&crate::agent_dispatch::handle_agent_gateway_frame(&[0xff, 0xff]));
+        assert!(
+            !crate::enclave_serve::reply_resets_idle(&err_frame),
+            "an agent-error reply must NOT reset the idle deadline"
+        );
+        // SUCCESS reply (key 1 = Bytes, the PUBLIC_IDENTITY / PROVE_IDENTITY success shape) MUST extend it.
+        let mut success_body = Vec::new();
+        ciborium::ser::into_writer(
+            &ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Integer(1.into()),
+                ciborium::value::Value::Bytes(vec![0u8; 65]),
+            )]),
+            &mut success_body,
+        )
+        .unwrap();
+        let success_frame = agent_frame(&success_body);
+        assert!(
+            crate::enclave_serve::reply_resets_idle(&success_frame),
+            "a non-error reply (key 1 = Bytes) MUST reset the idle deadline"
+        );
+    }
+
+    /// The pump CONSULTS the idle deadline: with a ZERO idle budget (already exhausted at entry) it breaks on
+    /// the FIRST read — `Instant::now() >= deadline` — BEFORE processing the buffered 0x40 frame, returning
+    /// `Ok(())` with ZERO bytes back. A regression that ignored the deadline would instead read + reply, so
+    /// this guards the slowloris bound's enforcement (the deviceless suite cannot drive a real wall-clock
+    /// expiry; the live 300s budget is exercised by the aya/SNP smoke).
+    #[test]
+    fn serve_pump_respects_expired_idle_deadline() {
+        use std::io::Read as _;
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        install_serving_state();
+        let (mut relay_side, mut peer) = UnixStream::pair().unwrap();
+        (&peer).write_all(&agent_frame(&[0xff, 0xff])).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        crate::enclave_serve::serve_framed_pump(&mut relay_side, agent_serve_one_frame, Duration::ZERO)
+            .expect("an exhausted idle budget breaks before reading → Ok(())");
+        let mut back = Vec::new();
+        let _ = peer.set_read_timeout(Some(Duration::from_millis(200)));
+        let _ = peer.read_to_end(&mut back);
+        assert!(back.is_empty(), "expired idle: nothing read or replied; got {back:?}");
+    }
+
+    /// A per-stream `prepare` (SO_*TIMEO arming) failure on ONE accepted stream is logged as a stream-setup
+    /// fault and SKIPPED — the loop keeps serving (the NEXT stream replies). Covers the prod arming seam
+    /// (`configure_vsock_session_timeouts`) the device-bound `run_agent_serve_loop` owns but the deviceless
+    /// suite otherwise never drives, AND that an arm fault is never mislabeled/escalated.
+    #[test]
+    fn serve_loop_stream_setup_failure_skips_and_continues() {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        install_serving_state();
+        let (first, _first_peer) = UnixStream::pair().unwrap();
+        let (second, mut second_peer) = UnixStream::pair().unwrap();
+        (&second_peer).write_all(&agent_frame(&[0xff, 0xff])).unwrap();
+        second_peer.shutdown(std::net::Shutdown::Write).unwrap();
+        // `prepare` fails for the FIRST accepted stream (a deviceless stand-in for a setsockopt arm failure),
+        // then succeeds — the loop must skip the first and still serve the second.
+        let mut first_seen = false;
+        drive_agent_serve_finite(vec![Ok(first), Ok(second)].into_iter(), |_: &mut UnixStream| {
+            if !first_seen {
+                first_seen = true;
+                return Err(ProtocolError::WireProtocol("test: forced stream setup failure"));
+            }
+            Ok(())
+        });
+        assert_eq!(
+            read_reply(&mut second_peer).msg_type,
+            crate::MessageType::AgentGateway,
+            "the serial loop keeps serving after a per-stream setup failure"
         );
     }
 }

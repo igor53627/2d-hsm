@@ -20,6 +20,12 @@ pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Per-syscall read timeout (shorter than session idle; `read_exact_with_idle_deadline` also checks the idle instant).
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Backoff after an `accept(2)` ERROR to cap an EMFILE/ENFILE busy-spin: under fd exhaustion the kernel
+/// fails accept IMMEDIATELY without draining the backlog entry, so a bare log+continue would tight-spin a
+/// core + flood stderr until fds free elsewhere. SINGLE SOURCE for every serial accept loop (the agent
+/// serve loop AND the (b) host-anchor relay) so the anti-spin value can never silently diverge between
+/// them. Accept errors are rare for AF_VSOCK, so this never delays the steady state.
+pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// One enclave process: shared authorization state across all transport connections.
 pub struct SharedEnclaveRuntime {
@@ -188,15 +194,28 @@ where
         };
         let reply = handle_frame(&frame)?;
         write_framed_message(stream, &reply)?;
-        // Wire/agent-error replies are complete frames but must not extend the idle budget.
-        let reset_idle = decode_message(&reply)
-            .map(|framed| !is_wire_error_payload(&framed.payload))
-            .unwrap_or(false);
-        if reset_idle {
+        // A NON-error reply extends the idle budget; a wire/agent-error reply must NOT (else a peer holds a
+        // slot by dribbling parseable-but-erroring frames forever). See [`reply_resets_idle`].
+        if reply_resets_idle(&reply) {
             idle_deadline = Instant::now() + idle_timeout;
         }
     }
     Ok(())
+}
+
+/// Does this self-encoded reply frame EXTEND the inter-frame idle budget? A reply extends it iff it is NOT
+/// a wire/agent-error frame — a peer must not keep its slot alive by dribbling parseable-but-erroring
+/// frames (the agent error band `0x40..=0x46` IS wire-error-shaped, so it correctly does NOT extend).
+/// [`is_wire_error_payload`] is the predicate — NOT the `#[cfg(test)]`-only `decode_agent_error_code`
+/// (which can't compile in prod). A decode failure or a sub-header reply conservatively does NOT extend
+/// (treated like an error). EXTRACTED from the inline rule so the SUCCESS direction (extends) and the
+/// ERROR direction (does not) are both directly, deterministically testable without driving a wall-clock
+/// idle expiry. The producer [`serve_framed_connection`] keeps its byte-identical inline copy this slice
+/// and converges onto this helper as the NAMED §8 follow-up (do not perturb the SNP-validated producer).
+pub(crate) fn reply_resets_idle(reply: &[u8]) -> bool {
+    decode_message(reply)
+        .map(|framed| !is_wire_error_payload(&framed.payload))
+        .unwrap_or(false)
 }
 
 /// Panic while holding this lock may leave [`EnclaveState`] inconsistent — fail closed via process exit.

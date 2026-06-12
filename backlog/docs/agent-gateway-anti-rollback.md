@@ -1162,6 +1162,28 @@ request golden vector is a 5b-2b test-vector item.
     aya SNP live smoke** (DEBUG build; a real 0x40 round-trip over vsock from the host) — production live-serve
     still needs the attested host-vsock keystore-source slice. NAMED follow-ups: producer-convergence onto
     `serve_framed_pump`; concurrent-capped (if multi-client).
+  - **xhigh review-max applied (22 raw→19 survived→+3 sweep→15 findings; ZERO runtime correctness bugs — all
+    hardening / log-taxonomy / test-adequacy / cleanup / efficiency).** Fixes landed: (1) the idle-reset rule
+    is EXTRACTED to `pub(crate) fn reply_resets_idle(reply)` in `enclave_serve.rs` (the SUCCESS-extends + the
+    ERROR-does-not directions are now both DETERMINISTICALLY unit-testable without a wall-clock expiry — the
+    error-only classifier test left the positive half unguarded, so a flipped/dropped `!` re-opening the
+    slowloris hole would have passed every test); the pump calls it; the producer keeps its byte-identical
+    inline copy (convergence = the named follow-up). (2) `ACCEPT_ERROR_BACKOFF` PROMOTED to a single
+    `pub const` in `enclave_serve.rs` (was duplicated verbatim in `agent_gateway_boot` + `host_anchor_relay` —
+    a silent-drift surface). (3) a wrong-type / bad-version pump Err is now logged CALMLY at `[info]` via
+    `is_peer_protocol_reject` (the CLOSE-SILENTLY policy an UNAUTHENTICATED peer trips pre-auth was a `[warn]`
+    flood lever; genuine IO faults stay `[warn]`). (4) the per-stream SO_*TIMEO arming moved to a
+    `prepare`-seam threaded through `handle_agent_accepted`/`serve_agent_loop`/the finite twin (mirrors the
+    producer's `run_incoming_accept_loop` `prepare_connection`) — an arm failure is now labeled "stream setup
+    failed" (NOT mislabeled "accept error"), skipped WITHOUT backoff (not fd pressure), AND deviceless-testable.
+    NEW deviceless tests: `reply_extends_idle_on_success_not_on_error`, `serve_pump_respects_expired_idle_deadline`
+    (ZERO idle budget → break-before-read), `serve_loop_stream_setup_failure_skips_and_continues`.
+    Re-validation: aya `agent-gateway,vsock-transport` **441 lib (438+3) + 2 bin-integration, 0 failed, clippy
+    clean**; darwin gate-free 92 lib green. DEFERRED to the producer-convergence follow-up (do NOT perturb the
+    SNP-validated producer this slice): the redundant per-frame `decode_message(&reply)` re-parse + the owning
+    payload-Vec alloc (efficiency) — fix it for BOTH the pump AND the producer together via a handler that
+    returns `(frame, is_error)`. The real wall-clock 300s idle expiry stays an aya 5b-2c-iii smoke obligation
+    (deviceless can't drive a true timer).
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
   `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
