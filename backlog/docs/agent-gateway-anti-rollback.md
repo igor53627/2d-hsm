@@ -1090,8 +1090,9 @@ request golden vector is a 5b-2b test-vector item.
     the agent build), calling the SHARED `seal_root::set_pq_seal_v1_provisioning_root` so `resolve` succeeds
     standalone. Sharing the root mechanism does NOT weaken isolation (distinct domain-separated KDFs).
   - **SECURITY boundary:** the seam enforces ONLY the structural/seal invariant; it MUST NOT judge
-    freshness/anti-rollback — a rolled-back-but-valid blob unseals + installs, then the handshake `reconcile`
-    (NOT this module) catches it. Structurally enforced: the module use-list imports NO
+    freshness/anti-rollback — a rolled-back-but-valid blob UNSEALS fine; the handshake `reconcile` (NOT this
+    module), which runs on `&body` BEFORE install (canonical install-after-`Ready` order above), then catches
+    it and fails closed, so a stale keystore is NEVER installed. Structurally enforced: the module use-list imports NO
     `agent_anchor`/`agent_boot`/`reconcile`/`marks`/`AdoptForward`/`AnchorState` symbol (grep-checkable);
     AdoptForward + re-seal-forward stay strictly 5b-2e. Honors `MAX_KEYSTORE_BLOB_SIZE` (re-installable).
   - **NEW SURFACE (house rule):** feature `lab-agent-keystore-from-file = ["agent-gateway"]` (base

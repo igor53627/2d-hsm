@@ -18,9 +18,12 @@
 //! The seam enforces the STRUCTURAL/seal invariant by reusing `unseal_body` VERBATIM (length → magic
 //! `2DAGTKS\0` → `format_version == 2` BEFORE decrypt → measurement-binding → strict whole-buffer CBOR →
 //! `validate()` incl. `structural_version != 0`). It MUST NOT judge freshness/anti-rollback: a
-//! rolled-back-but-structurally-valid blob unseals + installs fine, then the boot handshake's `reconcile`
-//! (NOT this module) compares `freshness_epoch`/`structural_version`/marks against the anchor and fails
-//! closed for a stale blob. NO double-judging, NO re-seal-forward (AdoptForward stays strictly 5b-2e). This
+//! rolled-back-but-structurally-valid blob UNSEALS fine (the seam does not judge freshness); the boot
+//! handshake's `reconcile` (NOT this module) — which runs on the returned `&body` BEFORE the keystore is
+//! installed (the canonical install-after-`Ready` order; §8 5b-2c) — compares
+//! `freshness_epoch`/`structural_version`/marks against the anchor and fails closed for a stale blob, so a
+//! stale keystore is NEVER installed/served. NO double-judging, NO re-seal-forward (AdoptForward stays
+//! strictly 5b-2e). This
 //! is enforced STRUCTURALLY: the use-list below imports NO `agent_anchor` / `agent_boot` / `reconcile` /
 //! `marks` / `AdoptForward` / `AnchorState` symbol (grep-checkable).
 //!
@@ -616,20 +619,29 @@ mod tests {
             }
             s
         };
-        let must_contain = |needle: &str, what: &str| {
-            assert!(
-                sidecar.contains(needle),
-                "sidecar {what} drifted from the source of truth — re-mint the .json; expected {needle}"
-            );
-        };
-        // Couple BOTH the blob digest/len AND the descriptive seal_inputs (nonce / measurement / root hex)
-        // to the source-of-truth constants, so a future regen that forgets the .json re-mint can't leave a
-        // stale OR a misdescribing sidecar (the seal_inputs annotations were previously uncoupled).
-        must_contain(&hex(&Sha256::digest(blob)), "blob_sha256");
-        must_contain(&format!("\"blob_len_bytes\": {}", blob.len()), "blob_len_bytes");
-        must_contain(&hex(&GOLDEN_AGENT_NONCE), "nonce_hex");
-        must_contain(&hex(AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT), "enclave_measurement_hex");
-        must_contain(&hex(GOLDEN_AGENT_ROOT), "provisioning_root_hex");
+        // Parse the sidecar (this ALSO asserts it is well-formed JSON), then compare SPECIFIC fields — not
+        // substrings — so a value that drifted into the wrong field or a comment can't false-pass. Couples
+        // BOTH the blob digest/len AND the descriptive seal_inputs (nonce / measurement / root hex) to the
+        // source-of-truth constants, so a future regen that forgets the .json re-mint fails CI.
+        let v: serde_json::Value =
+            serde_json::from_str(sidecar).expect("genesis sidecar must be valid JSON");
+        let sha = hex(&Sha256::digest(blob));
+        let nonce = hex(&GOLDEN_AGENT_NONCE);
+        let meas = hex(AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT);
+        let root = hex(GOLDEN_AGENT_ROOT);
+        assert_eq!(v["blob_sha256"].as_str(), Some(sha.as_str()), "sidecar blob_sha256 drift — re-mint .json");
+        assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
+        assert_eq!(v["envelope"]["nonce_hex"].as_str(), Some(nonce.as_str()), "sidecar nonce_hex drift");
+        assert_eq!(
+            v["seal_inputs"]["enclave_measurement_hex"].as_str(),
+            Some(meas.as_str()),
+            "sidecar enclave_measurement_hex drift"
+        );
+        assert_eq!(
+            v["seal_inputs"]["provisioning_root_hex"].as_str(),
+            Some(root.as_str()),
+            "sidecar provisioning_root_hex drift"
+        );
     }
 
     /// REGEN (manual): `cargo test --features agent-gateway,lab-agent-keystore-from-file \
