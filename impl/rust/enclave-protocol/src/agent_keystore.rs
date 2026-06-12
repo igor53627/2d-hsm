@@ -1262,6 +1262,46 @@ mod tests {
     }
 
     #[test]
+    fn marks_payload_strict_decoder_is_the_inverse_of_the_encoder() {
+        // ANTI-SELF-CERTIFICATION (5b-2e): the new strict decoder must reconstruct EXACTLY the marks
+        // surfaces the FROZEN encoder emitted — on the genesis golden AND a multi-row body — so the
+        // AdoptForward hash-equality gate (re-hash of a candidate seeded from the decode) is sound.
+        // This freezes the decoder against the encoder via a round-trip, NOT a hand vector.
+        for body in [marks_body(), {
+            let mut b = marks_body();
+            b.counters = vec![ctr(1, 200, b"target-a", 5), ctr(2, 0, b"", 9_000_000_000)];
+            b.faucet.cumulative_native_spend = [0xaa; 32];
+            b.faucet.lifetime_spend = [0xbb; 32];
+            b.strict_recovery_counter = 42;
+            b
+        }] {
+            let payload = body.encode_marks_payload();
+            let decoded =
+                crate::agent_cbor::strict_decode_marks_payload(&payload, MAX_COUNTER_ENTRIES)
+                    .expect("frozen encoder output strict-decodes");
+            // Rows: env is folded out of the wire, so compare the non-env fields; the encoder sorts
+            // rows by (authority, scope_class, scope_target), so compare against that same order.
+            let mut sorted = body.counters.clone();
+            sorted.sort_by(|a, b| {
+                a.authority
+                    .cmp(&b.authority)
+                    .then(a.scope_class.cmp(&b.scope_class))
+                    .then(a.scope_target.as_slice().cmp(b.scope_target.as_slice()))
+            });
+            assert_eq!(decoded.rows.len(), sorted.len());
+            for (d, c) in decoded.rows.iter().zip(sorted.iter()) {
+                assert_eq!(d.authority, c.authority);
+                assert_eq!(d.scope_class, c.scope_class);
+                assert_eq!(d.scope_target, c.scope_target);
+                assert_eq!(d.highest_accepted_counter, c.highest_accepted_counter);
+            }
+            assert_eq!(decoded.cumulative_native_spend, body.faucet.cumulative_native_spend);
+            assert_eq!(decoded.lifetime_spend, body.faucet.lifetime_spend);
+            assert_eq!(decoded.strict_recovery_counter, body.strict_recovery_counter);
+        }
+    }
+
+    #[test]
     fn marks_digest_is_sha3_of_domain_then_payload() {
         // Pin the digest = SHA3-256(MARKS_DOMAIN ‖ payload) relationship (payload hand-verified above),
         // so no captured hex is needed.
