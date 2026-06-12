@@ -58,6 +58,16 @@ compile_error!(
     "lab file provisioning features are for debug/integration builds only, not release"
 );
 
+// TASK-7.7 5b-2d: the agent sealed-keystore FILE loader + agent file provisioning root are lab/integration
+// surfaces only — they accept the sealed keystore + provisioning root from operator-supplied files, which
+// belongs to debug/integration images, never a production agent binary (production sources the sealed
+// keystore over the attested host-vsock install/restore channel, a deferred slice). Hard-ban from release.
+#[cfg(all(release_build, feature = "lab-agent-keystore-from-file"))]
+compile_error!(
+    "`lab-agent-keystore-from-file` (agent sealed-keystore file loader) is for debug/integration builds \
+     only, not release"
+);
+
 // (4c) in-guest quote smoke (TASK-7.7 5b-2b-ii (d-ii)/4c): a diagnostic surface for lab/debug guest
 // images only — it deliberately stages a vsock black-hole lapse, configfs entry seeding and a
 // nonzero-exit child, none of which belongs in a production binary.
@@ -167,6 +177,18 @@ pub mod secp256k1;
 // mirroring the producer `pq-seal-v1` primitives with distinct magic + KDF/measurement domains.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_keystore;
+// Agent Gateway sealed-keystore unseal-at-boot loader (TASK-7.7 5b-2d): the agent twin of
+// `boot_lab_pq_seal` — sources the sealed agent keystore + the agent provisioning root (lab file source)
+// and unseals it via `agent_keystore::unseal_body`, fail-closed. A PURE source→unseal→return seam: it does
+// NOT install and does NOT judge freshness (the 5b-2c bin installs; the handshake reconciles). The lab file
+// source is release-banned above. agent-gateway-gated.
+#[cfg(feature = "agent-gateway")]
+mod boot_agent_keystore;
+#[cfg(feature = "agent-gateway")]
+pub use boot_agent_keystore::{
+    boot_configure_agent_seal_root, unseal_agent_keystore_at_boot,
+    AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+};
 // Agent Gateway identity proof (TASK-7.6.3). EIP-191 0x19 PROVE_IDENTITY preimage + signer.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_identity;

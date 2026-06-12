@@ -63,8 +63,9 @@
 //! (The cooperative `SnpQuoteProducer`/`fetch_report_deadline` from 5b-2b-i were DELETED in
 //! (d-ii)(4a); the production quote producer is `HardBoundedQuoteProducer` —
 //! (d-ii)/2, `quote_subprocess`, triple-gated.) **5b-2c** the agent-gateway bin + boot
-//! sequencing (set platform root → unseal the agent keystore → `install_agent_keystore` →
-//! `run_boot_anti_rollback_handshake` → `decide_serve(outcome, cfg!(release_build))?` → serve);
+//! sequencing (set platform root → unseal the agent keystore → `run_boot_anti_rollback_handshake(&body)` →
+//! `decide_serve(outcome, cfg!(release_build))?` → `install_agent_keystore(body, measurement)` → serve —
+//! install AFTER `Ready` so a stale-but-valid keystore is never made process-global before the gate);
 //! **5b-2d** the sealed-blob source + unseal sequencing; **5b-2e** the `AdoptForward` signed raw-marks
 //! channel (last + separate — it flips `AdoptForwardUnsupported` from terminal to executable). The
 //! handshake is single-threaded over the challenge/binding process-globals — 5b-2c MUST NOT run it

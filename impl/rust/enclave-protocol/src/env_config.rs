@@ -50,6 +50,12 @@ pub const LEGACY_HSM_PQ_SEALED_SIGNER_FILE: &str = "2D_HSM_PQ_SEALED_SIGNER_FILE
 pub const TWOD_HSM_ENCLAVE_MEASUREMENT_FILE: &str = "TWOD_HSM_ENCLAVE_MEASUREMENT_FILE";
 pub const LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE: &str = "2D_HSM_ENCLAVE_MEASUREMENT_FILE";
 
+// TASK-7.7 5b-2d: lab/integration source for the sealed AGENT keystore (pq-agent-keystore-v1). Read RAW
+// (a sealed binary blob — never newline-trimmed). Behind `lab-agent-keystore-from-file` (debug only); the
+// production host-vsock install/restore source is a deferred slice.
+pub const TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE: &str = "TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE";
+pub const LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE: &str = "2D_HSM_AGENT_SEALED_KEYSTORE_FILE";
+
 /// When `1`, allow boot without platform PQ root (transport-only smoke; NOT mainnet).
 pub const TWOD_HSM_TRANSPORT_ONLY_MODE: &str = "TWOD_HSM_TRANSPORT_ONLY_MODE";
 pub const LEGACY_HSM_TRANSPORT_ONLY_MODE: &str = "2D_HSM_TRANSPORT_ONLY_MODE";
