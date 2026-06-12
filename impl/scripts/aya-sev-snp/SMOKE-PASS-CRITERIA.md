@@ -64,23 +64,29 @@ all PASS.
 
 ### 5b-2c-iii acceptance checklist (explicit; check off with run evidence)
 
-- [ ] **Core:** a real 0x40 PUBLIC_IDENTITY round-trip over vsock from the host against the DEBUG
+Status: **PASSED on aya 2026-06-12 — 2 consecutive SNP runs at `4784984`, `RESULT PASS phases=5`
+both, full 300 s window in each (`idle-expiry elapsed_ms=301778` run 1 / `302040` run 2 — both deep
+inside [298 000, 332 000)); KVM expected-refusal PASS (2 restart cycles, never served); aya cargo
+suites 456+0 (lab-agent-smoke, incl. the linux shipped-glue cross-validation) + 4+0 (refusal arms)
++ the `relay_real_vsock_loopback_with_lab_anchor` `#[ignore]` composition 1+0 on real AF_VSOCK.**
+
+- [x] **Core:** a real 0x40 PUBLIC_IDENTITY round-trip over vsock from the host against the DEBUG
   `twod-hsm-agent-gateway` bin on a real SEV-SNP launch (client phase `public-identity`, byte-exact
   against the minted smoke fixture).
-- [ ] **The real 300 s wall-clock idle expiry** (the doc-pinned item deviceless tests cannot drive):
+- [x] **The real 300 s wall-clock idle expiry** (the doc-pinned item deviceless tests cannot drive):
   client phase `idle-expiry` PASS with `elapsed_ms` ∈ **[298 000, 332 000)** — floor = 300 s − 2 s
   slop (NEVER an exact floor — the (d-ii) 399 ms lesson), ceiling = 300 s + the 30 s `SO_RCVTIMEO`
   read-arm tick + 2 s slop (the close lands at the first read-wake ≥ the deadline). At least one
   FULL-WINDOW `RESULT PASS phases=5` run; `PASS-DEV phases=4` (skip-idle) never satisfies this.
-- [ ] **Expected-error + close taxonomy live:** `identity-unknown-keyref` (exact 0x42),
+- [x] **Expected-error + close taxonomy live:** `identity-unknown-keyref` (exact 0x42),
   `non-agent-close` (zero reply bytes + the calm `[info]` close), `post-expiry-liveness` (the
   SERIAL loop serves the next client).
-- [ ] **Bin logging acceptance split BY PATH:** (i) the happy boot above; (ii) validation-refusal +
+- [x] **Bin logging acceptance split BY PATH:** (i) the happy boot above; (ii) validation-refusal +
   (iii) outcome-refusal — both pinned deviceless in `tests/twod_hsm_agent_gateway_bin.rs` (CI) AND
   (iii) E2E via `run-kvm-agent-refusal.sh` with restart evidence.
-- [ ] **Canonical boot order observable in logs:** root → unseal → budget (raw, validated) → relay
+- [x] **Canonical boot order observable in logs:** root → unseal → budget (raw, validated) → relay
   channel → handshake (`decide_serve` inside) → install-AFTER-Ready → serve.
-- [ ] **aya `#[ignore]` composition test green on aya:** `relay_real_vsock_loopback_with_lab_anchor`
+- [x] **aya `#[ignore]` composition test green on aya:** `relay_real_vsock_loopback_with_lab_anchor`
   (real CID_ANY bind + shipped relay pump + the REAL lab anchor stub; discharges the bind-CID-ANY
   reality item, seeds TASK-21).
 
