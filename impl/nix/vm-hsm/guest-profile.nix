@@ -109,5 +109,8 @@ in
     # TASK-7.7 (d-ii)/4c: in-guest quote-smoke oneshot package (disk-image.nix overrides it for the
     # disk-production-lab-quote-smoke output).
     quoteSmokePackage = null;
+    # TASK-7.7 5b-2c-iii: in-guest agent-gateway serve bin (disk-image.nix overrides it for the
+    # disk-production-lab-agent-gateway output).
+    agentGatewayPackage = null;
   };
 }

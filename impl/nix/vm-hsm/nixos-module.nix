@@ -30,6 +30,10 @@
   # TASK-7.7 (d-ii)/4c: opt-in in-guest quote-smoke oneshot (the lab-only `twod-hsm-quote-smoke`
   # bin). Default off — only the disk-production-lab-quote-smoke image sets it.
   quoteSmokePackage ? null,
+  # TASK-7.7 5b-2c-iii: opt-in agent-gateway serve unit (the DEBUG `twod-hsm-agent-gateway` bin +
+  # the lab keystore file source). Default off — only the disk-production-lab-agent-gateway image
+  # sets it. Lab-only by the eval assert below (the keystore source feature is release-banned).
+  agentGatewayPackage ? null,
   ...
 }:
 
@@ -72,6 +76,28 @@ let
     done
     echo "twod-hsm-quote-smoke: journald-breadcrumb FAIL"; exit 1
   '';
+  # TASK-7.7 5b-2c-iii: the TEST-KEYS-ONLY smoke agent keystore (lab-prod-fixtures; length-pinned
+  # copy of the committed testvector). Referenced directly here rather than threaded through
+  # guest-profile specialArgs: the agent unit is lab-only BY THE EVAL ASSERT below, and the lab
+  # fixture IS its only keystore source today (the production attested host-vsock source is a
+  # deferred slice with its own wiring).
+  agentSmokeKeystoreFile = (import ./lab-prod-fixtures.nix { inherit pkgs; }).agentSealedKeystoreFile;
+  # TASK-7.7 5b-2c-iii: journald-ARRIVAL witness for the agent unit's serve marker. A long-running
+  # unit cannot use the (4c) ExecStartPost trick (fires at start, skipped on start failure) — this
+  # runs as a SEPARATE After=-ordered oneshot, retry-grepping bounded 120×1s (the agent may
+  # crash-loop until the host relay/anchor answer; the marker is the EVENTUAL Ready evidence).
+  # SELF-MATCH GUARD: echoes ONLY the distinct journald-serve marker, never the grepped literal.
+  agentJournaldWitness = pkgs.writeShellScript "twod-hsm-agent-smoke-journald-witness" ''
+    ${pkgs.systemd}/bin/journalctl --sync 2>/dev/null || true
+    for i in $(seq 1 120); do
+      if ${pkgs.systemd}/bin/journalctl -u twod-hsm-agent-gateway -b --no-pager 2>/dev/null \
+           | grep -qF 'agent gateway: serving on vsock'; then
+        echo "twod-hsm-agent-smoke: journald-serve PASS"; exit 0
+      fi
+      sleep 1
+    done
+    echo "twod-hsm-agent-smoke: journald-serve FAIL"; exit 1
+  '';
 in
 {
   # Mainnet gate (TASK-5 AC#10): a productionMode guest must NOT ship lab attestation
@@ -108,6 +134,24 @@ in
       message =
         "twod-hsm: quoteSmokePackage (the (4c) debug quote-smoke) MUST NOT be embedded in a "
         + "productionMode/mainnet image — it is a lab-only, release-banned diagnostic.";
+    }
+    {
+      # TASK-7.7 5b-2c-iii: the agent-gateway smoke image is the SAME mechanical lab-only discipline —
+      # its keystore source (lab-agent-keystore-from-file, a DEBUG-only release-banned feature) reads
+      # the TEST-KEYS-ONLY smoke fixture; a mainnet image embedding it is un-constructible at eval.
+      assertion = agentGatewayPackage == null || !productionMode;
+      message =
+        "twod-hsm: agentGatewayPackage (the 5b-2c-iii DEBUG agent-gateway + lab keystore source) "
+        + "MUST NOT be embedded in a productionMode/mainnet image — the production agent keystore "
+        + "source (attested host-vsock install/restore) is a deferred slice.";
+    }
+    {
+      # The agent unit bakes TWOD_HSM_PQ_SEAL_V1_ROOT_FILE from the profile's provisioning-root
+      # fixture; without it the env would dangle — fail at eval (use the production-lab profile).
+      assertion = agentGatewayPackage == null || pqSealProvisioningRootFile != null;
+      message =
+        "twod-hsm: agentGatewayPackage requires pqSealProvisioningRootFile (the production-lab "
+        + "profile supplies the lab fixture).";
     }
     {
       # Couple the env-gate and the unit-gate: sealRootSource="snp" points the enclave's root file at
@@ -274,6 +318,90 @@ in
       ReadWritePaths = [ "/sys/kernel/config/tsm" ];
     };
   };
+
+  # TASK-7.7 5b-2c-iii: the agent-gateway serve unit for the aya SNP live smoke. LONG-RUNNING (the
+  # bin diverges into the serial 0x40 serve loop after Ready), `Restart=always` — the boot wrapper's
+  # exit-for-supervisor-restart design: every boot failure (root/unseal/budget/handshake/install) is
+  # a process exit, and the unit restarts until the host-side relay+anchor answer (the smoke runner
+  # starts them BEFORE qemu; `StartLimitIntervalSec=0` gives the crash-loop unlimited headroom).
+  # Standalone — deliberately does NOT gate or order against the producer enclave unit (distinct
+  # ports: producer serve 5000, boot-relay dial 5001, agent serve 5002).
+  systemd.services."twod-hsm-agent-gateway" = lib.mkIf (isProd && agentGatewayPackage != null) {
+    description = "2d-hsm agent-gateway 0x40 serve bin (TASK-7.7 5b-2c-iii lab smoke)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-modules-load.service" "systemd-udev-settle.service" "sys-kernel-config.mount" ];
+    unitConfig = {
+      # The boot handshake's quote child writes configfs-tsm — same barrier as the enclave unit.
+      RequiresMountsFor = "/sys/kernel/config";
+      # Unlimited restart headroom: until the host relay/anchor are reachable the boot fail-closes
+      # and exits by design; the default start-limit would wedge the unit in `failed` instead of
+      # reaching the EVENTUAL Ready the smoke's boot-to-Ready grep polls for.
+      StartLimitIntervalSec = 0;
+    };
+    serviceConfig = {
+      ExecStart = "${agentGatewayPackage}/bin/twod-hsm-agent-gateway";
+      Restart = "always";
+      RestartSec = "3";
+      SyslogIdentifier = "twod-hsm-agent-gateway";
+      # DISCHARGES the (4c) template caveat recorded on the quote-smoke unit: the agent bin's stdout
+      # is PROTOCOL-ONLY (the 0x40 protocol rides vsock and stdout stays EMPTY in a normal boot, but
+      # the dispatch-first quote child CAN write protocol frames to it) — so stdout goes to journal
+      # ONLY, never teed to ttyS0. All operator/marker lines are stderr → journal AND the serial
+      # console (the smoke's boot-to-Ready grep reads them off the serial log).
+      StandardOutput = "journal";
+      StandardError = "journal+console";
+      # PRODUCTION SANDBOX KNOBS (mirror the enclave unit): without ReadWritePaths the quote child
+      # cannot create/write /sys/kernel/config/tsm/report/* under ProtectSystem=strict /
+      # ProtectKernelTunables and the smoke would never reach Ready.
+      NoNewPrivileges = true;
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      PrivateTmp = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      RestrictSUIDSGID = true;
+      LockPersonality = true;
+      ReadWritePaths = [ "/sys/kernel/config/tsm" ];
+    };
+    preStart = ''
+      echo "[vm-hsm] starting twod-hsm-agent-gateway (5b-2c-iii lab smoke)" >/dev/console
+    '';
+    environment = {
+      # VMADDR_CID_ANY; serve port 5002 — structurally absent collision with the producer's 5000
+      # (relay!=serve is boot-validated; producer-vs-agent is avoided by construction here).
+      TWOD_HSM_VSOCK_CID = "4294967295";
+      TWOD_HSM_VSOCK_PORT = "5002";
+      # Boot-relay DIAL port (the guest dials host CID 2 : 5001 during the handshake).
+      TWOD_HSM_ANCHOR_RELAY_PORT = "5001";
+      # The agent's lab keystore source: the SAME provisioning-root env var name as the producer
+      # (domain-separated KDFs inside agent_keystore provide isolation) + the TEST-KEYS-ONLY smoke
+      # blob (lab-prod-fixtures; the production attested host-vsock source is a deferred slice).
+      TWOD_HSM_PQ_SEAL_V1_ROOT_FILE = "${pqSealProvisioningRootFile}";
+      TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE = "${agentSmokeKeystoreFile}";
+      # No TWOD_HSM_ENCLAVE_MEASUREMENT_FILE: the blob is sealed under the placeholder measurement
+      # (the genesis precedent; the attested 48-byte measurement is the deferred production slice —
+      # recorded smoke non-coverage in SMOKE-PASS-CRITERIA.md).
+    };
+  };
+
+  # TASK-7.7 5b-2c-iii: journald-ARRIVAL witness for the agent serve marker. The (4c) ExecStartPost
+  # trick does NOT transfer to a long-running unit (it fires at start, not after the interesting
+  # output, and is skipped on a start failure) — so this is a SEPARATE After=-ordered oneshot doing a
+  # bounded retry-grep. SELF-MATCH GUARD: echoes ONLY the distinct `journald-serve PASS|FAIL` marker,
+  # never the grepped literal.
+  systemd.services."twod-hsm-agent-smoke-journald" =
+    lib.mkIf (isProd && agentGatewayPackage != null) {
+      description = "2d-hsm 5b-2c-iii journald witness for the agent serve marker";
+      wantedBy = [ "multi-user.target" ]; # standalone witness — does NOT gate the agent unit
+      after = [ "twod-hsm-agent-gateway.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${agentJournaldWitness}";
+        StandardOutput = "journal+console";
+        StandardError = "journal+console";
+      };
+    };
 
   # TASK-1.1 (sealed-boot loop): derive the pq-seal root from the SNP firmware into a tmpfs file the
   # enclave reads (sealRootSource="snp"). Unlike the selftest, this IS load-bearing — the enclave

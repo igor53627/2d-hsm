@@ -24,4 +24,16 @@ in
       exit 1
     fi
   '';
+  # TASK-7.7 5b-2c-iii: the minted SMOKE agent keystore (TEST KEYS ONLY — the anchor seed and the
+  # secp scalar are public in-repo constants; see lab_agent_smoke.rs + the .json sidecar). The exact
+  # byte length pins the committed v2 blob; a regen changes it — update in the SAME commit (the
+  # in-crate byte-exact freeze + sidecar tests catch a blob/sidecar split, this catches a blob/nix split).
+  agentSealedKeystoreFile = pkgs.runCommand "twod-hsm-lab-agent-smoke-keystore" { } ''
+    cp ${tv}/agent-gateway/agent_keystore_smoke_v1.sealed.bin $out
+    sz=$(wc -c < "$out" | tr -d ' ')
+    if [ "$sz" != "4418" ]; then
+      echo "expected the 4418-byte v2 smoke agent keystore blob, got $sz" >&2
+      exit 1
+    fi
+  '';
 }

@@ -11,9 +11,16 @@ let
   # agent-gateway trips the `ml-dsa-65 ⊕ agent-gateway` compile_error (lib.rs, vsock §10.2). A
   # future "consolidate builds" cleanup MUST NOT merge this arm into the producer derivations.
   quoteSmoke = profile == "quote-smoke";
+  # TASK-7.7 5b-2c-iii: the agent-gateway serve bin for the aya SNP live smoke. SEPARATE derivation
+  # for the same role-isolation reason as quoteSmoke (ml-dsa-65 ⊕ agent-gateway compile_error).
+  # Features = the §8 manifest pin (agent-gateway + vsock-transport) PLUS lab-agent-keystore-from-file
+  # (the only wired keystore source today; release-banned ⇒ this MUST stay a debug build) — and
+  # NOT lab-agent-smoke (that feature gates HOST-side smoke tooling, never a guest bin).
+  agentGateway = profile == "agent-gateway";
   pname =
     if staging then "enclave-vsock-staging"
     else if quoteSmoke then "twod-hsm-quote-smoke"
+    else if agentGateway then "twod-hsm-agent-gateway"
     else "enclave-vsock";
   buildFeatures =
     if staging then
@@ -22,11 +29,14 @@ let
       [ "lab-production-vsock" ]
     else if quoteSmoke then
       [ "agent-gateway" "vsock-transport" "lab-quote-smoke" ]
+    else if agentGateway then
+      [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" ]
     else
       [ "production-vsock" ];
-  # quoteSmoke MUST stay a debug build: lab-quote-smoke is release-banned (lib.rs compile_error),
-  # and debug ⇒ TWOD_HSM_STRICT_RELEASE_GUARDS unset ⇒ the ban does not trip (by design).
-  debugBuild = staging || labProd || transportSmoke || quoteSmoke;
+  # quoteSmoke/agentGateway MUST stay debug builds: lab-quote-smoke / lab-agent-keystore-from-file are
+  # release-banned (lib.rs compile_errors), and debug ⇒ TWOD_HSM_STRICT_RELEASE_GUARDS unset ⇒ the
+  # bans do not trip (by design). The release-built agent spawn shape stays the recorded 5b-2c residual.
+  debugBuild = staging || labProd || transportSmoke || quoteSmoke || agentGateway;
 in
 
 rustPlatform.buildRustPackage {
