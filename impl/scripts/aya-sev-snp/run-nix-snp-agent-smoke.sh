@@ -63,8 +63,13 @@ echo "SNP: qemu=$QEMU_BIN bios=$SNP_BIOS"
 
 echo "[1/4] host bins (lab anchor stub + host relay + 0x40 smoke client)"
 BIN_DIR="${BIN_DIR:-$RUST_DIR/target/debug}"
-if [[ ! -x "$BIN_DIR/twod-hsm-lab-anchor" || ! -x "$BIN_DIR/twod-hsm-host-anchor-relay" \
-      || ! -x "$BIN_DIR/twod-hsm-agent-smoke-client" || -n "${FORCE_CARGO_BUILD:-}" ]]; then
+# ALWAYS rebuild — never a presence-skip. The matrix flagged that a `! -x` skip lets STALE
+# target/debug binaries from a prior checkout drive a freshly-built guest image and report a
+# false-green (these host tools DEFINE the anchor behavior + client expectations, so a stale tool
+# silently invalidates the acceptance). cargo incremental compilation makes this ~free when the
+# sources are unchanged; the cost of a guaranteed-fresh build is negligible against a 300 s smoke.
+# (Override BIN_DIR to point at a deliberately pre-built tree if you must skip — explicit, not silent.)
+if [[ "$BIN_DIR" == "$RUST_DIR/target/debug" ]]; then
   (cd "$RUST_DIR" && cargo build --features agent-gateway,vsock-transport,lab-agent-smoke \
      --bin twod-hsm-lab-anchor --bin twod-hsm-host-anchor-relay --bin twod-hsm-agent-smoke-client)
 fi

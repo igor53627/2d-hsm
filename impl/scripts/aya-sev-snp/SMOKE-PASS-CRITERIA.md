@@ -66,17 +66,32 @@ all PASS.
 
 Status: **PASSED on aya 2026-06-12 — 2 consecutive SNP runs at `4784984`, `RESULT PASS phases=5`
 both, full 300 s window in each (`idle-expiry elapsed_ms=301778` run 1 / `302040` run 2 — both deep
-inside [298 000, 332 000)); KVM expected-refusal PASS (2 restart cycles, never served); aya cargo
-suites 456+0 (lab-agent-smoke, incl. the linux shipped-glue cross-validation) + 4+0 (refusal arms)
-+ the `relay_real_vsock_loopback_with_lab_anchor` `#[ignore]` composition 1+0 on real AF_VSOCK.**
+inside the final [298 000, 340 000) window below); KVM expected-refusal PASS (2 restart cycles,
+never served); aya cargo suites 456+0 (lab-agent-smoke, incl. the linux shipped-glue
+cross-validation) + 4+0 (refusal arms) + the `relay_real_vsock_loopback_with_lab_anchor` `#[ignore]`
+composition 1+0 on real AF_VSOCK.**
+
+> **Evidence provenance (honest pin):** the two SNP runs were executed at `4784984`. A later review-fix
+> commit (`a6a4f61`) WIDENED the idle-expiry ceiling `332 000 → 340 000` ms (a load-jitter false-RED at
+> the ~330 s upper bimodal mode — see the idle-expiry item) and moved the aya `#[ignore]` loopback test
+> off a colliding port. Neither change alters the recorded SNP serve behavior: the ceiling only WIDENS
+> the accept window (the recorded `elapsed_ms` 301778/302040 fall inside BOTH the old and the final
+> window, so the evidence stands), and the port fix touches only the `--ignored` suite. A confirming
+> SNP run on the final tree is a cheap re-pin if desired, but is not required to validate the recorded
+> 300 s wall-clock expiry.
 
 - [x] **Core:** a real 0x40 PUBLIC_IDENTITY round-trip over vsock from the host against the DEBUG
   `twod-hsm-agent-gateway` bin on a real SEV-SNP launch (client phase `public-identity`, byte-exact
   against the minted smoke fixture).
 - [x] **The real 300 s wall-clock idle expiry** (the doc-pinned item deviceless tests cannot drive):
-  client phase `idle-expiry` PASS with `elapsed_ms` ∈ **[298 000, 332 000)** — floor = 300 s − 2 s
+  client phase `idle-expiry` PASS with `elapsed_ms` ∈ **[298 000, 340 000)** — floor = 300 s − 2 s
   slop (NEVER an exact floor — the (d-ii) 399 ms lesson), ceiling = 300 s + the 30 s `SO_RCVTIMEO`
-  read-arm tick + 2 s slop (the close lands at the first read-wake ≥ the deadline). At least one
+  read-arm tick + **10 s** load-jitter headroom. The +10 s (not 2 s) is structural: `SESSION_IDLE_TIMEOUT`
+  (300 s) is an EXACT multiple of the 30 s read arm, so the deadline lands on a read boundary and the
+  close is BIMODAL — ~300 s, or ~330 s when a sub-second-early `SO_RCVTIMEO` return forces an 11th full
+  tick; the ceiling must clear that 330 s upper mode with real headroom. Single source = the
+  `IDLE_EXPIRY_CEILING_MS = 340_000` constant + its `idle_expiry_window_bounds_are_sane` test
+  (`lab_agent_smoke.rs`); this doc must track that constant, not a frozen literal. At least one
   FULL-WINDOW `RESULT PASS phases=5` run; `PASS-DEV phases=4` (skip-idle) never satisfies this.
 - [x] **Expected-error + close taxonomy live:** `identity-unknown-keyref` (exact 0x42),
   `non-agent-close` (zero reply bytes + the calm `[info]` close), `post-expiry-liveness` (the
