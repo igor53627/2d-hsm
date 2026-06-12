@@ -405,6 +405,13 @@ pub enum MessageType {
     /// relay and writes this frame (SNP quote + public challenge); it is NEVER serve-dispatched, so
     /// `decode_wire_command` rejects it fail-closed (a hostile inbound `0x41` cannot reach a handler).
     AgentBootRelay = 0x41,
+    /// Agent Gateway anti-rollback **raw-marks-relay** request frame (TASK-7.7 slice 5b-2e). Reserved
+    /// outer band `0x40..0x4F` (`0x42`/`0x43` are inner `AgentError` codes — a DISJOINT namespace from
+    /// this outer-frame byte). The SECOND enclave-initiated leg: on `AdoptForward` the enclave writes
+    /// this (scope + the same fresh nonce + the adopted epoch — NO SNP quote; the attestation was bound
+    /// on the `0x41` leg) and the anchor returns the signed raw marks. Like `0x41` it is NEVER
+    /// serve-dispatched — a hostile inbound `0x44` fails closed in `decode_wire_command`.
+    AgentAnchorMarksRelay = 0x44,
 }
 
 /// Простой диспетчер команд (скелет).
@@ -506,6 +513,7 @@ pub fn decode_message(data: &[u8]) -> Result<FramedMessage, ProtocolError> {
         0x30 => MessageType::GetStatus,
         0x40 => MessageType::AgentGateway,
         0x41 => MessageType::AgentBootRelay,
+        0x44 => MessageType::AgentAnchorMarksRelay,
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
 
@@ -1562,6 +1570,11 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
         MessageType::AgentBootRelay => Err(ProtocolError::WireProtocol(
             "AGENT_BOOT_RELAY is enclave-initiated; not serve-dispatchable",
         )),
+        // AGENT_ANCHOR_MARKS_RELAY (0x44) is likewise ENCLAVE-INITIATED (the AdoptForward marks fetch);
+        // a hostile inbound 0x44 to the serve dispatcher fails closed here (TASK-7.7 slice 5b-2e).
+        MessageType::AgentAnchorMarksRelay => Err(ProtocolError::WireProtocol(
+            "AGENT_ANCHOR_MARKS_RELAY is enclave-initiated; not serve-dispatchable",
+        )),
     }
 }
 
@@ -1600,6 +1613,7 @@ pub fn peek_msg_type_from_frame(frame: &[u8]) -> Option<MessageType> {
         Some(0x30) => Some(MessageType::GetStatus),
         Some(0x40) => Some(MessageType::AgentGateway),
         Some(0x41) => Some(MessageType::AgentBootRelay),
+        Some(0x44) => Some(MessageType::AgentAnchorMarksRelay),
         _ => None,
     }
 }
@@ -3899,10 +3913,30 @@ mod agent_gateway_framing_tests {
         assert_eq!(peek_msg_type_from_frame(&mk(0x40)), Some(MessageType::AgentGateway));
         // 0x41 = AGENT_BOOT_RELAY (TASK-7.7 5b-2, enclave-initiated boot handshake frame).
         assert_eq!(peek_msg_type_from_frame(&mk(0x41)), Some(MessageType::AgentBootRelay));
+        // 0x44 = AGENT_ANCHOR_MARKS_RELAY (TASK-7.7 5b-2e, enclave-initiated AdoptForward marks fetch).
+        assert_eq!(peek_msg_type_from_frame(&mk(0x44)), Some(MessageType::AgentAnchorMarksRelay));
         // Unknown bytes still fail closed (None) — must NOT fall back to a producer type (the old bug).
+        // 0x42/0x43 are inner AgentError CODES, NOT outer MessageType bytes → still None.
         assert_eq!(peek_msg_type_from_frame(&mk(0x42)), None);
+        assert_eq!(peek_msg_type_from_frame(&mk(0x43)), None);
         assert_eq!(peek_msg_type_from_frame(&mk(0xFF)), None);
         assert_eq!(peek_msg_type_from_frame(&[]), None);
+    }
+
+    // 5b-2e: the 0x44 marks-relay frame round-trips at the framing layer but is NEVER serve-dispatched
+    // (enclave-initiated). A hostile inbound 0x44 to the serve dispatcher fails closed.
+    #[test]
+    fn agent_anchor_marks_relay_decodes_but_is_not_serve_dispatchable() {
+        let frame = encode_message(MessageType::AgentAnchorMarksRelay, &[0xA0]).unwrap();
+        let decoded = decode_message(&frame).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::AgentAnchorMarksRelay);
+        assert!(
+            matches!(
+                decode_wire_command(decoded.msg_type, &decoded.payload),
+                Err(ProtocolError::WireProtocol(m)) if m.contains("enclave-initiated")
+            ),
+            "a hostile inbound 0x44 must fail closed in the serve dispatcher"
+        );
     }
 
     // A 0x40 frame is recognized at the framing layer. WITHOUT the agent-gateway feature the
