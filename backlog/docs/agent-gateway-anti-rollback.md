@@ -936,8 +936,16 @@ request golden vector is a 5b-2b test-vector item.
       behavioral tests already landed in 5b-2b-ii(a) — `vsock_channel_*` aya tests — leaving (d) the configfs
       + hard-bound items.)
 - **5b-2c — agent-gateway bin + boot sequencing**: set platform root → unseal the agent keystore →
-  `install_agent_keystore` → `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake` →
-  `decide_serve(outcome, cfg!(release_build))?` → serve. Like the daemon (b), 5b-2c needs a **`pub`
+  `RelayAnchorTransport::new(...)` → `run_boot_anti_rollback_handshake(&body)` →
+  `decide_serve(outcome, cfg!(release_build))?` → **`install_agent_keystore(body, measurement)`** → serve.
+  **CANONICAL ORDERING (reconciled — anti-rollback timing contract):** install the keystore **only AFTER**
+  the handshake returns `Ready` (the move-vs-borrow order in the 5b-2d record: the handshake BORROWS
+  `&body`, install MOVES it LAST). So a stale-but-structurally-valid keystore is **never** written to the
+  process-global `INSTALLED_KEYSTORE` — non-`Ready` fails closed BEFORE install, and stale state never
+  becomes visible to any dispatch path (vs an install-before-handshake order, which would rely on
+  "no-serve-before-the-gate" to keep already-installed stale state from being used). `install_agent_keystore`
+  returns `bool`; **`false` (overwrite / empty-measurement / poison) is a FATAL boot abort.** Like the
+  daemon (b), 5b-2c needs a **`pub`
   library boot-sequencing entrypoint** (e.g. `run_agent_gateway_boot(...)`) — the `RelayAnchorTransport` /
   `BootQuoteProducer` / `BootRelayChannel` types it names are `pub(crate)`, unreachable from a separate-crate
   `[[bin]]`. **Manifest obligation (pinned — previously unpinned anywhere):** the 5b-2c bin is a NEW `[[bin]]`
@@ -1116,10 +1124,29 @@ request golden vector is a 5b-2b test-vector item.
     clippy clean; release-build + the lab feature fails to compile (release-ban).
   - **DEFERS:** the production host-vsock install/restore wire envelope (its own slice; the framing is still
     PROVISIONAL); the real attested 48-byte SNP launch measurement (production derives it from the SNP
-    report, not the placeholder); the 5b-2c bin wiring (install ordering, false-is-fatal, a real production
-    root hook); AdoptForward/re-seal (5b-2e). A per-role agent root env var was rejected as a wider diff
-    (the shared `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` is correct — distinct KDF domains; flagged for reviewer
-    sign-off).
+    report, not the placeholder); the 5b-2c bin wiring (install-after-Ready ordering, false-is-fatal, a real
+    production root hook); AdoptForward/re-seal (5b-2e). A per-role agent root env var was rejected as a
+    wider diff (the shared `TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` is correct — distinct KDF domains; flagged for
+    reviewer sign-off). The production root provider, the production sealed-blob source, and the real
+    measurement source are explicit ORDERED 5b-2c/later obligations, each replacing one of this slice's
+    documented fail-closed stubs.
+  - **NO PRODUCTION CALLER until 5b-2c:** in a non-lab (production) agent build the seam + root-step are
+    fail-closed STUBS (no env read), so `unseal_agent_keystore_at_boot` is intentionally UNREACHABLE/inert
+    until the 5b-2c bin wires a real root + source; the from-disk integration test is what keeps the
+    otherwise-dead loader CI-exercised. **Producer ⊕ agent is a BUILD-LEVEL `compile_error!`** (lib.rs
+    `all(ml-dsa-65, agent-gateway)`), so NO single binary runs both role root-steps — the shared install-once
+    provisioning-root slot is configured by exactly one role; the distinct agent placeholder measurement is
+    belt-and-suspenders cross-role hygiene, not a dual-role-in-one-binary scenario (which can't be built).
+  - **Full-Matrix reconciliation (PR #65, 6 cells — gemini infra-down both runs, NOTED not silently
+    dropped; codex/claude/grok × security+design):** ZERO core-logic defects. Applied: (1) codex security
+    Low — the lab file readers now use a CAPPED reader (`boot_input::read_boot_file_capped`, reads ≤ max+1)
+    so `/dev/zero` / an oversize file fails closed instead of OOMing the boot path (pinned by
+    `seam_neverending_file_capped_not_oom`); (2) codex design Medium — the loader's tests now serialize on
+    the CRATE-WIDE `agent_dispatch::lock_and_reset_agent_process_globals()` (+ a seal-root/env reset) instead
+    of a private lock, so they can't race other agent tests on `INSTALLED_KEYSTORE`; (3) claude design Low —
+    the sidecar coupling test now also pins `nonce_hex`/`enclave_measurement_hex`/`provisioning_root_hex` to
+    the source-of-truth constants (not just sha256/len). The codex design "High" (boot-ordering doc
+    contradiction) is the §8 5b-2c CANONICAL ORDERING reconciliation above (install-after-Ready).
 - **5b-2e — `AdoptForward`** (last + separate, because it changes fail-closed behavior — flips
   `AdoptForwardUnsupported` from terminal to executable): the `anchor_root`-signed raw-marks channel +
   `hash(adopted)==marks_digest` seed + re-seal/persistence.

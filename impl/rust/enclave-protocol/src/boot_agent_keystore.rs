@@ -65,8 +65,10 @@ fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
             "agent keystore: TWOD_HSM_PQ_SEAL_V1_ROOT_FILE not set (expected path to a 32-byte provisioning root)",
         )
     })?;
-    let bytes = crate::boot_input::read_boot_file(
+    // CAPPED at 32+1: a 33rd byte (or /dev/zero) makes try_into::<[u8;32]> fail without OOM.
+    let bytes = crate::boot_input::read_boot_file_capped(
         path.as_ref(),
+        32,
         "agent keystore: failed to read TWOD_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
     )?;
     bytes.try_into().map_err(|_| {
@@ -117,8 +119,11 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
                 "agent keystore: TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE not set",
             )
         })?;
-    let blob = crate::boot_input::read_boot_file(
+    // CAPPED read (read_boot_file_capped returns at most MAX+1): a never-ending special file (/dev/zero) or
+    // an oversize file can't OOM the boot path before this length check — the +1 makes "too large" exact.
+    let blob = crate::boot_input::read_boot_file_capped(
         path.as_ref(),
+        crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE,
         "agent keystore: failed to read TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE",
     )?;
     if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
@@ -145,14 +150,24 @@ fn agent_boot_measurement() -> Result<Vec<u8>, ProtocolError> {
     use crate::env_config::{
         var_twod, LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE, TWOD_HSM_ENCLAVE_MEASUREMENT_FILE,
     };
+    // A measurement is tiny (a 48-byte SNP launch measurement or a short placeholder); cap the read so a
+    // /dev/zero / oversize file can't OOM the boot path, then trim trailing newlines (text manifest).
+    const AGENT_MEASUREMENT_FILE_MAX_BYTES: usize = 4096;
     let measurement = match var_twod(
         TWOD_HSM_ENCLAVE_MEASUREMENT_FILE,
         LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
     ) {
-        Ok(path) => crate::boot_input::read_boot_file_trim_trailing_newlines(
-            path.as_ref(),
-            "agent keystore: failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE",
-        )?,
+        Ok(path) => {
+            let mut bytes = crate::boot_input::read_boot_file_capped(
+                path.as_ref(),
+                AGENT_MEASUREMENT_FILE_MAX_BYTES,
+                "agent keystore: failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE",
+            )?;
+            while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                bytes.pop();
+            }
+            bytes
+        }
         Err(_) => AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT.to_vec(),
     };
     if measurement.is_empty() {
@@ -220,25 +235,24 @@ mod tests {
     /// Fixed nonce → byte-stable genesis golden blob (the only randomness in the seal).
     const GOLDEN_AGENT_NONCE: [u8; 24] = [0x5d; 24];
 
-    /// Serializes the env + process-global mutation across parallel tests AND resets the seal-root global
-    /// + the installed-keystore slot on acquire and drop (the producer's `SealedSignerTestGuard` reset is
-    /// producer-wired; this is the agent-side twin).
-    static BOOT_AGENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Acquire the CRATE-WIDE agent process-globals lock (`lock_and_reset_agent_process_globals`) so this
+    /// loader's tests serialize with — and reset the same INSTALLED_KEYSTORE / binding / challenge globals
+    /// as — every other Agent Gateway test (agent_dispatch / agent_boot / quote), rather than racing them
+    /// under a private lock. It does NOT cover the seal-root global or these env vars, so add those here.
     struct BootAgentTestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     impl BootAgentTestGuard {
         fn acquire() -> Self {
-            let g = BOOT_AGENT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            clear_boot_state();
+            let g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+            clear_seal_root_and_env();
             BootAgentTestGuard(g)
         }
     }
     impl Drop for BootAgentTestGuard {
         fn drop(&mut self) {
-            clear_boot_state();
+            clear_seal_root_and_env();
         }
     }
-    fn clear_boot_state() {
+    fn clear_seal_root_and_env() {
         for k in [
             TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
             LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE,
@@ -250,7 +264,6 @@ mod tests {
             std::env::remove_var(k);
         }
         crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
-        crate::agent_dispatch::reset_agent_keystore_for_tests();
     }
 
     /// A minimal valid v2 GENESIS keystore body: structural_version=1 (>=1, never 0),
@@ -396,6 +409,20 @@ mod tests {
         assert!(
             matches!(err, ProtocolError::PqSigningUnavailable(s) if s.contains("MAX_KEYSTORE_BLOB_SIZE")),
             "oversize label: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "lab-agent-keystore-from-file")]
+    #[test]
+    fn seam_neverending_file_capped_not_oom() {
+        // A never-ending special file (/dev/zero) must be CAPPED (read_boot_file_capped) and rejected by
+        // the size check — NOT read until OOM/hang. This test completing quickly is itself the assertion.
+        let _g = BootAgentTestGuard::acquire();
+        std::env::set_var(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, "/dev/zero");
+        let err = unseal_agent_keystore_at_boot().unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::PqSigningUnavailable(s) if s.contains("MAX_KEYSTORE_BLOB_SIZE")),
+            "/dev/zero must be capped + rejected as oversize, got {err:?}"
         );
     }
 
@@ -582,19 +609,27 @@ mod tests {
             include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
         let sidecar =
             include_str!("../testvectors/agent-gateway/agent_keystore_genesis_v2.json");
-        let mut sha = String::with_capacity(64);
-        for b in Sha256::digest(blob) {
-            sha.push_str(&format!("{b:02x}"));
-        }
-        assert!(
-            sidecar.contains(&sha),
-            "sidecar blob_sha256 drifted from the committed blob — re-mint the .json; expected {sha}"
-        );
-        assert!(
-            sidecar.contains(&format!("\"blob_len_bytes\": {}", blob.len())),
-            "sidecar blob_len_bytes drifted from the committed blob ({})",
-            blob.len()
-        );
+        let hex = |bytes: &[u8]| -> String {
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+        let must_contain = |needle: &str, what: &str| {
+            assert!(
+                sidecar.contains(needle),
+                "sidecar {what} drifted from the source of truth — re-mint the .json; expected {needle}"
+            );
+        };
+        // Couple BOTH the blob digest/len AND the descriptive seal_inputs (nonce / measurement / root hex)
+        // to the source-of-truth constants, so a future regen that forgets the .json re-mint can't leave a
+        // stale OR a misdescribing sidecar (the seal_inputs annotations were previously uncoupled).
+        must_contain(&hex(&Sha256::digest(blob)), "blob_sha256");
+        must_contain(&format!("\"blob_len_bytes\": {}", blob.len()), "blob_len_bytes");
+        must_contain(&hex(&GOLDEN_AGENT_NONCE), "nonce_hex");
+        must_contain(&hex(AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT), "enclave_measurement_hex");
+        must_contain(&hex(GOLDEN_AGENT_ROOT), "provisioning_root_hex");
     }
 
     /// REGEN (manual): `cargo test --features agent-gateway,lab-agent-keystore-from-file \
