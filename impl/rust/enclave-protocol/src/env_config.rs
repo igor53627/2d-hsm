@@ -233,11 +233,18 @@ mod boot_budget_tests {
     }
 
     #[test]
-    fn legacy_alias_resolves() {
+    fn legacy_aliases_resolve_for_all_three_vars() {
         let _g = BUDGET_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear();
+        // Exercise ALL THREE legacy aliases (not just max_attempts) so a typo/copy-paste error in any
+        // legacy const name is caught by CI.
         std::env::set_var(LEGACY_HSM_BOOT_MAX_ATTEMPTS, "7");
-        assert_eq!(boot_budget_config_from_env().unwrap().0, 7);
+        std::env::set_var(LEGACY_HSM_BOOT_PER_LEG_TIMEOUT_MS, "1234");
+        std::env::set_var(LEGACY_HSM_BOOT_OVERALL_BUDGET_MS, "99999");
+        let (attempts, per_leg, overall) = boot_budget_config_from_env().unwrap();
+        assert_eq!(attempts, 7);
+        assert_eq!(per_leg, Duration::from_millis(1234));
+        assert_eq!(overall, Duration::from_millis(99999));
         clear();
     }
 
