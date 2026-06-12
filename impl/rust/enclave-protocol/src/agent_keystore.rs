@@ -520,6 +520,44 @@ impl KeystoreBody {
         h.update(self.encode_marks_payload());
         h.finalize().into()
     }
+
+    /// 5b-2e `AdoptForward` seed: overwrite EXACTLY the four marks surfaces — `counters`,
+    /// `faucet.cumulative_native_spend`, `faucet.lifetime_spend`, `strict_recovery_counter` — from
+    /// the authenticated decoded marks, set `freshness_epoch = epoch`, and leave `structural_version`
+    /// UNCHANGED (AdoptForward fires only on a counter/spend-only gap; a structural bump would itself
+    /// look like a structural mutation on the next reconcile). Each row's `environment_identifier` is
+    /// reconstructed from `config` (the wire folds env out), then [`validate`] re-asserts the env-fold
+    /// + caps + field lengths. `config`/`entries`/`audit`/faucet-policy fields are UNTOUCHED.
+    ///
+    /// Writes rows **absolutely** — it does NOT route through [`advance_counter`], whose forward-only
+    /// `incoming <= highest` guard would reject an absolute re-write. Monotonicity (`adopted >= local`)
+    /// is NOT enforced here; that is the caller's defense-in-depth belt AFTER the hash-equality gate
+    /// (the gate against the anchor's signed digest is the security boundary, not this seeder).
+    #[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 3/8; the caller lands in commit 4
+    pub(crate) fn seed_marks_forward(
+        &mut self,
+        m: &crate::agent_cbor::DecodedMarks,
+        epoch: u64,
+    ) -> Result<(), KeystoreError> {
+        let env = self.config.environment_identifier.clone();
+        self.counters = m
+            .rows
+            .iter()
+            .map(|r| CounterEntry {
+                authority: r.authority,
+                environment_identifier: env.clone(), // env-fold inverse, from config (never host-chosen)
+                scope_class: r.scope_class,
+                scope_target: r.scope_target.clone(),
+                highest_accepted_counter: r.highest_accepted_counter,
+            })
+            .collect();
+        self.faucet.cumulative_native_spend = m.cumulative_native_spend;
+        self.faucet.lifetime_spend = m.lifetime_spend;
+        self.strict_recovery_counter = m.strict_recovery_counter;
+        self.freshness_epoch = epoch;
+        // structural_version DELIBERATELY UNCHANGED (counter/spend-only gap).
+        self.validate()
+    }
 }
 
 /// `environment_identifier` rules (TASK-7.1 §10.6): UTF-8, length `1..=64`, `[a-z0-9-]`, no
@@ -1299,6 +1337,70 @@ mod tests {
             assert_eq!(decoded.lifetime_spend, body.faucet.lifetime_spend);
             assert_eq!(decoded.strict_recovery_counter, body.strict_recovery_counter);
         }
+    }
+
+    #[test]
+    fn seed_marks_forward_round_trips_the_digest_and_preserves_structural_version() {
+        // THE property the AdoptForward hash gate (commit 4) relies on: a body SEEDED from the decode
+        // of a payload P has compute_local_marks_digest() == SHA3(MARKS_DOMAIN ‖ P) == the source
+        // body's digest. So re-hashing a candidate seeded from the host-relayed marks recovers the
+        // anchor's signed digest IFF the marks are genuine.
+        let mut source = marks_body();
+        source.counters = vec![ctr(1, 200, b"target-a", 5), ctr(2, 0, b"", 9_000_000_000)];
+        source.faucet.cumulative_native_spend = [0xaa; 32];
+        source.faucet.lifetime_spend = [0xbb; 32];
+        source.strict_recovery_counter = 42;
+        let payload = source.encode_marks_payload();
+        let decoded =
+            crate::agent_cbor::strict_decode_marks_payload(&payload, MAX_COUNTER_ENTRIES).unwrap();
+
+        // A fresh candidate: same config (so env-fold reconstructs identically) but cleared marks +
+        // a DIFFERENT epoch and a DISTINCT structural_version we expect to survive untouched.
+        let mut candidate = marks_body();
+        candidate.freshness_epoch = 1;
+        candidate.structural_version = 5;
+        candidate.seed_marks_forward(&decoded, 99).expect("seed validates");
+
+        assert_eq!(candidate.freshness_epoch, 99, "freshness_epoch bumped to the adopted epoch");
+        assert_eq!(candidate.structural_version, 5, "structural_version UNCHANGED (counter/spend gap)");
+        assert!(candidate.counters.iter().all(|c| c.environment_identifier == candidate.config.environment_identifier),
+            "every reconstructed row carries the config env (env-fold inverse)");
+        assert_eq!(
+            candidate.compute_local_marks_digest(),
+            source.compute_local_marks_digest(),
+            "seeded candidate digest == source digest (the gate recovers the signed digest)"
+        );
+        let mut h = Sha3_256::new();
+        h.update(MARKS_DOMAIN);
+        h.update(&payload);
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(candidate.compute_local_marks_digest(), expected);
+    }
+
+    #[test]
+    fn seed_marks_forward_writes_absolutely_and_re_seals() {
+        // Absolute write: seeding can LOWER a counter that advance_counter's forward-only guard would
+        // reject — the seeder writes the authenticated marks verbatim (monotonicity is the caller's
+        // belt, not the seeder's job).
+        let mut body = marks_body();
+        body.counters = vec![ctr(1, 0, b"x", 1_000)]; // local high-water 1000
+        let lower = {
+            let mut b = marks_body();
+            b.counters = vec![ctr(1, 0, b"x", 5)]; // an absolute re-write to 5 (< 1000)
+            let p = b.encode_marks_payload();
+            crate::agent_cbor::strict_decode_marks_payload(&p, MAX_COUNTER_ENTRIES).unwrap()
+        };
+        body.seed_marks_forward(&lower, 2).expect("absolute seed validates");
+        assert_eq!(body.counters[0].highest_accepted_counter, 5, "absolute write, not forward-only");
+
+        // The seeded body re-seals + unseals (re-installable on the re-run). seal_body validates +
+        // honors MAX_KEYSTORE_BLOB_SIZE; unseal recovers the exact body.
+        let root = [0x42u8; 32];
+        let meas = b"meas-xyz";
+        let blob = seal_body(&body, &root, meas).expect("seeded body seals");
+        assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE);
+        let unsealed = unseal_body(&blob, &root, meas).unwrap();
+        assert_eq!(unsealed, body);
     }
 
     #[test]
