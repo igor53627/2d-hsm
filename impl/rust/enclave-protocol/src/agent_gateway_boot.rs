@@ -388,17 +388,23 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
     run_agent_serve_loop()
 }
 
-/// A pump `Err` that is a PROTOCOL-LEVEL reject of PEER input — the deliberate CLOSE-SILENTLY cases an
-/// UNAUTHENTICATED peer can trip BEFORE any keystore auth (a non-0x40 misroute → `WireProtocol`; a bad
-/// version byte → `InvalidVersion`) — vs a genuine local/transport fault (IO write break, reset). The
-/// former are logged CALMLY (info) so they are not an attacker-controllable WARN-flood lever (the producer
-/// path folds wrong-type into an Ok error-reply and never warns); genuine faults stay at warn. Read-side
-/// EOF / idle-timeout / oversize already break to `Ok` inside the pump, so they never reach this arm.
+/// A pump `Err` that is a PROTOCOL-LEVEL reject of PEER input — every case an UNAUTHENTICATED peer can trip
+/// at the DECODE/ROUTE layer BEFORE any keystore auth — vs a genuine local/transport fault. The former are
+/// logged CALMLY (info) so a peer cannot turn malformed pre-auth frames into a WARN-flood lever (the producer
+/// path folds these into an Ok error-reply and never warns); genuine faults stay at warn. The peer-reject
+/// classes: a misrouted type (`WireProtocol`), a bad version byte (`InvalidVersion`), an unknown message-type
+/// byte (`UnknownMessageType`), and a sub-header / too-short frame — `decode_message` surfaces the last as
+/// `Io(UnexpectedEof)`; a MID-frame read EOF already breaks to `Ok` inside the pump (read taxonomy), so the
+/// ONLY `UnexpectedEof` reaching this arm is a peer's short frame (write faults are `BrokenPipe`/`ConnectionReset`,
+/// never `UnexpectedEof`). Read-side idle-timeout / oversize also break to `Ok` and never reach here.
 fn is_peer_protocol_reject(e: &ProtocolError) -> bool {
-    matches!(
-        e,
-        ProtocolError::WireProtocol(_) | ProtocolError::InvalidVersion { .. }
-    )
+    match e {
+        ProtocolError::WireProtocol(_)
+        | ProtocolError::InvalidVersion { .. }
+        | ProtocolError::UnknownMessageType(_) => true,
+        ProtocolError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => true,
+        _ => false,
+    }
 }
 
 /// THE agent serve port is 0x40-ONLY: decode the frame, REQUIRE `MessageType::AgentGateway`, route to the
@@ -1339,5 +1345,30 @@ mod tests {
             crate::MessageType::AgentGateway,
             "the serial loop keeps serving after a per-stream setup failure"
         );
+    }
+
+    /// Pin the calm-vs-warn boundary: EVERY decode/route reject a peer can trip pre-auth (misroute, bad
+    /// version, unknown type, too-short frame) is classified calm (no [warn] flood lever); genuine
+    /// transport/write faults and our own oversize stay warn.
+    #[test]
+    fn peer_protocol_rejects_are_calm_genuine_faults_are_not() {
+        use std::io::{Error as IoError, ErrorKind};
+        assert!(is_peer_protocol_reject(&ProtocolError::WireProtocol("non-0x40")));
+        assert!(is_peer_protocol_reject(&ProtocolError::InvalidVersion { got: 9, expected: 1 }));
+        assert!(is_peer_protocol_reject(&ProtocolError::UnknownMessageType(0x77)));
+        assert!(is_peer_protocol_reject(&ProtocolError::Io(IoError::new(
+            ErrorKind::UnexpectedEof,
+            "frame too short"
+        ))));
+        // Genuine transport/write faults and our own MessageTooLarge are NOT calm — they warrant [warn].
+        assert!(!is_peer_protocol_reject(&ProtocolError::Io(IoError::new(
+            ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+        assert!(!is_peer_protocol_reject(&ProtocolError::Io(IoError::new(
+            ErrorKind::BrokenPipe,
+            "epipe"
+        ))));
+        assert!(!is_peer_protocol_reject(&ProtocolError::MessageTooLarge(1)));
     }
 }

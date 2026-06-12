@@ -1214,9 +1214,16 @@ request golden vector is a 5b-2b test-vector item.
       `MAX_SESSION_LIFETIME` from `accepted_at`, independent of idle reset) + a max-frames-per-connection cap +
       an adversarial "a steady stream of successful frames cannot monopolize / starve a second client" test.
       The interim single-client (host-only) deployment is safe under the trust boundary above.
+    - **(low — FIXED) incomplete calm-close classification** (surfaced by `roborev compact` re-verify): the
+      original `is_peer_protocol_reject` caught only `WireProtocol`+`InvalidVersion`, so other peer-controlled
+      pre-auth decode rejects (`UnknownMessageType`, a sub-header `Io(UnexpectedEof)` short frame) still hit the
+      `[warn]` arm — the same flood-lever class as fix (3), left half-done. Extended to ALL peer decode/route
+      rejects (the only `UnexpectedEof` reaching the arm is a peer's short frame; mid-frame read EOF breaks to
+      `Ok`; write faults are `BrokenPipe`/`ConnectionReset`), pinned by the new
+      `peer_protocol_rejects_are_calm_genuine_faults_are_not` unit test.
     - **(low) live-timer obligation** → add the real 300s wall-clock idle-expiry round-trip as an EXPLICIT
       checklisted acceptance item for the 5b-2c-iii aya/SNP smoke (deviceless can't drive a true timer), not
-      just prose. compact consolidated the matrix; CI green.
+      just prose. compact consolidated the matrix (job 8558); the const contradiction VERIFIED-fixed; CI green.
 - **5b-2d — sealed-blob source + unseal sequencing — LANDED (lab file source).** NEW agent-gateway-gated
   `src/boot_agent_keystore.rs` (the agent twin of `boot_lab_pq_seal`), TWO public fns:
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
