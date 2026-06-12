@@ -103,7 +103,13 @@ pub fn unseal_agent_keystore_at_boot() -> Result<(crate::agent_keystore::Keystor
     // resolve_provisioning_root fails closed in a real build if no root was set; under cfg(test) /
     // reference-seal-v1-root it falls back to the committed reference root (a testing convenience the
     // negative ordering test pins via the production-stub path, not via a naive unset-root assertion).
-    let root = crate::seal_root::resolve_provisioning_root()?;
+    // Re-label its error so a missing-root failure stays `agent keystore:`-prefixed (operator-
+    // distinguishable from a producer-signer failure) instead of leaking the shared producer message.
+    let root = crate::seal_root::resolve_provisioning_root().map_err(|_| {
+        ProtocolError::PqSigningUnavailable(
+            "agent keystore: provisioning root not configured (run boot_configure_agent_seal_root at boot)",
+        )
+    })?;
     let body =
         crate::agent_keystore::unseal_body(&blob, &root, &measurement).map_err(map_keystore_error)?;
     Ok((body, measurement))
