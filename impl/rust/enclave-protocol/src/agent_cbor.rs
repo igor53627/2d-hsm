@@ -320,6 +320,15 @@ impl StrictParser<'_> {
         }
         self.take(N)?.try_into().map_err(|_| ())
     }
+
+    /// Read a canonical text string (major 3, UTF-8 enforced) of at most `max` bytes.
+    fn text(&mut self, max: usize) -> Result<String, ()> {
+        let len = self.typed_head(3)? as usize;
+        if len > max {
+            return Err(());
+        }
+        core::str::from_utf8(self.take(len)?).map(|s| s.to_owned()).map_err(|_| ())
+    }
 }
 
 /// Strict-decode a FROZEN-v1 marks payload (the inverse of `encode_marks_payload`). `max_rows` bounds
@@ -376,6 +385,71 @@ pub(crate) fn strict_decode_marks_payload(
         return Err(()); // trailing bytes
     }
     Ok(DecodedMarks { rows, cumulative_native_spend, lifetime_spend, strict_recovery_counter })
+}
+
+/// The strict-decoded OUTER fields of an `anchor_root`-signed marks response (5b-2e), keys
+/// `{1,2,3,4,5,6,13}` in canonical ascending order. The crypto/scope/nonce/epoch checks live in
+/// `agent_anchor::verify_marks_response_bytes`; this layer only binds the exact canonical wire bytes.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+#[derive(Debug, Clone)]
+pub(crate) struct MarksRespFields {
+    pub version: u64,
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub epoch: u64,
+    pub nonce: [u8; 32],
+    pub marks_payload: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+/// Strict-canonical decode of a marks-response envelope. DEDICATED (not `strict_decode_map`) because
+/// key 6 (`marks_payload`) legitimately exceeds the shared `MAX_STR_LEN`=4096 bstr cap — a non-trivial
+/// counter table is multi-KiB — so key 6 is bounded by `max_payload` (the caller's
+/// `MAX_MARKS_PAYLOAD_LEN`) while every other field keeps the strict head/canonicality discipline and
+/// the shared bounds. Keys read POSITIONALLY (`1,2,3,4,5,6,13`, strictly ascending == canonical), so
+/// dup/out-of-order keys cannot pass. The shared `strict_decode_map`'s 4096 bstr cap stays intact for
+/// every other agent wire map (the freshness response included).
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+pub(crate) fn strict_decode_marks_response(
+    bytes: &[u8],
+    max_payload: usize,
+) -> Result<MarksRespFields, ()> {
+    let mut p = StrictParser { buf: bytes, pos: 0 };
+    if p.typed_head(5)? != 7 {
+        return Err(()); // map(7): keys {1..=6, 13}
+    }
+    if p.uint()? != 1 {
+        return Err(());
+    }
+    let version = p.uint()?;
+    if p.uint()? != 2 {
+        return Err(());
+    }
+    let chain_id = p.uint()?;
+    if p.uint()? != 3 {
+        return Err(());
+    }
+    let environment_identifier = p.text(MAX_STR_LEN as usize)?;
+    if p.uint()? != 4 {
+        return Err(());
+    }
+    let epoch = p.uint()?;
+    if p.uint()? != 5 {
+        return Err(());
+    }
+    let nonce = p.bstr_exact::<32>()?;
+    if p.uint()? != 6 {
+        return Err(());
+    }
+    let marks_payload = p.bstr(max_payload)?;
+    if p.uint()? != 13 {
+        return Err(());
+    }
+    let signature = p.bstr_exact::<64>()?;
+    if p.pos != bytes.len() {
+        return Err(()); // trailing bytes
+    }
+    Ok(MarksRespFields { version, chain_id, environment_identifier, epoch, nonce, marks_payload, signature })
 }
 
 #[cfg(test)]
