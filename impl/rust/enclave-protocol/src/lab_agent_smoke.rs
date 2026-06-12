@@ -137,6 +137,45 @@ pub(crate) fn smoke_sealed_blob() -> Vec<u8> {
     .expect("smoke body seals")
 }
 
+/// Build a stub-conformant 0x41 request frame for the SMOKE scope and `nonce`: correct cleartext
+/// `report_data` binding + a minimal synthetic quote whose EMBEDDED report_data (offset 0x50)
+/// matches it. Shared by the deviceless stub-conformance tests AND the aya `#[ignore]`
+/// relay+anchor vsock-loopback composition test in `host_anchor_relay` (the TASK-21 seed).
+pub(crate) fn smoke_request_frame(nonce: [u8; 32]) -> Vec<u8> {
+    let body = smoke_body();
+    smoke_request_frame_for_scope(
+        body.config.twod_chain_id,
+        &body.config.environment_identifier,
+        nonce,
+        None,
+    )
+}
+
+/// [`smoke_request_frame`] for an ARBITRARY `(chain, env)` scope; `quote_override` lets a test
+/// supply a quote whose embedded report_data deliberately mismatches the (always-correct)
+/// cleartext binding at key 5.
+pub(crate) fn smoke_request_frame_for_scope(
+    chain_id: u64,
+    env: &str,
+    nonce: [u8; 32],
+    quote_override: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let report_data = crate::agent_anchor::anchor_handshake_report_data(chain_id, env, &nonce);
+    let quote = quote_override.unwrap_or_else(|| {
+        let mut q = vec![0u8; 0x50];
+        q.extend_from_slice(&report_data);
+        q
+    });
+    let req = crate::agent_boot_driver::AnchorBootRequest {
+        chain_id,
+        environment_identifier: env,
+        nonce,
+        report_data,
+    };
+    crate::agent_boot_relay::encode_anchor_boot_request(&quote, &[], &req)
+        .expect("smoke request encodes")
+}
+
 // ---------------------------------------------------------------------------------------------
 // Lab anchor stub — the TCP endpoint `twod-hsm-host-anchor-relay` dials during the smoke's boot
 // handshake. Serial accept, one pump per connection, never dies (mirrors the relay's loop
@@ -751,41 +790,6 @@ mod tests {
 
     // ---- lab anchor stub conformance (deviceless; the drift-unrepresentable pins) ----
 
-    fn test_request_frame(body: &KeystoreBody, nonce: [u8; 32]) -> Vec<u8> {
-        test_request_frame_for_scope(
-            body.config.twod_chain_id,
-            &body.config.environment_identifier,
-            nonce,
-            None,
-        )
-    }
-
-    /// Build a valid 0x41 request frame for `(chain, env, nonce)`. `quote_override` lets a test
-    /// supply a quote whose EMBEDDED report_data deliberately mismatches the (always-correct)
-    /// cleartext binding at key 5.
-    fn test_request_frame_for_scope(
-        chain_id: u64,
-        env: &str,
-        nonce: [u8; 32],
-        quote_override: Option<Vec<u8>>,
-    ) -> Vec<u8> {
-        let report_data =
-            crate::agent_anchor::anchor_handshake_report_data(chain_id, env, &nonce);
-        let quote = quote_override.unwrap_or_else(|| {
-            let mut q = vec![0u8; 0x50];
-            q.extend_from_slice(&report_data);
-            q
-        });
-        let req = crate::agent_boot_driver::AnchorBootRequest {
-            chain_id,
-            environment_identifier: env,
-            nonce,
-            report_data,
-        };
-        crate::agent_boot_relay::encode_anchor_boot_request(&quote, &[], &req)
-            .expect("test request encodes")
-    }
-
     /// Drive ONE real stub pump over an in-memory stream pair: write `request_frame` into the
     /// peer end, run [`lab_anchor_pump_one`], return (pump result, every byte the stub wrote back).
     fn drive_stub_pump(
@@ -817,7 +821,7 @@ mod tests {
         // reconcile == Fresh. Makes "the anchor stub can't reach Ready" unrepresentable pre-aya.
         let body = smoke_body();
         let nonce = [0xab_u8; 32];
-        let (outcome, written_back) = drive_stub_pump(&body, &test_request_frame(&body, nonce));
+        let (outcome, written_back) = drive_stub_pump(&body, &smoke_request_frame(nonce));
         outcome.expect("stub pump succeeds on a conformant request");
         let raw = crate::agent_boot_relay::read_bounded_anchor_response(
             &mut std::io::Cursor::new(written_back),
@@ -848,7 +852,7 @@ mod tests {
         let (n1, n2) = ([0x01_u8; 32], [0x02_u8; 32]);
         let mut raws = Vec::new();
         for nonce in [n1, n2] {
-            let (outcome, written) = drive_stub_pump(&body, &test_request_frame(&body, nonce));
+            let (outcome, written) = drive_stub_pump(&body, &smoke_request_frame(nonce));
             outcome.expect("pump ok");
             let raw = crate::agent_boot_relay::read_bounded_anchor_response(
                 &mut std::io::Cursor::new(written),
@@ -889,7 +893,7 @@ mod tests {
         // A request whose cleartext binding is self-consistent but for a DIFFERENT scope than the
         // provisioned keystore: decode passes, the stub's scope guard must fault-close.
         let body = smoke_body();
-        let frame = test_request_frame_for_scope(9999, "some-other-env", [0xcd_u8; 32], None);
+        let frame = smoke_request_frame_for_scope(9999, "some-other-env", [0xcd_u8; 32], None);
         let (outcome, written_back) = drive_stub_pump(&body, &frame);
         assert!(matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("scope")));
         assert!(written_back.is_empty());
@@ -900,7 +904,7 @@ mod tests {
         // Key 5 carries the CORRECT binding but the quote's embedded report_data (offset 0x50)
         // does not match it — the match-only quote policy must fault-close, zero bytes back.
         let body = smoke_body();
-        let frame = test_request_frame_for_scope(
+        let frame = smoke_request_frame_for_scope(
             body.config.twod_chain_id,
             &body.config.environment_identifier,
             [0xef_u8; 32],

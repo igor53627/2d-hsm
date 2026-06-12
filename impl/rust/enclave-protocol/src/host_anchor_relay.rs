@@ -948,4 +948,79 @@ mod tests {
         assert!(cb <= PUMP_BUDGET, "connect budget never exceeds the pump budget");
         assert_eq!(cb, PUMP_BUDGET / CONNECT_BUDGET_DIVISOR);
     }
+
+    /// aya-only `#[ignore]` (needs the `vsock_loopback` module): the FULL guest→relay→anchor
+    /// composition over a REAL AF_VSOCK leg — discharges the doc-pinned "real-vsock-loopback
+    /// (bind-CID `CID_ANY` reality)" item that lands with the 5b-2c bring-up, AND seeds TASK-21's
+    /// relay⊇anchor differential test with a MODELABLE anchor: the anchor side is the REAL 5b-2c-iii
+    /// lab stub pump (`lab_agent_smoke::lab_anchor_pump_one`) on TCP loopback, exactly what the live
+    /// smoke runs. Guest leg = the production `VsockBootRelayChannel` dialing loopback CID 1; relay
+    /// leg = a REAL `CID_ANY` vsock bind + the SHIPPED `relay_one_pump` with the SHIPPED
+    /// `TcpAnchorDial`. The returned bytes must pass the REAL guest verify path and reconcile Fresh.
+    /// Run: `cargo test --features agent-gateway,vsock-transport \
+    ///       relay_real_vsock_loopback_with_lab_anchor -- --ignored` (on aya).
+    /// Triage: a FAILURE binding/accepting can mean `vsock_loopback` is not loaded (`modprobe
+    /// vsock_loopback`) or a stray listener on port 5997 (`ss --vsock`).
+    #[test]
+    #[ignore]
+    fn relay_real_vsock_loopback_with_lab_anchor() {
+        use crate::agent_boot_relay::BootRelayChannel as _;
+        /// vsock loopback CID (`VMADDR_CID_LOCAL`; requires the `vsock_loopback` module).
+        const LOOPBACK_CID: u32 = 1;
+        const RELAY_TEST_PORT: u32 = 5997; // 5999/5998 are taken by the agent_boot_relay aya tests
+        let deadline = || std::time::Instant::now() + Duration::from_secs(5);
+
+        // 1. The REAL lab anchor stub pump on TCP loopback (one connection, test thread).
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub TCP listener");
+        let stub_addr = tcp.local_addr().expect("stub addr");
+        let body = crate::lab_agent_smoke::smoke_body();
+        let stub_body = body.clone();
+        let stub = std::thread::spawn(move || {
+            let (mut conn, _) = tcp.accept().expect("stub accept");
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            conn.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let key = ed25519_dalek::SigningKey::from_bytes(
+                &crate::lab_agent_smoke::LAB_ANCHOR_TEST_SEED,
+            );
+            crate::lab_agent_smoke::lab_anchor_pump_one(&mut conn, &stub_body, &key, deadline())
+                .expect("the real stub pump signs the relayed request");
+        });
+
+        // 2. The relay leg: REAL CID_ANY bind (what production run_host_anchor_relay does) + the
+        //    SHIPPED pump + SHIPPED TCP dialer pointed at the stub.
+        let listener = vsock_listen::bind_vsock_listener(DEFAULT_VSOCK_CID, RELAY_TEST_PORT)
+            .expect("relay binds CID_ANY on the loopback test port");
+        let relay = std::thread::spawn(move || {
+            let (mut enclave, _addr) = listener.accept().expect("relay accept");
+            configure_relay_session_timeouts(&mut enclave, PUMP_BUDGET)
+                .expect("arm enclave-leg timeouts");
+            let dial = TcpAnchorDial { addrs: vec![stub_addr] };
+            // RelayFault is LOG-ONLY (deliberately no Debug derive) — surface the triage label.
+            if let Err(fault) = relay_one_pump(&mut enclave, &dial) {
+                panic!("relay pump failed: {}", fault.triage_label());
+            }
+        });
+
+        // 3. The guest leg: the PRODUCTION channel, a stub-conformant smoke request.
+        let nonce = [0x6b_u8; 32];
+        let frame = crate::lab_agent_smoke::smoke_request_frame(nonce);
+        let mut ch = crate::agent_boot_relay::VsockBootRelayChannel::new(LOOPBACK_CID, RELAY_TEST_PORT);
+        let raw = ch.round_trip(&frame, deadline()).expect("guest round trip over real vsock");
+
+        // 4. The stub's bytes pass the REAL guest verify path and reconcile Fresh.
+        let state = crate::agent_anchor::verify_anchor_response_bytes(&raw, &nonce, &body.config)
+            .expect("stub response verifies against the smoke fixture's anchor_root");
+        assert_eq!(
+            crate::agent_anchor::reconcile(
+                body.freshness_epoch,
+                body.structural_version,
+                &body.compute_local_marks_digest(),
+                &state,
+            ),
+            crate::agent_anchor::ReconcileDecision::Fresh,
+            "the composed guest→relay→anchor path must land reconcile == Fresh"
+        );
+        relay.join().expect("relay thread");
+        stub.join().expect("stub thread");
+    }
 }
