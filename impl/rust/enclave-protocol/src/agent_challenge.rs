@@ -122,10 +122,13 @@ pub(crate) fn issue_challenge(
     Ok(challenge)
 }
 
-/// Retire the outstanding challenge (the single-use primitive): `take()` the slot under the lock and
-/// return what it took (`None` if there was none). The boot caller routes **every** verify outcome
-/// through this, then on success asserts the returned `Challenge.nonce()` equals the nonce it verified
-/// against. After this, a replayed `(nonce, response)` finds an empty (or rotated) slot.
+/// Retire the outstanding challenge (the single-use RETIRE primitive): `take()` the slot under the lock
+/// and return what it took (`None` if there was none). After this, a replayed `(nonce, response)` finds
+/// an empty (or rotated) slot. This is the LOWER-LEVEL retire, used by two callers: (1)
+/// [`verify_outstanding_response`] — the safe consume-then-verify path the boot reconcile routes through,
+/// which consumes via this and hands the verified nonce back; and (2) the driver's transport-error path,
+/// which retires an un-answered challenge before re-issuing a fresh one. The nonce-handoff contract lives
+/// on [`verify_outstanding_response`], not here.
 pub(crate) fn consume_outstanding_challenge() -> Option<Challenge> {
     OUTSTANDING_CHALLENGE
         .lock()
