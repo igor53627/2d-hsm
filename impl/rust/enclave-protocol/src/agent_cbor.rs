@@ -479,6 +479,91 @@ pub(crate) fn strict_decode_marks_response(
     Ok(MarksRespFields { version, chain_id, environment_identifier, epoch, nonce, marks_payload, signature })
 }
 
+/// Decoded fields of an anti-rollback per-op **commit ACK** (TASK-7.7 slice 6). The crypto/scope/
+/// nonce/epoch/structural/marks/request_id checks live in `agent_anchor::verify_commit_ack_bytes`; this
+/// layer only binds the exact canonical wire bytes. Unlike the marks RESPONSE (whose key 6 is a multi-KiB
+/// payload), the commit ack records only the post-op marks **digest** (32 B), so every field is
+/// fixed-size or bounded-small and the whole map keeps the strict head/canonicality discipline.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
+#[derive(Debug, Clone)]
+pub(crate) struct CommitAckFields {
+    pub version: u64,
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub epoch: u64,
+    pub structural_version: u64,
+    pub marks_digest: [u8; 32],
+    pub nonce: [u8; 32],
+    pub request_id: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+/// Strict-canonical decode of a commit-ack envelope: `map(9)` with keys `{1,2,3,4,5,6,7,8,13}` read
+/// POSITIONALLY in strictly-ascending (== canonical) order, so dup/out-of-order keys cannot pass. Every
+/// integer is shortest-form, `env`/`request_id` are length-capped, and the fixed-width digest/nonce/sig
+/// use the exact-length readers; trailing bytes are rejected. `max_request_id` is the caller's
+/// `agent_dispatch::MAX_REQUEST_ID_LEN` (single source). Returns `Err(())` on ANY deviation.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
+pub(crate) fn strict_decode_commit_ack(
+    bytes: &[u8],
+    max_request_id: usize,
+) -> Result<CommitAckFields, ()> {
+    let mut p = StrictParser { buf: bytes, pos: 0 };
+    if p.typed_head(5)? != 9 {
+        return Err(()); // map(9): keys {1..=8, 13}
+    }
+    if p.uint()? != 1 {
+        return Err(());
+    }
+    let version = p.uint()?;
+    if p.uint()? != 2 {
+        return Err(());
+    }
+    let chain_id = p.uint()?;
+    if p.uint()? != 3 {
+        return Err(());
+    }
+    let environment_identifier = p.text(MAX_STR_LEN as usize)?;
+    if p.uint()? != 4 {
+        return Err(());
+    }
+    let epoch = p.uint()?;
+    if p.uint()? != 5 {
+        return Err(());
+    }
+    let structural_version = p.uint()?;
+    if p.uint()? != 6 {
+        return Err(());
+    }
+    let marks_digest = p.bstr_exact::<32>()?;
+    if p.uint()? != 7 {
+        return Err(());
+    }
+    let nonce = p.bstr_exact::<32>()?;
+    if p.uint()? != 8 {
+        return Err(());
+    }
+    let request_id = p.bstr(max_request_id)?;
+    if p.uint()? != 13 {
+        return Err(());
+    }
+    let signature = p.bstr_exact::<64>()?;
+    if p.pos != bytes.len() {
+        return Err(()); // trailing bytes
+    }
+    Ok(CommitAckFields {
+        version,
+        chain_id,
+        environment_identifier,
+        epoch,
+        structural_version,
+        marks_digest,
+        nonce,
+        request_id,
+        signature,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

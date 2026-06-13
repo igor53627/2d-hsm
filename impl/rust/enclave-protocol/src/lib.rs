@@ -412,6 +412,14 @@ pub enum MessageType {
     /// on the `0x41` leg) and the anchor returns the signed raw marks. Like `0x41` it is NEVER
     /// serve-dispatched — a hostile inbound `0x44` fails closed in `decode_wire_command`.
     AgentAnchorMarksRelay = 0x44,
+    /// Agent Gateway anti-rollback **per-op commit-relay** request frame (TASK-7.7 slice 6). Reserved
+    /// outer band `0x40..0x4F` (`0x42`/`0x43`/`0x44` inner `AgentError` codes are a DISJOINT namespace
+    /// from this outer-frame byte). The THIRD enclave-initiated leg and the first MUTATING one: on a
+    /// rollback-sensitive op the enclave writes this (scope + the proposed new `epoch`/`structural_version`
+    /// + the post-op `marks_digest` + a fresh per-op nonce + the op's `request_id` — NO SNP quote) and the
+    /// anchor durably records the commit and returns a signed ACK. Like `0x41`/`0x44` it is NEVER
+    /// serve-dispatched — a hostile inbound `0x45` fails closed in `decode_wire_command`.
+    AgentAnchorCommitRelay = 0x45,
 }
 
 /// Простой диспетчер команд (скелет).
@@ -514,6 +522,7 @@ pub fn decode_message(data: &[u8]) -> Result<FramedMessage, ProtocolError> {
         0x40 => MessageType::AgentGateway,
         0x41 => MessageType::AgentBootRelay,
         0x44 => MessageType::AgentAnchorMarksRelay,
+        0x45 => MessageType::AgentAnchorCommitRelay,
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
 
@@ -1575,6 +1584,11 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
         MessageType::AgentAnchorMarksRelay => Err(ProtocolError::WireProtocol(
             "AGENT_ANCHOR_MARKS_RELAY is enclave-initiated; not serve-dispatchable",
         )),
+        // AGENT_ANCHOR_COMMIT_RELAY (0x45) is likewise ENCLAVE-INITIATED (the per-op seal-before-emit
+        // commit); a hostile inbound 0x45 to the serve dispatcher fails closed here (TASK-7.7 slice 6).
+        MessageType::AgentAnchorCommitRelay => Err(ProtocolError::WireProtocol(
+            "AGENT_ANCHOR_COMMIT_RELAY is enclave-initiated; not serve-dispatchable",
+        )),
     }
 }
 
@@ -1614,6 +1628,7 @@ pub fn peek_msg_type_from_frame(frame: &[u8]) -> Option<MessageType> {
         Some(0x40) => Some(MessageType::AgentGateway),
         Some(0x41) => Some(MessageType::AgentBootRelay),
         Some(0x44) => Some(MessageType::AgentAnchorMarksRelay),
+        Some(0x45) => Some(MessageType::AgentAnchorCommitRelay),
         _ => None,
     }
 }
@@ -3915,6 +3930,8 @@ mod agent_gateway_framing_tests {
         assert_eq!(peek_msg_type_from_frame(&mk(0x41)), Some(MessageType::AgentBootRelay));
         // 0x44 = AGENT_ANCHOR_MARKS_RELAY (TASK-7.7 5b-2e, enclave-initiated AdoptForward marks fetch).
         assert_eq!(peek_msg_type_from_frame(&mk(0x44)), Some(MessageType::AgentAnchorMarksRelay));
+        // 0x45 = AGENT_ANCHOR_COMMIT_RELAY (TASK-7.7 slice 6, enclave-initiated per-op commit).
+        assert_eq!(peek_msg_type_from_frame(&mk(0x45)), Some(MessageType::AgentAnchorCommitRelay));
         // Unknown bytes still fail closed (None) — must NOT fall back to a producer type (the old bug).
         // 0x42/0x43 are inner AgentError CODES, NOT outer MessageType bytes → still None.
         assert_eq!(peek_msg_type_from_frame(&mk(0x42)), None);
@@ -3936,6 +3953,22 @@ mod agent_gateway_framing_tests {
                 Err(ProtocolError::WireProtocol(m)) if m.contains("enclave-initiated")
             ),
             "a hostile inbound 0x44 must fail closed in the serve dispatcher"
+        );
+    }
+
+    // slice 6: the 0x45 commit-relay frame round-trips at the framing layer but is NEVER serve-dispatched
+    // (enclave-initiated, MUTATING). A hostile inbound 0x45 to the serve dispatcher fails closed.
+    #[test]
+    fn agent_anchor_commit_relay_decodes_but_is_not_serve_dispatchable() {
+        let frame = encode_message(MessageType::AgentAnchorCommitRelay, &[0xA0]).unwrap();
+        let decoded = decode_message(&frame).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::AgentAnchorCommitRelay);
+        assert!(
+            matches!(
+                decode_wire_command(decoded.msg_type, &decoded.payload),
+                Err(ProtocolError::WireProtocol(m)) if m.contains("enclave-initiated")
+            ),
+            "a hostile inbound 0x45 must fail closed in the serve dispatcher"
         );
     }
 
