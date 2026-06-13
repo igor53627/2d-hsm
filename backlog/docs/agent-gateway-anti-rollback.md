@@ -612,7 +612,8 @@ allocating** (no OOM from a hostile relay). Two seams, **both deadline-aware**: 
 per call for stale-reply isolation). `RelayAnchorTransport<Q, C>` gives **each leg its own `timeout`
 deadline** (a fresh `Instant::now() + timeout` computed just before each) — so a hung quote can't stall
 boot AND quote latency can't starve the channel's budget (no false channel timeout). Per-attempt
-wall-clock is ≤ 2×timeout; the driver's per-attempt COUNT bound caps total boot. It is the concrete
+wall-clock is ≤ 2×timeout for a freshness attempt, ≤ 3×timeout for an adopting one (5b-2e: the
+`marks_round_trip` is a third per-leg-bounded leg); the driver's per-attempt COUNT bound caps total boot. It is the concrete
 `AnchorBootTransport` composing fetch-quote → encode-request → channel-relay → return raw bytes; every
 failure folds to the
 coarse always-retryable `AnchorTransportError`. **No nonce-precheck** (a precheck-to-retryable would
@@ -828,7 +829,7 @@ request golden vector is a 5b-2b test-vector item.
           fail-closed/resolve logic is CI-tested in the default/agent-gateway build (no vsock dep).
         - **Budget — single source, NO new operator knob.** `PUMP_BUDGET` (10 s) is a **HEAD-OF-LINE
           bound** (prevents a wedged pump blocking the serial loop), NOT the boot bound — the enclave owns
-          `max_attempts·(2·timeout+ε)`; the daemon carries NO ε, NO producer, NO budget arithmetic. The
+          `max_attempts·(3·timeout+ε)` (quote + freshness + marks legs, 5b-2e); the daemon carries NO ε, NO producer, NO budget arithmetic. The
           connect timeout + `SO_RCVTIMEO`/`SO_SNDTIMEO` are DERIVED from `PUMP_BUDGET` (a floored fraction),
           never separate knobs. HONEST coordination caveat: "same source" means matching consts sized to
           the same boot-handshake envelope, NOT a shared runtime value (different process — the daemon does
@@ -1054,7 +1055,8 @@ request golden vector is a 5b-2b test-vector item.
      phases=7) — **this gate (d) is FULLY CLOSED** (debug-smoke spawn shape closed; the release
      agent-bin spawn shape stays a 5b-2c residual); live serve waits on 5b-2c + the (b) host-relay daemon.
   2. **Boot-budget validation** — the structural fail-closed config check of the boot-budget invariant
-     (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`, or the generalized form if distinct timeouts ship),
+     (`max_attempts · (3·timeout + ε) ≤ overall_boot_budget` — quote + freshness + marks legs, 5b-2e; or the
+     generalized leg-sum form if distinct timeouts ship),
      ordered BEFORE any live-serve wrapper — full spec in the "Per-leg sizing floor" section below. Listed
      HERE too so this summary cannot be read as "(d) is the only gate" (a prior wording said "the ONE hard
      precondition", contradicting the budget MUST below — both gates are required). **The enforceable
@@ -1091,8 +1093,8 @@ request golden vector is a 5b-2b test-vector item.
   - NEW gate-free `env_config::boot_budget_config_from_env() -> (u32, Duration, Duration)` in
     `validate()` PARAM ORDER (positional, no config struct). Three env knobs `TWOD_HSM_BOOT_MAX_ATTEMPTS`
     / `_PER_LEG_TIMEOUT_MS` / `_OVERALL_BUDGET_MS` (+ legacy); overall is DERIVE-BY-DEFAULT
-    (`max_attempts·(2·per_leg + 1000ms margin) + 2000ms`, saturating, ≫ the real ε so it always clears
-    `validate()`'s nominal≤overall) but an operator may widen it. Parse+default ONLY — `validate()` is the
+    (`max_attempts·(3·per_leg + 1000ms margin) + 2000ms` — 3 legs since 5b-2e, saturating, ≫ the real ε so
+    it always clears `validate()`'s nominal≤overall) but an operator may widen it. Parse+default ONLY — `validate()` is the
     sole band judge. CI-tested on darwin (gate-free, 6 unit tests incl. a non-UTF-8 fail-closed case). A
     gated TRIPWIRE test (`boot_derive_margin_covers_quote_attempt_overhead`) pins the 1000ms margin ≥ the
     real ε so a future ε growth can't silently push the DEFAULT-config boot below `validate()`'s floor.
@@ -1469,7 +1471,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   → **MAX_PER_LEG_TIMEOUT sanity ceiling** (keeps every blessed value panic-free for the transport's
   `Instant::now() + timeout` mints — std's Add panics on overflow; xhigh finding) → CHECKED overflow
   (defense-in-depth, unreachable while the ceiling holds; checked NOT saturating) → ε-bearing
-  exceeds; the `2·` exists only as a call-site fact — the formula is the generalized leg-sum). The
+  exceeds; the `3·` (quote + freshness + marks) exists only as a call-site fact — the formula is the generalized leg-sum). The
   producer's constructors take it as an ORDERING WITNESS (`new(&budget, spawn)` /
   `production(&budget)`): validation-before-claim is a compile fact — SCOPE HONESTY: the witness
   proves SOME budget validated, not that THE SAME instance feeds the wiring; the timeout binding is
@@ -1629,6 +1631,14 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   There is no "wire it live but best-effort" window — (4a) DELETED the cooperative path (nothing
   best-effort remains to wire); a live serving 5b-2c MUST wait for (d) — (4b) wiring + the (4c) smoke
   (the wedged-read hang is otherwise reachable).
+- **⚠️ 5b-2e UPDATE — the budget is now THREE legs.** Everything in this bullet below describes the
+  historical 5b-2b TWO-leg model (quote + freshness). 5b-2e's `AdoptForward` path runs a THIRD per-leg-
+  bounded round-trip (`marks_round_trip`) within an attempt, and a continuously-advancing anchor can make
+  every one of `max_attempts` attempts take it, so the **enforced invariant and the derived default are
+  now `max_attempts · (3·timeout + ε)`** (quote + freshness + marks; the marks leg adds one channel
+  deadline, NOT a second ε). `per_attempt_nominal_cost` sums all three legs and the env-config derive uses
+  `3·per_leg`. Read every `2·timeout`/`2·per_leg` below as `3·` for the CURRENT enforced ceiling — the
+  generalized leg-sum shape is unchanged; only the leg COUNT grew.
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
   is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout` + the subprocess overhead ε
   ([`QUOTE_ATTEMPT_OVERHEAD`], as of (d)); total boot ≤ `max_attempts · (2·timeout + ε)`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
@@ -1645,7 +1655,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   to the deadline; see above.) **Per-leg sizing floor (5b-2c):** the
   per-leg `timeout` is shared SEQUENTIALLY by connect + I/O, so 5b-2c MUST pick a value with headroom for
   both (NB per the kernel-timer note below, a connect can only consume "nearly the whole leg" when the per-leg `timeout` is ≲ the ~2s kernel connect timer — for longer legs a wedged connect is kernel-capped at ~2s and the I/O budget keeps the rest), AND MUST
-  satisfy the boot-budget invariant **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`** (ε = the
+  satisfy the boot-budget invariant **`max_attempts · (3·timeout + ε) ≤ overall_boot_budget`** (3 legs
+  since 5b-2e — quote + freshness + marks; ε = the
   quote-subprocess overhead const `QUOTE_ATTEMPT_OVERHEAD`, see the ε term below) so the bounded
   retry loop can't blow the operator's total boot deadline. **The checked-arithmetic validation
   artifact EXISTS ((d-ii)/3): `quote_subprocess::ValidatedBootBudget`** — the invariant is validated
@@ -1675,7 +1686,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   worst-case connect-only cost is `max_attempts · min(timeout, ~2s)` (the no-listener/reset case is prompt,
   milliseconds). Budget-consumption was never a *new* exposure from (a') (the old watchdog also blocked the
   caller up to the budget; (a') removed the *leak*, not the time cost), and the
-  enforced CEILING is the ε-bearing form `max_attempts · (2·timeout + ε) ≤ overall_boot_budget` — the
+  enforced CEILING is the ε-bearing form `max_attempts · (3·timeout + ε) ≤ overall_boot_budget` (5b-2e: 3 legs) — the
   TIMEOUT portion is conservative (the kernel connect timer can only make real attempts cheaper, never
   costlier; the I/O leg, which has no kernel cap, can still consume its full per-leg share), but ε is
   ADDITIVE overhead the kernel timer cannot absorb (it lands between the legs), which is exactly why the
@@ -1735,7 +1746,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   runtime guarantee — the runtime hard bounds remain the per-leg deadlines themselves, and operators
   MUST size `overall_boot_budget` with slack above the nominal product (a budget set exactly equal to
   it is mis-sized by definition). The enforced check is therefore
-  **`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`**
+  **`max_attempts · (3·timeout + ε) ≤ overall_boot_budget`** (3 legs since 5b-2e — quote + freshness + marks)
   (nominal worst case `max_attempts·ε ≈ ≤0.8s` at the 64-ceiling) — an explicit term, not silent slack. **Generalized form (the
   `2·` assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if
   5b-2c exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
