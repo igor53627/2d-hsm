@@ -456,8 +456,10 @@ pub(crate) struct AnchorCommit<'a> {
 /// the op's `nonce` + `request_id` — that `Ok(())` is the seal-before-emit GO signal. ANY failure
 /// ([`CommitFailure`]) ⇒ the caller fails the op CLOSED (no seal, no emit). Pure over the channel seam:
 /// the request and the expected-ack are built from the ONE [`AnchorCommit`], so a drift is unrepresentable.
+// `C: ?Sized` so the 6-4 dispatch wiring can pass a `&mut dyn BootRelayChannel` from the process-global
+// commit-channel slot (`Box<dyn BootRelayChannel>`), not only a concrete type.
 #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
-pub(crate) fn run_anchor_commit<C: BootRelayChannel>(
+pub(crate) fn run_anchor_commit<C: BootRelayChannel + ?Sized>(
     channel: &mut C,
     commit: &AnchorCommit,
     config: &crate::agent_keystore::KeystoreConfig,

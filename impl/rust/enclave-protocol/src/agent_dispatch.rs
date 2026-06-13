@@ -207,11 +207,15 @@ pub enum AgentResponse {
     /// correlation is implicit at the synchronous 0x40 frame layer.)
     ProveIdentity(IdentityProof),
     /// GENERATE_KEYS result: the generated public key material PLUS the mutated `candidate` keystore
-    /// (counter advanced + new entries). The frame layer seals the candidate, returns the sealed blob
-    /// for the host to persist, and swaps it into the live slot (clone→seal→persist→swap, §7.2).
+    /// (counter advanced + new entries + the atomic epoch/structural bump). The frame layer COMMITS the
+    /// candidate's post-op state to the anchor (TASK-7.7 slice 6-4, seal-before-emit) THEN seals it,
+    /// returns the sealed blob for the host to persist, and swaps it into the live slot
+    /// (clone→commit→seal→persist→swap, §7.2). `request_id` is the op's envelope (key-4) request_id,
+    /// carried here so the frame-layer commit can key the anchor record by it (idempotency).
     GenerateKeys {
         keys: Vec<GeneratedKey>,
         candidate: Box<KeystoreBody>,
+        request_id: Vec<u8>,
     },
 }
 
@@ -555,18 +559,24 @@ fn handle_generate_keys(
             crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
             _ => AgentError::SealFailed,
         })?;
-    // Anti-rollback structural bump (TASK-7.7 key 5): GENERATE_KEYS is a structural mutation the anchor
-    // cannot reconstruct, so bump structural_version per COMMITTED op (once, regardless of `count`).
-    // `checked_add` → SealFailed (0x46) on overflow, never wrap (a wrapped counter would let a restore
-    // masquerade as an adoptable gap). This is a LOCAL-ONLY bump and currently INERT: advancing
-    // `freshness_epoch` + the anchor ack atomically with it (seal-before-emit) and the boot `reconcile`
-    // that reads `structural_version` are the deferred co-slice — nothing reads it at boot yet. It rides
-    // the candidate, so it ships only under `agent-keygen-exec-preview` like the rest of this handler.
-    candidate.structural_version = candidate
-        .structural_version
-        .checked_add(1)
-        .ok_or(AgentError::SealFailed)?;
-    Ok(AgentResponse::GenerateKeys { keys, candidate: Box::new(candidate) })
+    // Anti-rollback ATOMIC bump (TASK-7.7 slice 6-2/6-4 key 5): GENERATE_KEYS is a STRUCTURAL op
+    // (`commit_bump_class`), so advance `freshness_epoch` + `structural_version` TOGETHER as one checked
+    // unit (overflow on either ⇒ SealFailed, never wrap — a wrapped counter would let a restore
+    // masquerade as an adoptable gap). The advanced epoch is the post-op state the frame-layer anchor
+    // commit RECORDS and the seal BINDS (seal-before-emit). The epoch advance was LOCAL-ONLY/INERT until
+    // 6-4 — it is now LIVE alongside the commit (still only under `agent-keygen-exec-preview`).
+    // This handler is GENERATE_KEYS-specific; derive its bump class from the single-source classifier
+    // (Structural — key mint is anchor-unreconstructable) rather than a hardcoded bool.
+    let bumps_structural =
+        matches!(AgentOpcode::GenerateKeys.commit_bump_class(), CommitBumpClass::Structural);
+    candidate
+        .advance_commit_epoch(bumps_structural)
+        .map_err(|_| AgentError::SealFailed)?;
+    Ok(AgentResponse::GenerateKeys {
+        keys,
+        candidate: Box::new(candidate),
+        request_id: env.request_id.clone(),
+    })
 }
 
 /// Map a keygen failure to the anti-oracle §10.9 band.
@@ -631,6 +641,88 @@ pub fn reset_agent_keystore_for_tests() {
     if let Ok(mut guard) = INSTALLED_KEYSTORE.lock() {
         *guard = None;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// TASK-7.7 slice 6-4: the per-op anchor-commit channel + the seal-before-emit commit helper. The commit
+// CODE compiles always but only RUNS under `agent-keygen-exec-preview` (the only path that produces a
+// GENERATE_KEYS candidate; without the feature GENERATE_KEYS → NotConfigured, so the commit is never
+// reached). The boot-time real-channel install is the 6-4b follow-up (`install_commit_channel`).
+// ---------------------------------------------------------------------------------------------------
+
+/// Per-op anchor-commit round-trip budget — the serve-time commit's wall-clock bound. A fixed const for
+/// now (a budget-threaded/configurable value is a deferred follow-up); the commit fails closed on lapse
+/// regardless, so this is a liveness bound, not a correctness param.
+const COMMIT_ROUND_TRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Process-global slot holding the boot-installed channel to the host anchor relay, used by the
+/// seal-before-emit per-op commit. Installed once at boot AFTER the keystore (so a commit can never run
+/// before a verified boot). `Send` so it can live in the static; accessed ONLY under the
+/// `INSTALLED_KEYSTORE` lock (which the serial serve loop holds), so the round-trip is serialized and
+/// the two-lock order is always KEYSTORE→COMMIT_CHANNEL (never reversed → no deadlock).
+static INSTALLED_COMMIT_CHANNEL: Mutex<
+    Option<Box<dyn crate::agent_boot_relay::BootRelayChannel + Send>>,
+> = Mutex::new(None);
+
+/// Install the boot channel to the host anchor relay for per-op commits (agent-profile boot, slice 6-4b).
+/// Install-once: returns `false` if a channel is already installed (boot race / caller mistake).
+#[cfg_attr(not(test), allow(dead_code))] // staged 6-4a; the boot caller lands in 6-4b
+#[must_use]
+pub(crate) fn install_commit_channel(
+    channel: Box<dyn crate::agent_boot_relay::BootRelayChannel + Send>,
+) -> bool {
+    match INSTALLED_COMMIT_CHANNEL.lock() {
+        Ok(mut guard) if guard.is_none() => {
+            *guard = Some(channel);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_commit_channel_for_tests() {
+    if let Ok(mut guard) = INSTALLED_COMMIT_CHANNEL.lock() {
+        *guard = None;
+    }
+}
+
+/// Draw a fresh 32-byte CSPRNG nonce for ONE per-op commit. Anti-replay: a captured ACK cannot replay
+/// for a LATER op, which draws a DIFFERENT nonce. `getrandom` failure ⇒ fail closed.
+fn draw_commit_nonce() -> Result<[u8; 32], AgentError> {
+    let mut nonce = [0u8; 32];
+    getrandom::getrandom(&mut nonce).map_err(|_| AgentError::SealFailed)?;
+    Ok(nonce)
+}
+
+/// TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT: COMMIT the candidate's post-op state to the anchor BEFORE the
+/// frame layer seals it. Draws a fresh per-op nonce, builds the [`crate::agent_boot_relay::AnchorCommit`]
+/// from the candidate's advanced `(freshness_epoch, structural_version)` + post-op marks digest + the
+/// op's `request_id`, and runs the round-trip + ack-verify. `Ok(())` is the GO signal (the anchor durably
+/// recorded EXACTLY the proposed state); ANY failure — no channel installed, transport, ack mismatch,
+/// getrandom — ⇒ `Err(SealFailed)`, and the caller MUST NOT seal / swap / emit (no offline window). The
+/// coarse fail-closed `SealFailed` keeps the anti-oracle surface minimal. Called under the
+/// `INSTALLED_KEYSTORE` lock, so the commit-channel round-trip is serialized.
+fn commit_candidate_to_anchor(candidate: &KeystoreBody, request_id: &[u8]) -> Result<(), AgentError> {
+    let nonce = draw_commit_nonce()?;
+    let commit = crate::agent_boot_relay::AnchorCommit {
+        new_epoch: candidate.freshness_epoch,
+        new_structural_version: candidate.structural_version,
+        marks_digest: candidate.compute_local_marks_digest(),
+        nonce,
+        request_id,
+    };
+    let mut guard = INSTALLED_COMMIT_CHANNEL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let channel = guard.as_mut().ok_or(AgentError::SealFailed)?; // no channel installed ⇒ fail closed
+    crate::agent_boot_relay::run_anchor_commit(
+        &mut **channel,
+        &commit,
+        &candidate.config,
+        std::time::Instant::now() + COMMIT_ROUND_TRIP_BUDGET,
+    )
+    .map_err(|_| AgentError::SealFailed)
 }
 
 /// The boot-resolved anti-rollback binding (TASK-7.7 AC#5). Opaque presence marker — the funding gate
@@ -724,6 +816,7 @@ pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'s
     // and no test inherits a keystore a prior frame test left installed.
     reset_agent_keystore_for_tests();
     reset_anti_rollback_binding_for_tests();
+    reset_commit_channel_for_tests(); // slice 6-4: frame-path tests install a mock commit channel
     crate::agent_challenge::reset_outstanding_challenge_for_tests();
     // The quote-producer process-ledger claim ((d-ii)/2) — triple-gated like its module (the enclosing
     // module is already agent-gateway-gated; the inner cfg completes the gate so non-linux / non-vsock
@@ -777,8 +870,18 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
         None => return encode_agent_error(AgentError::WrongProfile),
     };
     match outcome {
-        Ok(AgentResponse::GenerateKeys { keys, candidate }) => {
-            // Seal the candidate (counter advanced + new entries) so the host can persist it.
+        Ok(AgentResponse::GenerateKeys { keys, candidate, request_id }) => {
+            // TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT: COMMIT the candidate's advanced post-op state to the
+            // anchor (its DURABLE record) BEFORE sealing/swapping/emitting. ANY commit failure (no channel,
+            // transport, ack mismatch) ⇒ fail closed: live state UNTOUCHED, NO sealed blob, NO swap, NO
+            // signature/refs emitted (no offline window). Runs under the INSTALLED_KEYSTORE `guard` (serial)
+            // — the two-lock order is KEYSTORE→COMMIT_CHANNEL. A crash AFTER the ack but BEFORE the swap
+            // leaves the anchor ahead → next-boot reconcile StructuralGap→restore (the structural-op case),
+            // recoverable, never a silent loss. [Reached only under agent-keygen-exec-preview.]
+            if let Err(e) = commit_candidate_to_anchor(&candidate, &request_id) {
+                return encode_agent_error(e);
+            }
+            // Seal the candidate (counter advanced + new entries + advanced epoch) so the host can persist it.
             let sealed = match crate::seal_root::resolve_provisioning_root() {
                 Ok(root) => match seal_body(&candidate, &root, &measurement) {
                     Ok(blob) => blob,
@@ -972,6 +1075,61 @@ mod tests {
         crate::agent_dispatch::lock_and_reset_agent_process_globals()
     }
 
+    /// The lab anchor signing key the seal-before-emit tests use — a body whose `config.anchor_root` is
+    /// this key's verifying key accepts an ACK this key signs.
+    fn anchor_test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32])
+    }
+
+    /// A scripted process-global commit channel for the 6-4 seal-before-emit tests: decode the 0x45
+    /// request and answer per the action — a conformant anchor (signs the proposed state with
+    /// `anchor_test_key`), a transport failure, or a forged signer (wrong key → ack fails verify).
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    enum CommitChannelAct {
+        Ok,
+        Transport,
+        WrongKey,
+    }
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    struct TestCommitChannel(CommitChannelAct);
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    impl crate::agent_boot_relay::BootRelayChannel for TestCommitChannel {
+        fn round_trip(
+            &mut self,
+            frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            let d = crate::agent_boot_relay::decode_anchor_commit_request(frame)
+                .expect("a frame-layer commit must encode a decodable 0x45 request");
+            let key = match self.0 {
+                CommitChannelAct::Transport => {
+                    return Err(crate::agent_boot_driver::AnchorTransportError(
+                        "test commit transport down",
+                    ))
+                }
+                CommitChannelAct::Ok => anchor_test_key(),
+                CommitChannelAct::WrongKey => ed25519_dalek::SigningKey::from_bytes(&[0x09; 32]),
+            };
+            Ok(crate::agent_anchor::test_signed_commit_ack_bytes(
+                &key,
+                d.chain_id,
+                &d.environment_identifier,
+                d.new_epoch,
+                d.new_structural_version,
+                d.marks_digest,
+                d.nonce,
+                d.request_id,
+            ))
+        }
+        fn marks_round_trip(
+            &mut self,
+            _frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            unreachable!("commit tests never call marks_round_trip")
+        }
+    }
+
     #[test]
     fn producer_profile_rejects_all_agent_opcodes() {
         let (body, key_ref) = body_with_key();
@@ -1162,7 +1320,7 @@ mod tests {
             ],
         );
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
-            AgentResponse::GenerateKeys { keys, candidate } => {
+            AgentResponse::GenerateKeys { keys, candidate, .. } => {
                 assert_eq!(keys.len(), 3, "3 transfer keys generated");
                 assert!(keys.iter().all(|k| k.key_purpose == KeyPurpose::AgentTransferK1));
                 assert_eq!(candidate.entries.len(), 3, "candidate has the new entries");
@@ -1180,7 +1338,7 @@ mod tests {
 
     #[cfg(feature = "agent-keygen-exec-preview")]
     #[test]
-    fn generate_keys_bumps_structural_version_per_op_local_only() {
+    fn generate_keys_atomically_advances_epoch_and_structural_per_op() {
         use ed25519_dalek::SigningKey;
         let _g = gate_configured();
         let admin = SigningKey::from_bytes(&[7u8; 32]);
@@ -1199,10 +1357,12 @@ mod tests {
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
             AgentResponse::GenerateKeys { candidate, .. } => {
                 // +1 per COMMITTED op, regardless of count (NOT +3).
-                assert_eq!(candidate.structural_version, 2);
-                // LOCAL-ONLY: freshness_epoch + strict_recovery_counter untouched (epoch advance + anchor
-                // ack are the deferred seal-before-emit co-slice).
-                assert_eq!(candidate.freshness_epoch, body.freshness_epoch);
+                assert_eq!(candidate.structural_version, 2, "structural +1 per committed op");
+                // 6-4: GENERATE_KEYS is Structural, so the ATOMIC bump advances freshness_epoch TOGETHER
+                // with structural_version (was LOCAL-ONLY/INERT before 6-4). The anchor commit records this
+                // advanced epoch and the seal binds it (the frame-layer seal-before-emit path).
+                assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "epoch advances atomically");
+                // strict_recovery_counter is a marks surface, NOT bumped by a structural op.
                 assert_eq!(candidate.strict_recovery_counter, body.strict_recovery_counter);
             }
             _ => panic!("expected GenerateKeys"),
@@ -1313,7 +1473,7 @@ mod tests {
             ],
         );
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
-            AgentResponse::GenerateKeys { keys, candidate } => {
+            AgentResponse::GenerateKeys { keys, candidate, .. } => {
                 assert_eq!(keys.len(), 1);
                 assert_eq!(keys[0].key_purpose, KeyPurpose::AgentFaucetTreasuryK1);
                 assert_eq!(candidate.entries.len(), 1);
@@ -1534,6 +1694,9 @@ mod tests {
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // 6-4: GENERATE_KEYS through the frame now COMMITS to the anchor before sealing, so the body's
+        // anchor_root must be the key the test commit channel signs with (PUBLIC_IDENTITY ignores it).
+        body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
         // One transfer key so PUBLIC_IDENTITY has something to return.
         let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 };
         let key_ref =
@@ -1563,6 +1726,9 @@ mod tests {
         // (key 1) AND the new sealed keystore blob (key 2) for the host to persist.
         #[cfg(feature = "agent-keygen-exec-preview")]
         {
+        // 6-4 seal-before-emit: install a conformant commit channel so the per-op anchor commit succeeds
+        // and the frame proceeds to seal + swap.
+        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::Ok))));
         let (cap, pay) =
             generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
         let gen_env = envelope(
@@ -1618,6 +1784,64 @@ mod tests {
         );
         } // end #[cfg(agent-keygen-exec-preview)] GENERATE_KEYS frame section
 
+        reset_agent_keystore_for_tests();
+    }
+
+    /// 6-4 SEAL-BEFORE-EMIT fail-closed: a per-op commit failure (no channel / transport / forged ACK)
+    /// MUST fail the op closed (0x46) with NO seal and NO swap — the live slot is untouched, so the SAME
+    /// cap is still accepted once a conformant channel is installed (the failed ops never advanced the
+    /// counter). This is the load-bearing anti-rollback property: a signature/refs are emitted ONLY after
+    /// the anchor durably recorded the advance.
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_commit_failure_fails_closed_no_swap() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+        assert!(install_agent_keystore(body, b"meas"));
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
+        let gen_env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        // (a) NO commit channel installed → fail closed 0x46 (no offline window).
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
+            Some(0x46),
+            "no commit channel ⇒ SealFailed"
+        );
+        // (b) a TRANSPORT failure on the commit → fail closed 0x46.
+        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::Transport))));
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
+            Some(0x46),
+            "commit transport failure ⇒ SealFailed"
+        );
+        reset_commit_channel_for_tests();
+        // (c) a FORGED ACK (wrong signer) → fail closed 0x46 (the durable record didn't verify).
+        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::WrongKey))));
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
+            Some(0x46),
+            "forged commit ack ⇒ SealFailed"
+        );
+        reset_commit_channel_for_tests();
+        // (d) PROOF OF NO SWAP across all three failures: the live counter never advanced, so the SAME cap
+        //     (counter 1) is STILL accepted once a conformant channel is installed. If any failed op had
+        //     swapped, the live counter would be 1 and this cap (contiguity expects 2) would be 0x43.
+        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::Ok))));
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
+            None,
+            "the failed commits did NOT swap — the same cap now succeeds"
+        );
         reset_agent_keystore_for_tests();
     }
 
