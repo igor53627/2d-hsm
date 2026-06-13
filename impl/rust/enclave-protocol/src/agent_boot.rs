@@ -256,8 +256,16 @@ pub(crate) fn execute_adopt_forward(
     //    freshness_epoch = state.epoch; validate(). The original `body` is untouched.
     let mut candidate = body.clone();
     candidate.seed_marks_forward(&decoded, state.epoch).map_err(|_| AdoptForwardFail::Seed)?;
-    // 4. THE GATE — recompute via the production digest path, byte-compare. Fail-closed, no install.
-    if candidate.compute_local_marks_digest() != state.marks_digest {
+    // 4. THE GATE — recompute via the production digest path, CONSTANT-TIME byte-compare. Fail-closed,
+    //    no install. Constant-time is defense-in-depth, NOT the load-bearing guard: the chosen-input
+    //    timing attack a plain `!=` would expose is already foreclosed upstream — step 1's Ed25519
+    //    `verify_strict` means a host cannot vary `candidate` without a valid anchor signature, so it
+    //    cannot adaptively probe prefix-matches against `state.marks_digest`. We still compare in
+    //    constant time because it is the house standard for every fund-custody digest comparison and
+    //    removes the premise entirely (subtle's `ct_eq` over both 32-byte digests; no early exit).
+    use subtle::ConstantTimeEq;
+    let local_digest = candidate.compute_local_marks_digest();
+    if !bool::from(local_digest.as_slice().ct_eq(state.marks_digest.as_slice())) {
         return Err(AdoptForwardFail::HashMismatch);
     }
     // 5. Defense-in-depth BELT — never the gate (the gate is the SHA3 equality above). Can never reject

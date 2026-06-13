@@ -85,6 +85,15 @@ const MAX_MAP_ENTRIES: u64 = 64;
 const MAX_ARRAY_ENTRIES: u64 = 64;
 const MAX_STR_LEN: u64 = 4096; // per-field caps are <= 64 B; 4 KiB is generous headroom
 
+/// The marks-payload `scope_target` byte-length ceiling — SINGLE-SOURCED here so the encode↔decode
+/// inverse is an enforced invariant, not an emergent one: [`strict_decode_marks_payload`] rejects any
+/// row whose `scope_target` exceeds it, and `KeystoreBody::validate` rejects any counter row that does,
+/// so a body that `validate()` accepts ALWAYS round-trips through `encode_marks_payload` →
+/// `strict_decode_marks_payload` (the AdoptForward digest path). Equal to [`MAX_STR_LEN`] (the shared
+/// bstr cap the decoder already applies); naming it makes the cross-module coupling explicit and
+/// drift-proof.
+pub(crate) const MARKS_SCOPE_TARGET_MAX_LEN: usize = MAX_STR_LEN as usize;
+
 /// Hand-rolled **strict canonical CBOR** reader (RFC 8949 §4.2.1) for untrusted host wire maps. It
 /// produces a [`Value`] only after the *entire* item passes, so the caller's signature/structural
 /// checks bind the exact wire bytes. Returns `Err(())` (the caller maps it to its own `Malformed`)
@@ -375,7 +384,7 @@ pub(crate) fn strict_decode_marks_payload(
         // scope_class is encoded as a CBOR uint (e.g. 200 -> 0x18 0xC8), NOT a raw byte; range-check
         // it fits u8 — a blind cast would silently corrupt scope semantics.
         let scope_class = u8::try_from(p.uint()?).map_err(|_| ())?;
-        let scope_target = p.bstr(MAX_STR_LEN as usize)?;
+        let scope_target = p.bstr(MARKS_SCOPE_TARGET_MAX_LEN)?;
         let highest_accepted_counter = p.uint()?;
         let key = (authority, scope_class, scope_target.clone());
         if let Some(prev) = &prev_key {

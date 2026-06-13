@@ -13,6 +13,9 @@ serde = { version = "1.0", features = ["derive"] }
 sha3 = "0.12.0"
 thiserror = "1.0"
 ed25519-dalek = "2"
+# Constant-time equality for the fund-custody digest gate (`execute_adopt_forward`). Already in the
+# build graph (transitively via ed25519-dalek); declared directly because we now use it by name.
+subtle = "2"
 pqcrypto-mldsa = { version = "0.1.2", optional = true }
 pqcrypto-traits = { version = "0.3.5", optional = true }
 zeroize = { version = "1.8", features = ["serde"], optional = true }

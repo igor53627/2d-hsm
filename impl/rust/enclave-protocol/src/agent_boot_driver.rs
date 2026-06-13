@@ -36,6 +36,15 @@
 //! - **Structurally bounded.** The loop is `for _ in 1..=max_attempts` — no `loop {}`, no
 //!   host-controlled break ⇒ an infinite boot loop (e.g. a continuously-advancing or hostile anchor) is
 //!   impossible. `max_attempts == 0` ⇒ `Unstartable` (never loops, never serves).
+//! - **AdoptForward needs ≥ 2 attempts (BY DESIGN, fail-closed).** A successful adopt consumes ONE
+//!   attempt to seed `*body` forward; the NEXT iteration reconciles the seeded body as `Fresh` and
+//!   reaches `Ready`. So `max_attempts == 1` supports only a PLAIN-`Fresh` boot — when an `AdoptForward`
+//!   is required it fail-closes with `RetriesExhausted("adopted forward; re-run budget exhausted before
+//!   Fresh")` even though the adopt itself succeeded (the body is seeded, but no install — only the
+//!   `Fresh` reconcile installs the binding). This is deliberate, not a bug: it keeps the `1..=N` bound
+//!   clean (no special last-attempt re-entry) and stays fail-closed. The default config is 5; an
+//!   operator who sets `max_attempts == 1` opts out of the rare restore-then-adopt path. Pinned by
+//!   `adopt_forward_with_one_attempt_cannot_reach_ready` + `repeated_successful_adopts_exhaust_*`.
 //! - **Fail-closed default.** Every non-`Ready` path returns `FailClosed(..)`; the caller must abort.
 //!
 //! ## Retry classification — anti-grind (load-bearing, fragile)
@@ -641,6 +650,66 @@ mod tests {
         assert_eq!(t.marks_attempts, 1, "one marks fetch on the adopt");
         assert_eq!(body.freshness_epoch, 6, "the installed body was seeded forward");
         assert!(is_anti_rollback_configured(), "the re-run Fresh arm installed the binding");
+    }
+
+    #[test]
+    fn adopt_forward_with_one_attempt_cannot_reach_ready() {
+        // gemini review: `max_attempts == 1` supports only a plain-`Fresh` boot. An `AdoptForward`-
+        // required boot fail-closes even though the adopt SUCCEEDS: attempt 1 seeds the body forward,
+        // but there is no second attempt to reconcile the seeded body as `Fresh` → RetriesExhausted.
+        // This is the documented, deliberate fail-closed property (NOT attempts==1 the count, the SEMANTIC
+        // floor for adopt). The honest exhaustion reason names the adopt — NOT "no attempt completed".
+        let _g = test_lock();
+        let mut body = test_body(5, 2);
+        let payload = body.encode_marks_payload();
+        let digest = body.compute_local_marks_digest();
+        let mut t = TestTransport::new(vec![
+            MockAction::Sign { epoch: 6, sv: 2, marks: digest }, // AdoptForward (epoch 6 > local 5)
+        ])
+        .with_marks(vec![MarksAct::Sign(payload)]);
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 1) {
+            BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(reason)) => {
+                assert_eq!(reason, "adopted forward; re-run budget exhausted before Fresh");
+            }
+            other => panic!("expected RetriesExhausted after a single-attempt adopt, got {other:?}"),
+        }
+        assert_eq!(t.attempts, 1, "exactly one attempt — the adopt consumed it");
+        assert_eq!(t.marks_attempts, 1, "the adopt did fetch + accept the marks");
+        assert_eq!(body.freshness_epoch, 6, "the body WAS seeded forward by the (successful) adopt");
+        assert!(!is_anti_rollback_configured(), "no install: only a Fresh reconcile installs the binding");
+    }
+
+    #[test]
+    fn repeated_successful_adopts_exhaust_with_honest_reason() {
+        // coderabbit review: the loop can hit the bound with ZERO transport failures when every attempt
+        // SUCCESSFULLY adopts and the anchor advances again before a re-run reaches Fresh. The exhaustion
+        // reason must NOT misreport this as "no attempt completed" — it carries the honest adopt string.
+        // (Distinct from `advancing_anchor_terminates_bounded`, which exhausts via marks-leg FLAPS.)
+        let _g = test_lock();
+        let mut body = test_body(5, 2);
+        // seed_marks_forward advances epoch + the marks surfaces, but the marks DIGEST is over the
+        // counter/spend surfaces (not the epoch), so it is unchanged across a pure epoch advance — the
+        // same payload/digest hashes on every iteration.
+        let payload = body.encode_marks_payload();
+        let digest = body.compute_local_marks_digest();
+        let mut t = TestTransport::new(vec![
+            MockAction::Sign { epoch: 6, sv: 2, marks: digest }, // attempt 1: AdoptForward (6 > 5)
+            MockAction::Sign { epoch: 7, sv: 2, marks: digest }, // attempt 2: AdoptForward again (7 > 6 seeded)
+        ])
+        .with_marks(vec![MarksAct::Sign(payload.clone()), MarksAct::Sign(payload)]);
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 2) {
+            BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(reason)) => {
+                assert_eq!(
+                    reason, "adopted forward; re-run budget exhausted before Fresh",
+                    "repeated-adopt exhaustion reports the adopt, not the default 'no attempt completed'"
+                );
+            }
+            other => panic!("expected RetriesExhausted on repeated adopts, got {other:?}"),
+        }
+        assert_eq!(t.attempts, 2, "two attempts, both adopted — bounded, not infinite");
+        assert_eq!(t.marks_attempts, 2, "each attempt fetched + accepted marks (NO transport flap)");
+        assert_eq!(body.freshness_epoch, 7, "seeded forward on each successful adopt");
+        assert!(!is_anti_rollback_configured());
     }
 
     #[test]

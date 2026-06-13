@@ -237,7 +237,14 @@ fn classify_close(fault: &RelayFault) -> &'static str {
                 "oversized-anchor-response"
             }
             ProtocolError::WireProtocol(m) if m.contains("deadline") => "pump-timeout",
-            ProtocolError::WireProtocol(m) if m.contains("boot request") => "malformed-request",
+            // BOTH enclave request grammars the pump decodes (0x41 "boot request" and the 5b-2e 0x44
+            // "marks request") bucket as malformed-request — else a bad 0x44 frame falls through to the
+            // generic relay-error bucket and weakens operator triage.
+            ProtocolError::WireProtocol(m)
+                if m.contains("boot request") || m.contains("marks request") =>
+            {
+                "malformed-request"
+            }
             _ => "relay-error",
         },
     }
@@ -696,6 +703,48 @@ mod tests {
         assert_eq!(dial.dials.get(), 1);
     }
 
+    // 1b. marks_pump_forwards_under_the_marks_cap — Regression (5b-2e): the 0x44 marks leg forwards the
+    //     request VERBATIM and reads back under the LARGER MAX_MARKS_RESPONSE_LEN cap. The response body
+    //     here is > MAX_ANCHOR_RESPONSE_LEN (4096) — exactly what test 5 REJECTS on the 0x41 freshness
+    //     path — so it forwarding end to end proves the pump branches the cap by message type, not a
+    //     single shared 4096.
+    #[test]
+    fn marks_pump_forwards_under_the_marks_cap() {
+        let req = crate::agent_boot_relay::encode_anchor_marks_request(
+            &crate::agent_boot_relay::AnchorMarksRequest {
+                chain_id: 11565,
+                environment_identifier: "testnet",
+                nonce: [0; 32],
+                epoch: 7,
+            },
+        )
+        .unwrap();
+        let (relay_side, mut peer) = enclave_pair_with(&req);
+        // A marks body LARGER than the 4096 freshness cap but within MAX_MARKS_RESPONSE_LEN. Frame it by
+        // hand (4-byte BE len + body), as test 5 does — no cap helper, so the test owns the exact bytes.
+        let big = vec![0x5e_u8; MAX_ANCHOR_RESPONSE_LEN + 904]; // 5000 bytes
+        assert!(
+            big.len() > MAX_ANCHOR_RESPONSE_LEN && big.len() < MAX_MARKS_RESPONSE_LEN,
+            "the body must straddle the two caps to prove the 0x44 branch"
+        );
+        let mut framed = Vec::with_capacity(4 + big.len());
+        framed.extend_from_slice(&(big.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&big);
+        let dial = FakeAnchorDial::new(vec![DialAct::Ok(framed)]);
+        drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
+        // The 0x44 request reached the anchor byte-identically.
+        assert_eq!(*dial.last_forwarded.borrow(), req, "0x44 request forwarded verbatim");
+        // The enclave reads back the FULL > 4096 body verbatim — the marks cap was applied on both legs.
+        let mut len_buf = [0u8; 4];
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+        peer.read_exact(&mut len_buf).unwrap();
+        let n = u32::from_be_bytes(len_buf) as usize;
+        let mut got = vec![0u8; n];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(got, big, "the full marks response (> freshness cap) is written back verbatim");
+        assert_eq!(dial.dials.get(), 1);
+    }
+
     // 2. malformed_enclave_request_rejects_before_dial — Regression: decode-before-round-trip
     //    defense-in-depth; dial NEVER invoked; ZERO bytes written back.
     #[test]
@@ -894,6 +943,14 @@ mod tests {
         // A genuine malformed boot request → malformed-request (the cores prefix "boot request:").
         assert_eq!(
             classify_close(&RelayFault::Pump(ProtocolError::WireProtocol("boot request: bad CBOR"))),
+            "malformed-request"
+        );
+        // 5b-2e: a malformed 0x44 marks request ALSO buckets as malformed-request (cores prefix
+        // "marks request:") — not the generic relay-error bucket.
+        assert_eq!(
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "marks request: bad CBOR"
+            ))),
             "malformed-request"
         );
         // Anything else → relay-error.

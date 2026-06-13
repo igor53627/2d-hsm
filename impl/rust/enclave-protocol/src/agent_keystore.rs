@@ -103,6 +103,11 @@ pub enum KeystoreError {
     InvalidFieldLength,
     /// Two key entries share the same `key_ref` (the opaque handle must be unique).
     DuplicateKeyRef,
+    /// Two counter rows share the same `(authority, scope_class, scope_target)` tuple. The marks
+    /// grammar is one row per tuple (the strict decoder rejects duplicates); a duplicate here would make
+    /// the monotonicity belt and counter updates order-dependent and would not round-trip through
+    /// `strict_decode_marks_payload` on the AdoptForward path.
+    DuplicateCounterTuple,
     /// The sealed blob would exceed the vsock `MAX_MESSAGE_SIZE` budget (entries/counters/audit too
     /// large to transmit to the host — Nitro has no persistent enclave storage).
     BlobTooLarge,
@@ -670,6 +675,16 @@ impl KeystoreBody {
                 return Err(KeystoreError::DuplicateKeyRef);
             }
         }
+        // The marks-payload grammar (the AdoptForward digest path) is one row per
+        // `(authority, scope_class, scope_target)` tuple with `scope_target` bounded by the strict
+        // decoder's cap. Enforce BOTH here so the encode↔decode inverse is a validated invariant: any
+        // body `validate()` accepts round-trips through `encode_marks_payload` →
+        // `strict_decode_marks_payload`. `advance_counter` already dedups (find-or-insert), so a
+        // duplicate or over-cap row only arises from a corrupt/forged sealed blob (AEAD-authenticated,
+        // so unreachable in practice) or a future caller that skips the dedup — this gate makes both
+        // fail closed at the seal/unseal boundary rather than producing a non-adoptable sealed state.
+        let mut seen_tuples =
+            std::collections::HashSet::<(&[u8; 32], u8, &[u8])>::with_capacity(self.counters.len());
         for c in &self.counters {
             // One sealed keystore is one environment: every counter row must carry the keystore's
             // own environment_identifier (format-valid AND equal to config), not just a well-formed
@@ -677,6 +692,12 @@ impl KeystoreBody {
             validate_environment_identifier(&c.environment_identifier)?;
             if c.environment_identifier != self.config.environment_identifier {
                 return Err(KeystoreError::InvalidEnvironmentId);
+            }
+            if c.scope_target.len() > crate::agent_cbor::MARKS_SCOPE_TARGET_MAX_LEN {
+                return Err(KeystoreError::InvalidFieldLength);
+            }
+            if !seen_tuples.insert((&c.authority, c.scope_class, c.scope_target.as_slice())) {
+                return Err(KeystoreError::DuplicateCounterTuple);
             }
         }
         // Audit ring: capacity bounded, and the materialized record vector cannot exceed it.
@@ -1132,6 +1153,39 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_counter_tuple_rejected() {
+        // 5b-2e marks-grammar invariant: one row per (authority, scope_class, scope_target). A duplicate
+        // would make the monotonicity belt + counter updates order-dependent and would not round-trip
+        // through `strict_decode_marks_payload` on the AdoptForward path. Enforced at the seal/unseal
+        // boundary so a forged/corrupt blob (or a future caller that skips advance_counter's dedup) fails
+        // closed. (advance_counter already dedups, so this is unreachable in normal operation.)
+        let mut body = sample_body();
+        let base = body.counters[0].clone();
+        body.counters.push(base); // identical tuple — a second row with the same (auth, class, target)
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::DuplicateCounterTuple));
+    }
+
+    #[test]
+    fn over_cap_scope_target_rejected() {
+        // The marks decoder caps scope_target at MARKS_SCOPE_TARGET_MAX_LEN; validate() enforces the same
+        // cap so the encode↔decode inverse holds (a body validate() accepts always round-trips through
+        // encode_marks_payload → strict_decode_marks_payload). One byte over the cap fails closed.
+        let cap = crate::agent_cbor::MARKS_SCOPE_TARGET_MAX_LEN;
+        let mut body = sample_body();
+        body.counters[0].scope_target = vec![0x01u8; cap + 1];
+        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+        // The cap itself is accepted (inclusive), and the round-trip holds at the boundary.
+        body.counters[0].scope_target = vec![0x01u8; cap];
+        assert!(body.validate().is_ok(), "a scope_target exactly at the cap is valid");
+        let decoded = crate::agent_cbor::strict_decode_marks_payload(
+            &body.encode_marks_payload(),
+            MAX_COUNTER_ENTRIES,
+        )
+        .expect("a validate()-accepted body round-trips through the strict marks decoder");
+        assert_eq!(decoded.rows.len(), body.counters.len(), "every counter row survives the round-trip");
+    }
+
+    #[test]
     fn oversized_blob_rejected() {
         // MAX_TOTAL_KEY_ENTRIES entries (each with a unique key_ref) is within the count cap but
         // serializes past MAX_MESSAGE_SIZE, so seal_body must reject it as BlobTooLarge.
@@ -1169,19 +1223,44 @@ mod tests {
             HEADER_LEN + v.len() + TAG_LEN
         };
         let target = MAX_KEYSTORE_BLOB_SIZE + 1; // smallest over-limit sealed size
+        let cap = crate::agent_cbor::MARKS_SCOPE_TARGET_MAX_LEN; // validate() caps each scope_target here
         let mut body = sample_body();
-        // scope_target bytes <= 0x17 encode as 1 CBOR byte each, and at ~1 MiB the CBOR array
-        // header size is constant, so sealed size is linear in the padding length — one correction
-        // pass lands it exactly on `target`.
-        body.counters[0].scope_target = vec![0x01u8; target];
+        body.counters.clear();
+        // Pad to ~1 MiB with MANY counter rows (distinct authority ⇒ unique tuples; each scope_target ≤
+        // the per-row cap) — `validate()` now rejects a single over-cap scope_target before the blob-size
+        // budget, so the old one-giant-row padding can't reach this gate. A half-cap padding length keeps
+        // each row's increment < cap, so a final tuning row can land the sealed size on the exact byte.
+        let pad_len = cap / 2;
+        let make_row = |idx: u32, len: usize| {
+            let mut authority = [0u8; 32];
+            authority[..4].copy_from_slice(&idx.to_be_bytes());
+            CounterEntry {
+                authority,
+                environment_identifier: "mainnet".to_string(),
+                scope_class: 1,
+                scope_target: vec![0x01u8; len],
+                highest_accepted_counter: 1,
+            }
+        };
+        let mut idx = 0u32;
+        while sealed_size(&body) + cap < target {
+            body.counters.push(make_row(idx, pad_len));
+            idx += 1;
+        }
+        // Final row: linear-correct its scope_target length so the sealed size lands exactly on `target`
+        // (the bstr length header is constant across this range, so sealed size is 1:1 in the length).
+        body.counters.push(make_row(idx, pad_len));
         let s0 = sealed_size(&body);
-        let len1 = (target as isize + (target as isize - s0 as isize)) as usize;
-        body.counters[0].scope_target = vec![0x01u8; len1];
+        let last_len = (pad_len as isize + (target as isize - s0 as isize)) as usize;
+        assert!(last_len >= 1 && last_len <= cap, "tuning length {last_len} must be within [1, cap]");
+        body.counters.last_mut().unwrap().scope_target = vec![0x01u8; last_len];
         let s1 = sealed_size(&body);
         assert!(
             s1 > MAX_KEYSTORE_BLOB_SIZE && s1 <= crate::MAX_MESSAGE_SIZE as usize,
             "boundary blob sealed={s1} not in (MAX_KEYSTORE_BLOB_SIZE, MAX_MESSAGE_SIZE]"
         );
+        // validate() PASSES (capped scope_targets, unique tuples) so seal reaches the blob-size budget.
+        assert!(body.validate().is_ok(), "the padded body must pass validate() to reach the size budget");
         assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::BlobTooLarge));
     }
 

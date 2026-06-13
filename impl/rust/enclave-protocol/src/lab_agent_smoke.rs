@@ -943,7 +943,25 @@ mod tests {
         let candidate = crate::agent_boot::execute_adopt_forward(&raw, &body, &state, &nonce)
             .expect("the marks reply drives execute_adopt_forward to a candidate");
         assert_eq!(candidate.freshness_epoch, epoch);
+        // `seed_marks_forward` must NOT bump structural_version — assert it directly so a regression that
+        // bumped it (leaving the re-run stuck in AdoptForward instead of Fresh) fails HERE, not silently.
+        assert_eq!(
+            candidate.structural_version, state.structural_version,
+            "seed advances epoch + marks only; structural_version is unchanged"
+        );
         assert_eq!(candidate.compute_local_marks_digest(), state.marks_digest);
+        // The candidate now reconciles Fresh against the same anchor state (epoch + structural + marks
+        // all match) — the post-seed re-run would reach Ready. Asserts the seed truly clears AdoptForward.
+        assert_eq!(
+            crate::agent_anchor::reconcile(
+                candidate.freshness_epoch,
+                candidate.structural_version,
+                &candidate.compute_local_marks_digest(),
+                &state,
+            ),
+            crate::agent_anchor::ReconcileDecision::Fresh,
+            "the adopted candidate reconciles Fresh — the next handshake reaches Ready"
+        );
     }
 
     #[test]

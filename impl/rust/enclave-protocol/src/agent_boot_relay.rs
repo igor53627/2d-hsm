@@ -222,6 +222,7 @@ pub(crate) struct AnchorMarksRequest<'a> {
 /// forwards). NOT an enclave trust boundary (the enclave only encodes the request + verifies the
 /// signed response); hardened anyway, mirroring [`DecodedBootRequest`].
 #[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the relay + tests)
+#[derive(Debug)]
 pub(crate) struct DecodedMarksRequest {
     pub chain_id: u64,
     pub environment_identifier: String,
@@ -1001,16 +1002,26 @@ mod tests {
         )
         .unwrap();
         assert!(decode_anchor_marks_request(&boot).is_err());
-        // Trailing bytes after the CBOR map → reject.
-        let mut frame = encode_anchor_marks_request(&AnchorMarksRequest {
+        // Trailing bytes after the CBOR map → reject. The extra byte must live INSIDE the framed
+        // payload (re-frame with the correct length), NOT appended after the outer frame — otherwise the
+        // frame-length check rejects it first and the inner `cursor.position() != payload.len()`
+        // trailing-CBOR guard is never exercised (the branch this test exists to pin).
+        let frame = encode_anchor_marks_request(&AnchorMarksRequest {
             chain_id: 1,
             environment_identifier: "e",
             nonce: [0; 32],
             epoch: 0,
         })
         .unwrap();
-        frame.push(0x00);
-        assert!(decode_anchor_marks_request(&frame).is_err());
+        let mut payload = crate::decode_message(&frame).unwrap().payload;
+        payload.push(0x00);
+        let frame =
+            crate::encode_message(crate::MessageType::AgentAnchorMarksRelay, &payload).unwrap();
+        let err = decode_anchor_marks_request(&frame).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::WireProtocol(m) if m.contains("trailing bytes")),
+            "must hit the inner trailing-CBOR guard, got {err:?}"
+        );
     }
 
     #[test]
@@ -1020,6 +1031,32 @@ mod tests {
         assert_eq!(MAX_MARKS_RESPONSE_LEN, crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN + MARKS_RESP_ENVELOPE_RESERVE);
         const _: () = assert!(MAX_MARKS_RESPONSE_LEN > MAX_ANCHOR_RESPONSE_LEN);
         assert_eq!(MAX_ANCHOR_RESPONSE_LEN, 4096, "freshness cap unchanged");
+    }
+
+    #[test]
+    fn marks_response_reserve_covers_max_env_id_and_max_payload() {
+        // coderabbit review: the outer signed marks response ALSO carries `environment_identifier`, so
+        // MARKS_RESP_ENVELOPE_RESERVE (256) must cover it on top of the fixed envelope (version/chain/
+        // nonce/epoch/signature + CBOR framing). It always does — env_id is structurally bounded to 64
+        // bytes by `validate_environment_identifier` (the sealed config the request scope comes from AND
+        // the verify both enforce 1..=64), so the WORST CASE is a 64-char env_id over a MAX payload.
+        // Build exactly that and assert it still fits the read cap — so `read_bounded_response_cap` never
+        // rejects a legitimately-signed reply before verification.
+        let env64 = "a".repeat(64); // valid per the keystore env rules, the reachable maximum
+        let max_payload = vec![0u8; crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN];
+        let signed = crate::agent_anchor::test_signed_marks_response_bytes(
+            &anchor_key(),
+            CHAIN,
+            &env64,
+            0,
+            [0u8; 32],
+            max_payload,
+        );
+        assert!(
+            signed.len() <= MAX_MARKS_RESPONSE_LEN,
+            "worst-case signed marks response ({}) must fit the read cap ({MAX_MARKS_RESPONSE_LEN})",
+            signed.len(),
+        );
     }
 
     fn test_config() -> KeystoreConfig {
