@@ -1738,8 +1738,9 @@ mod tests {
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
-        // 6-4: GENERATE_KEYS through the frame now COMMITS to the anchor before sealing, so the body's
-        // anchor_root must be the key the test commit channel signs with (PUBLIC_IDENTITY ignores it).
+        // 6-4: GENERATE_KEYS through the frame now COMMITS to the anchor (after computing the seal,
+        // before swap/emit), so the body's anchor_root must be the key the test commit channel signs
+        // with (PUBLIC_IDENTITY ignores it).
         body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
         // One transfer key so PUBLIC_IDENTITY has something to return.
         let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 };

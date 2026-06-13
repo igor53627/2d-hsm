@@ -383,9 +383,11 @@ with no wildcard so a new sub-op can't default into the wrong class). MUST NOT b
 advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT be aliased
 onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
 **ATOMICITY invariant (LIVE — slice 6-4a):** the GENERATE_KEYS bump advances atomically with
-`freshness_epoch` (`advance_commit_epoch`), and the frame layer commits exactly that
-`{epoch, structural, marks}` through the anchor BEFORE sealing/emitting (seal-before-emit); boot
-`reconcile` reads `structural_version` (structural-ahead → `StructuralGap`). It remains behind the
+`freshness_epoch` (`advance_commit_epoch`); the frame layer then computes the sealed blob FIRST
+(side-effect-free) and commits exactly that `{epoch, structural, marks}` through the anchor BEFORE the
+swap/emit (the "seal-before-emit" order is seal→commit→swap→emit, so a deterministic seal failure fails
+closed without advancing the anchor); boot `reconcile` reads `structural_version` (structural-ahead →
+`StructuralGap`). It remains behind the
 off-by-default `agent-keygen-exec-preview` gate until the boot channel install (6-4b) + the request_id
 idempotency/crash-reconcile proof (6-5) land and TASK-18 un-gates production keygen.
 

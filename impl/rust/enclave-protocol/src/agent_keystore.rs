@@ -447,9 +447,11 @@ pub struct KeystoreBody {
     /// counter/spend advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change,
     /// and MUST NOT be aliased onto [`KeystoreConfig::monotonic_treasury_config_version`]. Overflow:
     /// `checked_add` → fail closed (never wrap). The GENERATE_KEYS bump is **LIVE** (TASK-7.7 slice
-    /// 6-4a): `advance_commit_epoch` advances `freshness_epoch` + `structural_version` atomically and the
-    /// frame layer commits exactly that state through the anchor before sealing/emitting
-    /// (seal-before-emit); boot `reconcile` already reads this field (structural-ahead → `StructuralGap`).
+    /// 6-4a): `advance_commit_epoch` advances `freshness_epoch` + `structural_version` atomically; the
+    /// frame layer then computes the sealed blob FIRST (side-effect-free) and commits exactly that
+    /// `{epoch, structural, marks}` through the anchor BEFORE the swap/emit (the "seal-before-emit" order
+    /// is seal→commit→swap→emit); boot `reconcile` already reads this field (structural-ahead →
+    /// `StructuralGap`).
     /// Still gated behind the off-by-default `agent-keygen-exec-preview` until the boot channel install
     /// (6-4b) + the request_id idempotency/crash-reconcile proof (6-5) land and TASK-18 un-gates
     /// production keygen.
