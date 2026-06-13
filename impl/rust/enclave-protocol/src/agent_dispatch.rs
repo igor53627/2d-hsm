@@ -485,7 +485,7 @@ fn generate_keys_canonical_params(purpose_code: u64, count: u64) -> Vec<u8> {
 
 /// GENERATE_KEYS(1): after a verified admin capability, bind the request params to the cap, generate
 /// `count` keys of `purpose` on a CANDIDATE clone, and advance the capability counter. Returns the
-/// candidate for the frame layer to seal → persist → swap (no live mutation here).
+/// candidate for the frame layer to seal → anchor-commit → swap → emit (no live mutation here).
 ///
 /// Compiled always (so its imports/helpers stay "used") but only CALLED under the
 /// `agent-keygen-exec-preview` feature — without it, dispatch routes GENERATE_KEYS to NotConfigured.
@@ -902,6 +902,9 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             // two-lock order is KEYSTORE→COMMIT_CHANNEL. A crash AFTER the ack but BEFORE the swap
             // leaves the anchor ahead → next-boot reconcile StructuralGap→restore (the structural-op
             // case), recoverable, never a silent loss. [Reached only under agent-keygen-exec-preview.]
+            // INVARIANT for any future edit (e.g. the 6-7 shared seam): `candidate` is read by BOTH
+            // `seal_body` and `commit_candidate_to_anchor`; the committed `{epoch, structural, marks}`
+            // MUST equal the sealed body's, so do NOT mutate `candidate` between the seal and the commit.
             let sealed = match crate::seal_root::resolve_provisioning_root() {
                 Ok(root) => match seal_body(&candidate, &root, &measurement) {
                     Ok(blob) => blob,

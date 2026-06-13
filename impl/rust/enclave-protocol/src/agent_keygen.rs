@@ -53,12 +53,13 @@ const RNG_RETRIES: usize = 8;
 /// all `count` succeed).
 ///
 /// **CALLER CONTRACT — pass a CANDIDATE, not live state.** `body` must be a *working copy* of the
-/// live keystore (`let mut candidate = live.clone()`); the caller then `seal_body(&candidate)`,
-/// returns the sealed blob to the host for persistence, and swaps the candidate into live state
-/// **only after persistence succeeds**. Passing the live body directly would, on a later
-/// seal/persist failure, leave unpersisted keys (e.g. a phantom treasury that then blocks retries)
-/// live in memory. The seal → persist → swap commit is owned by the dispatch-execution slice
-/// (deferred; GENERATE_KEYS currently fail-closes at the capability seam).
+/// live keystore (`let mut candidate = live.clone()`); the frame layer then `seal_body(&candidate)`,
+/// commits the candidate's advanced state to the anchor, swaps the candidate into the live in-memory
+/// slot, and emits the sealed blob for the (untrusted) host to persist afterward. Passing the live body
+/// directly would, on a later seal/commit failure, leave unpersisted keys (e.g. a phantom treasury that
+/// then blocks retries) live in memory. This seal → anchor-commit → swap → emit flow is owned by the
+/// dispatch-execution slice (6-4a, behind `agent-keygen-exec-preview`; otherwise GENERATE_KEYS
+/// fail-closes at the capability seam).
 ///
 /// - **Treasury** (`agent_faucet_treasury_k1`): singleton — `count` must be 1 and none may already
 ///   exist (else [`GenerateKeysError::TreasuryExists`]).

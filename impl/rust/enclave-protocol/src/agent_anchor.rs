@@ -431,7 +431,7 @@ pub(crate) enum MarksError {
 
 /// Why a per-op commit ACK was rejected (TASK-7.7 slice 6; coarse band like [`MarksError`]). The ack
 /// confirms the anchor DURABLY RECORDED exactly what the enclave proposed; any mismatch fails the op
-/// closed (no seal, no signature/refs emitted).
+/// closed (discard the already-computed sealed blob, no swap, no signature/refs emitted).
 #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitAckError {

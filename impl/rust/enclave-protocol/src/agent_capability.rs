@@ -40,8 +40,8 @@
 //!   `reset_lifetime_breaker` share it. This slice applies the uniform admin contiguity rule to all
 //!   caps (`is_recovery` only selects the verifying authority) — the distinct recovery-counter rule
 //!   lands with the mutation slice.
-//! - **counter ADVANCE + atomic re-seal** (`highest := counter`, clone→seal→persist→swap): part of the
-//!   GENERATE_KEYS-execution / candidate-swap mutation slice (7.2/7.6.x territory).
+//! - **counter ADVANCE + atomic re-seal** (`highest := counter`, clone→seal→anchor-commit→swap→emit):
+//!   part of the GENERATE_KEYS-execution / candidate-swap mutation slice (7.2/7.6.x territory).
 //!
 //! A capability that passes this verify therefore reaches the handler, which today returns
 //! `0x45 AGENT_NOT_CONFIGURED` (execution not yet wired). Only a holder of the sealed authority's
