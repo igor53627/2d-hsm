@@ -871,17 +871,21 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
     };
     match outcome {
         Ok(AgentResponse::GenerateKeys { keys, candidate, request_id }) => {
-            // TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT: COMMIT the candidate's advanced post-op state to the
-            // anchor (its DURABLE record) BEFORE sealing/swapping/emitting. ANY commit failure (no channel,
-            // transport, ack mismatch) ⇒ fail closed: live state UNTOUCHED, NO sealed blob, NO swap, NO
-            // signature/refs emitted (no offline window). Runs under the INSTALLED_KEYSTORE `guard` (serial)
-            // — the two-lock order is KEYSTORE→COMMIT_CHANNEL. A crash AFTER the ack but BEFORE the swap
-            // leaves the anchor ahead → next-boot reconcile StructuralGap→restore (the structural-op case),
-            // recoverable, never a silent loss. [Reached only under agent-keygen-exec-preview.]
-            if let Err(e) = commit_candidate_to_anchor(&candidate, &request_id) {
-                return encode_agent_error(e);
-            }
-            // Seal the candidate (counter advanced + new entries + advanced epoch) so the host can persist it.
+            // TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT. Order: SEAL (compute) → COMMIT (durable anchor
+            // advance) → SWAP → EMIT. The seal is computed FIRST because it is SIDE-EFFECT-FREE — it
+            // validates + CBOR-encodes + AEADs into a local buffer, persisting and emitting NOTHING.
+            // Doing it before the commit makes any DETERMINISTIC seal failure — `BlobTooLarge` for an
+            // over-cap keygen batch (host-influenced count), or a `validate()` reject — fail closed
+            // (0x46) with NO anchor commit, so an oversize request can no longer durably advance the
+            // anchor to a structural state that was never sealed (which would force a spurious next-boot
+            // StructuralGap→restore for a recoverable condition). The COMMIT still strictly precedes the
+            // SWAP/EMIT, so the anchor never lags the emitted state — the anti-rollback invariant
+            // (anchor ≥ any sealed/emitted state) is preserved. ANY commit failure (no channel,
+            // transport, ack mismatch) ⇒ fail closed: live state UNTOUCHED, NO swap, NO signature/refs
+            // emitted (no offline window). Runs under the INSTALLED_KEYSTORE `guard` (serial) — the
+            // two-lock order is KEYSTORE→COMMIT_CHANNEL. A crash AFTER the ack but BEFORE the swap
+            // leaves the anchor ahead → next-boot reconcile StructuralGap→restore (the structural-op
+            // case), recoverable, never a silent loss. [Reached only under agent-keygen-exec-preview.]
             let sealed = match crate::seal_root::resolve_provisioning_root() {
                 Ok(root) => match seal_body(&candidate, &root, &measurement) {
                     Ok(blob) => blob,
@@ -889,6 +893,9 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 },
                 Err(_) => return encode_agent_error(AgentError::SealFailed),
             };
+            if let Err(e) = commit_candidate_to_anchor(&candidate, &request_id) {
+                return encode_agent_error(e);
+            }
             let body = encode_generate_keys_response(&keys, &sealed);
             // Swap the live in-memory slot so subsequent commands see the advanced counter + new
             // keys; durability is the host's job (it persists `sealed`, returned above).
@@ -1004,6 +1011,10 @@ mod tests {
     use crate::agent_keystore::{
         AuditRing, CreationMetadata, FaucetState, KeyPurpose, KeystoreConfig,
     };
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    use crate::agent_keystore::{
+        BackupExportMetadata, KeyAlgorithm, KeyEntry, MAX_TOTAL_KEY_ENTRIES,
+    };
 
     fn base_body() -> KeystoreBody {
         KeystoreBody {
@@ -1091,7 +1102,23 @@ mod tests {
         WrongKey,
     }
     #[cfg(feature = "agent-keygen-exec-preview")]
-    struct TestCommitChannel(CommitChannelAct);
+    struct TestCommitChannel {
+        act: CommitChannelAct,
+        /// Bumped at the TOP of every `round_trip`, so a test can assert the commit was reached
+        /// (`> 0`) or — for the seal-before-commit ordering proof — NEVER reached (`== 0`). Defaults
+        /// to a throwaway counter the test ignores via [`TestCommitChannel::new`].
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    impl TestCommitChannel {
+        fn new(act: CommitChannelAct) -> Self {
+            Self { act, calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+        }
+        /// Share a caller-held counter so the test can read how many commits were attempted.
+        fn counted(act: CommitChannelAct, calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { act, calls }
+        }
+    }
     #[cfg(feature = "agent-keygen-exec-preview")]
     impl crate::agent_boot_relay::BootRelayChannel for TestCommitChannel {
         fn round_trip(
@@ -1099,9 +1126,10 @@ mod tests {
             frame: &[u8],
             _deadline: std::time::Instant,
         ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let d = crate::agent_boot_relay::decode_anchor_commit_request(frame)
                 .expect("a frame-layer commit must encode a decodable 0x45 request");
-            let key = match self.0 {
+            let key = match self.act {
                 CommitChannelAct::Transport => {
                     return Err(crate::agent_boot_driver::AnchorTransportError(
                         "test commit transport down",
@@ -1728,7 +1756,7 @@ mod tests {
         {
         // 6-4 seal-before-emit: install a conformant commit channel so the per-op anchor commit succeeds
         // and the frame proceeds to seal + swap.
-        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::Ok))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
         let (cap, pay) =
             generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
         let gen_env = envelope(
@@ -1818,7 +1846,7 @@ mod tests {
             "no commit channel ⇒ SealFailed"
         );
         // (b) a TRANSPORT failure on the commit → fail closed 0x46.
-        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::Transport))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Transport))));
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
             Some(0x46),
@@ -1826,7 +1854,7 @@ mod tests {
         );
         reset_commit_channel_for_tests();
         // (c) a FORGED ACK (wrong signer) → fail closed 0x46 (the durable record didn't verify).
-        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::WrongKey))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::WrongKey))));
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
             Some(0x46),
@@ -1836,11 +1864,80 @@ mod tests {
         // (d) PROOF OF NO SWAP across all three failures: the live counter never advanced, so the SAME cap
         //     (counter 1) is STILL accepted once a conformant channel is installed. If any failed op had
         //     swapped, the live counter would be 1 and this cap (contiguity expects 2) would be 0x43.
-        assert!(install_commit_channel(Box::new(TestCommitChannel(CommitChannelAct::Ok))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
             None,
             "the failed commits did NOT swap — the same cap now succeeds"
+        );
+        reset_agent_keystore_for_tests();
+    }
+
+    /// 6-4 SEAL-BEFORE-COMMIT ordering proof: a candidate that fails to SEAL deterministically
+    /// (`BlobTooLarge` — an over-cap keygen batch, the exact host-triggerable case from the matrix
+    /// review) MUST fail closed (0x46) WITHOUT ever reaching the anchor commit. The seal is computed
+    /// before the commit, so the durable anchor is never advanced to a structural state that can never
+    /// be sealed (which would otherwise force a spurious next-boot StructuralGap→restore). We pin the
+    /// "no commit" half with a shared call-counter on the installed channel: it must be 0.
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_unsealable_candidate_never_commits() {
+        use ed25519_dalek::SigningKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+        // Pre-load the live body to ONE under the count cap with unique, validate()-passing entries
+        // (65-byte 0x04 pubkey, 32-byte scalar). Generating 1 key tips the candidate to exactly
+        // MAX_TOTAL_KEY_ENTRIES — within the COUNT cap but past the SIZE cap, so `seal_body` rejects
+        // it as `BlobTooLarge` (see agent_keystore::tests::oversized_blob_rejected).
+        body.entries = (0..(MAX_TOTAL_KEY_ENTRIES - 1) as u64)
+            .map(|i| {
+                let mut key_ref = [0u8; 32];
+                key_ref[..8].copy_from_slice(&i.to_le_bytes());
+                KeyEntry {
+                    key_ref,
+                    purpose: KeyPurpose::AgentTransferK1,
+                    algorithm: KeyAlgorithm::Secp256k1,
+                    public_identity: {
+                        let mut p = vec![0x04u8; 65];
+                        p[1] = 0xcc;
+                        p
+                    },
+                    secret_scalar: zeroize::Zeroizing::new(vec![0x11u8; 32]),
+                    creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                    backup_export_metadata: BackupExportMetadata::default(),
+                }
+            })
+            .collect();
+        assert!(install_agent_keystore(body, b"meas"));
+        // A CONFORMANT channel (would ACK happily) instrumented with a shared call-counter.
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
+            CommitChannelAct::Ok,
+            Arc::clone(&calls),
+        ))));
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
+        let gen_env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
+            Some(0x46),
+            "an unsealable (over-size) candidate fails closed with SealFailed"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the anchor commit was NEVER reached — seal failure short-circuits before the durable commit"
         );
         reset_agent_keystore_for_tests();
     }
