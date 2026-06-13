@@ -210,8 +210,9 @@ pub enum AgentResponse {
     /// (counter advanced + new entries + the atomic epoch/structural bump). The frame layer SEALS the
     /// candidate (side-effect-free compute), then COMMITS its post-op state to the anchor (TASK-7.7
     /// slice 6-4, seal-before-emit), then returns the sealed blob for the host to persist and swaps it
-    /// into the live slot (clone→seal→commit→persist→swap, §7.2 — seal precedes commit so a
-    /// deterministic seal failure fails closed WITHOUT advancing the anchor). `request_id` is the op's
+    /// into the live slot (enclave-local order clone→seal→commit→swap→emit; the host persists the
+    /// returned blob AFTERWARD, §7.2 — seal precedes commit so a deterministic seal failure fails closed
+    /// WITHOUT advancing the anchor). `request_id` is the op's
     /// envelope (key-4) request_id, carried here so the frame-layer commit can key the anchor record by
     /// it (idempotency).
     GenerateKeys {
