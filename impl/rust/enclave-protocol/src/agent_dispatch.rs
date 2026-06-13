@@ -863,10 +863,13 @@ fn sealed_optout_acknowledged(_keystore: &KeystoreBody) -> bool {
 /// Always returns a body (never errors out of band), so the wire layer just frames it. Profile is
 /// derived from slot presence: no installed keystore ⇒ not an agent instance ⇒ `WrongProfile`.
 ///
-/// For a mutating opcode (GENERATE_KEYS) dispatch returns a CANDIDATE body; this layer **seals** it
-/// (provisioning root from [`crate::seal_root`] + the stored measurement), returns the sealed blob in
-/// the response for the host to persist, and **swaps** it into the live slot — only after a
-/// successful seal (seal failure ⇒ `0x46`, live state untouched).
+/// For a mutating opcode (GENERATE_KEYS) dispatch returns a CANDIDATE body; this layer runs the
+/// seal-before-emit order **seal → anchor-commit → swap → emit**: it **seals** the candidate
+/// (provisioning root from [`crate::seal_root`] + the stored measurement, side-effect-free), **commits**
+/// the candidate's advanced state to the anchor, **swaps** it into the live slot, and returns the sealed
+/// blob in the response for the host to persist. ANY seal OR commit failure ⇒ `0x46` with the live state
+/// untouched (no swap/emit) — the seal-failure path short-circuits before the commit, so a deterministic
+/// seal failure never advances the anchor.
 pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
     // Recover from a poisoned lock rather than bricking the agent permanently: the slot's only
     // mutation is the final swap below, performed AFTER every fallible step succeeds, so a panic in an
