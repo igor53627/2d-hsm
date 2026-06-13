@@ -1174,6 +1174,51 @@ mod tests {
     }
 
     #[test]
+    fn commit_request_and_ack_preimage_are_field_compatible() {
+        // Anti-drift (review wf_16383b1d): the commit-request encoder (here) and the ack preimage
+        // (agent_anchor::commit_ack_signed_preimage) are two independent hand-rolled map(8) emitters that
+        // MUST stay field-compatible — a conformant anchor parses the 0x45 request (keys 1..=8) and
+        // re-emits those exact fields under COMMIT_ACK_DOMAIN to produce the ACK the enclave verifies. A
+        // drift in either (add/reorder/type-slip a signed field) silently breaks every conformant ACK
+        // (fail-closed). This test pins the WHOLE loop — request encode → decode → anchor-signed ACK →
+        // verify Ok — so any such drift fails HERE rather than at runtime against a real anchor.
+        let req = AnchorCommitRequest {
+            chain_id: CHAIN,
+            environment_identifier: ENV,
+            new_epoch: 8,
+            new_structural_version: 3,
+            marks_digest: [0x5c; 32],
+            nonce: [0x9a; 32],
+            request_id: b"op-req-1",
+        };
+        let frame = encode_anchor_commit_request(&req).unwrap();
+        let d = decode_anchor_commit_request(&frame).unwrap();
+        // The conformant anchor echoes the DECODED request fields into a signed ACK ...
+        let ack = crate::agent_anchor::test_signed_commit_ack_bytes(
+            &anchor_key(),
+            d.chain_id,
+            &d.environment_identifier,
+            d.new_epoch,
+            d.new_structural_version,
+            d.marks_digest,
+            d.nonce,
+            d.request_id.clone(),
+        );
+        // ... and the enclave's verifier accepts it against the SAME proposed values.
+        let expected = crate::agent_anchor::ExpectedCommitAck {
+            nonce: &d.nonce,
+            epoch: d.new_epoch,
+            structural_version: d.new_structural_version,
+            marks_digest: &d.marks_digest,
+            request_id: &d.request_id,
+        };
+        assert_eq!(
+            crate::agent_anchor::verify_commit_ack_bytes(&ack, &expected, &test_config()),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn marks_request_decode_rejects_wrong_type_and_shape() {
         // A 0x41 boot-relay frame is NOT a marks request.
         let boot = encode_anchor_boot_request(
