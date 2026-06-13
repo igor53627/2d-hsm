@@ -335,6 +335,12 @@ pub(crate) fn encode_anchor_commit_request(
     request: &AnchorCommitRequest,
 ) -> Result<Vec<u8>, ProtocolError> {
     use crate::agent_capability::{put_bytes, put_text, put_uint};
+    // Defense-in-depth: reject an over-cap request_id at ENCODE — the decoder + ack verifier enforce the
+    // same MAX_REQUEST_ID_LEN, so an over-cap internal caller would otherwise mint a frame this crate
+    // later rejects. Fail-closed before allocating.
+    if request.request_id.len() > crate::agent_dispatch::MAX_REQUEST_ID_LEN {
+        return Err(ProtocolError::WireProtocol("commit request: request_id exceeds MAX_REQUEST_ID_LEN"));
+    }
     let mut payload = Vec::with_capacity(160 + request.environment_identifier.len() + request.request_id.len());
     put_uint(&mut payload, 5, 8); // map header: 8 pairs
     put_uint(&mut payload, 0, 1);
@@ -1139,9 +1145,10 @@ mod tests {
         })
         .unwrap();
         assert!(decode_anchor_commit_request(&marks).is_err());
-        // request_id over the 64-byte cap → reject.
+        // request_id over the 64-byte cap → the ENCODER rejects it (defense-in-depth, never mints a frame
+        // the decoder would reject).
         let big = vec![0x41u8; crate::agent_dispatch::MAX_REQUEST_ID_LEN + 1];
-        let frame = encode_anchor_commit_request(&AnchorCommitRequest {
+        let enc_err = encode_anchor_commit_request(&AnchorCommitRequest {
             chain_id: 1,
             environment_identifier: "e",
             new_epoch: 1,
@@ -1150,9 +1157,26 @@ mod tests {
             nonce: [0; 32],
             request_id: &big,
         })
-        .unwrap();
-        let err = decode_anchor_commit_request(&frame).unwrap_err();
-        assert!(matches!(err, ProtocolError::WireProtocol(m) if m.contains("request_id")), "got {err:?}");
+        .unwrap_err();
+        assert!(matches!(enc_err, ProtocolError::WireProtocol(m) if m.contains("request_id")), "got {enc_err:?}");
+        // ... and the DECODER (the trust boundary for untrusted host frames) rejects a HOSTILE over-cap
+        // frame the encoder would never produce — hand-built via ciborium to bypass the encoder cap.
+        use ciborium::value::Value;
+        let hostile = vec![
+            (Value::Integer(1.into()), Value::Integer(1.into())),
+            (Value::Integer(2.into()), Value::Integer(1.into())),
+            (Value::Integer(3.into()), Value::Text("e".into())),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(5.into()), Value::Integer(1.into())),
+            (Value::Integer(6.into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Integer(7.into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Integer(8.into()), Value::Bytes(big)),
+        ];
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(hostile), &mut payload).unwrap();
+        let frame = crate::encode_message(crate::MessageType::AgentAnchorCommitRelay, &payload).unwrap();
+        let dec_err = decode_anchor_commit_request(&frame).unwrap_err();
+        assert!(matches!(dec_err, ProtocolError::WireProtocol(m) if m.contains("request_id")), "got {dec_err:?}");
         // Trailing bytes INSIDE the framed payload → reject the inner trailing-CBOR guard (re-frame, as
         // the marks test does, so the frame-length check doesn't reject it first).
         let frame = encode_anchor_commit_request(&AnchorCommitRequest {

@@ -1385,4 +1385,47 @@ mod tests {
         ciborium::ser::into_writer(&Value::Map(freshness_map), &mut freshness_bytes).unwrap();
         assert!(verify_commit_ack_bytes(&freshness_bytes, &commit_expected(), &cfg).is_err());
     }
+
+    #[test]
+    fn commit_request_payload_byte_matches_ack_preimage_body() {
+        // INDEPENDENT anti-drift (compact 7184): the round-trip test reuses commit_ack_signed_preimage on
+        // BOTH sign and verify, so it can't catch a COORDINATED encoder/preimage drift. The 0x45 request
+        // payload (map(8) body) and the ack signed preimage (COMMIT_ACK_DOMAIN ‖ the SAME map(8) body)
+        // MUST be byte-identical after the domain prefix — this asserts the two INDEPENDENT hand-rolled
+        // emitters agree byte-for-byte, so a reorder/type-slip in either is caught here.
+        // (Relies on COMMIT_REQUEST_VERSION == COMMIT_ACK_VERSION; if the version namespaces ever diverge
+        // intentionally, this invariant + test must be revisited — the assert message says so.)
+        let frame = crate::agent_boot_relay::encode_anchor_commit_request(
+            &crate::agent_boot_relay::AnchorCommitRequest {
+                chain_id: TEST_CHAIN,
+                environment_identifier: TEST_ENV,
+                new_epoch: TEST_EPOCH,
+                new_structural_version: TEST_STRUCTURAL,
+                marks_digest: TEST_MARKS_DIGEST,
+                nonce: TEST_NONCE,
+                request_id: TEST_REQUEST_ID,
+            },
+        )
+        .unwrap();
+        let payload = crate::decode_message(&frame).unwrap().payload;
+        let f = crate::agent_cbor::CommitAckFields {
+            version: COMMIT_ACK_VERSION,
+            chain_id: TEST_CHAIN,
+            environment_identifier: TEST_ENV.to_string(),
+            epoch: TEST_EPOCH,
+            structural_version: TEST_STRUCTURAL,
+            marks_digest: TEST_MARKS_DIGEST,
+            nonce: TEST_NONCE,
+            request_id: TEST_REQUEST_ID.to_vec(),
+            signature: [0u8; 64],
+        };
+        let preimage = commit_ack_signed_preimage(&f);
+        assert_eq!(
+            payload.as_slice(),
+            &preimage[COMMIT_ACK_DOMAIN.len()..],
+            "the 0x45 request payload body must byte-match the ack preimage's post-domain bytes — the two \
+             independent map(8) emitters must agree; a divergence is an encoder/preimage drift (revisit \
+             if COMMIT_REQUEST_VERSION and COMMIT_ACK_VERSION ever diverge)"
+        );
+    }
 }
