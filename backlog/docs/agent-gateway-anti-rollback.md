@@ -1646,10 +1646,11 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   `quote_timeout`/`relay_timeout` is **deferred to 5b-2c** (the bin that constructs the transport and owns
   operator config) — NOT 5b-2b-i/ii, which keep the single-budget model. 5b-2c, if it splits them, MUST
   restate the resulting total-boot bound as a success criterion so "timeout" is never ambiguous between
-  total-attempt and per-leg. **Exact-bound caveat — SATISFIED in 5b-2b-ii(a):** the `≤ 2·timeout` bound only
+  total-attempt and per-leg. **Exact-bound caveat — SATISFIED in 5b-2b-ii(a):** the per-leg bound (`≤ 2·timeout`
+  for a freshness attempt, `≤ 3·timeout` for an adopting one — see the ⚠️ 5b-2e banner) only
   holds if the socket `SO_*TIMEO` are derived from the *remaining* per-leg budget, NOT set equal to the full
   leg `timeout` — otherwise a single blocked in-flight syscall could overrun a leg by up to one socket
-  timeout. `VsockBootRelayChannel` achieves this via `DeadlineSocket`, which reapplies the timeout =
+  timeout. (The derived-from-remaining premise applies to every channel leg, freshness and marks alike.) `VsockBootRelayChannel` achieves this via `DeadlineSocket`, which reapplies the timeout =
   remaining-budget before EVERY read/write (not once), so the channel-I/O leg is tightly bounded by the
   deadline. (Connect is the cancellable hard bound (a') — DONE PR #56: non-blocking connect + `poll(POLLOUT)`
   to the deadline; see above.) **Per-leg sizing floor (5b-2c):** the
@@ -1710,7 +1711,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   sub-`MIN_BOUNDARY_BUDGET` timeouts at config-parse time (a 0ms leg is
   meaningless and `set_read_timeout(ZERO)` is an Err on vsock). *Hardening note (one of TWO
   prose-enforced premises this gate rests on — the other is the same-instance driver-count binding,
-  the named test-backed (4b) item above):* the `2·` accounting assumes connect+I/O share ONE deadline, which is only
+  the named test-backed (4b) item above):* the per-leg accounting assumes connect+I/O share ONE deadline — and
+  this premise applies INDEPENDENTLY to each channel leg (freshness AND, on adopt, marks; the `3·` counts
+  quote + freshness-channel + marks-channel) — which is only
   wiring-enforced in `round_trip_inner` (see above) — when 5b-2c builds the budget check, prefer computing it
   where both deadlines ORIGINATE (e.g. a constructor that derives connect and I/O deadlines from one
   channel-leg value), so the structural gate cannot outlive the wiring assumption it depends on.
@@ -1725,7 +1728,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   CHECKED overflow [defense-in-depth, unreachable while the ceiling holds; checked NOT saturating —
   a saturated `Duration::MAX` product would PASS `≤ Duration::MAX`, the exact wrapped-product
   failure named above] → exceeds); the check arithmetic is written in the GENERALIZED leg-sum form
-  (the `2·` literal appears nowhere in code — a future distinct-timeout split changes constructor
+  (no multiplier literal appears in code — `per_attempt_nominal_cost` sums quote + freshness + marks + ε
+  as named legs; a future distinct-timeout split changes constructor
   INPUTS, never the formula). The BEFORE-claim ordering pin is now STRUCTURAL:
   `HardBoundedQuoteProducer::{new, production}` take `&ValidatedBootBudget` as an ordering witness
   (scope honesty: SOME budget — same-instance binding is `production_transport` for the timeout +
