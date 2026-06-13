@@ -413,8 +413,11 @@ pub enum MessageType {
     /// serve-dispatched — a hostile inbound `0x44` fails closed in `decode_wire_command`.
     AgentAnchorMarksRelay = 0x44,
     /// Agent Gateway anti-rollback **per-op commit-relay** request frame (TASK-7.7 slice 6). Reserved
-    /// outer band `0x40..0x4F` (`0x42`/`0x43`/`0x44` inner `AgentError` codes are a DISJOINT namespace
-    /// from this outer-frame byte). The THIRD enclave-initiated leg and the first MUTATING one: on a
+    /// outer band `0x40..0x4F`. The inner `AgentError` status codes `0x42`/`0x43`/`0x44`/`0x45`
+    /// (`0x45` = `AGENT_NOT_CONFIGURED`) are a DISJOINT namespace from these OUTER-frame bytes — an outer
+    /// `0x45 AgentAnchorCommitRelay` frame and an inner `0x45` CBOR status key never coexist on one wire
+    /// position (outer = frame type byte; inner = a CBOR map value), so the reuse is unambiguous. The
+    /// THIRD enclave-initiated leg and the first MUTATING one: on a
     /// rollback-sensitive op the enclave writes this (scope + the proposed new `epoch`/`structural_version`
     /// + the post-op `marks_digest` + a fresh per-op nonce + the op's `request_id` — NO SNP quote) and the
     /// anchor durably records the commit and returns a signed ACK. Like `0x41`/`0x44` it is NEVER

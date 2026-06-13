@@ -589,17 +589,22 @@ and opcode inside the CBOR payload, so it can evolve without a frame-version bum
   ENCLAVE-INITIATED anti-rollback boot handshake; NOT serve-dispatchable: `decode_wire_command`
   rejects an inbound `0x41` with a wire error)**; **`0x44` (`AgentAnchorMarksRelay`, TASK-7.7 5b-2e —
   ENCLAVE-INITIATED `AdoptForward` raw-marks fetch; same enclave-initiated/NOT-serve-dispatchable
-  contract as `0x41` — `decode_wire_command` rejects an inbound `0x44` with a wire error)**.
-  `0x42..0x43` and `0x45..0x4F` unallocated. `0x50..0x7F` left for future producer/other families.
+  contract as `0x41` — `decode_wire_command` rejects an inbound `0x44` with a wire error)**;
+  **`0x45` (`AgentAnchorCommitRelay`, TASK-7.7 slice 6 — ENCLAVE-INITIATED per-op seal-before-emit
+  commit; same enclave-initiated/NOT-serve-dispatchable contract — `decode_wire_command` rejects an
+  inbound `0x45` with a wire error)**. NB the outer `0x44`/`0x45` frame bytes are a DISJOINT namespace
+  from the inner `AgentError` codes `0x44 AGENT_CAP_EXCEEDED` / `0x45 AGENT_NOT_CONFIGURED` (inner CBOR
+  status keys, never outer frame types). `0x42..0x43` and `0x46..0x4F` unallocated. `0x50..0x7F` left
+  for future producer/other families.
 - **Why not a frame-version bump or a wide outer range:** producer frames
   (`0x01/0x10/0x20/0x30`) stay byte-identical and still decode (success criterion:
   "existing producer commands remain wire-compatible"), and inner opcodes are CBOR
   ints that cost no scarce outer bytes.
 
 **Fail-closed at three checkpoints** (none may fall back to a producer type — AC#3/AC#20):
-1. `decode_message`: `0x40 → AgentGateway`; `0x41 → AgentBootRelay`, `0x44 → AgentAnchorMarksRelay`
-   (both then `decode_wire_command`-rejected as enclave-initiated/not-serve-dispatchable);
-   `0x42..0x43`, `0x45..0xFF → UnknownMessageType`.
+1. `decode_message`: `0x40 → AgentGateway`; `0x41 → AgentBootRelay`, `0x44 → AgentAnchorMarksRelay`,
+   `0x45 → AgentAnchorCommitRelay` (all three then `decode_wire_command`-rejected as
+   enclave-initiated/not-serve-dispatchable); `0x42..0x43`, `0x46..0xFF → UnknownMessageType`.
 2. `peek_msg_type_from_frame` (routing/error-frame helper): returns *no* type for
    unrecognized bytes. This PR fixes a prior fail-**open** default (unknown types fell back
    to `GetMeasurement`): it now returns `Option<MessageType>` and an unrecognized request's
@@ -828,10 +833,11 @@ Frozen, self-checked, in-repo artifacts in
 Required tests (consumed by TASK-7.3/7.4/7.6, AC#21):
 - Producer frames `0x01/0x10/0x20/0x30` still decode unchanged after adding `0x40`.
 - `peek_msg_type_from_frame` returns no-type for unknown bytes `0x42`/`0xFF` (never `GetMeasurement`);
-  `0x40 → AgentGateway`, `0x41 → AgentBootRelay`, `0x44 → AgentAnchorMarksRelay` (TASK-7.7 5b-2/5b-2e;
-  both enclave-initiated, fail-closed in `decode_wire_command`). *(History: `0x41` previously peeked to
-  no-type, allocated to `AgentBootRelay` in 5b-2; `0x44` allocated to `AgentAnchorMarksRelay` in 5b-2e —
-  unknown-frame coverage is now `0x42..0x43` + `0x45..`.)*
+  `0x40 → AgentGateway`, `0x41 → AgentBootRelay`, `0x44 → AgentAnchorMarksRelay`,
+  `0x45 → AgentAnchorCommitRelay` (TASK-7.7 5b-2/5b-2e/slice 6; all enclave-initiated, fail-closed in
+  `decode_wire_command`). *(History: `0x41` previously peeked to no-type, allocated to `AgentBootRelay`
+  in 5b-2; `0x44` → `AgentAnchorMarksRelay` in 5b-2e; `0x45` → `AgentAnchorCommitRelay` in slice 6 —
+  unknown-frame coverage is now `0x42..0x43` + `0x46..`.)*
 - Unknown `agent_version`/opcode/treasury-sub-op → `AGENT_MALFORMED`, no state touch.
 - Role/profile cross-rejection matrix (producer↔agent), both before state touch.
 - Key-purpose cross-rejection (transfer↔faucet; producer purposes rejected by agent commands).
