@@ -137,7 +137,7 @@ impl AgentOpcode {
     /// The per-op COMMIT bump class (TASK-7.7 slice 6): which sealed-state fields a committed
     /// rollback-sensitive op advances at the anchor. SECURITY-LOAD-BEARING. Exhaustive/wildcard-free so a
     /// new opcode forces a classification; pinned consistent with [`Self::is_rollback_sensitive`] by
-    /// `commit_bump_class_matches_rollback_sensitive`.
+    /// `commit_bump_class_exhaustive_and_consistent_with_rollback_sensitive`.
     ///
     /// `Structural` mutates anchor-UNRECONSTRUCTABLE state NOT captured in the marks digest, so a dropped
     /// commit-seal reconciles `StructuralGap`→restore on next boot. `EpochOnly`'s full effect IS in the

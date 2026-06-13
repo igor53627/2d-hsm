@@ -1703,6 +1703,15 @@ mod tests {
         assert_eq!(b.advance_commit_epoch(true), Err(KeystoreError::MonotonicOverflow));
         assert_eq!(b.freshness_epoch, e, "epoch untouched when structural overflows (computed-before-assign)");
         assert_eq!(b.structural_version, u64::MAX, "no partial mutation");
+        // EPOCH-ONLY path: the epoch check is UNCONDITIONAL (runs regardless of bumps_structural), so an
+        // epoch at u64::MAX must overflow even when bumps_structural=false. Pins the unconditional-epoch
+        // contract against a future refactor that gated the epoch check on bumps_structural.
+        let mut b = sample_body();
+        b.freshness_epoch = u64::MAX;
+        let s = b.structural_version;
+        assert_eq!(b.advance_commit_epoch(false), Err(KeystoreError::MonotonicOverflow));
+        assert_eq!(b.freshness_epoch, u64::MAX, "epoch-only overflow leaves epoch unchanged");
+        assert_eq!(b.structural_version, s, "epoch-only never touches structural");
     }
 
     #[test]

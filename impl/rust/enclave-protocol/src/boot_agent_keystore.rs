@@ -220,8 +220,12 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
         | K::InvalidFieldLength
         | K::DuplicateKeyRef
         | K::DuplicateCounterTuple
-        | K::MonotonicOverflow
         | K::BlobTooLarge => "agent keystore: invalid keystore body",
+        // A monotonic-counter overflow is a runtime capacity condition (epoch/structural at u64::MAX),
+        // NOT structural body corruption — a distinct label so incident response looks at the counter,
+        // not a malformed blob. (Unreachable via the boot UNSEAL path, which performs no bump — present
+        // for match-exhaustiveness; the live surface is the 6-4 per-op commit dispatch mapping.)
+        K::MonotonicOverflow => "agent keystore: monotonic counter overflow",
     };
     ProtocolError::PqSigningUnavailable(label)
 }
