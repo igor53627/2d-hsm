@@ -67,6 +67,23 @@ pub(crate) const MAX_ANCHOR_RESPONSE_LEN: usize = 4096;
 /// versions while staying tiny.
 pub(crate) const MAX_QUOTE_REPORT_LEN: usize = 8192;
 
+/// 5b-2e: envelope reserve over the marks payload for the marks RESPONSE (keys 1–5 scope/nonce/epoch
+/// ~80 B + the key-6 bstr length prefix ~5 B + the key-13 64-byte signature + map overhead). 256 B is
+/// comfortable headroom.
+pub(crate) const MARKS_RESP_ENVELOPE_RESERVE: usize = 256;
+
+/// 5b-2e: upper bound on the `anchor_root`-signed RAW-MARKS response — DISTINCT from
+/// [`MAX_ANCHOR_RESPONSE_LEN`] (4096): a marks payload describing a non-trivial counter table is
+/// multi-KiB (a body sealing under [`crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE`] is the genuine
+/// ceiling), so the marks leg gets its OWN cap. The 4 KiB freshness-leg cap is UNCHANGED (raising a
+/// single shared cap would loosen the freshness DoS bound). Checked before alloc, like
+/// [`read_bounded_anchor_response`]; the marks fetch is only paid on the `AdoptForward` path.
+pub(crate) const MAX_MARKS_RESPONSE_LEN: usize =
+    crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN + MARKS_RESP_ENVELOPE_RESERVE;
+
+/// Body-level version of the 5b-2e marks-relay request map (key 1).
+const MARKS_REQUEST_VERSION: u64 = 1;
+
 /// Owned, decoded boot-relay request — for the untrusted **host relay** (5b-2b) and round-trip tests.
 /// NOT an enclave trust boundary: the enclave only *encodes* the request and *verifies the response*; it
 /// never decodes a request. (Kept hardened anyway — see [`decode_anchor_boot_request`].)
@@ -192,6 +209,89 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
     })
 }
 
+/// 5b-2e raw-marks request the enclave writes on the `AdoptForward` path. Borrows the scope so it
+/// shares the `&body.config` lifetime; carries the SAME fresh nonce + the adopted epoch, **NO quote**.
+pub(crate) struct AnchorMarksRequest<'a> {
+    pub chain_id: u64,
+    pub environment_identifier: &'a str,
+    pub nonce: [u8; 32],
+    pub epoch: u64,
+}
+
+/// Owned, decoded marks request — for the untrusted **host relay** (it peeks the type, validates, and
+/// forwards). NOT an enclave trust boundary (the enclave only encodes the request + verifies the
+/// signed response); hardened anyway, mirroring [`DecodedBootRequest`].
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the relay + tests)
+pub(crate) struct DecodedMarksRequest {
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub nonce: [u8; 32],
+    pub epoch: u64,
+}
+
+/// Encode a 5b-2e raw-marks request frame: a canonical int-keyed CBOR map (keys 1..=5) under a
+/// [`crate::MessageType::AgentAnchorMarksRelay`] (`0x44`) frame. NO quote/cert (the attestation was
+/// bound on the `0x41` leg this attempt). Built with the same canonical encoders so a conformant
+/// anchor recomputes identical bytes.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the transport seam, commit 6)
+pub(crate) fn encode_anchor_marks_request(
+    request: &AnchorMarksRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    let mut payload = Vec::with_capacity(96 + request.environment_identifier.len());
+    put_uint(&mut payload, 5, 5); // map header: 5 pairs
+    put_uint(&mut payload, 0, 1);
+    put_uint(&mut payload, 0, MARKS_REQUEST_VERSION);
+    put_uint(&mut payload, 0, 2);
+    put_uint(&mut payload, 0, request.chain_id);
+    put_uint(&mut payload, 0, 3);
+    put_text(&mut payload, request.environment_identifier);
+    put_uint(&mut payload, 0, 4);
+    put_bytes(&mut payload, &request.nonce);
+    put_uint(&mut payload, 0, 5);
+    put_uint(&mut payload, 0, request.epoch);
+    crate::encode_message(crate::MessageType::AgentAnchorMarksRelay, &payload)
+}
+
+/// Decode + validate a 5b-2e marks request frame (for the untrusted host relay + tests). Lenient
+/// ciborium decode is fine (no quote/cert; not signature-bound — the enclave verifies only the
+/// RESPONSE), but the shape is strictly enforced: `0x44` type, integer keys exactly `{1..=5}` no dup,
+/// version `== 1`, exact-length nonce (32). Every failure is [`ProtocolError::WireProtocol`].
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the relay branch, host_anchor_relay)
+pub(crate) fn decode_anchor_marks_request(frame: &[u8]) -> Result<DecodedMarksRequest, ProtocolError> {
+    use crate::agent_cbor::{as_bytes_n, as_u64, check_strict_keys, map_get};
+    use ciborium::value::Value;
+
+    let framed = crate::decode_message(frame)?;
+    if framed.msg_type != crate::MessageType::AgentAnchorMarksRelay {
+        return Err(ProtocolError::WireProtocol("not an AGENT_ANCHOR_MARKS_RELAY frame"));
+    }
+    let mut cursor = std::io::Cursor::new(framed.payload.as_slice());
+    let value: Value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|_| ProtocolError::WireProtocol("marks request: bad CBOR"))?;
+    if cursor.position() as usize != framed.payload.len() {
+        return Err(ProtocolError::WireProtocol("marks request: trailing bytes after CBOR"));
+    }
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol("marks request: payload is not a CBOR map"));
+    };
+    if !check_strict_keys(&map, |n| (1..=5).contains(&n)) {
+        return Err(ProtocolError::WireProtocol("marks request: unexpected/missing/duplicate key"));
+    }
+    let req_u64 = |k: u64| map_get(&map, k).and_then(as_u64).ok_or(ProtocolError::WireProtocol("marks request: bad uint"));
+    if req_u64(1)? != MARKS_REQUEST_VERSION {
+        return Err(ProtocolError::WireProtocol("marks request: unsupported version"));
+    }
+    let chain_id = req_u64(2)?;
+    let environment_identifier = match map_get(&map, 3) {
+        Some(Value::Text(s)) => s.clone(),
+        _ => return Err(ProtocolError::WireProtocol("marks request: env must be text")),
+    };
+    let nonce = map_get(&map, 4).and_then(as_bytes_n::<32>).ok_or(ProtocolError::WireProtocol("marks request: nonce must be 32 bytes"))?;
+    let epoch = req_u64(5)?;
+    Ok(DecodedMarksRequest { chain_id, environment_identifier, nonce, epoch })
+}
+
 /// Read the anchor response off a stream: a single 4-byte BE length prefix then exactly that many raw
 /// anchor-signed bytes (no version/type framing — the relay forwards exactly what the anchor signed).
 /// The length is checked against [`MAX_ANCHOR_RESPONSE_LEN`] **before** allocating, so a hostile relay
@@ -215,10 +315,22 @@ pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
     reader: &mut R,
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>, ProtocolError> {
+    read_bounded_response_cap(reader, deadline, MAX_ANCHOR_RESPONSE_LEN)
+}
+
+/// 5b-2e: read a length-prefixed raw response bounded by an EXPLICIT `cap` (cap-before-alloc). The
+/// freshness leg passes [`MAX_ANCHOR_RESPONSE_LEN`] (4096, unchanged); the marks leg passes
+/// [`MAX_MARKS_RESPONSE_LEN`]. The cap is a parameter — NOT a single shared constant raised for both —
+/// so the freshness-path DoS bound stays tight.
+pub(crate) fn read_bounded_response_cap<R: std::io::Read>(
+    reader: &mut R,
+    deadline: std::time::Instant,
+    cap: usize,
+) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
     crate::read_exact_with_idle_deadline(reader, &mut len_buf, Some(deadline))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_ANCHOR_RESPONSE_LEN {
+    if len > cap {
         return Err(ProtocolError::WireProtocol("anchor response too large"));
     }
     let mut body = vec![0u8; len];
@@ -232,7 +344,13 @@ pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
 /// [`read_bounded_anchor_response`]. Rejects a response over [`MAX_ANCHOR_RESPONSE_LEN`] (the reader
 /// would reject it anyway — fail at the source).
 pub(crate) fn frame_anchor_response(response_bytes: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    if response_bytes.len() > MAX_ANCHOR_RESPONSE_LEN {
+    frame_response_cap(response_bytes, MAX_ANCHOR_RESPONSE_LEN)
+}
+
+/// 5b-2e: frame a length-prefixed raw response bounded by an EXPLICIT `cap` (the marks leg passes
+/// [`MAX_MARKS_RESPONSE_LEN`]; the freshness leg keeps 4096). Sibling of [`read_bounded_response_cap`].
+pub(crate) fn frame_response_cap(response_bytes: &[u8], cap: usize) -> Result<Vec<u8>, ProtocolError> {
+    if response_bytes.len() > cap {
         return Err(ProtocolError::WireProtocol("anchor response too large to frame"));
     }
     let mut out = Vec::with_capacity(4 + response_bytes.len());
@@ -412,8 +530,20 @@ pub(crate) fn relay_round_trip_over_stream<S: std::io::Read + std::io::Write>(
     request_frame: &[u8],
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>, ProtocolError> {
+    relay_round_trip_over_stream_cap(stream, request_frame, deadline, MAX_ANCHOR_RESPONSE_LEN)
+}
+
+/// 5b-2e: [`relay_round_trip_over_stream`] with an EXPLICIT response cap — the marks (`0x44`) leg passes
+/// [`MAX_MARKS_RESPONSE_LEN`]; the freshness (`0x41`) leg keeps the 4096 default. Same deadline-guarded
+/// write + cap-before-alloc read; only the cap differs, so the freshness DoS bound stays tight.
+pub(crate) fn relay_round_trip_over_stream_cap<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    request_frame: &[u8],
+    deadline: std::time::Instant,
+    cap: usize,
+) -> Result<Vec<u8>, ProtocolError> {
     deadline_guarded_write(stream, request_frame, deadline, "anchor relay: deadline before write")?;
-    read_bounded_anchor_response(stream, deadline)
+    read_bounded_response_cap(stream, deadline, cap)
 }
 
 /// The host-relay **forward core** (TASK-7.7 5b-2b): the one enclave↔anchor pump the host relay daemon
@@ -801,6 +931,62 @@ mod tests {
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::agent_dispatch::lock_and_reset_agent_process_globals()
+    }
+
+    // ---- 5b-2e marks request codec (commit 5b/8) ----
+
+    #[test]
+    fn marks_request_encodes_and_decodes_round_trip() {
+        let req = AnchorMarksRequest {
+            chain_id: 11565,
+            environment_identifier: "testnet",
+            nonce: [0x9a; 32],
+            epoch: 7,
+        };
+        let frame = encode_anchor_marks_request(&req).unwrap();
+        // It is a 0x44 frame (not 0x41), and never serve-dispatchable (enclave-initiated).
+        assert_eq!(crate::peek_msg_type_from_frame(&frame), Some(crate::MessageType::AgentAnchorMarksRelay));
+        let d = decode_anchor_marks_request(&frame).unwrap();
+        assert_eq!(d.chain_id, 11565);
+        assert_eq!(d.environment_identifier, "testnet");
+        assert_eq!(d.nonce, [0x9a; 32]);
+        assert_eq!(d.epoch, 7);
+    }
+
+    #[test]
+    fn marks_request_decode_rejects_wrong_type_and_shape() {
+        // A 0x41 boot-relay frame is NOT a marks request.
+        let boot = encode_anchor_boot_request(
+            &[0u8; 0x50],
+            &[],
+            &AnchorBootRequest {
+                chain_id: 11565,
+                environment_identifier: "testnet",
+                nonce: [0; 32],
+                report_data: anchor_handshake_report_data(11565, "testnet", &[0; 32]),
+            },
+        )
+        .unwrap();
+        assert!(decode_anchor_marks_request(&boot).is_err());
+        // Trailing bytes after the CBOR map → reject.
+        let mut frame = encode_anchor_marks_request(&AnchorMarksRequest {
+            chain_id: 1,
+            environment_identifier: "e",
+            nonce: [0; 32],
+            epoch: 0,
+        })
+        .unwrap();
+        frame.push(0x00);
+        assert!(decode_anchor_marks_request(&frame).is_err());
+    }
+
+    #[test]
+    fn marks_response_cap_is_above_payload_and_distinct_from_freshness() {
+        // The marks response cap is the payload ceiling + a small reserve, and is FAR above the 4096
+        // freshness cap (which is unchanged) — so a non-trivial marks table is deliverable.
+        assert_eq!(MAX_MARKS_RESPONSE_LEN, crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN + MARKS_RESP_ENVELOPE_RESERVE);
+        const _: () = assert!(MAX_MARKS_RESPONSE_LEN > MAX_ANCHOR_RESPONSE_LEN);
+        assert_eq!(MAX_ANCHOR_RESPONSE_LEN, 4096, "freshness cap unchanged");
     }
 
     fn test_config() -> KeystoreConfig {

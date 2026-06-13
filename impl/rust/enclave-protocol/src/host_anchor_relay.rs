@@ -27,8 +27,9 @@
 //! cross-component sync OBLIGATION (Risk #1 in the design), not a present fact.
 
 use crate::agent_boot_relay::{
-    deadline_guarded_write, decode_anchor_boot_request, frame_anchor_response,
-    relay_round_trip_over_stream,
+    deadline_guarded_write, decode_anchor_boot_request, decode_anchor_marks_request,
+    frame_response_cap, relay_round_trip_over_stream_cap, MAX_ANCHOR_RESPONSE_LEN,
+    MAX_MARKS_RESPONSE_LEN,
 };
 use crate::enclave_serve::ACCEPT_ERROR_BACKOFF;
 use crate::vsock_addr::{self, DEFAULT_VSOCK_CID};
@@ -341,12 +342,29 @@ where
     D: AnchorDial,
     D::Stream: ArmAnchorTimeouts,
 {
-    // 1. Read the enclave request frame, then DECODE-VALIDATE it BEFORE dialing — reject a malformed
-    //    request before spending a TCP connect (defense-in-depth; test 2 pins dial-never-called).
-    //    Both the reader and the decoder are the verbatim `pub(crate)` cores (no codec dup).
+    // 1. Read the enclave request frame, then PEEK the type + DECODE-VALIDATE it BEFORE dialing —
+    //    reject a malformed request before spending a TCP connect (defense-in-depth; test 2 pins
+    //    dial-never-called). Both the reader and the decoders are the verbatim `pub(crate)` cores (no
+    //    codec dup). 5b-2e: the relay now serves TWO enclave-initiated legs — 0x41 freshness (quote +
+    //    cert) and 0x44 raw-marks (no quote) — each with its OWN decoder + response cap, so neither
+    //    decoder straddles two grammars. An unknown/other type fails closed.
     let frame = crate::read_framed_message_with_idle_deadline(enclave, Some(deadline))
         .map_err(RelayFault::Pump)?;
-    decode_anchor_boot_request(&frame).map_err(RelayFault::Pump)?;
+    let response_cap = match crate::peek_msg_type_from_frame(&frame) {
+        Some(crate::MessageType::AgentBootRelay) => {
+            decode_anchor_boot_request(&frame).map_err(RelayFault::Pump)?;
+            MAX_ANCHOR_RESPONSE_LEN
+        }
+        Some(crate::MessageType::AgentAnchorMarksRelay) => {
+            decode_anchor_marks_request(&frame).map_err(RelayFault::Pump)?;
+            MAX_MARKS_RESPONSE_LEN
+        }
+        _ => {
+            return Err(RelayFault::Pump(ProtocolError::WireProtocol(
+                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are forwardable",
+            )))
+        }
+    };
 
     // 2. Request is well-formed → dial the anchor under the hard connect bound (distinct AnchorConnect
     //    classification — tests 3/4). The connect leg shares ONE budget across ALL resolved addrs
@@ -364,7 +382,8 @@ where
     //    — the verbatim `relay_round_trip_over_stream` core (deadline-guarded anchor write +
     //    read_bounded_anchor_response). ZERO codec dup. `anchor` drops at fn return (fresh-conn-per-
     //    pump; stale-reply + cross-pump isolation — mirrors the enclave's documented fresh-conn-per-call).
-    let response = relay_round_trip_over_stream(&mut anchor, &frame, deadline).map_err(RelayFault::Pump)?;
+    let response = relay_round_trip_over_stream_cap(&mut anchor, &frame, deadline, response_cap)
+        .map_err(RelayFault::Pump)?;
 
     // 5. Frame the response with the SHARED `frame_anchor_response` writer (so writer↔reader can't drift
     //    on BE/prefix) and write it back to the enclave via the SAME `deadline_guarded_write` the reused
@@ -374,7 +393,7 @@ where
     //    enclave write anywhere — on EVERY fault above the fn returned Err BEFORE reaching here, so the
     //    enclave stream received ZERO anchor-looking bytes (the never-synth behavioral invariant; tests
     //    2/5/6/9 + lapsed_deadline_pump_never_synth).
-    let wire = frame_anchor_response(&response).map_err(RelayFault::Pump)?;
+    let wire = frame_response_cap(&response, response_cap).map_err(RelayFault::Pump)?;
     deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
         .map_err(RelayFault::Pump)?;
     Ok(())

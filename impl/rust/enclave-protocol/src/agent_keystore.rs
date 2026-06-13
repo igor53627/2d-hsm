@@ -463,7 +463,10 @@ impl KeystoreBody {
     /// must not be reused here).
     // TODO(agent_cbor): the canonical ENCODER has 3 consumers now (capability/anchor/here); agent_cbor
     // is decode-only today, so reuse agent_capability's encoders in place until they move there.
-    fn encode_marks_payload(&self) -> Vec<u8> {
+    // `pub(crate)` (5b-2e): the lab anchor stub serves this verbatim as the 0x44 raw-marks response so
+    // it self-consistently hashes to the `compute_local_marks_digest` it also commits on the 0x41 leg.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn encode_marks_payload(&self) -> Vec<u8> {
         use crate::agent_capability::{put_bytes, put_uint};
         // The digest's determinism + injectivity rest on every row's environment_identifier equalling
         // config.environment_identifier (validate() enforces this at every seal/unseal boundary), which
