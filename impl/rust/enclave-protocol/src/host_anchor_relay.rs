@@ -27,9 +27,9 @@
 //! cross-component sync OBLIGATION (Risk #1 in the design), not a present fact.
 
 use crate::agent_boot_relay::{
-    deadline_guarded_write, decode_anchor_boot_request, decode_anchor_marks_request,
-    frame_response_cap, relay_round_trip_over_stream_cap, MAX_ANCHOR_RESPONSE_LEN,
-    MAX_MARKS_RESPONSE_LEN,
+    deadline_guarded_write, decode_anchor_boot_request, decode_anchor_commit_request,
+    decode_anchor_marks_request, frame_response_cap, relay_round_trip_over_stream_cap,
+    MAX_ANCHOR_RESPONSE_LEN, MAX_MARKS_RESPONSE_LEN,
 };
 use crate::enclave_serve::ACCEPT_ERROR_BACKOFF;
 use crate::vsock_addr::{self, DEFAULT_VSOCK_CID};
@@ -237,14 +237,15 @@ fn classify_close(fault: &RelayFault) -> &'static str {
                 "oversized-anchor-response"
             }
             ProtocolError::WireProtocol(m) if m.contains("deadline") => "pump-timeout",
-            // BOTH enclave request grammars the pump decodes (0x41 "boot request" and the 5b-2e 0x44
-            // "marks request") bucket as malformed-request, as does an UNFORWARDABLE/unknown type byte or
-            // a too-short header (the relay's own "...are forwardable" reject) — all are a malformed
-            // REQUEST from the enclave/peer, not a relay/anchor fault; else they fall through to the
-            // generic relay-error bucket and weaken operator triage.
+            // EVERY enclave request grammar the pump decodes (0x41 "boot request", 5b-2e 0x44 "marks
+            // request", slice-6 0x45 "commit request") buckets as malformed-request, as does an
+            // UNFORWARDABLE/unknown type byte or a too-short header (the relay's own "...are forwardable"
+            // reject) — all are a malformed REQUEST from the enclave/peer, not a relay/anchor fault; else
+            // they fall through to the generic relay-error bucket and weaken operator triage.
             ProtocolError::WireProtocol(m)
                 if m.contains("boot request")
                     || m.contains("marks request")
+                    || m.contains("commit request")
                     || m.contains("forwardable") =>
             {
                 "malformed-request"
@@ -358,7 +359,8 @@ where
     //    dial-never-called). Both the reader and the decoders are the verbatim `pub(crate)` cores (no
     //    codec dup). 5b-2e: the relay now serves TWO enclave-initiated legs — 0x41 freshness (quote +
     //    cert) and 0x44 raw-marks (no quote) — each with its OWN decoder + response cap, so neither
-    //    decoder straddles two grammars. An unknown/other type fails closed.
+    //    decoder straddles two grammars. An unknown/other type fails closed. slice 6: a THIRD leg — 0x45
+    //    commit (no quote; the signed ACK is small, so it reuses the 4096 freshness cap).
     let frame = crate::read_framed_message_with_idle_deadline(enclave, Some(deadline))
         .map_err(RelayFault::Pump)?;
     let response_cap = match crate::peek_msg_type_from_frame(&frame) {
@@ -370,9 +372,15 @@ where
             decode_anchor_marks_request(&frame).map_err(RelayFault::Pump)?;
             MAX_MARKS_RESPONSE_LEN
         }
+        Some(crate::MessageType::AgentAnchorCommitRelay) => {
+            decode_anchor_commit_request(&frame).map_err(RelayFault::Pump)?;
+            // The commit ACK is a fixed-shape signed record (~200 B) — the 4096 freshness cap, NOT the
+            // multi-KiB marks cap.
+            MAX_ANCHOR_RESPONSE_LEN
+        }
         _ => {
             return Err(RelayFault::Pump(ProtocolError::WireProtocol(
-                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are forwardable",
+                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) / AGENT_ANCHOR_COMMIT_RELAY (0x45) are forwardable",
             )))
         }
     };
@@ -749,6 +757,44 @@ mod tests {
         assert_eq!(dial.dials.get(), 1);
     }
 
+    // 1c. commit_pump_forwards_under_the_freshness_cap — Regression (slice 6): the 0x45 commit leg
+    //     forwards the request VERBATIM and reads back the small signed ACK under the 4096 freshness cap
+    //     (the commit ack is a fixed-shape signed record, NOT the multi-KiB marks cap).
+    #[test]
+    fn commit_pump_forwards_under_the_freshness_cap() {
+        let req = crate::agent_boot_relay::encode_anchor_commit_request(
+            &crate::agent_boot_relay::AnchorCommitRequest {
+                chain_id: 11565,
+                environment_identifier: "testnet",
+                new_epoch: 8,
+                new_structural_version: 3,
+                marks_digest: [0x5c; 32],
+                nonce: [0x9a; 32],
+                request_id: b"op-req-1",
+            },
+        )
+        .unwrap();
+        let (relay_side, mut peer) = enclave_pair_with(&req);
+        // A small ACK-sized body (well within the 4096 freshness cap). Frame by hand (4-byte BE len + body).
+        let ack = vec![0x5e_u8; 200];
+        let mut framed = Vec::with_capacity(4 + ack.len());
+        framed.extend_from_slice(&(ack.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&ack);
+        let dial = FakeAnchorDial::new(vec![DialAct::Ok(framed)]);
+        drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
+        // The 0x45 request reached the anchor byte-identically.
+        assert_eq!(*dial.last_forwarded.borrow(), req, "0x45 commit request forwarded verbatim");
+        // The enclave reads back the ACK verbatim.
+        let mut len_buf = [0u8; 4];
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+        peer.read_exact(&mut len_buf).unwrap();
+        let n = u32::from_be_bytes(len_buf) as usize;
+        let mut got = vec![0u8; n];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(got, ack, "the commit ack is written back verbatim");
+        assert_eq!(dial.dials.get(), 1);
+    }
+
     // 2. malformed_enclave_request_rejects_before_dial — Regression: decode-before-round-trip
     //    defense-in-depth; dial NEVER invoked; ZERO bytes written back.
     #[test]
@@ -957,11 +1003,18 @@ mod tests {
             ))),
             "malformed-request"
         );
+        // slice 6: a malformed 0x45 commit request likewise buckets as malformed-request ("commit request:").
+        assert_eq!(
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "commit request: bad CBOR"
+            ))),
+            "malformed-request"
+        );
         // An UNFORWARDABLE/unknown type byte or too-short header (the relay's own reject) is a malformed
         // REQUEST too — the literal string the unknown-type arm returns must bucket as malformed-request.
         assert_eq!(
             classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
-                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are forwardable"
+                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) / AGENT_ANCHOR_COMMIT_RELAY (0x45) are forwardable"
             ))),
             "malformed-request"
         );

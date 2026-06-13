@@ -416,6 +416,83 @@ pub(crate) fn decode_anchor_commit_request(frame: &[u8]) -> Result<DecodedCommit
     })
 }
 
+/// Why a per-op anchor COMMIT failed — coarse, always-FAIL-CLOSED band (slice 6). On ANY variant the
+/// caller MUST fail the op closed: no seal, no signature/refs emitted (seal-before-emit; there is no
+/// offline window for fund custody). No "retryable vs terminal" split at this layer — a failed commit
+/// means the op did NOT durably commit, full stop.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
+#[derive(Debug)]
+pub(crate) enum CommitFailure {
+    /// The 0x45 request frame could not be encoded (e.g. over-cap request_id).
+    Encode,
+    /// The channel round-trip failed — anchor unreachable / relay dropped the leg / timeout.
+    Transport(AnchorTransportError),
+    /// The signed ACK did not verify against the proposed values (forged / replayed / scope / nonce /
+    /// epoch / structural / marks / request_id mismatch — the anchor did not durably record what was
+    /// proposed).
+    Ack(crate::agent_anchor::CommitAckError),
+}
+
+/// The enclave-PROPOSED post-op state for ONE per-op anchor commit (slice 6). Carries ONLY the proposed
+/// op-state — the SCOPE (`chain_id`/`environment_identifier`) is NOT here: [`run_anchor_commit`] derives
+/// it from the sealed `config` for BOTH the outbound request AND the ack scope check, so a stale/mismatched
+/// scope is structurally unrepresentable (the request scope == the verify scope == the sealed config). The
+/// 0x45 request the enclave SENDS and the values the ACK must ECHO are both built from this one struct (+
+/// config), so they cannot diverge.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
+#[derive(Debug)]
+pub(crate) struct AnchorCommit<'a> {
+    pub new_epoch: u64,
+    pub new_structural_version: u64,
+    pub marks_digest: [u8; 32],
+    pub nonce: [u8; 32],
+    pub request_id: &'a [u8],
+}
+
+/// slice 6-3: run ONE per-op anchor commit round-trip over a [`BootRelayChannel`] — encode the 0x45
+/// request, send it (fresh-conn, deadline-bounded, 4096-cap read — the ACK is small), and verify the
+/// signed ACK against the proposed values via [`crate::agent_anchor::verify_commit_ack_bytes`]. Returns
+/// `Ok(())` ONLY when the anchor durably recorded EXACTLY the proposed `(epoch, structural, marks)` under
+/// the op's `nonce` + `request_id` — that `Ok(())` is the seal-before-emit GO signal. ANY failure
+/// ([`CommitFailure`]) ⇒ the caller fails the op CLOSED (no seal, no emit). Pure over the channel seam:
+/// the request and the expected-ack are built from the ONE [`AnchorCommit`], so a drift is unrepresentable.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
+pub(crate) fn run_anchor_commit<C: BootRelayChannel>(
+    channel: &mut C,
+    commit: &AnchorCommit,
+    config: &crate::agent_keystore::KeystoreConfig,
+    deadline: std::time::Instant,
+) -> Result<(), CommitFailure> {
+    let frame = encode_anchor_commit_request(&AnchorCommitRequest {
+        // Scope from the SEALED config (never caller-supplied) — the same scope `verify_commit_ack_bytes`
+        // checks the ack against, so request scope == verify scope == sealed config by construction.
+        chain_id: config.twod_chain_id,
+        environment_identifier: &config.environment_identifier,
+        new_epoch: commit.new_epoch,
+        new_structural_version: commit.new_structural_version,
+        marks_digest: commit.marks_digest,
+        nonce: commit.nonce,
+        request_id: commit.request_id,
+    })
+    .map_err(|_| CommitFailure::Encode)?;
+    // The ACK is a fixed-shape signed record; the channel's 4096-cap `round_trip` suffices (NOT the
+    // multi-KiB marks cap). Fresh-connection-per-call + deadline-bounded are the channel's obligations.
+    let ack = channel.round_trip(&frame, deadline).map_err(CommitFailure::Transport)?;
+    crate::agent_anchor::verify_commit_ack_bytes(
+        &ack,
+        &crate::agent_anchor::ExpectedCommitAck {
+            nonce: &commit.nonce,
+            epoch: commit.new_epoch,
+            structural_version: commit.new_structural_version,
+            marks_digest: &commit.marks_digest,
+            request_id: commit.request_id,
+        },
+        config,
+    )
+    .map_err(CommitFailure::Ack)?;
+    Ok(())
+}
+
 /// Read the anchor response off a stream: a single 4-byte BE length prefix then exactly that many raw
 /// anchor-signed bytes (no version/type framing — the relay forwards exactly what the anchor signed).
 /// The length is checked against [`MAX_ANCHOR_RESPONSE_LEN`] **before** allocating, so a hostile relay
@@ -1240,6 +1317,105 @@ mod tests {
             crate::agent_anchor::verify_commit_ack_bytes(&ack, &expected, &test_config()),
             Ok(())
         );
+    }
+
+    // ---- slice 6-3: run_anchor_commit composition ----
+
+    /// A scripted commit channel: decodes the 0x45 request (recovering the proposed fields) and answers
+    /// per the action — a conformant anchor echoing the proposal, a transport failure, a forged signer,
+    /// or an anchor that recorded a DIFFERENT epoch than proposed.
+    enum CommitAct {
+        Ok,
+        Transport,
+        Forged,
+        WrongEpoch,
+    }
+    struct CommitMock(CommitAct);
+    impl BootRelayChannel for CommitMock {
+        fn round_trip(
+            &mut self,
+            request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, AnchorTransportError> {
+            let d = decode_anchor_commit_request(request_frame).expect("commit frame decodes");
+            let sign = |key: &SigningKey, epoch: u64| {
+                crate::agent_anchor::test_signed_commit_ack_bytes(
+                    key, d.chain_id, &d.environment_identifier, epoch, d.new_structural_version,
+                    d.marks_digest, d.nonce, d.request_id.clone(),
+                )
+            };
+            match self.0 {
+                CommitAct::Ok => Ok(sign(&anchor_key(), d.new_epoch)),
+                CommitAct::Transport => Err(AnchorTransportError("commit transport down")),
+                CommitAct::Forged => Ok(sign(&SigningKey::from_bytes(&[9u8; 32]), d.new_epoch)),
+                CommitAct::WrongEpoch => Ok(sign(&anchor_key(), d.new_epoch + 1)),
+            }
+        }
+        fn marks_round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, AnchorTransportError> {
+            unreachable!("commit tests never call marks_round_trip")
+        }
+    }
+
+    #[test]
+    fn run_anchor_commit_ok_and_fail_closed_paths() {
+        let commit = AnchorCommit {
+            new_epoch: 8,
+            new_structural_version: 3,
+            marks_digest: [0x5c; 32],
+            nonce: [0x9a; 32],
+            request_id: b"op-req-1",
+        };
+        // test_config()'s scope (CHAIN/ENV) is what run_anchor_commit derives for the request — the mock
+        // decodes that scope and signs the ack with it, and verify checks against the same config.
+        let cfg = test_config();
+        // A conformant ACK echoing the proposal → Ok(()) (the seal-before-emit GO signal).
+        assert!(matches!(
+            run_anchor_commit(&mut CommitMock(CommitAct::Ok), &commit, &cfg, far_deadline()),
+            Ok(())
+        ));
+        // Transport failure → fail-closed Transport (anchor unavailable ⇒ no offline window).
+        assert!(matches!(
+            run_anchor_commit(&mut CommitMock(CommitAct::Transport), &commit, &cfg, far_deadline()),
+            Err(CommitFailure::Transport(_))
+        ));
+        // Forged ACK (signed by a NON-anchor_root key) → fail-closed Ack(SignatureInvalid).
+        assert!(matches!(
+            run_anchor_commit(&mut CommitMock(CommitAct::Forged), &commit, &cfg, far_deadline()),
+            Err(CommitFailure::Ack(crate::agent_anchor::CommitAckError::SignatureInvalid))
+        ));
+        // The anchor recorded a DIFFERENT epoch than proposed → fail-closed Ack(EpochMismatch): the
+        // enclave must NOT seal/emit when the durable record diverges from what it's about to seal.
+        assert!(matches!(
+            run_anchor_commit(&mut CommitMock(CommitAct::WrongEpoch), &commit, &cfg, far_deadline()),
+            Err(CommitFailure::Ack(crate::agent_anchor::CommitAckError::EpochMismatch))
+        ));
+        // An over-cap request_id → fail-closed Encode BEFORE any channel round-trip (the channel panics
+        // if ever reached, proving encode fails first — no avoidable anchor round-trip).
+        struct NeverChannel;
+        impl BootRelayChannel for NeverChannel {
+            fn round_trip(&mut self, _f: &[u8], _d: std::time::Instant) -> Result<Vec<u8>, AnchorTransportError> {
+                panic!("encode must fail closed BEFORE any round_trip")
+            }
+            fn marks_round_trip(&mut self, _f: &[u8], _d: std::time::Instant) -> Result<Vec<u8>, AnchorTransportError> {
+                unreachable!()
+            }
+        }
+        let big = vec![0x41u8; crate::agent_dispatch::MAX_REQUEST_ID_LEN + 1];
+        let over = AnchorCommit {
+            new_epoch: 8,
+            new_structural_version: 3,
+            marks_digest: [0x5c; 32],
+            nonce: [0x9a; 32],
+            request_id: &big,
+        };
+        assert!(matches!(
+            run_anchor_commit(&mut NeverChannel, &over, &cfg, far_deadline()),
+            Err(CommitFailure::Encode)
+        ));
     }
 
     #[test]
