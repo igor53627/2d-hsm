@@ -1641,7 +1641,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   generalized leg-sum shape is unchanged; only the leg COUNT grew.
 - **Timeout semantics + total bound.** The single-`timeout`-per-leg model from 5b-2a is the **baseline and
   is final for 5b-2b** (quote and channel each get `timeout`; one attempt ≤ `2·timeout` + the subprocess overhead ε
-  ([`QUOTE_ATTEMPT_OVERHEAD`], as of (d)); total boot ≤ `max_attempts · (2·timeout + ε)`) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
+  ([`QUOTE_ATTEMPT_OVERHEAD`], as of (d)); total boot ≤ `max_attempts · (2·timeout + ε)` **for the 5b-2b two-leg model — 5b-2e raises this to `3·timeout` per the ⚠️ banner above**) — `RelayAnchorTransport` threads one `Duration` and gives each leg its own
   `Instant::now()+timeout`. **Decision (was an unassigned SHOULD):** exposing *distinct*
   `quote_timeout`/`relay_timeout` is **deferred to 5b-2c** (the bin that constructs the transport and owns
   operator config) — NOT 5b-2b-i/ii, which keep the single-budget model. 5b-2c, if it splits them, MUST
@@ -1668,12 +1668,15 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   local variable, NOT a structural gate; re-verify on any refactor of `round_trip_inner`):** `connect_bounded`'s
   `deadline` arg is the **per-leg channel deadline** —
   `round_trip_inner` passes the *same* `deadline` local to `connect_bounded` and to the channel-I/O
-  `DeadlineSocket`, so connect + I/O share ONE channel-leg `timeout` (the `2·` in the invariant counts the
-  *quote* leg + the *channel* leg, NOT connect-vs-I/O). Nothing prevents a refactor from passing two different
+  `DeadlineSocket`, so connect + I/O share ONE channel-leg `timeout` — and this holds INDEPENDENTLY for
+  EACH channel leg the boot runs (the freshness `anchor_round_trip` and, on an adopt, the 5b-2e
+  `marks_round_trip` — both go through the same `round_trip_inner` wiring). The leg COUNT in the invariant
+  counts the *quote* leg + the *freshness-channel* leg + the *marks-channel* leg (`3·`), NOT connect-vs-I/O
+  within a single channel leg. Nothing prevents a refactor from passing two different
   deadlines (no newtype/constructor coupling — by the standard this doc applies to (d), that would be a prose
   check, which is why this line says *wiring*-enforced), so any future change to `round_trip_inner` MUST
-  re-verify it; the named break mode is handing `connect_bounded` the *overall* boot deadline, which would
-  void the `2·timeout` accounting. 5b-2c does NOT thread this deadline (it only constructs the channel and
+  re-verify it (for BOTH channel legs); the named break mode is handing `connect_bounded` the *overall* boot deadline, which would
+  void the per-leg accounting. 5b-2c does NOT thread this deadline (it only constructs the channel and
   supplies `max_attempts`/`timeout`), so the surviving 5b-2c obligation is purely the budget sizing
   (`max_attempts · (3·timeout + ε) ≤ overall_boot_budget` — 3 legs since 5b-2e). **Post-(a') threat model (kernel-timer-aware):** with
   the fd/thread leak gone, a black-holing host no longer exhausts the guest fd table. For the remaining TIME
