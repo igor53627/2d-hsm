@@ -433,13 +433,14 @@ pub(crate) enum CommitFailure {
     Ack(crate::agent_anchor::CommitAckError),
 }
 
-/// The enclave-PROPOSED post-op state for ONE per-op anchor commit (slice 6). The 0x45 request the
-/// enclave SENDS and the values the ACK must ECHO are BOTH built from this one struct (in
-/// [`run_anchor_commit`]), so they cannot diverge.
+/// The enclave-PROPOSED post-op state for ONE per-op anchor commit (slice 6). Carries ONLY the proposed
+/// op-state — the SCOPE (`chain_id`/`environment_identifier`) is NOT here: [`run_anchor_commit`] derives
+/// it from the sealed `config` for BOTH the outbound request AND the ack scope check, so a stale/mismatched
+/// scope is structurally unrepresentable (the request scope == the verify scope == the sealed config). The
+/// 0x45 request the enclave SENDS and the values the ACK must ECHO are both built from this one struct (+
+/// config), so they cannot diverge.
 #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
 pub(crate) struct AnchorCommit<'a> {
-    pub chain_id: u64,
-    pub environment_identifier: &'a str,
     pub new_epoch: u64,
     pub new_structural_version: u64,
     pub marks_digest: [u8; 32],
@@ -462,8 +463,10 @@ pub(crate) fn run_anchor_commit<C: BootRelayChannel>(
     deadline: std::time::Instant,
 ) -> Result<(), CommitFailure> {
     let frame = encode_anchor_commit_request(&AnchorCommitRequest {
-        chain_id: commit.chain_id,
-        environment_identifier: commit.environment_identifier,
+        // Scope from the SEALED config (never caller-supplied) — the same scope `verify_commit_ack_bytes`
+        // checks the ack against, so request scope == verify scope == sealed config by construction.
+        chain_id: config.twod_chain_id,
+        environment_identifier: &config.environment_identifier,
         new_epoch: commit.new_epoch,
         new_structural_version: commit.new_structural_version,
         marks_digest: commit.marks_digest,
@@ -1359,14 +1362,14 @@ mod tests {
     #[test]
     fn run_anchor_commit_ok_and_fail_closed_paths() {
         let commit = AnchorCommit {
-            chain_id: CHAIN,
-            environment_identifier: ENV,
             new_epoch: 8,
             new_structural_version: 3,
             marks_digest: [0x5c; 32],
             nonce: [0x9a; 32],
             request_id: b"op-req-1",
         };
+        // test_config()'s scope (CHAIN/ENV) is what run_anchor_commit derives for the request — the mock
+        // decodes that scope and signs the ack with it, and verify checks against the same config.
         let cfg = test_config();
         // A conformant ACK echoing the proposal → Ok(()) (the seal-before-emit GO signal).
         assert!(matches!(
