@@ -191,7 +191,7 @@ fn phase_gc_seed() -> Result<String, String> {
     Ok(format!("seeded={path}"))
 }
 
-/// Phase 3 — `budget-claim`: validate the boot budget (nominal 2·(2·10s+ε) ≈ 40.02s ≤ 45s; 10s ≥
+/// Phase 3 — `budget-claim`: validate the boot budget (nominal 2·(3·10s+ε) ≈ 60.02s ≤ 70s; 10s ≥
 /// `MIN_BOUNDARY_BUDGET`), claim THE process producer through the standalone claim+shape door
 /// `HardBoundedQuoteProducer::production` (deliberately NOT a new `transport_with_spawn` caller —
 /// that mint's any-new-caller-is-a-review-flag rule stays clean), then observe claim PERMANENCE
@@ -200,7 +200,7 @@ fn phase_gc_seed() -> Result<String, String> {
 /// for phases 4–6 (single-claim reuse). Never-generic-Q held: concrete type, no `<Q>` anywhere.
 #[allow(clippy::type_complexity)]
 fn phase_budget_claim() -> Result<(HardBoundedQuoteProducer, ValidatedBootBudget, String), String> {
-    let budget = ValidatedBootBudget::validate(2, Duration::from_secs(10), Duration::from_secs(45))
+    let budget = ValidatedBootBudget::validate(2, Duration::from_secs(10), Duration::from_secs(70))
         .map_err(|e| format!("budget validate refused: {e}"))?;
     let producer = HardBoundedQuoteProducer::production(&budget)
         .map_err(|e| format!("first production() refused: {e}"))?;

@@ -27,8 +27,9 @@
 //! cross-component sync OBLIGATION (Risk #1 in the design), not a present fact.
 
 use crate::agent_boot_relay::{
-    deadline_guarded_write, decode_anchor_boot_request, frame_anchor_response,
-    relay_round_trip_over_stream,
+    deadline_guarded_write, decode_anchor_boot_request, decode_anchor_marks_request,
+    frame_response_cap, relay_round_trip_over_stream_cap, MAX_ANCHOR_RESPONSE_LEN,
+    MAX_MARKS_RESPONSE_LEN,
 };
 use crate::enclave_serve::ACCEPT_ERROR_BACKOFF;
 use crate::vsock_addr::{self, DEFAULT_VSOCK_CID};
@@ -41,7 +42,7 @@ use std::time::Duration;
 // Budget consts — single source, NO new operator knob (§8 L1443-1447 + design §5).
 // ---------------------------------------------------------------------------------------------------
 
-/// Per-pump HEAD-OF-LINE bound (NOT the boot bound — the enclave owns `max_attempts·(2·timeout+ε)`;
+/// Per-pump HEAD-OF-LINE bound (NOT the boot bound — the enclave owns `max_attempts·(3·timeout+ε)`;
 /// this daemon carries NO ε, NO producer, NO budget arithmetic). Prevents a wedged pump from blocking
 /// the serial loop forever. One absolute `Instant` minted at PUMP ENTRY — i.e. BEFORE the enclave read
 /// (the natural consequence of reading the request before connecting) — spans the whole framed pump
@@ -236,7 +237,18 @@ fn classify_close(fault: &RelayFault) -> &'static str {
                 "oversized-anchor-response"
             }
             ProtocolError::WireProtocol(m) if m.contains("deadline") => "pump-timeout",
-            ProtocolError::WireProtocol(m) if m.contains("boot request") => "malformed-request",
+            // BOTH enclave request grammars the pump decodes (0x41 "boot request" and the 5b-2e 0x44
+            // "marks request") bucket as malformed-request, as does an UNFORWARDABLE/unknown type byte or
+            // a too-short header (the relay's own "...are forwardable" reject) — all are a malformed
+            // REQUEST from the enclave/peer, not a relay/anchor fault; else they fall through to the
+            // generic relay-error bucket and weaken operator triage.
+            ProtocolError::WireProtocol(m)
+                if m.contains("boot request")
+                    || m.contains("marks request")
+                    || m.contains("forwardable") =>
+            {
+                "malformed-request"
+            }
             _ => "relay-error",
         },
     }
@@ -341,12 +353,29 @@ where
     D: AnchorDial,
     D::Stream: ArmAnchorTimeouts,
 {
-    // 1. Read the enclave request frame, then DECODE-VALIDATE it BEFORE dialing — reject a malformed
-    //    request before spending a TCP connect (defense-in-depth; test 2 pins dial-never-called).
-    //    Both the reader and the decoder are the verbatim `pub(crate)` cores (no codec dup).
+    // 1. Read the enclave request frame, then PEEK the type + DECODE-VALIDATE it BEFORE dialing —
+    //    reject a malformed request before spending a TCP connect (defense-in-depth; test 2 pins
+    //    dial-never-called). Both the reader and the decoders are the verbatim `pub(crate)` cores (no
+    //    codec dup). 5b-2e: the relay now serves TWO enclave-initiated legs — 0x41 freshness (quote +
+    //    cert) and 0x44 raw-marks (no quote) — each with its OWN decoder + response cap, so neither
+    //    decoder straddles two grammars. An unknown/other type fails closed.
     let frame = crate::read_framed_message_with_idle_deadline(enclave, Some(deadline))
         .map_err(RelayFault::Pump)?;
-    decode_anchor_boot_request(&frame).map_err(RelayFault::Pump)?;
+    let response_cap = match crate::peek_msg_type_from_frame(&frame) {
+        Some(crate::MessageType::AgentBootRelay) => {
+            decode_anchor_boot_request(&frame).map_err(RelayFault::Pump)?;
+            MAX_ANCHOR_RESPONSE_LEN
+        }
+        Some(crate::MessageType::AgentAnchorMarksRelay) => {
+            decode_anchor_marks_request(&frame).map_err(RelayFault::Pump)?;
+            MAX_MARKS_RESPONSE_LEN
+        }
+        _ => {
+            return Err(RelayFault::Pump(ProtocolError::WireProtocol(
+                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are forwardable",
+            )))
+        }
+    };
 
     // 2. Request is well-formed → dial the anchor under the hard connect bound (distinct AnchorConnect
     //    classification — tests 3/4). The connect leg shares ONE budget across ALL resolved addrs
@@ -364,7 +393,8 @@ where
     //    — the verbatim `relay_round_trip_over_stream` core (deadline-guarded anchor write +
     //    read_bounded_anchor_response). ZERO codec dup. `anchor` drops at fn return (fresh-conn-per-
     //    pump; stale-reply + cross-pump isolation — mirrors the enclave's documented fresh-conn-per-call).
-    let response = relay_round_trip_over_stream(&mut anchor, &frame, deadline).map_err(RelayFault::Pump)?;
+    let response = relay_round_trip_over_stream_cap(&mut anchor, &frame, deadline, response_cap)
+        .map_err(RelayFault::Pump)?;
 
     // 5. Frame the response with the SHARED `frame_anchor_response` writer (so writer↔reader can't drift
     //    on BE/prefix) and write it back to the enclave via the SAME `deadline_guarded_write` the reused
@@ -374,7 +404,7 @@ where
     //    enclave write anywhere — on EVERY fault above the fn returned Err BEFORE reaching here, so the
     //    enclave stream received ZERO anchor-looking bytes (the never-synth behavioral invariant; tests
     //    2/5/6/9 + lapsed_deadline_pump_never_synth).
-    let wire = frame_anchor_response(&response).map_err(RelayFault::Pump)?;
+    let wire = frame_response_cap(&response, response_cap).map_err(RelayFault::Pump)?;
     deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
         .map_err(RelayFault::Pump)?;
     Ok(())
@@ -677,6 +707,48 @@ mod tests {
         assert_eq!(dial.dials.get(), 1);
     }
 
+    // 1b. marks_pump_forwards_under_the_marks_cap — Regression (5b-2e): the 0x44 marks leg forwards the
+    //     request VERBATIM and reads back under the LARGER MAX_MARKS_RESPONSE_LEN cap. The response body
+    //     here is > MAX_ANCHOR_RESPONSE_LEN (4096) — exactly what test 5 REJECTS on the 0x41 freshness
+    //     path — so it forwarding end to end proves the pump branches the cap by message type, not a
+    //     single shared 4096.
+    #[test]
+    fn marks_pump_forwards_under_the_marks_cap() {
+        let req = crate::agent_boot_relay::encode_anchor_marks_request(
+            &crate::agent_boot_relay::AnchorMarksRequest {
+                chain_id: 11565,
+                environment_identifier: "testnet",
+                nonce: [0; 32],
+                epoch: 7,
+            },
+        )
+        .unwrap();
+        let (relay_side, mut peer) = enclave_pair_with(&req);
+        // A marks body LARGER than the 4096 freshness cap but within MAX_MARKS_RESPONSE_LEN. Frame it by
+        // hand (4-byte BE len + body), as test 5 does — no cap helper, so the test owns the exact bytes.
+        let big = vec![0x5e_u8; MAX_ANCHOR_RESPONSE_LEN + 904]; // 5000 bytes
+        assert!(
+            big.len() > MAX_ANCHOR_RESPONSE_LEN && big.len() < MAX_MARKS_RESPONSE_LEN,
+            "the body must straddle the two caps to prove the 0x44 branch"
+        );
+        let mut framed = Vec::with_capacity(4 + big.len());
+        framed.extend_from_slice(&(big.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&big);
+        let dial = FakeAnchorDial::new(vec![DialAct::Ok(framed)]);
+        drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
+        // The 0x44 request reached the anchor byte-identically.
+        assert_eq!(*dial.last_forwarded.borrow(), req, "0x44 request forwarded verbatim");
+        // The enclave reads back the FULL > 4096 body verbatim — the marks cap was applied on both legs.
+        let mut len_buf = [0u8; 4];
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+        peer.read_exact(&mut len_buf).unwrap();
+        let n = u32::from_be_bytes(len_buf) as usize;
+        let mut got = vec![0u8; n];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(got, big, "the full marks response (> freshness cap) is written back verbatim");
+        assert_eq!(dial.dials.get(), 1);
+    }
+
     // 2. malformed_enclave_request_rejects_before_dial — Regression: decode-before-round-trip
     //    defense-in-depth; dial NEVER invoked; ZERO bytes written back.
     #[test]
@@ -875,6 +947,22 @@ mod tests {
         // A genuine malformed boot request → malformed-request (the cores prefix "boot request:").
         assert_eq!(
             classify_close(&RelayFault::Pump(ProtocolError::WireProtocol("boot request: bad CBOR"))),
+            "malformed-request"
+        );
+        // 5b-2e: a malformed 0x44 marks request ALSO buckets as malformed-request (cores prefix
+        // "marks request:") — not the generic relay-error bucket.
+        assert_eq!(
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "marks request: bad CBOR"
+            ))),
+            "malformed-request"
+        );
+        // An UNFORWARDABLE/unknown type byte or too-short header (the relay's own reject) is a malformed
+        // REQUEST too — the literal string the unknown-type arm returns must bucket as malformed-request.
+        assert_eq!(
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are forwardable"
+            ))),
             "malformed-request"
         );
         // Anything else → relay-error.

@@ -219,6 +219,7 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
         | K::CounterRegression
         | K::InvalidFieldLength
         | K::DuplicateKeyRef
+        | K::DuplicateCounterTuple
         | K::BlobTooLarge => "agent keystore: invalid keystore body",
     };
     ProtocolError::PqSigningUnavailable(label)

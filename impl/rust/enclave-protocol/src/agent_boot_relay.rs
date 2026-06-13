@@ -67,6 +67,23 @@ pub(crate) const MAX_ANCHOR_RESPONSE_LEN: usize = 4096;
 /// versions while staying tiny.
 pub(crate) const MAX_QUOTE_REPORT_LEN: usize = 8192;
 
+/// 5b-2e: envelope reserve over the marks payload for the marks RESPONSE (keys 1–5 scope/nonce/epoch
+/// ~80 B + the key-6 bstr length prefix ~5 B + the key-13 64-byte signature + map overhead). 256 B is
+/// comfortable headroom.
+pub(crate) const MARKS_RESP_ENVELOPE_RESERVE: usize = 256;
+
+/// 5b-2e: upper bound on the `anchor_root`-signed RAW-MARKS response — DISTINCT from
+/// [`MAX_ANCHOR_RESPONSE_LEN`] (4096): a marks payload describing a non-trivial counter table is
+/// multi-KiB (a body sealing under [`crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE`] is the genuine
+/// ceiling), so the marks leg gets its OWN cap. The 4 KiB freshness-leg cap is UNCHANGED (raising a
+/// single shared cap would loosen the freshness DoS bound). Checked before alloc, like
+/// [`read_bounded_anchor_response`]; the marks fetch is only paid on the `AdoptForward` path.
+pub(crate) const MAX_MARKS_RESPONSE_LEN: usize =
+    crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN + MARKS_RESP_ENVELOPE_RESERVE;
+
+/// Body-level version of the 5b-2e marks-relay request map (key 1).
+const MARKS_REQUEST_VERSION: u64 = 1;
+
 /// Owned, decoded boot-relay request — for the untrusted **host relay** (5b-2b) and round-trip tests.
 /// NOT an enclave trust boundary: the enclave only *encodes* the request and *verifies the response*; it
 /// never decodes a request. (Kept hardened anyway — see [`decode_anchor_boot_request`].)
@@ -192,6 +209,90 @@ pub(crate) fn decode_anchor_boot_request(frame: &[u8]) -> Result<DecodedBootRequ
     })
 }
 
+/// 5b-2e raw-marks request the enclave writes on the `AdoptForward` path. Borrows the scope so it
+/// shares the `&body.config` lifetime; carries the SAME fresh nonce + the adopted epoch, **NO quote**.
+pub(crate) struct AnchorMarksRequest<'a> {
+    pub chain_id: u64,
+    pub environment_identifier: &'a str,
+    pub nonce: [u8; 32],
+    pub epoch: u64,
+}
+
+/// Owned, decoded marks request — for the untrusted **host relay** (it peeks the type, validates, and
+/// forwards). NOT an enclave trust boundary (the enclave only encodes the request + verifies the
+/// signed response); hardened anyway, mirroring [`DecodedBootRequest`].
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the relay + tests)
+#[derive(Debug)]
+pub(crate) struct DecodedMarksRequest {
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub nonce: [u8; 32],
+    pub epoch: u64,
+}
+
+/// Encode a 5b-2e raw-marks request frame: a canonical int-keyed CBOR map (keys 1..=5) under a
+/// [`crate::MessageType::AgentAnchorMarksRelay`] (`0x44`) frame. NO quote/cert (the attestation was
+/// bound on the `0x41` leg this attempt). Built with the same canonical encoders so a conformant
+/// anchor recomputes identical bytes.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the transport seam, commit 6)
+pub(crate) fn encode_anchor_marks_request(
+    request: &AnchorMarksRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    let mut payload = Vec::with_capacity(96 + request.environment_identifier.len());
+    put_uint(&mut payload, 5, 5); // map header: 5 pairs
+    put_uint(&mut payload, 0, 1);
+    put_uint(&mut payload, 0, MARKS_REQUEST_VERSION);
+    put_uint(&mut payload, 0, 2);
+    put_uint(&mut payload, 0, request.chain_id);
+    put_uint(&mut payload, 0, 3);
+    put_text(&mut payload, request.environment_identifier);
+    put_uint(&mut payload, 0, 4);
+    put_bytes(&mut payload, &request.nonce);
+    put_uint(&mut payload, 0, 5);
+    put_uint(&mut payload, 0, request.epoch);
+    crate::encode_message(crate::MessageType::AgentAnchorMarksRelay, &payload)
+}
+
+/// Decode + validate a 5b-2e marks request frame (for the untrusted host relay + tests). Lenient
+/// ciborium decode is fine (no quote/cert; not signature-bound — the enclave verifies only the
+/// RESPONSE), but the shape is strictly enforced: `0x44` type, integer keys exactly `{1..=5}` no dup,
+/// version `== 1`, exact-length nonce (32). Every failure is [`ProtocolError::WireProtocol`].
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 5b/8 (consumed by the relay branch, host_anchor_relay)
+pub(crate) fn decode_anchor_marks_request(frame: &[u8]) -> Result<DecodedMarksRequest, ProtocolError> {
+    use crate::agent_cbor::{as_bytes_n, as_u64, check_strict_keys, map_get};
+    use ciborium::value::Value;
+
+    let framed = crate::decode_message(frame)?;
+    if framed.msg_type != crate::MessageType::AgentAnchorMarksRelay {
+        return Err(ProtocolError::WireProtocol("not an AGENT_ANCHOR_MARKS_RELAY frame"));
+    }
+    let mut cursor = std::io::Cursor::new(framed.payload.as_slice());
+    let value: Value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|_| ProtocolError::WireProtocol("marks request: bad CBOR"))?;
+    if cursor.position() as usize != framed.payload.len() {
+        return Err(ProtocolError::WireProtocol("marks request: trailing bytes after CBOR"));
+    }
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol("marks request: payload is not a CBOR map"));
+    };
+    if !check_strict_keys(&map, |n| (1..=5).contains(&n)) {
+        return Err(ProtocolError::WireProtocol("marks request: unexpected/missing/duplicate key"));
+    }
+    let req_u64 = |k: u64| map_get(&map, k).and_then(as_u64).ok_or(ProtocolError::WireProtocol("marks request: bad uint"));
+    if req_u64(1)? != MARKS_REQUEST_VERSION {
+        return Err(ProtocolError::WireProtocol("marks request: unsupported version"));
+    }
+    let chain_id = req_u64(2)?;
+    let environment_identifier = match map_get(&map, 3) {
+        Some(Value::Text(s)) => s.clone(),
+        _ => return Err(ProtocolError::WireProtocol("marks request: env must be text")),
+    };
+    let nonce = map_get(&map, 4).and_then(as_bytes_n::<32>).ok_or(ProtocolError::WireProtocol("marks request: nonce must be 32 bytes"))?;
+    let epoch = req_u64(5)?;
+    Ok(DecodedMarksRequest { chain_id, environment_identifier, nonce, epoch })
+}
+
 /// Read the anchor response off a stream: a single 4-byte BE length prefix then exactly that many raw
 /// anchor-signed bytes (no version/type framing — the relay forwards exactly what the anchor signed).
 /// The length is checked against [`MAX_ANCHOR_RESPONSE_LEN`] **before** allocating, so a hostile relay
@@ -215,10 +316,22 @@ pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
     reader: &mut R,
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>, ProtocolError> {
+    read_bounded_response_cap(reader, deadline, MAX_ANCHOR_RESPONSE_LEN)
+}
+
+/// 5b-2e: read a length-prefixed raw response bounded by an EXPLICIT `cap` (cap-before-alloc). The
+/// freshness leg passes [`MAX_ANCHOR_RESPONSE_LEN`] (4096, unchanged); the marks leg passes
+/// [`MAX_MARKS_RESPONSE_LEN`]. The cap is a parameter — NOT a single shared constant raised for both —
+/// so the freshness-path DoS bound stays tight.
+pub(crate) fn read_bounded_response_cap<R: std::io::Read>(
+    reader: &mut R,
+    deadline: std::time::Instant,
+    cap: usize,
+) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
     crate::read_exact_with_idle_deadline(reader, &mut len_buf, Some(deadline))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_ANCHOR_RESPONSE_LEN {
+    if len > cap {
         return Err(ProtocolError::WireProtocol("anchor response too large"));
     }
     let mut body = vec![0u8; len];
@@ -232,7 +345,13 @@ pub(crate) fn read_bounded_anchor_response<R: std::io::Read>(
 /// [`read_bounded_anchor_response`]. Rejects a response over [`MAX_ANCHOR_RESPONSE_LEN`] (the reader
 /// would reject it anyway — fail at the source).
 pub(crate) fn frame_anchor_response(response_bytes: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    if response_bytes.len() > MAX_ANCHOR_RESPONSE_LEN {
+    frame_response_cap(response_bytes, MAX_ANCHOR_RESPONSE_LEN)
+}
+
+/// 5b-2e: frame a length-prefixed raw response bounded by an EXPLICIT `cap` (the marks leg passes
+/// [`MAX_MARKS_RESPONSE_LEN`]; the freshness leg keeps 4096). Sibling of [`read_bounded_response_cap`].
+pub(crate) fn frame_response_cap(response_bytes: &[u8], cap: usize) -> Result<Vec<u8>, ProtocolError> {
+    if response_bytes.len() > cap {
         return Err(ProtocolError::WireProtocol("anchor response too large to frame"));
     }
     let mut out = Vec::with_capacity(4 + response_bytes.len());
@@ -248,6 +367,15 @@ pub(crate) fn frame_anchor_response(response_bytes: &[u8]) -> Result<Vec<u8>, Pr
 /// always-retryable [`AnchorTransportError`] — the channel cannot smuggle a terminal/serve signal.
 pub(crate) trait BootRelayChannel {
     fn round_trip(
+        &mut self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, AnchorTransportError>;
+
+    /// 5b-2e: the raw-marks round-trip — identical obligations to [`round_trip`], but the response is
+    /// bounded by [`MAX_MARKS_RESPONSE_LEN`] (a marks payload is multi-KiB) instead of the 4096
+    /// freshness cap. Used ONLY on the `AdoptForward` path.
+    fn marks_round_trip(
         &mut self,
         request_frame: &[u8],
         deadline: std::time::Instant,
@@ -296,10 +424,12 @@ pub(crate) trait BootQuoteProducer {
 /// triple-gated type) and `C = VsockBootRelayChannel`.
 ///
 /// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
-/// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2·timeout + ε` wall-clock
-/// (ε = the quote-subprocess dispose overhead, `QUOTE_ATTEMPT_OVERHEAD`; the driver's `max_attempts`
-/// count bound caps total boot at `max_attempts · (2·timeout + ε)` — the ε term is load-bearing, §8:
-/// the ε-less product is NOT a valid ceiling). The single-budget model is final for 5b-2b; splitting
+/// `Instant::now() + timeout` deadline, so one freshness attempt is bounded by ≤ `2·timeout + ε`
+/// wall-clock (ε = the quote-subprocess dispose overhead, `QUOTE_ATTEMPT_OVERHEAD`). An attempt that
+/// adopts (5b-2e) runs a THIRD bounded leg — the `marks_round_trip` — so its worst case is
+/// `3·timeout + ε`; the driver's `max_attempts` count bound caps total boot at
+/// `max_attempts · (3·timeout + ε)` — the ε term is load-bearing, §8: the ε-less product is NOT a valid
+/// ceiling. The single-budget model is final for 5b-2b; splitting
 /// into distinct `quote_timeout` / `relay_timeout` is deferred to 5b-2c (see §8). The bound is HARD
 /// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); (4a) deleted the only cooperative
 /// impl (`SnpQuoteProducer`) — SCOPE HONESTLY: that deletes the TYPE, not the CLASS (the trait stays
@@ -365,6 +495,17 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
         // The returned bytes are UNTRUSTED and returned verbatim — verified downstream by the driver.
         self.channel.round_trip(&frame, std::time::Instant::now() + self.timeout)
     }
+
+    fn marks_round_trip(
+        &mut self,
+        request: &AnchorMarksRequest,
+    ) -> Result<Vec<u8>, AnchorTransportError> {
+        // The marks leg carries NO quote (the attestation was bound on the freshness leg this attempt),
+        // so it is a pure channel round-trip under its OWN `timeout` budget — no quote-fetch sub-leg.
+        let frame = encode_anchor_marks_request(request)
+            .map_err(|_| AnchorTransportError("anchor relay: marks request encode failed"))?;
+        self.channel.marks_round_trip(&frame, std::time::Instant::now() + self.timeout)
+    }
 }
 
 /// Write `bytes` then flush `stream`, checking `deadline` before **both** the `write_all` AND the `flush`
@@ -412,8 +553,20 @@ pub(crate) fn relay_round_trip_over_stream<S: std::io::Read + std::io::Write>(
     request_frame: &[u8],
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>, ProtocolError> {
+    relay_round_trip_over_stream_cap(stream, request_frame, deadline, MAX_ANCHOR_RESPONSE_LEN)
+}
+
+/// 5b-2e: [`relay_round_trip_over_stream`] with an EXPLICIT response cap — the marks (`0x44`) leg passes
+/// [`MAX_MARKS_RESPONSE_LEN`]; the freshness (`0x41`) leg keeps the 4096 default. Same deadline-guarded
+/// write + cap-before-alloc read; only the cap differs, so the freshness DoS bound stays tight.
+pub(crate) fn relay_round_trip_over_stream_cap<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    request_frame: &[u8],
+    deadline: std::time::Instant,
+    cap: usize,
+) -> Result<Vec<u8>, ProtocolError> {
     deadline_guarded_write(stream, request_frame, deadline, "anchor relay: deadline before write")?;
-    read_bounded_anchor_response(stream, deadline)
+    read_bounded_response_cap(stream, deadline, cap)
 }
 
 /// The host-relay **forward core** (TASK-7.7 5b-2b): the one enclave↔anchor pump the host relay daemon
@@ -655,15 +808,16 @@ impl VsockBootRelayChannel {
         &self,
         request_frame: &[u8],
         deadline: std::time::Instant,
+        cap: usize,
     ) -> Result<Vec<u8>, ProtocolError> {
         let mut stream = connect_bounded(self.host_cid, self.port, deadline)?;
         // TIGHT per-syscall deadline: DeadlineSocket reapplies SO_RCVTIMEO/SO_SNDTIMEO = the budget
         // REMAINING to `deadline` before EVERY read/write — so a syscall that begins late in the framed
         // exchange cannot block past the absolute deadline (a once-set timeout could overrun by up to one
         // socket-timeout; see §8 "Exact-bound caveat"). The in-fn deadline re-checks in
-        // relay_round_trip_over_stream still bound the loop; together the leg is bounded by ~`deadline`.
+        // relay_round_trip_over_stream_cap still bound the loop; together the leg is bounded by ~`deadline`.
         let mut socket = DeadlineSocket { inner: &mut stream, deadline };
-        relay_round_trip_over_stream(&mut socket, request_frame, deadline)
+        relay_round_trip_over_stream_cap(&mut socket, request_frame, deadline, cap)
     }
 }
 
@@ -723,8 +877,18 @@ impl BootRelayChannel for VsockBootRelayChannel {
         // Blanket map: EVERY ProtocolError (incl. a deadline-lapse WireProtocol, which reads as
         // "malformed" but is a timeout) folds to the always-retryable AnchorTransportError. Do NOT key
         // terminal-vs-retryable off the variant (see deadline_guarded_write's variant caveat).
-        self.round_trip_inner(request_frame, deadline)
+        self.round_trip_inner(request_frame, deadline, MAX_ANCHOR_RESPONSE_LEN)
             .map_err(|_| AnchorTransportError("anchor relay: vsock channel round-trip failed"))
+    }
+
+    fn marks_round_trip(
+        &mut self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, AnchorTransportError> {
+        // Same channel mechanics; only the response cap differs (marks payloads are multi-KiB).
+        self.round_trip_inner(request_frame, deadline, MAX_MARKS_RESPONSE_LEN)
+            .map_err(|_| AnchorTransportError("anchor relay: vsock marks round-trip failed"))
     }
 }
 
@@ -801,6 +965,98 @@ mod tests {
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::agent_dispatch::lock_and_reset_agent_process_globals()
+    }
+
+    // ---- 5b-2e marks request codec (commit 5b/8) ----
+
+    #[test]
+    fn marks_request_encodes_and_decodes_round_trip() {
+        let req = AnchorMarksRequest {
+            chain_id: 11565,
+            environment_identifier: "testnet",
+            nonce: [0x9a; 32],
+            epoch: 7,
+        };
+        let frame = encode_anchor_marks_request(&req).unwrap();
+        // It is a 0x44 frame (not 0x41), and never serve-dispatchable (enclave-initiated).
+        assert_eq!(crate::peek_msg_type_from_frame(&frame), Some(crate::MessageType::AgentAnchorMarksRelay));
+        let d = decode_anchor_marks_request(&frame).unwrap();
+        assert_eq!(d.chain_id, 11565);
+        assert_eq!(d.environment_identifier, "testnet");
+        assert_eq!(d.nonce, [0x9a; 32]);
+        assert_eq!(d.epoch, 7);
+    }
+
+    #[test]
+    fn marks_request_decode_rejects_wrong_type_and_shape() {
+        // A 0x41 boot-relay frame is NOT a marks request.
+        let boot = encode_anchor_boot_request(
+            &[0u8; 0x50],
+            &[],
+            &AnchorBootRequest {
+                chain_id: 11565,
+                environment_identifier: "testnet",
+                nonce: [0; 32],
+                report_data: anchor_handshake_report_data(11565, "testnet", &[0; 32]),
+            },
+        )
+        .unwrap();
+        assert!(decode_anchor_marks_request(&boot).is_err());
+        // Trailing bytes after the CBOR map → reject. The extra byte must live INSIDE the framed
+        // payload (re-frame with the correct length), NOT appended after the outer frame — otherwise the
+        // frame-length check rejects it first and the inner `cursor.position() != payload.len()`
+        // trailing-CBOR guard is never exercised (the branch this test exists to pin).
+        let frame = encode_anchor_marks_request(&AnchorMarksRequest {
+            chain_id: 1,
+            environment_identifier: "e",
+            nonce: [0; 32],
+            epoch: 0,
+        })
+        .unwrap();
+        let mut payload = crate::decode_message(&frame).unwrap().payload;
+        payload.push(0x00);
+        let frame =
+            crate::encode_message(crate::MessageType::AgentAnchorMarksRelay, &payload).unwrap();
+        let err = decode_anchor_marks_request(&frame).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::WireProtocol(m) if m.contains("trailing bytes")),
+            "must hit the inner trailing-CBOR guard, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn marks_response_cap_is_above_payload_and_distinct_from_freshness() {
+        // The marks response cap is the payload ceiling + a small reserve, and is FAR above the 4096
+        // freshness cap (which is unchanged) — so a non-trivial marks table is deliverable.
+        assert_eq!(MAX_MARKS_RESPONSE_LEN, crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN + MARKS_RESP_ENVELOPE_RESERVE);
+        const _: () = assert!(MAX_MARKS_RESPONSE_LEN > MAX_ANCHOR_RESPONSE_LEN);
+        assert_eq!(MAX_ANCHOR_RESPONSE_LEN, 4096, "freshness cap unchanged");
+    }
+
+    #[test]
+    fn marks_response_reserve_covers_max_env_id_and_max_payload() {
+        // coderabbit review: the outer signed marks response ALSO carries `environment_identifier`, so
+        // MARKS_RESP_ENVELOPE_RESERVE (256) must cover it on top of the fixed envelope (version/chain/
+        // nonce/epoch/signature + CBOR framing). It always does — env_id is structurally bounded to 64
+        // bytes by `validate_environment_identifier` (the sealed config the request scope comes from AND
+        // the verify both enforce 1..=64), so the WORST CASE is a 64-char env_id over a MAX payload.
+        // Build exactly that and assert it still fits the read cap — so `read_bounded_response_cap` never
+        // rejects a legitimately-signed reply before verification.
+        let env64 = "a".repeat(64); // valid per the keystore env rules, the reachable maximum
+        let max_payload = vec![0u8; crate::agent_anchor::MAX_MARKS_PAYLOAD_LEN];
+        let signed = crate::agent_anchor::test_signed_marks_response_bytes(
+            &anchor_key(),
+            CHAIN,
+            &env64,
+            0,
+            [0u8; 32],
+            max_payload,
+        );
+        assert!(
+            signed.len() <= MAX_MARKS_RESPONSE_LEN,
+            "worst-case signed marks response ({}) must fit the read cap ({MAX_MARKS_RESPONSE_LEN})",
+            signed.len(),
+        );
     }
 
     fn test_config() -> KeystoreConfig {
@@ -961,6 +1217,16 @@ mod tests {
                 }
             };
             Ok(bytes)
+        }
+
+        fn marks_round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, AnchorTransportError> {
+            // These RelayAnchorTransport composition tests exercise only the FRESHNESS leg; the marks
+            // leg is driven by the driver-level execute-arm tests (agent_boot_driver TestTransport).
+            Err(AnchorTransportError("mock channel: marks_round_trip not scripted"))
         }
     }
 
@@ -1266,13 +1532,13 @@ mod tests {
     #[test]
     fn driver_ready_through_relay_transport() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::SignFresh { epoch: 7, sv: 2, marks }]),
         );
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 7),
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -1285,13 +1551,13 @@ mod tests {
         // frame_anchor_response → read_bounded_anchor_response — so the 4-byte-prefix response framing is
         // exercised in the full composition, not bypassed by returning raw bytes.
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::SignFreshFramed { epoch: 7, sv: 2, marks }]),
         );
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 7),
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -1301,13 +1567,13 @@ mod tests {
     #[test]
     fn driver_retry_then_ready_uses_fresh_nonce_each_attempt() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::Err, ChAct::SignFresh { epoch: 7, sv: 2, marks }]),
         );
-        assert!(matches!(run_boot_anti_rollback_handshake(&mut t, &body, 5), BootDriverOutcome::Ready(_)));
+        assert!(matches!(run_boot_anti_rollback_handshake(&mut t, &mut body, 5), BootDriverOutcome::Ready(_)));
         assert_eq!(t.channel.connects, 2, "one channel error then success = 2 connects");
         assert_ne!(t.channel.seen_nonces[0], t.channel.seen_nonces[1], "a fresh nonce per attempt");
     }
@@ -1315,13 +1581,13 @@ mod tests {
     #[test]
     fn driver_wrong_nonce_reply_is_terminal() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::SignWrongNonce { epoch: 7, sv: 2, marks }]),
         );
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyNonceMismatch)) => {}
             other => panic!("expected VerifyNonceMismatch, got {other:?}"),
         }
@@ -1540,11 +1806,11 @@ mod tests {
     #[test]
     fn driver_oversize_quote_response_garbage_is_terminal_malformed() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // A garbage (non-CBOR) reply -> driver -> verify -> Malformed (terminal). Confirms untrusted
         // bytes are safely rejected downstream, not by the transport.
         let mut t = transport(FakeQuote::ok(), MockChannel::new(vec![ChAct::Raw(vec![0xff, 0xff])]));
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyMalformed)) => {}
             other => panic!("expected VerifyMalformed, got {other:?}"),
         }

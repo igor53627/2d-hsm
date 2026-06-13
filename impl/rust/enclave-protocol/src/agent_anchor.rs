@@ -37,6 +37,12 @@ use sha3::{Digest, Sha3_512};
 const ANCHOR_DOMAIN: &[u8] = b"2d-hsm/agent-anchor/v1\0";
 /// Only response-format version this build understands.
 const ANCHOR_RESPONSE_VERSION: u64 = 1;
+/// Domain prefix for the 5b-2e `AdoptForward` raw-marks-response signing preimage. DISTINCT from
+/// [`ANCHOR_DOMAIN`] and `agent_keystore::MARKS_DOMAIN` (three labels, three purposes) so a signature
+/// from one protocol leg can never substitute for another. Trailing NUL is part of the label.
+const MARKS_RESP_DOMAIN: &[u8] = b"2d-hsm/agent-anchor-marks-resp/v1\0";
+/// Only marks-response-format version this build understands.
+const MARKS_RESP_VERSION: u64 = 1;
 /// Domain for the SNP `report_data` the enclave puts in its handshake attestation (the anchor verifies
 /// the enclave's side; that verification is anchor-side, this is just the binding the enclave commits).
 const HANDSHAKE_REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-agent-anchor-handshake-v1";
@@ -376,6 +382,140 @@ pub(crate) fn test_signed_response_bytes(
         (Value::Integer(6.into()), Value::Bytes(r.marks_digest.to_vec())),
         (Value::Integer(7.into()), Value::Bytes(r.nonce.to_vec())),
         (Value::Integer(13.into()), Value::Bytes(r.signature.to_vec())),
+    ];
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
+    out
+}
+
+// -------------------------------------------------------------------------------------------------
+// 5b-2e AdoptForward raw-marks response — the SECOND anchor_root-signed channel (a deliberate mirror
+// of the freshness response above). The freshness response commits the anchor's `marks_digest` (a
+// SHA3 hash, non-invertible); on AdoptForward the enclave fetches the RAW marks here, re-hashes them,
+// and requires byte-exact equality against that signed digest (the security boundary lives in
+// `agent_boot::execute_adopt_forward`). This module owns the wire/crypto: domain-separated Ed25519
+// verify vs the sealed `anchor_root`, same-scope + same-single-use-nonce + same-epoch binding.
+// -------------------------------------------------------------------------------------------------
+
+/// The genuine ceiling on a signed marks payload: a payload describes a body that itself must seal
+/// under [`crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE`] (the plaintext marks are strictly smaller
+/// than the sealed body, which also carries key material), so a payload whose body can't seal is
+/// un-adoptable. The wire-transport cap ([`crate::agent_boot_relay`]) adds an envelope reserve on top.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+pub(crate) const MAX_MARKS_PAYLOAD_LEN: usize = crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE;
+
+/// Why a marks response was rejected (coarse boot-ceremony band, like [`AnchorError`]).
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarksError {
+    /// Bad CBOR / unknown version / wrong key-set / wrong field length.
+    Malformed,
+    /// Ed25519 verification failed, or `anchor_root` is not a valid key.
+    SignatureInvalid,
+    /// `chain_id` / `environment_identifier` did not match the sealed config.
+    ScopeMismatch,
+    /// The response did not echo the enclave's fresh challenge nonce (stale/replayed).
+    NonceMismatch,
+    /// The response epoch did not equal the verified freshness `state.epoch` (cross-epoch splice).
+    EpochMismatch,
+}
+
+/// `MARKS_RESP_DOMAIN ‖ canonical-CBOR({1..=6})` — keys 1..=6 ascending, shortest-form, key 13 (the
+/// signature) excluded. Built with the same canonical encoders the freshness preimage uses, so a
+/// conformant anchor signer matches byte-for-byte. The marks payload (key 6) is an opaque bstr here.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+fn marks_resp_signed_preimage(f: &crate::agent_cbor::MarksRespFields) -> Vec<u8> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    let mut out =
+        Vec::with_capacity(MARKS_RESP_DOMAIN.len() + 96 + f.environment_identifier.len() + f.marks_payload.len());
+    out.extend_from_slice(MARKS_RESP_DOMAIN);
+    put_uint(&mut out, 5, 6); // map(6): keys 1..=6 (key 13 signature excluded)
+    put_uint(&mut out, 0, 1);
+    put_uint(&mut out, 0, f.version);
+    put_uint(&mut out, 0, 2);
+    put_uint(&mut out, 0, f.chain_id);
+    put_uint(&mut out, 0, 3);
+    put_text(&mut out, &f.environment_identifier);
+    put_uint(&mut out, 0, 4);
+    put_uint(&mut out, 0, f.epoch);
+    put_uint(&mut out, 0, 5);
+    put_bytes(&mut out, &f.nonce);
+    put_uint(&mut out, 0, 6);
+    put_bytes(&mut out, &f.marks_payload);
+    out
+}
+
+/// Verify a raw-marks response and return the authenticated `marks_payload` bytes for the AdoptForward
+/// hash-equality gate. Seven fail-closed checks (mirror of [`verify_anchor_response_bytes`] + the
+/// epoch echo): strict-canonical OUTER decode (binds the wire bytes the signature covers) → version →
+/// Ed25519 `verify_strict` vs the sealed `anchor_root` → scope (`chain_id`+`env`) → same single-use
+/// `expected_nonce` → `expected_epoch` (== the freshness `state.epoch`). The returned `marks_payload`
+/// is then strict-decoded + re-hashed by the caller (`execute_adopt_forward`) — the signature commits
+/// these bytes, but the digest gate is what authenticates the *values*.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+pub(crate) fn verify_marks_response_bytes(
+    bytes: &[u8],
+    expected_nonce: &[u8; DIGEST_LEN],
+    expected_epoch: u64,
+    config: &KeystoreConfig,
+) -> Result<Vec<u8>, MarksError> {
+    let f = crate::agent_cbor::strict_decode_marks_response(bytes, MAX_MARKS_PAYLOAD_LEN)
+        .map_err(|_| MarksError::Malformed)?;
+    if f.version != MARKS_RESP_VERSION {
+        return Err(MarksError::Malformed);
+    }
+    // Ed25519 verify against the pinned sealed anchor root (verify_strict rejects torsion/small-order).
+    let key = VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| MarksError::SignatureInvalid)?;
+    let sig = Signature::from_bytes(&f.signature);
+    key.verify_strict(&marks_resp_signed_preimage(&f), &sig)
+        .map_err(|_| MarksError::SignatureInvalid)?;
+    // Scope: this marks snapshot is for THIS keystore's chain + environment (the SEALED config).
+    if f.chain_id != config.twod_chain_id || f.environment_identifier != config.environment_identifier {
+        return Err(MarksError::ScopeMismatch);
+    }
+    // Freshness: the anchor must echo the SAME single-use nonce the freshness leg issued this attempt.
+    if &f.nonce != expected_nonce {
+        return Err(MarksError::NonceMismatch);
+    }
+    // Cross-epoch splice guard: the marks snapshot must be for the exact epoch the freshness AnchorState
+    // reported, so the host cannot pair a valid (other-epoch) marks message under the same nonce window.
+    if f.epoch != expected_epoch {
+        return Err(MarksError::EpochMismatch);
+    }
+    Ok(f.marks_payload)
+}
+
+/// Test/lab-only: build the canonically-encoded, validly-signed raw-marks response bytes a conformant
+/// anchor would send. The SINGLE source of the marks-response wire shape — the 5b-2e lab anchor stub
+/// reuses it (anti-drift), exactly as [`test_signed_response_bytes`] is the freshness-response source.
+#[cfg(any(test, feature = "lab-agent-smoke"))]
+pub(crate) fn test_signed_marks_response_bytes(
+    signing_key: &ed25519_dalek::SigningKey,
+    chain_id: u64,
+    environment_identifier: &str,
+    epoch: u64,
+    nonce: [u8; DIGEST_LEN],
+    marks_payload: Vec<u8>,
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let mut f = crate::agent_cbor::MarksRespFields {
+        version: MARKS_RESP_VERSION,
+        chain_id,
+        environment_identifier: environment_identifier.to_string(),
+        epoch,
+        nonce,
+        marks_payload,
+        signature: [0u8; 64],
+    };
+    f.signature = signing_key.sign(&marks_resp_signed_preimage(&f)).to_bytes();
+    let map: Vec<(Value, Value)> = vec![
+        (Value::Integer(1.into()), Value::Integer(f.version.into())),
+        (Value::Integer(2.into()), Value::Integer(f.chain_id.into())),
+        (Value::Integer(3.into()), Value::Text(f.environment_identifier.clone())),
+        (Value::Integer(4.into()), Value::Integer(f.epoch.into())),
+        (Value::Integer(5.into()), Value::Bytes(f.nonce.to_vec())),
+        (Value::Integer(6.into()), Value::Bytes(f.marks_payload.clone())),
+        (Value::Integer(13.into()), Value::Bytes(f.signature.to_vec())),
     ];
     let mut out = Vec::new();
     ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
@@ -804,5 +944,132 @@ mod tests {
             verify_anchor_response(&map, &nonce, &cfg),
             Err(AnchorError::SignatureInvalid)
         );
+    }
+
+    // ---- 5b-2e raw-marks response verify (commit 2/8) ----
+
+    const TEST_EPOCH: u64 = 7;
+    const TEST_NONCE: [u8; 32] = [0x9a; 32];
+
+    fn marks_payload_bytes() -> Vec<u8> {
+        // A small but non-trivial canonical marks payload (1 row + non-zero spend), built via the
+        // shared encoders so it matches the frozen grammar.
+        use crate::agent_capability::{put_bytes, put_uint};
+        let mut o = Vec::new();
+        put_uint(&mut o, 5, 4);
+        put_uint(&mut o, 0, 1);
+        put_uint(&mut o, 4, 1);
+        put_uint(&mut o, 4, 4);
+        put_bytes(&mut o, &[0x11; 32]);
+        put_uint(&mut o, 0, 0);
+        put_bytes(&mut o, b"x");
+        put_uint(&mut o, 0, 5);
+        put_uint(&mut o, 0, 2);
+        put_bytes(&mut o, &[0xaa; 32]);
+        put_uint(&mut o, 0, 3);
+        put_bytes(&mut o, &[0xbb; 32]);
+        put_uint(&mut o, 0, 4);
+        put_uint(&mut o, 0, 0);
+        o
+    }
+
+    fn good_marks_response(payload: &[u8]) -> Vec<u8> {
+        test_signed_marks_response_bytes(
+            &anchor_key(),
+            TEST_CHAIN,
+            TEST_ENV,
+            TEST_EPOCH,
+            TEST_NONCE,
+            payload.to_vec(),
+        )
+    }
+
+    #[test]
+    fn marks_response_verifies_and_returns_payload() {
+        let payload = marks_payload_bytes();
+        let bytes = good_marks_response(&payload);
+        let got = verify_marks_response_bytes(&bytes, &TEST_NONCE, TEST_EPOCH, &test_config())
+            .expect("conformant marks response verifies");
+        assert_eq!(got, payload, "the authenticated marks_payload is returned verbatim");
+    }
+
+    #[test]
+    fn marks_response_rejects_wrong_signer() {
+        // Signed by a key that is NOT the sealed anchor_root.
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let payload = marks_payload_bytes();
+        let bytes = test_signed_marks_response_bytes(
+            &other, TEST_CHAIN, TEST_ENV, TEST_EPOCH, TEST_NONCE, payload,
+        );
+        assert_eq!(
+            verify_marks_response_bytes(&bytes, &TEST_NONCE, TEST_EPOCH, &test_config()),
+            Err(MarksError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn marks_response_rejects_scope_nonce_epoch_mismatch() {
+        let payload = marks_payload_bytes();
+        // wrong chain_id → ScopeMismatch
+        let bad_chain = test_signed_marks_response_bytes(
+            &anchor_key(), TEST_CHAIN + 1, TEST_ENV, TEST_EPOCH, TEST_NONCE, payload.clone(),
+        );
+        assert_eq!(
+            verify_marks_response_bytes(&bad_chain, &TEST_NONCE, TEST_EPOCH, &test_config()),
+            Err(MarksError::ScopeMismatch)
+        );
+        // wrong env → ScopeMismatch
+        let bad_env = test_signed_marks_response_bytes(
+            &anchor_key(), TEST_CHAIN, "other-env", TEST_EPOCH, TEST_NONCE, payload.clone(),
+        );
+        assert_eq!(
+            verify_marks_response_bytes(&bad_env, &TEST_NONCE, TEST_EPOCH, &test_config()),
+            Err(MarksError::ScopeMismatch)
+        );
+        // good signature but the verifier expects a DIFFERENT nonce → NonceMismatch
+        let good = good_marks_response(&payload);
+        assert_eq!(
+            verify_marks_response_bytes(&good, &[0x00; 32], TEST_EPOCH, &test_config()),
+            Err(MarksError::NonceMismatch)
+        );
+        // good signature but the verifier expects a DIFFERENT epoch → EpochMismatch (cross-epoch splice)
+        assert_eq!(
+            verify_marks_response_bytes(&good, &TEST_NONCE, TEST_EPOCH + 1, &test_config()),
+            Err(MarksError::EpochMismatch)
+        );
+    }
+
+    #[test]
+    fn marks_response_rejects_noncanonical_outer_and_trailing() {
+        let good = good_marks_response(&marks_payload_bytes());
+        // canonical verifies
+        assert!(verify_marks_response_bytes(&good, &TEST_NONCE, TEST_EPOCH, &test_config()).is_ok());
+        // trailing byte → Malformed (strict outer decode rejects)
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            verify_marks_response_bytes(&trailing, &TEST_NONCE, TEST_EPOCH, &test_config()),
+            Err(MarksError::Malformed)
+        );
+    }
+
+    #[test]
+    fn marks_and_freshness_responses_are_domain_separated() {
+        // A FRESHNESS response (ANCHOR_DOMAIN) must NOT verify as a marks response, and vice-versa —
+        // the distinct MARKS_RESP_DOMAIN makes a cross-protocol signature substitution unrepresentable.
+        let cfg = test_config();
+        let freshness_map = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, TEST_EPOCH, 1, [0; 32], TEST_NONCE);
+        let mut freshness_bytes = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(freshness_map.clone()), &mut freshness_bytes).unwrap();
+        // freshness bytes decode to the wrong key-set/shape for the marks parser → never Ok.
+        assert!(verify_marks_response_bytes(&freshness_bytes, &TEST_NONCE, TEST_EPOCH, &cfg).is_err());
+        // The freshness response itself still verifies through ITS own path (sanity — no collateral break).
+        assert!(verify_anchor_response(&freshness_map, &TEST_NONCE, &cfg).is_ok());
+        // A marks response must not verify through the freshness path either: its key 6 is a bstr (the
+        // marks_payload), not a 32-byte digest → freshness parse rejects it.
+        let marks = good_marks_response(&marks_payload_bytes());
+        if let Ok(m) = crate::agent_cbor::strict_decode_map(&marks) {
+            assert!(verify_anchor_response(&m, &TEST_NONCE, &cfg).is_err());
+        }
     }
 }

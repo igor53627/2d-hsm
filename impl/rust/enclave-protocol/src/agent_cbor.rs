@@ -85,6 +85,15 @@ const MAX_MAP_ENTRIES: u64 = 64;
 const MAX_ARRAY_ENTRIES: u64 = 64;
 const MAX_STR_LEN: u64 = 4096; // per-field caps are <= 64 B; 4 KiB is generous headroom
 
+/// The marks-payload `scope_target` byte-length ceiling — SINGLE-SOURCED here so the encode↔decode
+/// inverse is an enforced invariant, not an emergent one: [`strict_decode_marks_payload`] rejects any
+/// row whose `scope_target` exceeds it, and `KeystoreBody::validate` rejects any counter row that does,
+/// so a body that `validate()` accepts ALWAYS round-trips through `encode_marks_payload` →
+/// `strict_decode_marks_payload` (the AdoptForward digest path). Equal to [`MAX_STR_LEN`] (the shared
+/// bstr cap the decoder already applies); naming it makes the cross-module coupling explicit and
+/// drift-proof.
+pub(crate) const MARKS_SCOPE_TARGET_MAX_LEN: usize = MAX_STR_LEN as usize;
+
 /// Hand-rolled **strict canonical CBOR** reader (RFC 8949 §4.2.1) for untrusted host wire maps. It
 /// produces a [`Value`] only after the *entire* item passes, so the caller's signature/structural
 /// checks bind the exact wire bytes. Returns `Err(())` (the caller maps it to its own `Malformed`)
@@ -242,6 +251,232 @@ pub(crate) fn strict_decode_map(bytes: &[u8]) -> Result<Vec<(Value, Value)>, ()>
         Value::Map(m) => Ok(m),
         _ => Err(()),
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Marks-payload strict decoder (TASK-7.7 5b-2e). The anti-rollback `marks_digest` is a SHA3 hash —
+// non-invertible — so the AdoptForward path must fetch the RAW marks (the host-relayed, anchor-signed
+// counter/spend high-water) and re-hash them to compare against the anchor's signed digest. That
+// requires DECODING the FROZEN-v1 marks payload (`agent_keystore::encode_marks_payload`) back into
+// rows + spend + recovery-counter. This is the inverse of that encoder.
+//
+// Why a DEDICATED decoder, not `strict_decode_map`:
+//   1. The counter-row array legitimately reaches `MAX_COUNTER_ENTRIES` (65_536) — far above the
+//      shared `MAX_ARRAY_ENTRIES`/`MAX_MAP_ENTRIES`=64 DoS bound. We parameterize the array cap
+//      (`max_rows`) into THIS reader only; the shared cap stays for every other agent wire map.
+//   2. The marks nest (top-map → key-1 array → row array → scalars) reaches the `MAX_CBOR_DEPTH`=4
+//      ceiling EXACTLY via `item()` recursion — fragile. This reader does an EXPLICIT typed row walk
+//      (never `item()` recursion), so a one-level-deeper variant (a nested array/map where a scalar
+//      is expected) fails the per-element type check structurally, with no reliance on the depth slack.
+// It reuses the SAME `StrictParser` head/canonicality discipline (shortest-form, no indefinite/tag/
+// float, exact byte accounting) — only the container walk is marks-specific.
+// -------------------------------------------------------------------------------------------------
+
+/// One decoded counter high-water row (env folded out — reconstructed from config by the seeder).
+// Staged (5b-2e commit 1/8): the AdoptForward caller that consumes these lands in commit 4. The test
+// build use-checks every item; allow dead-code only in the non-test lib build (the agent_anchor /
+// agent_boot staging convention). Remove when the driver execute arm wires them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedRow {
+    pub authority: [u8; 32],
+    pub scope_class: u8,
+    pub scope_target: Vec<u8>,
+    pub highest_accepted_counter: u64,
+}
+
+/// The decoded marks payload — the 4 surfaces the AdoptForward seed overwrites (counters, both
+/// spends, strict_recovery_counter). Env is folded out of the wire; entries/config/audit/epoch/
+/// structural_version are NOT carried by marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedMarks {
+    pub rows: Vec<DecodedRow>,
+    pub cumulative_native_spend: [u8; 32],
+    pub lifetime_spend: [u8; 32],
+    pub strict_recovery_counter: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl StrictParser<'_> {
+    /// Read a canonical CBOR head and require it be `expected_major`, returning the argument.
+    fn typed_head(&mut self, expected_major: u8) -> Result<u64, ()> {
+        let (major, arg) = self.head()?;
+        if major != expected_major {
+            return Err(());
+        }
+        Ok(arg)
+    }
+
+    /// Read a canonical unsigned integer (major 0).
+    fn uint(&mut self) -> Result<u64, ()> {
+        self.typed_head(0)
+    }
+
+    /// Read a canonical byte string (major 2) of at most `max` bytes.
+    fn bstr(&mut self, max: usize) -> Result<Vec<u8>, ()> {
+        let len = self.typed_head(2)? as usize;
+        if len > max {
+            return Err(());
+        }
+        Ok(self.take(len)?.to_vec())
+    }
+
+    /// Read a canonical byte string (major 2) of exactly `N` bytes.
+    fn bstr_exact<const N: usize>(&mut self) -> Result<[u8; N], ()> {
+        let len = self.typed_head(2)? as usize;
+        if len != N {
+            return Err(());
+        }
+        self.take(N)?.try_into().map_err(|_| ())
+    }
+
+    /// Read a canonical text string (major 3, UTF-8 enforced) of at most `max` bytes.
+    fn text(&mut self, max: usize) -> Result<String, ()> {
+        let len = self.typed_head(3)? as usize;
+        if len > max {
+            return Err(());
+        }
+        core::str::from_utf8(self.take(len)?).map(|s| s.to_owned()).map_err(|_| ())
+    }
+}
+
+/// Strict-decode a FROZEN-v1 marks payload (the inverse of `encode_marks_payload`). `max_rows` bounds
+/// the counter-row array (callers pass `MAX_COUNTER_ENTRIES`). Fail-closed `Err(())` on ANY deviation:
+/// non-canonical encoding, wrong key order/set, wrong element types, an over-cap row array, a
+/// `scope_class` that does not fit `u8`, an over-cap `scope_target`, or trailing bytes. Keys are read
+/// POSITIONALLY in the fixed `1,2,3,4` order (strictly ascending == canonical), so dup/out-of-order
+/// keys cannot pass. `scope_target`/`authority` use the shared `MAX_STR_LEN`/exact-32 bounds.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 1/8; the driver caller lands in commit 4
+pub(crate) fn strict_decode_marks_payload(
+    bytes: &[u8],
+    max_rows: usize,
+) -> Result<DecodedMarks, ()> {
+    let mut p = StrictParser { buf: bytes, pos: 0 };
+    // Top: map(4), keys 1..=4 in canonical ascending order.
+    if p.typed_head(5)? != 4 {
+        return Err(());
+    }
+    // key 1 -> array(rows); each row = array(4) [authority(bstr32), scope_class(uint), scope_target(bstr), counter(uint)]
+    if p.uint()? != 1 {
+        return Err(());
+    }
+    let n_rows = p.typed_head(4)? as usize;
+    // Cap + a TIGHT lower-bound alloc guard: each row is array(4) header(1) + authority bstr(2+32=34) +
+    // scope_class uint(>=1) + scope_target bstr(>=1) + counter uint(>=1) = >= 38 wire bytes. Bounding
+    // n_rows by remaining()/MIN_ROW_BYTES (not /1) stops a tiny frame declaring a huge row count from
+    // forcing a large up-front `Vec::with_capacity` (matches the shared map decoder's 2x-per-entry
+    // tightness — see the `5 => ... 2 * arg > remaining()` guard above).
+    const MIN_ROW_BYTES: usize = 38;
+    if n_rows > max_rows || n_rows.saturating_mul(MIN_ROW_BYTES) > p.remaining() {
+        return Err(());
+    }
+    let mut rows = Vec::with_capacity(n_rows);
+    // Enforce the encoder's CANONICAL row order on decode (strictly ascending by
+    // `(authority, scope_class, scope_target)`, env folded out): this rejects out-of-order AND duplicate
+    // rows at the DECODER, so the marks payload's canonicality does not rest SOLELY on the downstream
+    // re-encode+hash gate (defense in depth; the encoder sorts by exactly this key, agent_keystore).
+    let mut prev_key: Option<([u8; 32], u8, Vec<u8>)> = None;
+    for _ in 0..n_rows {
+        if p.typed_head(4)? != 4 {
+            return Err(()); // each row is exactly array(4)
+        }
+        let authority = p.bstr_exact::<32>()?;
+        // scope_class is encoded as a CBOR uint (e.g. 200 -> 0x18 0xC8), NOT a raw byte; range-check
+        // it fits u8 — a blind cast would silently corrupt scope semantics.
+        let scope_class = u8::try_from(p.uint()?).map_err(|_| ())?;
+        let scope_target = p.bstr(MARKS_SCOPE_TARGET_MAX_LEN)?;
+        let highest_accepted_counter = p.uint()?;
+        let key = (authority, scope_class, scope_target.clone());
+        if let Some(prev) = &prev_key {
+            if &key <= prev {
+                return Err(()); // not strictly ascending ⇒ duplicate or out-of-canonical-order row
+            }
+        }
+        prev_key = Some(key);
+        rows.push(DecodedRow { authority, scope_class, scope_target, highest_accepted_counter });
+    }
+    // key 2 -> cumulative_native_spend (bstr 32); key 3 -> lifetime_spend (bstr 32); key 4 -> strict_recovery_counter (uint)
+    if p.uint()? != 2 {
+        return Err(());
+    }
+    let cumulative_native_spend = p.bstr_exact::<32>()?;
+    if p.uint()? != 3 {
+        return Err(());
+    }
+    let lifetime_spend = p.bstr_exact::<32>()?;
+    if p.uint()? != 4 {
+        return Err(());
+    }
+    let strict_recovery_counter = p.uint()?;
+    if p.pos != bytes.len() {
+        return Err(()); // trailing bytes
+    }
+    Ok(DecodedMarks { rows, cumulative_native_spend, lifetime_spend, strict_recovery_counter })
+}
+
+/// The strict-decoded OUTER fields of an `anchor_root`-signed marks response (5b-2e), keys
+/// `{1,2,3,4,5,6,13}` in canonical ascending order. The crypto/scope/nonce/epoch checks live in
+/// `agent_anchor::verify_marks_response_bytes`; this layer only binds the exact canonical wire bytes.
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+#[derive(Debug, Clone)]
+pub(crate) struct MarksRespFields {
+    pub version: u64,
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub epoch: u64,
+    pub nonce: [u8; 32],
+    pub marks_payload: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+/// Strict-canonical decode of a marks-response envelope. DEDICATED (not `strict_decode_map`) because
+/// key 6 (`marks_payload`) legitimately exceeds the shared `MAX_STR_LEN`=4096 bstr cap — a non-trivial
+/// counter table is multi-KiB — so key 6 is bounded by `max_payload` (the caller's
+/// `MAX_MARKS_PAYLOAD_LEN`) while every other field keeps the strict head/canonicality discipline and
+/// the shared bounds. Keys read POSITIONALLY (`1,2,3,4,5,6,13`, strictly ascending == canonical), so
+/// dup/out-of-order keys cannot pass. The shared `strict_decode_map`'s 4096 bstr cap stays intact for
+/// every other agent wire map (the freshness response included).
+#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
+pub(crate) fn strict_decode_marks_response(
+    bytes: &[u8],
+    max_payload: usize,
+) -> Result<MarksRespFields, ()> {
+    let mut p = StrictParser { buf: bytes, pos: 0 };
+    if p.typed_head(5)? != 7 {
+        return Err(()); // map(7): keys {1..=6, 13}
+    }
+    if p.uint()? != 1 {
+        return Err(());
+    }
+    let version = p.uint()?;
+    if p.uint()? != 2 {
+        return Err(());
+    }
+    let chain_id = p.uint()?;
+    if p.uint()? != 3 {
+        return Err(());
+    }
+    let environment_identifier = p.text(MAX_STR_LEN as usize)?;
+    if p.uint()? != 4 {
+        return Err(());
+    }
+    let epoch = p.uint()?;
+    if p.uint()? != 5 {
+        return Err(());
+    }
+    let nonce = p.bstr_exact::<32>()?;
+    if p.uint()? != 6 {
+        return Err(());
+    }
+    let marks_payload = p.bstr(max_payload)?;
+    if p.uint()? != 13 {
+        return Err(());
+    }
+    let signature = p.bstr_exact::<64>()?;
+    if p.pos != bytes.len() {
+        return Err(()); // trailing bytes
+    }
+    Ok(MarksRespFields { version, chain_id, environment_identifier, epoch, nonce, marks_payload, signature })
 }
 
 #[cfg(test)]
@@ -414,5 +649,180 @@ mod tests {
         assert!(strict_decode_map(&[0xa1, 0x01, 0xa1, 0x01, 0x18, 0x01]).is_err());
         // canonical nested submap -> ok.
         assert!(strict_decode_map(&[0xa1, 0x01, 0xa1, 0x01, 0x00]).is_ok());
+    }
+
+    // ---- marks-payload strict decoder (5b-2e) ----
+
+    const ROWS_CAP: usize = 65_536; // == MAX_COUNTER_ENTRIES (the caller's bound)
+
+    /// Build a canonical marks payload from rows + spends + recovery counter, exactly mirroring
+    /// `encode_marks_payload`'s grammar — so the decoder is exercised against the real wire shape.
+    fn marks_bytes(
+        rows: &[([u8; 32], u8, &[u8], u64)],
+        cum: [u8; 32],
+        life: [u8; 32],
+        rec: u64,
+    ) -> Vec<u8> {
+        let mut o = Vec::new();
+        super::super::agent_capability::put_uint(&mut o, 5, 4); // map(4)
+        super::super::agent_capability::put_uint(&mut o, 0, 1); // key 1
+        super::super::agent_capability::put_uint(&mut o, 4, rows.len() as u64); // array(rows)
+        for (auth, sc, tgt, ctr) in rows {
+            super::super::agent_capability::put_uint(&mut o, 4, 4); // array(4)
+            super::super::agent_capability::put_bytes(&mut o, auth);
+            super::super::agent_capability::put_uint(&mut o, 0, u64::from(*sc));
+            super::super::agent_capability::put_bytes(&mut o, tgt);
+            super::super::agent_capability::put_uint(&mut o, 0, *ctr);
+        }
+        super::super::agent_capability::put_uint(&mut o, 0, 2);
+        super::super::agent_capability::put_bytes(&mut o, &cum);
+        super::super::agent_capability::put_uint(&mut o, 0, 3);
+        super::super::agent_capability::put_bytes(&mut o, &life);
+        super::super::agent_capability::put_uint(&mut o, 0, 4);
+        super::super::agent_capability::put_uint(&mut o, 0, rec);
+        o
+    }
+
+    #[test]
+    fn marks_decode_genesis_and_multi_row_round_trip() {
+        // Genesis golden: A4 01 80 02 5820 00*32 03 5820 00*32 04 00 (empty rows, zero spend/recovery).
+        let genesis = marks_bytes(&[], [0; 32], [0; 32], 0);
+        let g = strict_decode_marks_payload(&genesis, ROWS_CAP).unwrap();
+        assert!(g.rows.is_empty());
+        assert_eq!(g.cumulative_native_spend, [0; 32]);
+        assert_eq!(g.lifetime_spend, [0; 32]);
+        assert_eq!(g.strict_recovery_counter, 0);
+
+        // Multi-row with a 200 scope_class (the 0x18 0xC8 uint case) + a non-empty scope_target.
+        let bytes = marks_bytes(
+            &[([0x11; 32], 200, b"target-a", 5), ([0x22; 32], 0, b"", 9_000_000_000)],
+            [0xaa; 32],
+            [0xbb; 32],
+            42,
+        );
+        let d = strict_decode_marks_payload(&bytes, ROWS_CAP).unwrap();
+        assert_eq!(d.rows.len(), 2);
+        assert_eq!(d.rows[0], DecodedRow { authority: [0x11; 32], scope_class: 200, scope_target: b"target-a".to_vec(), highest_accepted_counter: 5 });
+        assert_eq!(d.rows[1].highest_accepted_counter, 9_000_000_000);
+        assert_eq!(d.cumulative_native_spend, [0xaa; 32]);
+        assert_eq!(d.lifetime_spend, [0xbb; 32]);
+        assert_eq!(d.strict_recovery_counter, 42);
+    }
+
+    #[test]
+    fn marks_decode_rejects_scope_class_over_255() {
+        // scope_class = 256 (0x19 0x01 0x00) does NOT fit u8 -> reject (silent-corruption trap).
+        let mut o = Vec::new();
+        super::super::agent_capability::put_uint(&mut o, 5, 4);
+        super::super::agent_capability::put_uint(&mut o, 0, 1);
+        super::super::agent_capability::put_uint(&mut o, 4, 1); // 1 row
+        super::super::agent_capability::put_uint(&mut o, 4, 4);
+        super::super::agent_capability::put_bytes(&mut o, &[0x11; 32]);
+        super::super::agent_capability::put_uint(&mut o, 0, 256); // scope_class = 256
+        super::super::agent_capability::put_bytes(&mut o, b"x");
+        super::super::agent_capability::put_uint(&mut o, 0, 5);
+        super::super::agent_capability::put_uint(&mut o, 0, 2);
+        super::super::agent_capability::put_bytes(&mut o, &[0; 32]);
+        super::super::agent_capability::put_uint(&mut o, 0, 3);
+        super::super::agent_capability::put_bytes(&mut o, &[0; 32]);
+        super::super::agent_capability::put_uint(&mut o, 0, 4);
+        super::super::agent_capability::put_uint(&mut o, 0, 0);
+        assert!(strict_decode_marks_payload(&o, ROWS_CAP).is_err());
+    }
+
+    #[test]
+    fn marks_decode_rejects_over_cap_rows_but_decodes_above_shared_array_cap() {
+        // A 1-row array with the declared count claiming 70 rows but only 1 present -> remaining()
+        // guard (and would be a count mismatch) rejects.
+        let mut over = Vec::new();
+        super::super::agent_capability::put_uint(&mut over, 5, 4);
+        super::super::agent_capability::put_uint(&mut over, 0, 1);
+        super::super::agent_capability::put_uint(&mut over, 4, (ROWS_CAP + 1) as u64); // > cap
+        assert!(strict_decode_marks_payload(&over, ROWS_CAP).is_err());
+
+        // 70 GENUINE rows (> the shared MAX_ARRAY_ENTRIES=64) DECODE — proving the marks reader uses
+        // its own larger cap, NOT the shared 64-array bound.
+        let rows: Vec<([u8; 32], u8, &[u8], u64)> =
+            (0..70u16).map(|i| ([i as u8; 32], 0u8, b"x".as_slice(), u64::from(i))).collect();
+        let bytes = marks_bytes(&rows, [0; 32], [0; 32], 0);
+        assert_eq!(strict_decode_marks_payload(&bytes, ROWS_CAP).unwrap().rows.len(), 70);
+        // ...while the SHARED strict_decode_map still rejects a 65-key map (shared cap intact).
+        let mut big_map = Vec::new();
+        super::super::agent_capability::put_uint(&mut big_map, 5, 65);
+        for k in 1..=65u64 {
+            super::super::agent_capability::put_uint(&mut big_map, 0, k);
+            super::super::agent_capability::put_uint(&mut big_map, 0, 0);
+        }
+        assert!(strict_decode_map(&big_map).is_err());
+    }
+
+    #[test]
+    fn marks_decode_rejects_noncanonical_dup_and_trailing() {
+        let base = marks_bytes(&[([0x11; 32], 1, b"x", 5)], [0; 32], [0; 32], 0);
+        assert!(strict_decode_marks_payload(&base, ROWS_CAP).is_ok());
+        // trailing byte -> reject.
+        let mut trailing = base.clone();
+        trailing.push(0x00);
+        assert!(strict_decode_marks_payload(&trailing, ROWS_CAP).is_err());
+        // non-shortest recovery counter (0x18 0x00 instead of 0x00 for the last key's value) -> reject.
+        let mut nonshort = Vec::new();
+        super::super::agent_capability::put_uint(&mut nonshort, 5, 4);
+        super::super::agent_capability::put_uint(&mut nonshort, 0, 1);
+        super::super::agent_capability::put_uint(&mut nonshort, 4, 0);
+        super::super::agent_capability::put_uint(&mut nonshort, 0, 2);
+        super::super::agent_capability::put_bytes(&mut nonshort, &[0; 32]);
+        super::super::agent_capability::put_uint(&mut nonshort, 0, 3);
+        super::super::agent_capability::put_bytes(&mut nonshort, &[0; 32]);
+        super::super::agent_capability::put_uint(&mut nonshort, 0, 4);
+        nonshort.extend_from_slice(&[0x18, 0x00]); // non-shortest 0
+        assert!(strict_decode_marks_payload(&nonshort, ROWS_CAP).is_err());
+    }
+
+    #[test]
+    fn marks_decode_rejects_wrong_key_order_and_set() {
+        // Swap keys 2 and 3's positions (3 before 2) -> the positional check (uint()? != 2) rejects.
+        let mut o = Vec::new();
+        super::super::agent_capability::put_uint(&mut o, 5, 4);
+        super::super::agent_capability::put_uint(&mut o, 0, 1);
+        super::super::agent_capability::put_uint(&mut o, 4, 0);
+        super::super::agent_capability::put_uint(&mut o, 0, 3); // key 3 where 2 is expected
+        super::super::agent_capability::put_bytes(&mut o, &[0; 32]);
+        super::super::agent_capability::put_uint(&mut o, 0, 2);
+        super::super::agent_capability::put_bytes(&mut o, &[0; 32]);
+        super::super::agent_capability::put_uint(&mut o, 0, 4);
+        super::super::agent_capability::put_uint(&mut o, 0, 0);
+        assert!(strict_decode_marks_payload(&o, ROWS_CAP).is_err());
+    }
+
+    #[test]
+    fn marks_decode_rejects_duplicate_and_out_of_order_rows() {
+        // Defense in depth: the decoder enforces the encoder's canonical strictly-ascending row order
+        // (authority, scope_class, scope_target), so a duplicate or reordered row is rejected at the
+        // DECODER — canonicality does not rest solely on the downstream hash gate.
+        let a1 = [0x11; 32];
+        let a2 = [0x22; 32];
+        // ascending (a1 < a2) decodes.
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"x", 1), (a2, 0, b"y", 2)], [0; 32], [0; 32], 0), ROWS_CAP).is_ok());
+        // out of order (a2 before a1) rejects.
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a2, 0, b"y", 2), (a1, 0, b"x", 1)], [0; 32], [0; 32], 0), ROWS_CAP).is_err());
+        // exact duplicate tuple rejects (not strictly ascending).
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"x", 1), (a1, 0, b"x", 9)], [0; 32], [0; 32], 0), ROWS_CAP).is_err());
+        // same authority+class, ascending scope_target decodes.
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"a", 1), (a1, 0, b"b", 2)], [0; 32], [0; 32], 0), ROWS_CAP).is_ok());
+    }
+
+    #[test]
+    fn marks_decode_rejects_one_level_deeper_row_element() {
+        // A row whose first element is a nested array (depth+1) instead of the authority bstr.
+        // The explicit typed walk requires major-2 (bstr) at that position -> reject, with NO reliance
+        // on the depth-4 slack (the depth-slack regression guard, D5).
+        let mut o = Vec::new();
+        super::super::agent_capability::put_uint(&mut o, 5, 4);
+        super::super::agent_capability::put_uint(&mut o, 0, 1);
+        super::super::agent_capability::put_uint(&mut o, 4, 1); // 1 row
+        super::super::agent_capability::put_uint(&mut o, 4, 4); // row array(4)
+        super::super::agent_capability::put_uint(&mut o, 4, 0); // element 0 is an array(0), NOT a bstr
+        // (the rest is unreachable — decode fails at the first element)
+        assert!(strict_decode_marks_payload(&o, ROWS_CAP).is_err());
     }
 }

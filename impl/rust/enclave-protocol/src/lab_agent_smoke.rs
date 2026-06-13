@@ -221,17 +221,17 @@ pub(crate) fn lab_anchor_root_matches(body: &KeystoreBody) -> Result<(), crate::
     Ok(())
 }
 
-/// One stub pump: read the full `0x41` frame (the relay forwards it VERBATIM, 6-byte header
-/// included), validate it with the crate's OWN request decoder (version/type/lengths/`report_data`
-/// cleartext binding), guard the scope against the provisioned keystore, match-only-check the
-/// embedded quote `report_data`, then answer with the reference-built signed freshness response
-/// framed by the shared writer. Every `Err` is a fault-close with ZERO bytes written back (every
-/// write happens after all checks). Returns the echoed nonce prefix for the log line.
+/// One stub pump: read the full frame (the relay forwards it VERBATIM, 6-byte header included), PEEK
+/// the type, and answer the matching enclave-initiated leg — `0x41` freshness (quote + cert) or
+/// `0x44` raw-marks (5b-2e, no quote). Each leg validates with the crate's OWN request decoder, guards
+/// the scope against the provisioned keystore, and answers with the reference-built signed response
+/// framed by the shared writer. Every `Err` is a fault-close with ZERO bytes written back (every write
+/// happens after all checks). Returns the echoed nonce prefix for the log line.
 ///
-/// MATCH-ONLY quote policy (recorded non-goal): the stub checks `report[0x50..0x90] == key 5` and
-/// performs NO AMD cert-chain verification — guest-side security never depends on anchor-side
-/// policy (the guest verifies the RESPONSE signature against its sealed root); this check exists
-/// only to catch a producer wiring bug live instead of silently signing over garbage.
+/// MATCH-ONLY quote policy (recorded non-goal, 0x41 only): the stub checks `report[0x50..0x90] == key 5`
+/// and performs NO AMD cert-chain verification — guest-side security never depends on anchor-side policy
+/// (the guest verifies the RESPONSE signature against its sealed root); this check exists only to catch
+/// a producer wiring bug live instead of silently signing over garbage.
 pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
     conn: &mut S,
     body: &KeystoreBody,
@@ -239,7 +239,25 @@ pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
     deadline: std::time::Instant,
 ) -> Result<[u8; 8], crate::ProtocolError> {
     let frame = crate::read_framed_message_with_idle_deadline(conn, Some(deadline))?;
-    let req = crate::agent_boot_relay::decode_anchor_boot_request(&frame)?;
+    match crate::peek_msg_type_from_frame(&frame) {
+        Some(crate::MessageType::AgentBootRelay) => lab_anchor_freshness_reply(conn, &frame, body, signing_key, deadline),
+        Some(crate::MessageType::AgentAnchorMarksRelay) => lab_anchor_marks_reply(conn, &frame, body, signing_key, deadline),
+        _ => Err(crate::ProtocolError::WireProtocol(
+            "lab anchor: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are answerable",
+        )),
+    }
+}
+
+/// The 0x41 freshness leg: validate + scope-guard + match-only quote check, then the signed freshness
+/// response committing the provisioned body's `(epoch, structural_version, marks_digest)`.
+fn lab_anchor_freshness_reply<S: std::io::Read + std::io::Write>(
+    conn: &mut S,
+    frame: &[u8],
+    body: &KeystoreBody,
+    signing_key: &ed25519_dalek::SigningKey,
+    deadline: std::time::Instant,
+) -> Result<[u8; 8], crate::ProtocolError> {
+    let req = crate::agent_boot_relay::decode_anchor_boot_request(frame)?;
     if req.chain_id != body.config.twod_chain_id
         || req.environment_identifier != body.config.environment_identifier
     {
@@ -253,9 +271,6 @@ pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
             "lab anchor: embedded quote report_data does not match the request binding",
         ));
     }
-    // The anchor's authoritative state IS the provisioned body's state (epoch/structural/marks all
-    // derived from the unsealed fixture via the crate's own digest), so the guest's reconcile lands
-    // on `Fresh` — pinned deviceless by `stub_response_passes_guest_verify_path`.
     let response = crate::agent_anchor::test_signed_response_bytes(
         signing_key,
         req.chain_id,
@@ -266,12 +281,46 @@ pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
         req.nonce,
     );
     let wire = crate::agent_boot_relay::frame_anchor_response(&response)?;
-    crate::agent_boot_relay::deadline_guarded_write(
-        conn,
-        &wire,
-        deadline,
-        "lab anchor: deadline before response write",
+    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before response write")?;
+    let mut nonce8 = [0u8; 8];
+    nonce8.copy_from_slice(&req.nonce[..8]);
+    Ok(nonce8)
+}
+
+/// The 5b-2e 0x44 raw-marks leg: validate + scope-guard, then the signed marks response carrying the
+/// provisioned body's OWN marks payload (so it self-consistently hashes to the `marks_digest` the
+/// freshness leg commits). Echoes the request epoch + nonce (the guest binds to both). NO quote.
+fn lab_anchor_marks_reply<S: std::io::Read + std::io::Write>(
+    conn: &mut S,
+    frame: &[u8],
+    body: &KeystoreBody,
+    signing_key: &ed25519_dalek::SigningKey,
+    deadline: std::time::Instant,
+) -> Result<[u8; 8], crate::ProtocolError> {
+    let req = crate::agent_boot_relay::decode_anchor_marks_request(frame)?;
+    if req.chain_id != body.config.twod_chain_id
+        || req.environment_identifier != body.config.environment_identifier
+    {
+        return Err(crate::ProtocolError::WireProtocol(
+            "lab anchor: marks request scope does not match the provisioned smoke keystore",
+        ));
+    }
+    // The raw marks ARE the provisioned body's marks payload — so SHA3(MARKS_DOMAIN ‖ payload) equals
+    // the digest the freshness leg signs, and the guest's hash-equality gate accepts.
+    let payload = body.encode_marks_payload();
+    let response = crate::agent_anchor::test_signed_marks_response_bytes(
+        signing_key,
+        req.chain_id,
+        &req.environment_identifier,
+        req.epoch,
+        req.nonce,
+        payload,
+    );
+    let wire = crate::agent_boot_relay::frame_response_cap(
+        &response,
+        crate::agent_boot_relay::MAX_MARKS_RESPONSE_LEN,
     )?;
+    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before marks response write")?;
     let mut nonce8 = [0u8; 8];
     nonce8.copy_from_slice(&req.nonce[..8]);
     Ok(nonce8)
@@ -847,6 +896,71 @@ mod tests {
             ),
             crate::agent_anchor::ReconcileDecision::Fresh,
             "anchor state derived from the provisioned body must reconcile Fresh"
+        );
+    }
+
+    #[test]
+    fn stub_marks_reply_passes_guest_marks_verify_and_executes_adopt() {
+        // 5b-2e D11 conformance: the lab stub's 0x44 marks reply, read back through the marks-cap
+        // reader, must pass the REAL guest verify_marks_response_bytes AND drive execute_adopt_forward
+        // to a candidate whose digest matches — the whole AdoptForward channel, deviceless, against a
+        // real second signer. The provisioned body's marks self-consistently hash to the digest, so a
+        // freshness AnchorState carrying that digest at a HIGHER epoch reconciles Fresh after the seed.
+        let body = smoke_body();
+        let nonce = [0x6e_u8; 32];
+        let epoch = body.freshness_epoch + 1; // the anchor is AHEAD by a counter/spend-only gap
+        let req = crate::agent_boot_relay::encode_anchor_marks_request(
+            &crate::agent_boot_relay::AnchorMarksRequest {
+                chain_id: body.config.twod_chain_id,
+                environment_identifier: &body.config.environment_identifier,
+                nonce,
+                epoch,
+            },
+        )
+        .unwrap();
+        let (outcome, written_back) = drive_stub_pump(&body, &req);
+        outcome.expect("stub answers the 0x44 marks request");
+        let raw = crate::agent_boot_relay::read_bounded_response_cap(
+            &mut std::io::Cursor::new(written_back),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            crate::agent_boot_relay::MAX_MARKS_RESPONSE_LEN,
+        )
+        .expect("stub framed the marks response with the shared writer");
+        // The guest verifies the marks message (sig/scope/nonce/epoch) and returns the payload.
+        let payload = crate::agent_anchor::verify_marks_response_bytes(&raw, &nonce, epoch, &body.config)
+            .expect("stub marks reply passes the REAL guest marks-verify path");
+        // And the whole execute_adopt_forward gate accepts it (the marks hash the freshness-committed
+        // digest at this epoch), producing a candidate that reconciles Fresh.
+        let state = crate::agent_anchor::AnchorState {
+            epoch,
+            structural_version: body.structural_version,
+            marks_digest: body.compute_local_marks_digest(),
+            chain_height: None,
+            chain_block_hash: None,
+        };
+        // sanity: the returned payload is exactly the body's marks payload (self-consistent stub).
+        assert_eq!(payload, body.encode_marks_payload());
+        let candidate = crate::agent_boot::execute_adopt_forward(&raw, &body, &state, &nonce)
+            .expect("the marks reply drives execute_adopt_forward to a candidate");
+        assert_eq!(candidate.freshness_epoch, epoch);
+        // `seed_marks_forward` must NOT bump structural_version — assert it directly so a regression that
+        // bumped it (leaving the re-run stuck in AdoptForward instead of Fresh) fails HERE, not silently.
+        assert_eq!(
+            candidate.structural_version, state.structural_version,
+            "seed advances epoch + marks only; structural_version is unchanged"
+        );
+        assert_eq!(candidate.compute_local_marks_digest(), state.marks_digest);
+        // The candidate now reconciles Fresh against the same anchor state (epoch + structural + marks
+        // all match) — the post-seed re-run would reach Ready. Asserts the seed truly clears AdoptForward.
+        assert_eq!(
+            crate::agent_anchor::reconcile(
+                candidate.freshness_epoch,
+                candidate.structural_version,
+                &candidate.compute_local_marks_digest(),
+                &state,
+            ),
+            crate::agent_anchor::ReconcileDecision::Fresh,
+            "the adopted candidate reconciles Fresh — the next handshake reaches Ready"
         );
     }
 

@@ -29,4 +29,19 @@ CODE / TEST HARDENING:
 - [8494 quote-smoke, Low] The lab-only quoteSmokePackage Nix guard (quoteSmokePackage==null || !productionMode) has no FAIL-side regression check — a negative tryEval test (productionMode=true + quoteSmokePackage set ⇒ expect assertion failure) would make the guard self-testing. (Currently eval-enforced for the lab image + documented; declined inline at #63 as disproportionate, parked here.)
 
 Source: roborev jobs 8022/8024/8025/8310/8324/8325/8327/8494 (terminal consolidations of the respective deleted branches). All other open rows on those branches were superseded-clean intermediate compacts.
+
+---
+
+### 5b-2e AdoptForward residuals (from the PR #69 `/code-review max` pass, 2026-06-13)
+
+The max-effort review (27 candidates → 13 verified) found **0 critical/high and 0 security defects** — the adversarial gate-security angle found NO wrong-accept path. The one Medium (orphaned `verify_outstanding_response` dead-code + lying docs) was FIXED in-PR via reroute, and the host-relay unknown-type triage bucket was completed in-PR. The remaining Low items are parked here (all non-blocking; several are documented-intentional):
+
+- **[test-DRY, Low]** The canonical marks-payload test builder is triplicated: `agent_boot::marks_payload`, `agent_cbor::marks_bytes`, `agent_anchor::marks_payload_bytes` (all byte-identical grammar). The agent_boot/agent_cbor copies fail LOUDLY on drift (digest/decoder-guarded), but `agent_anchor::marks_payload_bytes` is decoder-independent (round-trip-verbatim assert) and could silently encode a stale grammar. Consolidate into ONE `#[cfg(test)] pub(crate)` builder (mirror `test_signed_marks_response_bytes`'s single-sourcing).
+- **[provenance, Low]** 13 `#[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit N/8` markers across agent_anchor/agent_cbor/agent_keystore/agent_boot_relay/agent_boot remain on items that now have real production callers (verified: a clean build emits no dead-code warning for any). The "staged commit N/8" provenance is stale post-squash. Drop the now-redundant attrs/comments (several files also carry a module-level blanket allow, making the per-item ones doubly redundant).
+- **[perf, Low]** `marks_dominate_local` (agent_boot.rs:296) is O(N×M) nested `.find()` over two counter tables; `decoded.rows` is already strictly ascending by `(authority,scope_class,scope_target)`, so a `binary_search_by` → O(N·log M). Once-per-boot path, table "should never approach" MAX_COUNTER_ENTRIES, so low priority.
+- **[perf, Low]** The hash gate's `candidate.compute_local_marks_digest()` (agent_boot.rs:267) re-sorts+re-encodes the candidate marks even though the already-authenticated canonical `marks_payload` bytes are in hand (equal by the strict-decode↔encode inverse). `SHA3(MARKS_DOMAIN ‖ marks_payload)` would skip the re-encode — BUT the candidate re-encode is INTENTIONAL belt-and-suspenders behind the decoder; only act if that belt is judged redundant.
+- **[consistency, Low]** `decode_anchor_marks_request` env field uses lenient ciborium decode + an uncapped `s.clone()` (frame-bounded by MAX_MESSAGE_SIZE, out of the enclave trust boundary; matches the existing 0x41 decoder's deliberate lenient design). A strict-decode + a 64-byte env cap would tighten both relay decoders consistently. Benign — the enclave verifies only the signed RESPONSE.
+- **[liveness coupling, Low — documented]** `marks_dominate_local` belt fail-closes a hash-gate-PASSING adopt if the (not-yet-frozen) anchor data model ever legitimately prunes/lowers a local counter row. Never a wrong-accept (the hash gate authenticated first); availability-only. Revisit when the anchor data model freezes (already noted in the belt's doc-comment).
+
+Source: PR #69 code-review-max workflow wf_36523dbd (40 agents). The Medium + the host-relay bucket were fixed in-PR; these Lows are the parked residual.
 <!-- SECTION:DESCRIPTION:END -->
