@@ -152,14 +152,25 @@ impl AgentOpcode {
             // key material; CONFIGURE_TREASURY changes faucet CONFIG (limits/breaker — not a marks
             // surface). A dropped seal of either ⇒ StructuralGap⇒restore (design §3). [GENERATE_KEYS is
             // the only LIVE handler; CONFIGURE_TREASURY is deferred — its class is re-confirmed when its
-            // handler lands, but Structural is the design-named AND fail-closed-safe value.]
+            // handler lands, but Structural is the design-named AND fail-closed-safe value. CAVEAT for the
+            // CONFIGURE handler: opcode-level granularity OVER-classifies the `reset_lifetime_breaker`
+            // sub-op (marks-only: spend resets + strict_recovery_counter) as Structural — fail-closed-SAFE
+            // (a dropped seal fails to restore rather than silently adopting), but the handler will need a
+            // sub-op-level classifier (set_limits/refill/raise = Structural; reset = EpochOnly).]
             Self::GenerateKeys | Self::ConfigureTreasury => CommitBumpClass::Structural,
             // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
             // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); EXPORT_BACKUP is a
-            // freshness-gated read (no un-recoverable mutation); RESTORE_BACKUP re-seeds from
-            // re-presentable recovery material + advances the strict_recovery_counter (a marks surface).
-            // [All three handlers are deferred — each class is CONFIRMED at its handler slice; EpochOnly
-            // per the current design.]
+            // freshness-gated read; RESTORE_BACKUP re-seeds from re-presentable recovery material +
+            // advances the strict_recovery_counter (a marks surface). [All three handlers are deferred —
+            // each class is CONFIRMED at its handler slice; EpochOnly per the current design.
+            // CAVEAT for the EXPORT handler: EXPORT is specified to advance the AUDIT-ring backpressure
+            // high-water `audit.last_exported_seq`, which is NEITHER a marks surface NOR structural_version
+            // — so under EpochOnly a dropped EXPORT seal adopt-forwards and the seeder (which never touches
+            // `audit`) silently rolls `last_exported_seq` back, re-enabling overwrite of already-exported
+            // reviewable history (an AC#14 audit-completeness weakening, NOT a fund loss). The audit-ring
+            // write path is itself a deferred follow-up for ALL privileged ops; before the EXPORT handler
+            // lands, RESOLVE this: make `last_exported_seq` anti-rollback-covered, prove its rollback
+            // acceptable, or class EXPORT Structural.]
             Self::SignFaucetDispense | Self::ExportBackup | Self::RestoreBackup => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
             Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,
