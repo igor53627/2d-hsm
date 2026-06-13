@@ -556,7 +556,7 @@ mod tests {
 
     /// TRIPWIRE: the gate-free 5b-2c derive-by-default per-attempt margin MUST stay ≥ the real per-attempt
     /// ε (`QUOTE_ATTEMPT_OVERHEAD`) — else a DEFAULT-config boot derives an overall budget below the
-    /// `nominal = max_attempts·(2·per_leg + ε)` floor `ValidatedBootBudget::validate` enforces, failing
+    /// `nominal = max_attempts·(3·per_leg + ε)` floor `ValidatedBootBudget::validate` enforces, failing
     /// closed silently on the OUT-OF-BOX config. The parser is gate-free and can't reference the gated ε,
     /// so this pin lives here (mirrors the `QUOTE_ATTEMPT_OVERHEAD ≥ REAP_GRACE` pin in `quote_subprocess`).
     #[test]

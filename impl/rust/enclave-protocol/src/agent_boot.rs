@@ -227,10 +227,13 @@ pub(crate) enum AdoptForwardFail {
 /// **Why forgery is structurally dead & drift-proof:** the gate computes the digest via the *same*
 /// `KeystoreBody::compute_local_marks_digest` the local body and the anchor co-sign use (no second
 /// digest impl to drift); over a re-built candidate (clone + overwrite-4-surfaces → canonical
-/// re-encode), so only the *canonical* form's digest can match (a non-canonical-but-decodable inner
-/// payload re-canonicalizes to a different digest → rejected); the `≥`-belt is *additional*, never the
-/// gate. A host supplying arbitrarily-large-but-`≥-local` marks produces a candidate whose digest `≠
-/// state.marks_digest` (the anchor signed the genuine digest) → `HashMismatch`.
+/// re-encode), so only the *canonical* form's digest can match. A non-canonical inner payload never
+/// reaches the digest at all — step 2's `strict_decode_marks_payload` enforces strictly-ascending row
+/// order + minimal-length integers and rejects any reorder/dup/slack as `MarksDecode`; the
+/// canonical-only candidate re-encode is belt-and-suspenders BEHIND that decode gate, not the primary
+/// guard. The `≥`-belt is *additional*, never the gate. A host supplying arbitrarily-large-but-`≥-local`
+/// marks produces a candidate whose digest `≠ state.marks_digest` (the anchor signed the genuine digest)
+/// → `HashMismatch`.
 #[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 4/8; the driver execute arm lands in commit 6
 pub(crate) fn execute_adopt_forward(
     marks_bytes: &[u8],

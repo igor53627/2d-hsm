@@ -423,10 +423,12 @@ pub(crate) trait BootQuoteProducer {
 /// triple-gated type) and `C = VsockBootRelayChannel`.
 ///
 /// `timeout` is a **per-leg** budget: the quote fetch AND the channel round-trip each get their own
-/// `Instant::now() + timeout` deadline, so one attempt is bounded by ≤ `2·timeout + ε` wall-clock
-/// (ε = the quote-subprocess dispose overhead, `QUOTE_ATTEMPT_OVERHEAD`; the driver's `max_attempts`
-/// count bound caps total boot at `max_attempts · (2·timeout + ε)` — the ε term is load-bearing, §8:
-/// the ε-less product is NOT a valid ceiling). The single-budget model is final for 5b-2b; splitting
+/// `Instant::now() + timeout` deadline, so one freshness attempt is bounded by ≤ `2·timeout + ε`
+/// wall-clock (ε = the quote-subprocess dispose overhead, `QUOTE_ATTEMPT_OVERHEAD`). An attempt that
+/// adopts (5b-2e) runs a THIRD bounded leg — the `marks_round_trip` — so its worst case is
+/// `3·timeout + ε`; the driver's `max_attempts` count bound caps total boot at
+/// `max_attempts · (3·timeout + ε)` — the ε term is load-bearing, §8: the ε-less product is NOT a valid
+/// ceiling. The single-budget model is final for 5b-2b; splitting
 /// into distinct `quote_timeout` / `relay_timeout` is deferred to 5b-2c (see §8). The bound is HARD
 /// once (4b) wires `HardBoundedQuoteProducer` ((d-ii)/2 — landed); (4a) deleted the only cooperative
 /// impl (`SnpQuoteProducer`) — SCOPE HONESTLY: that deletes the TYPE, not the CLASS (the trait stays

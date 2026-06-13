@@ -117,9 +117,10 @@ pub(crate) trait AnchorBootTransport {
     /// [`AnchorTransportError`] (retryable) rather than block. (5b-2a's `RelayAnchorTransport` gives the
     /// quote producer AND the relay channel each their own `timeout` deadline — so a hung quote can't
     /// stall boot and quote latency can't starve the channel; 5b-2b's concrete impls just honor the
-    /// deadline they're handed. Per-attempt wall-clock ≤ 2×timeout + ε — ε = the quote-subprocess
-    /// dispose overhead `QUOTE_ATTEMPT_OVERHEAD`, a load-bearing term per §8: total boot ≤
-    /// `max_attempts · (2·timeout + ε)`, and the ε-less product is NOT a valid ceiling.)
+    /// deadline they're handed. Per-attempt wall-clock for this freshness leg ≤ 2×timeout + ε — ε = the
+    /// quote-subprocess dispose overhead `QUOTE_ATTEMPT_OVERHEAD`, a load-bearing term per §8. An attempt
+    /// that adopts runs a THIRD bounded leg ([`AnchorBootTransport::marks_round_trip`]) → ≤ 3×timeout + ε;
+    /// total boot ≤ `max_attempts · (3·timeout + ε)`, and the ε-less product is NOT a valid ceiling.)
     fn anchor_round_trip(
         &mut self,
         request: &AnchorBootRequest,
@@ -270,11 +271,12 @@ pub(crate) fn run_boot_anti_rollback_handshake(
             //
             // WALL-CLOCK NOTE: an adopting attempt runs a THIRD per-leg-bounded I/O leg (this
             // `marks_round_trip`, each its own `now + per_leg_timeout` deadline) on top of the quote +
-            // freshness legs — so its worst case is ~3×per_leg_timeout, not the 2× the nominal
-            // `ValidatedBootBudget` sizing formula assumes. That budget is a NOMINAL config-sizing `≤`
-            // check (boot-log triage only), NOT a runtime ceiling: the actual runtime hard bounds — each
-            // leg's own deadline + the `1..=max_attempts` count cap — still hold on the adopt path, so the
-            // boot stays bounded. Sizing `overall_boot_budget` to cover the marks leg is a §8 follow-up.
+            // freshness legs — so its worst case is ~3×per_leg_timeout. The nominal `ValidatedBootBudget`
+            // sizing formula NOW accounts for this third leg (5b-2e: `per_attempt_nominal_cost` sums
+            // quote + freshness + marks + ε; the derive-by-default overall uses 3·per_leg). That budget is
+            // a NOMINAL config-sizing `≤` check (boot-log triage only), NOT a runtime ceiling: the actual
+            // runtime hard bounds — each leg's own deadline + the `1..=max_attempts` count cap — are what
+            // keep the adopt path bounded regardless of the nominal.
             crate::agent_boot::BootAntiRollbackOutcome::AdoptForwardRequired { state, nonce } => {
                 let marks_req = crate::agent_boot_relay::AnchorMarksRequest {
                     chain_id: chain,

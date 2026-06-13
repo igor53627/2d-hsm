@@ -82,7 +82,7 @@ const DEFAULT_BOOT_MAX_ATTEMPTS: u32 = 5;
 const DEFAULT_BOOT_PER_LEG_TIMEOUT_MS: u64 = 5_000;
 /// Per-attempt overhead margin folded into the DERIVED default overall budget — deliberately ≫ the
 /// real per-attempt ε (`quote_subprocess::QUOTE_ATTEMPT_OVERHEAD` ≈ 12 ms), so a derive-by-default
-/// overall always clears `validate()`'s `nominal = max_attempts·(2·per_leg + ε) ≤ overall` with
+/// overall always clears `validate()`'s `nominal = max_attempts·(3·per_leg + ε) ≤ overall` with
 /// comfortable headroom WITHOUT this gate-free parser referencing the gated ε.
 // pub(crate) so the gated `agent_gateway_boot` test can pin it ≥ the real per-attempt ε
 // (`quote_subprocess::QUOTE_ATTEMPT_OVERHEAD`), which this gate-free parser cannot reference directly.
@@ -117,10 +117,12 @@ fn env_u64_or(primary: &str, legacy: &str, default: u64) -> Result<u64, String> 
 
 /// Saturating derive of the default overall boot budget from the resolved `max_attempts`/`per_leg_ms`.
 /// Saturating so an absurd operator `per_leg`/`attempts` can't overflow the derive — `validate()` then
-/// rejects an over-ceiling value fail-closed.
+/// rejects an over-ceiling value fail-closed. THREE per-leg multiples since 5b-2e: the worst-case
+/// attempt runs quote + freshness + marks (the AdoptForward leg), matching `validate()`'s 3-leg nominal
+/// (`quote_subprocess::per_attempt_nominal_cost`) so a derived-by-default overall still clears it.
 fn derive_overall_budget_ms(max_attempts: u32, per_leg_ms: u64) -> u64 {
     let per_attempt = per_leg_ms
-        .saturating_mul(2)
+        .saturating_mul(3)
         .saturating_add(BOOT_DERIVE_PER_ATTEMPT_MARGIN_MS);
     u64::from(max_attempts)
         .saturating_mul(per_attempt)
@@ -202,8 +204,8 @@ mod boot_budget_tests {
         let (attempts, per_leg, overall) = boot_budget_config_from_env().unwrap();
         assert_eq!(attempts, 5);
         assert_eq!(per_leg, Duration::from_millis(5_000));
-        // Derived overall comfortably exceeds the bare nominal 2·per_leg·attempts.
-        let bare_nominal = per_leg.checked_mul(2 * attempts).unwrap();
+        // Derived overall comfortably exceeds the bare nominal 3·per_leg·attempts (3 legs since 5b-2e).
+        let bare_nominal = per_leg.checked_mul(3 * attempts).unwrap();
         assert!(overall > bare_nominal, "derived overall {overall:?} must exceed bare nominal {bare_nominal:?}");
         clear();
     }
@@ -227,8 +229,8 @@ mod boot_budget_tests {
         let (attempts, per_leg, overall) = boot_budget_config_from_env().unwrap();
         assert_eq!(attempts, 3);
         assert_eq!(per_leg, Duration::from_millis(1_000));
-        // 3·(2·1000 + 1000) + 2000 = 3·3000 + 2000 = 11000.
-        assert_eq!(overall, Duration::from_millis(11_000));
+        // 3·(3·1000 + 1000) + 2000 = 3·4000 + 2000 = 14000 (3 legs since 5b-2e).
+        assert_eq!(overall, Duration::from_millis(14_000));
         clear();
     }
 

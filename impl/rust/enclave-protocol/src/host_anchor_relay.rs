@@ -42,7 +42,7 @@ use std::time::Duration;
 // Budget consts — single source, NO new operator knob (§8 L1443-1447 + design §5).
 // ---------------------------------------------------------------------------------------------------
 
-/// Per-pump HEAD-OF-LINE bound (NOT the boot bound — the enclave owns `max_attempts·(2·timeout+ε)`;
+/// Per-pump HEAD-OF-LINE bound (NOT the boot bound — the enclave owns `max_attempts·(3·timeout+ε)`;
 /// this daemon carries NO ε, NO producer, NO budget arithmetic). Prevents a wedged pump from blocking
 /// the serial loop forever. One absolute `Instant` minted at PUMP ENTRY — i.e. BEFORE the enclave read
 /// (the natural consequence of reading the request before connecting) — spans the whole framed pump
