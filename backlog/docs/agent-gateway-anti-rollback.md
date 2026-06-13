@@ -1675,7 +1675,7 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   re-verify it; the named break mode is handing `connect_bounded` the *overall* boot deadline, which would
   void the `2·timeout` accounting. 5b-2c does NOT thread this deadline (it only constructs the channel and
   supplies `max_attempts`/`timeout`), so the surviving 5b-2c obligation is purely the budget sizing
-  (`max_attempts · (2·timeout + ε) ≤ overall_boot_budget`). **Post-(a') threat model (kernel-timer-aware):** with
+  (`max_attempts · (3·timeout + ε) ≤ overall_boot_budget` — 3 legs since 5b-2e). **Post-(a') threat model (kernel-timer-aware):** with
   the fd/thread leak gone, a black-holing host no longer exhausts the guest fd table. For the remaining TIME
   cost, note the kernel's own per-socket connect timer: a non-blocking AF_VSOCK connect arms
   `vsk->connect_timeout` (**default `VSOCK_DEFAULT_CONNECT_TIMEOUT` ≈ 2s**; `connect_bounded` does not set
@@ -1694,8 +1694,8 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   a prose checklist line) — same MUST/enforceable standard the doc applies to (d), and gate #2 in the
   dependency-order list above:** because this invariant is
   now load-bearing as the sole availability bound, 5b-2c MUST validate **whichever invariant form it ships**
-  (the `2·timeout + ε` form, or the generalized `quote_timeout + channel_timeout + ε` form below if
-  distinct timeouts ship — BOTH carry ε; do NOT hardcode the `2·` special case in the check) where the
+  (the `3·timeout + ε` form, or the generalized `quote_timeout + freshness_timeout + marks_timeout + ε`
+  form below if distinct timeouts ship — BOTH carry ε; do NOT hardcode the `3·` special case in the check) where the
   transport/driver is
   constructed — a constructor/config check that **returns an error** (fail-closed, not merely a
   `debug_assert`, since the bound must hold in release) when the shipped form exceeds `overall_boot_budget`.
@@ -1748,9 +1748,9 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   it is mis-sized by definition). The enforced check is therefore
   **`max_attempts · (3·timeout + ε) ≤ overall_boot_budget`** (3 legs since 5b-2e — quote + freshness + marks)
   (nominal worst case `max_attempts·ε ≈ ≤0.8s` at the 64-ceiling) — an explicit term, not silent slack. **Generalized form (the
-  `2·` assumes connect+I/O share one per-leg `timeout` AND the quote leg uses the same `timeout`):** if
-  5b-2c exposes a *distinct* `quote_timeout` (deferred decision, see above), the invariant generalizes to
-  **`max_attempts · (quote_timeout + channel_timeout + ε) ≤ overall_boot_budget`** — 5b-2c MUST restate
+  `3·` assumes connect+I/O share one per-leg `timeout` on BOTH channel legs AND the quote leg uses the same `timeout`):** if
+  5b-2c exposes *distinct* per-leg timeouts (deferred decision, see above), the invariant generalizes to
+  **`max_attempts · (quote_timeout + freshness_timeout + marks_timeout + ε) ≤ overall_boot_budget`** — 5b-2c MUST restate
   and enforce whichever form it ships.
   - [x] **Deferred verification artifact (CHECKED residual — do not lose behind "DONE PR #56") —
     DISCHARGED in (4c), PASSED on aya 2026-06-11 (2 SNP runs; lapse fired at ~399ms, our deadline,
