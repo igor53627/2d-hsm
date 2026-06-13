@@ -354,7 +354,7 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
         req.new_structural_version,
         req.marks_digest,
         req.nonce,
-        req.request_id.clone(),
+        req.request_id, // moved (not cloned) — req.request_id is unused after this; req.nonce is Copy
     );
     let wire = crate::agent_boot_relay::frame_response_cap(
         &response,

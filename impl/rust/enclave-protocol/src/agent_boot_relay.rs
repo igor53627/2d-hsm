@@ -440,6 +440,7 @@ pub(crate) enum CommitFailure {
 /// 0x45 request the enclave SENDS and the values the ACK must ECHO are both built from this one struct (+
 /// config), so they cannot diverge.
 #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
+#[derive(Debug)]
 pub(crate) struct AnchorCommit<'a> {
     pub new_epoch: u64,
     pub new_structural_version: u64,
@@ -1391,6 +1392,29 @@ mod tests {
         assert!(matches!(
             run_anchor_commit(&mut CommitMock(CommitAct::WrongEpoch), &commit, &cfg, far_deadline()),
             Err(CommitFailure::Ack(crate::agent_anchor::CommitAckError::EpochMismatch))
+        ));
+        // An over-cap request_id → fail-closed Encode BEFORE any channel round-trip (the channel panics
+        // if ever reached, proving encode fails first — no avoidable anchor round-trip).
+        struct NeverChannel;
+        impl BootRelayChannel for NeverChannel {
+            fn round_trip(&mut self, _f: &[u8], _d: std::time::Instant) -> Result<Vec<u8>, AnchorTransportError> {
+                panic!("encode must fail closed BEFORE any round_trip")
+            }
+            fn marks_round_trip(&mut self, _f: &[u8], _d: std::time::Instant) -> Result<Vec<u8>, AnchorTransportError> {
+                unreachable!()
+            }
+        }
+        let big = vec![0x41u8; crate::agent_dispatch::MAX_REQUEST_ID_LEN + 1];
+        let over = AnchorCommit {
+            new_epoch: 8,
+            new_structural_version: 3,
+            marks_digest: [0x5c; 32],
+            nonce: [0x9a; 32],
+            request_id: &big,
+        };
+        assert!(matches!(
+            run_anchor_commit(&mut NeverChannel, &over, &cfg, far_deadline()),
+            Err(CommitFailure::Encode)
         ));
     }
 
