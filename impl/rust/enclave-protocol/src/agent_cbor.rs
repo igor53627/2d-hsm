@@ -352,10 +352,21 @@ pub(crate) fn strict_decode_marks_payload(
         return Err(());
     }
     let n_rows = p.typed_head(4)? as usize;
-    if n_rows > max_rows || n_rows > p.remaining() {
-        return Err(()); // cap + a cheap lower-bound alloc guard (each row is >= 1 byte)
+    // Cap + a TIGHT lower-bound alloc guard: each row is array(4) header(1) + authority bstr(2+32=34) +
+    // scope_class uint(>=1) + scope_target bstr(>=1) + counter uint(>=1) = >= 38 wire bytes. Bounding
+    // n_rows by remaining()/MIN_ROW_BYTES (not /1) stops a tiny frame declaring a huge row count from
+    // forcing a large up-front `Vec::with_capacity` (matches the shared map decoder's 2x-per-entry
+    // tightness — see the `5 => ... 2 * arg > remaining()` guard above).
+    const MIN_ROW_BYTES: usize = 38;
+    if n_rows > max_rows || n_rows.saturating_mul(MIN_ROW_BYTES) > p.remaining() {
+        return Err(());
     }
     let mut rows = Vec::with_capacity(n_rows);
+    // Enforce the encoder's CANONICAL row order on decode (strictly ascending by
+    // `(authority, scope_class, scope_target)`, env folded out): this rejects out-of-order AND duplicate
+    // rows at the DECODER, so the marks payload's canonicality does not rest SOLELY on the downstream
+    // re-encode+hash gate (defense in depth; the encoder sorts by exactly this key, agent_keystore).
+    let mut prev_key: Option<([u8; 32], u8, Vec<u8>)> = None;
     for _ in 0..n_rows {
         if p.typed_head(4)? != 4 {
             return Err(()); // each row is exactly array(4)
@@ -366,6 +377,13 @@ pub(crate) fn strict_decode_marks_payload(
         let scope_class = u8::try_from(p.uint()?).map_err(|_| ())?;
         let scope_target = p.bstr(MAX_STR_LEN as usize)?;
         let highest_accepted_counter = p.uint()?;
+        let key = (authority, scope_class, scope_target.clone());
+        if let Some(prev) = &prev_key {
+            if &key <= prev {
+                return Err(()); // not strictly ascending ⇒ duplicate or out-of-canonical-order row
+            }
+        }
+        prev_key = Some(key);
         rows.push(DecodedRow { authority, scope_class, scope_target, highest_accepted_counter });
     }
     // key 2 -> cumulative_native_spend (bstr 32); key 3 -> lifetime_spend (bstr 32); key 4 -> strict_recovery_counter (uint)
@@ -765,6 +783,23 @@ mod tests {
         super::super::agent_capability::put_uint(&mut o, 0, 4);
         super::super::agent_capability::put_uint(&mut o, 0, 0);
         assert!(strict_decode_marks_payload(&o, ROWS_CAP).is_err());
+    }
+
+    #[test]
+    fn marks_decode_rejects_duplicate_and_out_of_order_rows() {
+        // Defense in depth: the decoder enforces the encoder's canonical strictly-ascending row order
+        // (authority, scope_class, scope_target), so a duplicate or reordered row is rejected at the
+        // DECODER — canonicality does not rest solely on the downstream hash gate.
+        let a1 = [0x11; 32];
+        let a2 = [0x22; 32];
+        // ascending (a1 < a2) decodes.
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"x", 1), (a2, 0, b"y", 2)], [0; 32], [0; 32], 0), ROWS_CAP).is_ok());
+        // out of order (a2 before a1) rejects.
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a2, 0, b"y", 2), (a1, 0, b"x", 1)], [0; 32], [0; 32], 0), ROWS_CAP).is_err());
+        // exact duplicate tuple rejects (not strictly ascending).
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"x", 1), (a1, 0, b"x", 9)], [0; 32], [0; 32], 0), ROWS_CAP).is_err());
+        // same authority+class, ascending scope_target decodes.
+        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"a", 1), (a1, 0, b"b", 2)], [0; 32], [0; 32], 0), ROWS_CAP).is_ok());
     }
 
     #[test]

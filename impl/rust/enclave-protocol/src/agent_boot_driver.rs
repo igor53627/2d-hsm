@@ -267,6 +267,14 @@ pub(crate) fn run_boot_anti_rollback_handshake(
             // consumes ONE attempt — a continuously-advancing anchor exhausts the bound, never an infinite
             // loop). A marks-leg TRANSPORT flap retries like the freshness leg; a marks VERDICT (sig/scope/
             // nonce/epoch) or the hash gate / belt is TERMINAL.
+            //
+            // WALL-CLOCK NOTE: an adopting attempt runs a THIRD per-leg-bounded I/O leg (this
+            // `marks_round_trip`, each its own `now + per_leg_timeout` deadline) on top of the quote +
+            // freshness legs — so its worst case is ~3×per_leg_timeout, not the 2× the nominal
+            // `ValidatedBootBudget` sizing formula assumes. That budget is a NOMINAL config-sizing `≤`
+            // check (boot-log triage only), NOT a runtime ceiling: the actual runtime hard bounds — each
+            // leg's own deadline + the `1..=max_attempts` count cap — still hold on the adopt path, so the
+            // boot stays bounded. Sizing `overall_boot_budget` to cover the marks leg is a §8 follow-up.
             crate::agent_boot::BootAntiRollbackOutcome::AdoptForwardRequired { state, nonce } => {
                 let marks_req = crate::agent_boot_relay::AnchorMarksRequest {
                     chain_id: chain,
@@ -285,6 +293,10 @@ pub(crate) fn run_boot_anti_rollback_handshake(
                 match crate::agent_boot::execute_adopt_forward(&marks_bytes, body, &state, &nonce) {
                     Ok(seeded) => {
                         *body = seeded; // adopt: the next iteration reconciles the seeded body → Fresh
+                        // If THIS was the final attempt, the loop falls through to RetriesExhausted — make
+                        // its triage string honest (an adopt completed but no budget remained to re-run
+                        // to Fresh), not the default "no attempt completed".
+                        last_transport = "adopted forward; re-run budget exhausted before Fresh";
                         continue;
                     }
                     Err(cause) => {

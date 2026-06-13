@@ -269,6 +269,14 @@ pub(crate) fn execute_adopt_forward(
 /// `(authority, scope_class, scope_target)` — a local row absent from (or lowered by) the anchor's
 /// authoritative high-water is a regression; both spends + the recovery counter must not decrease.
 /// (`[u8; 32]` compares lexicographically == big-endian-u256 numeric order.) Belt-only — NEVER the gate.
+///
+/// ASSUMPTION (liveness, not security): this trips (`BeltRegression`, fail-closed) only if the anchor
+/// signs a hash-matching snapshot that DROPS or LOWERS a row the local body still holds — which the
+/// reconcile trust model rules out (the anchor records a MONOTONE, no-prune high-water,
+/// `agent_anchor` reconcile doc). So it is unreachable for a genuine anchor under that model. If the
+/// (not-yet-frozen) anchor data model ever allows a legitimate row prune, this belt would fail a valid
+/// adopt closed (availability loss, NEVER a wrong-accept — the hash gate already authenticated the
+/// state); revisit the assumption when the anchor data model freezes.
 #[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 4/8
 fn marks_dominate_local(
     decoded: &crate::agent_cbor::DecodedMarks,
