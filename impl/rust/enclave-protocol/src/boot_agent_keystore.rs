@@ -221,6 +221,11 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
         | K::DuplicateKeyRef
         | K::DuplicateCounterTuple
         | K::BlobTooLarge => "agent keystore: invalid keystore body",
+        // A monotonic-counter overflow is a runtime capacity condition (epoch/structural at u64::MAX),
+        // NOT structural body corruption — a distinct label so incident response looks at the counter,
+        // not a malformed blob. (Unreachable via the boot UNSEAL path, which performs no bump — present
+        // for match-exhaustiveness; the live surface is the 6-4 per-op commit dispatch mapping.)
+        K::MonotonicOverflow => "agent keystore: monotonic counter overflow",
     };
     ProtocolError::PqSigningUnavailable(label)
 }
@@ -532,6 +537,15 @@ mod tests {
                 }
                 other => panic!("mapper must yield PqSigningUnavailable, got {other:?}"),
             }
+        }
+        // Pin the DISTINCT MonotonicOverflow label EXACTLY (it must not regress to the generic
+        // "invalid keystore body" bucket — a runtime capacity condition reads differently in a log).
+        // (ProtocolError has no PartialEq, so match + compare the &'static str.)
+        match map_keystore_error(K::MonotonicOverflow) {
+            ProtocolError::PqSigningUnavailable(s) => {
+                assert_eq!(s, "agent keystore: monotonic counter overflow");
+            }
+            other => panic!("got {other:?}"),
         }
     }
 
