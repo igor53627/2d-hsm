@@ -141,22 +141,24 @@ pub(crate) fn boot_reconcile_anti_rollback(
     response_bytes: &[u8],
     body: &crate::agent_keystore::KeystoreBody,
 ) -> BootAntiRollbackOutcome {
-    // 1. CONSUME the outstanding challenge FIRST (take-before-verify ⇒ the nonce is retired on every
-    //    outcome, single-use is structural), holding the nonce VALUE so the AdoptForward arm can bind
-    //    the raw-marks message to the SAME nonce (§E2/D4). This is the exact two-step decomposition of
-    //    `verify_outstanding_response` (consume → verify_anchor_response_bytes), so the freshness
-    //    behavior is byte-identical — it is NOT a non-consuming peek (the slot is genuinely retired
-    //    before any verify; the `agent_challenge` module-doc prohibition is honored). The nonce is a
-    //    fresh-per-restart CSPRNG draw the host cannot predict, and a replayed `(nonce, response)` after
-    //    this attempt finds an empty slot (`NoChallenge`).
-    let challenge = match crate::agent_challenge::consume_outstanding_challenge() {
-        Some(c) => c,
-        None => return BootAntiRollbackOutcome::FailClosed(BootFailReason::NoChallenge),
-    };
-    let nonce = *challenge.nonce();
-    let state = match crate::agent_anchor::verify_anchor_response_bytes(response_bytes, &nonce, &body.config) {
-        Ok(s) => s,
-        Err(e) => return BootAntiRollbackOutcome::FailClosed(map_anchor_error(e)),
+    // 1. RETIRE-then-verify through the ONE safe primitive `verify_outstanding_response` (consume the
+    //    challenge FIRST ⇒ the nonce is retired on every outcome, single-use is structural), which hands
+    //    back the consumed nonce VALUE so the AdoptForward arm can bind the raw-marks message to the SAME
+    //    nonce (§E2/D4) WITHOUT a separate non-consuming peek. Routing the boot path through the primitive
+    //    (rather than re-inlining its consume→verify decomposition) keeps the verify logic single-sourced.
+    //    The nonce is a fresh-per-restart CSPRNG draw the host cannot predict, and a replayed
+    //    `(nonce, response)` after this attempt finds an empty slot (`NoOutstandingChallenge` → NoChallenge).
+    let (state, nonce) = match crate::agent_challenge::verify_outstanding_response(
+        response_bytes,
+        &body.config,
+    ) {
+        Ok(sn) => sn,
+        Err(crate::agent_challenge::ChallengeVerifyError::NoOutstandingChallenge) => {
+            return BootAntiRollbackOutcome::FailClosed(BootFailReason::NoChallenge)
+        }
+        Err(crate::agent_challenge::ChallengeVerifyError::Anchor(e)) => {
+            return BootAntiRollbackOutcome::FailClosed(map_anchor_error(e))
+        }
     };
 
     // 2. Recompute the local counter/spend marks digest from the sealed body.

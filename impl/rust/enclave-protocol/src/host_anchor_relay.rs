@@ -238,10 +238,14 @@ fn classify_close(fault: &RelayFault) -> &'static str {
             }
             ProtocolError::WireProtocol(m) if m.contains("deadline") => "pump-timeout",
             // BOTH enclave request grammars the pump decodes (0x41 "boot request" and the 5b-2e 0x44
-            // "marks request") bucket as malformed-request — else a bad 0x44 frame falls through to the
-            // generic relay-error bucket and weakens operator triage.
+            // "marks request") bucket as malformed-request, as does an UNFORWARDABLE/unknown type byte or
+            // a too-short header (the relay's own "...are forwardable" reject) — all are a malformed
+            // REQUEST from the enclave/peer, not a relay/anchor fault; else they fall through to the
+            // generic relay-error bucket and weaken operator triage.
             ProtocolError::WireProtocol(m)
-                if m.contains("boot request") || m.contains("marks request") =>
+                if m.contains("boot request")
+                    || m.contains("marks request")
+                    || m.contains("forwardable") =>
             {
                 "malformed-request"
             }
@@ -950,6 +954,14 @@ mod tests {
         assert_eq!(
             classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
                 "marks request: bad CBOR"
+            ))),
+            "malformed-request"
+        );
+        // An UNFORWARDABLE/unknown type byte or too-short header (the relay's own reject) is a malformed
+        // REQUEST too — the literal string the unknown-type arm returns must bucket as malformed-request.
+        assert_eq!(
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "anchor relay: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are forwardable"
             ))),
             "malformed-request"
         );

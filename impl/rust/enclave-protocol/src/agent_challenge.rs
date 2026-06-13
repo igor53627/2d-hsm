@@ -141,14 +141,21 @@ pub(crate) fn consume_outstanding_challenge() -> Option<Challenge> {
 /// the challenge in the same step. On any failure the caller MUST [`issue_challenge`] afresh before
 /// retrying (never reuse a nonce). `report_data` for the SNP quote comes from the [`Challenge`] that
 /// [`issue_challenge`] returned, not from a peek.
+///
+/// Returns `(AnchorState, nonce)` on success: the consumed nonce VALUE is handed back so the boot
+/// caller can bind a downstream message to the SAME single-use nonce (5b-2e `AdoptForward` binds its
+/// raw-marks fetch to it) WITHOUT a separate non-consuming peek — the slot is genuinely retired in this
+/// one step, and the nonce travels as an owned value, not a re-read of the (now-empty) slot.
 pub(crate) fn verify_outstanding_response(
     response_bytes: &[u8],
     config: &KeystoreConfig,
-) -> Result<AnchorState, ChallengeVerifyError> {
+) -> Result<(AnchorState, [u8; DIGEST_LEN]), ChallengeVerifyError> {
     let challenge =
         consume_outstanding_challenge().ok_or(ChallengeVerifyError::NoOutstandingChallenge)?;
-    verify_anchor_response_bytes(response_bytes, challenge.nonce(), config)
-        .map_err(ChallengeVerifyError::Anchor)
+    let nonce = *challenge.nonce();
+    let state = verify_anchor_response_bytes(response_bytes, &nonce, config)
+        .map_err(ChallengeVerifyError::Anchor)?;
+    Ok((state, nonce))
 }
 
 /// Whether a challenge is currently outstanding (presence-only; poison-recovers like the mutators so
@@ -260,8 +267,10 @@ mod tests {
         // retired (the same take()-before-verify path as the failure case).
         let resp =
             crate::agent_anchor::test_signed_response_bytes(&key, CHAIN, ENV, 7, 2, [0xab; 32], nonce);
-        let st = verify_outstanding_response(&resp, &cfg).expect("a valid signed response verifies");
+        let (st, ret_nonce) =
+            verify_outstanding_response(&resp, &cfg).expect("a valid signed response verifies");
         assert_eq!(st.epoch, 7);
+        assert_eq!(ret_nonce, nonce, "the primitive returns the consumed nonce VALUE it verified against");
         assert!(!has_outstanding_challenge(), "challenge consumed on success");
         // a replay of the (now-retired) valid response finds no outstanding challenge
         assert_eq!(
