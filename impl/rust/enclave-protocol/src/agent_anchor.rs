@@ -43,6 +43,15 @@ const ANCHOR_RESPONSE_VERSION: u64 = 1;
 const MARKS_RESP_DOMAIN: &[u8] = b"2d-hsm/agent-anchor-marks-resp/v1\0";
 /// Only marks-response-format version this build understands.
 const MARKS_RESP_VERSION: u64 = 1;
+/// Domain for the anti-rollback per-op **commit ACK** (TASK-7.7 slice 6). A FOURTH distinct label
+/// (alongside `ANCHOR_DOMAIN`/`MARKS_RESP_DOMAIN`/`MARKS_DOMAIN`) so a captured freshness- or
+/// marks-response signature can NEVER be replayed as a commit ack (and vice-versa). Trailing NUL is
+/// part of the label.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
+const COMMIT_ACK_DOMAIN: &[u8] = b"2d-hsm/agent-anchor-commit-ack/v1\0";
+/// Only commit-ack-format version this build understands.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1
+const COMMIT_ACK_VERSION: u64 = 1;
 /// Domain for the SNP `report_data` the enclave puts in its handshake attestation (the anchor verifies
 /// the enclave's side; that verification is anchor-side, this is just the binding the enclave commits).
 const HANDSHAKE_REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-agent-anchor-handshake-v1";
@@ -420,6 +429,31 @@ pub(crate) enum MarksError {
     EpochMismatch,
 }
 
+/// Why a per-op commit ACK was rejected (TASK-7.7 slice 6; coarse band like [`MarksError`]). The ack
+/// confirms the anchor DURABLY RECORDED exactly what the enclave proposed; any mismatch fails the op
+/// closed (no seal, no signature/refs emitted).
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitAckError {
+    /// Bad CBOR / unknown version / wrong key-set / wrong field length.
+    Malformed,
+    /// Ed25519 verification failed, or `anchor_root` is not a valid key.
+    SignatureInvalid,
+    /// `chain_id` / `environment_identifier` did not match the sealed config.
+    ScopeMismatch,
+    /// The ack did not echo the enclave's fresh per-op nonce (stale/replayed ack).
+    NonceMismatch,
+    /// The ack epoch did not equal the proposed new `freshness_epoch`.
+    EpochMismatch,
+    /// The ack `structural_version` did not equal the proposed new structural version.
+    StructuralMismatch,
+    /// The ack `marks_digest` did not equal the proposed post-op marks digest (anchor recorded a
+    /// DIFFERENT post-op state than the enclave is about to seal).
+    MarksMismatch,
+    /// The ack did not echo the op's `request_id` (the durable record is for a different op).
+    RequestIdMismatch,
+}
+
 /// `MARKS_RESP_DOMAIN ‖ canonical-CBOR({1..=6})` — keys 1..=6 ascending, shortest-form, key 13 (the
 /// signature) excluded. Built with the same canonical encoders the freshness preimage uses, so a
 /// conformant anchor signer matches byte-for-byte. The marks payload (key 6) is an opaque bstr here.
@@ -515,6 +549,148 @@ pub(crate) fn test_signed_marks_response_bytes(
         (Value::Integer(4.into()), Value::Integer(f.epoch.into())),
         (Value::Integer(5.into()), Value::Bytes(f.nonce.to_vec())),
         (Value::Integer(6.into()), Value::Bytes(f.marks_payload.clone())),
+        (Value::Integer(13.into()), Value::Bytes(f.signature.to_vec())),
+    ];
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
+    out
+}
+
+/// `COMMIT_ACK_DOMAIN ‖ canonical-CBOR({1..=8})` — keys 1..=8 ascending, shortest-form, key 13 (the
+/// signature) excluded. Built with the same canonical encoders the freshness/marks preimages use, so a
+/// conformant anchor signer matches byte-for-byte.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1
+fn commit_ack_signed_preimage(f: &crate::agent_cbor::CommitAckFields) -> Vec<u8> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    let mut out = Vec::with_capacity(
+        COMMIT_ACK_DOMAIN.len() + 160 + f.environment_identifier.len() + f.request_id.len(),
+    );
+    out.extend_from_slice(COMMIT_ACK_DOMAIN);
+    put_uint(&mut out, 5, 8); // map(8): keys 1..=8 (key 13 signature excluded)
+    put_uint(&mut out, 0, 1);
+    put_uint(&mut out, 0, f.version);
+    put_uint(&mut out, 0, 2);
+    put_uint(&mut out, 0, f.chain_id);
+    put_uint(&mut out, 0, 3);
+    put_text(&mut out, &f.environment_identifier);
+    put_uint(&mut out, 0, 4);
+    put_uint(&mut out, 0, f.epoch);
+    put_uint(&mut out, 0, 5);
+    put_uint(&mut out, 0, f.structural_version);
+    put_uint(&mut out, 0, 6);
+    put_bytes(&mut out, &f.marks_digest);
+    put_uint(&mut out, 0, 7);
+    put_bytes(&mut out, &f.nonce);
+    put_uint(&mut out, 0, 8);
+    put_bytes(&mut out, &f.request_id);
+    out
+}
+
+/// The enclave-PROPOSED values a commit ACK must echo back — passed by NAME (not positionally) because
+/// `epoch` and `structural_version` are both `u64` and a positional swap would be a silent forgery
+/// hole. The verifier confirms the anchor durably recorded EXACTLY these.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
+pub(crate) struct ExpectedCommitAck<'a> {
+    /// The fresh per-op nonce the enclave drew for THIS commit (anti-replay).
+    pub nonce: &'a [u8; DIGEST_LEN],
+    /// The proposed new `freshness_epoch` (= local epoch + 1).
+    pub epoch: u64,
+    /// The proposed new `structural_version`.
+    pub structural_version: u64,
+    /// The post-op marks digest the enclave computed on the candidate body.
+    pub marks_digest: &'a [u8; DIGEST_LEN],
+    /// The op's deterministic `request_id` (idempotency key; a retry hits the same anchor record).
+    pub request_id: &'a [u8],
+}
+
+/// Verify a per-op commit ACK against the values the enclave PROPOSED (TASK-7.7 slice 6). Eight
+/// fail-closed checks: strict-canonical OUTER decode → version → Ed25519 `verify_strict` vs the sealed
+/// `anchor_root` → scope (`chain_id`+`env`) → fresh per-op `nonce` echo → proposed `epoch` echo →
+/// proposed `structural_version` echo → proposed `marks_digest` echo → `request_id` echo. The ACK is the
+/// anchor's durable record that the proposed post-op state is committed; only on `Ok(())` may the enclave
+/// seal the advanced epoch and emit the op's signature/refs (seal-before-emit). Any mismatch fails the op
+/// CLOSED. The distinct [`COMMIT_ACK_DOMAIN`] makes a cross-leg signature substitution unrepresentable.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by 6-4 dispatch wiring
+pub(crate) fn verify_commit_ack_bytes(
+    bytes: &[u8],
+    expected: &ExpectedCommitAck,
+    config: &KeystoreConfig,
+) -> Result<(), CommitAckError> {
+    let f =
+        crate::agent_cbor::strict_decode_commit_ack(bytes, crate::agent_dispatch::MAX_REQUEST_ID_LEN)
+            .map_err(|_| CommitAckError::Malformed)?;
+    if f.version != COMMIT_ACK_VERSION {
+        return Err(CommitAckError::Malformed);
+    }
+    // Ed25519 verify against the pinned sealed anchor root (verify_strict rejects torsion/small-order).
+    let key =
+        VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| CommitAckError::SignatureInvalid)?;
+    let sig = Signature::from_bytes(&f.signature);
+    key.verify_strict(&commit_ack_signed_preimage(&f), &sig)
+        .map_err(|_| CommitAckError::SignatureInvalid)?;
+    // Scope: this ack is for THIS keystore's chain + environment (the SEALED config).
+    if f.chain_id != config.twod_chain_id || f.environment_identifier != config.environment_identifier {
+        return Err(CommitAckError::ScopeMismatch);
+    }
+    // Anti-replay: the ack must echo the SAME fresh per-op nonce this commit drew.
+    if &f.nonce != expected.nonce {
+        return Err(CommitAckError::NonceMismatch);
+    }
+    // The anchor must have recorded EXACTLY the proposed post-op state (epoch, structural, marks): a
+    // mismatch means the durable record diverges from what the enclave is about to seal → fail closed.
+    if f.epoch != expected.epoch {
+        return Err(CommitAckError::EpochMismatch);
+    }
+    if f.structural_version != expected.structural_version {
+        return Err(CommitAckError::StructuralMismatch);
+    }
+    if &f.marks_digest != expected.marks_digest {
+        return Err(CommitAckError::MarksMismatch);
+    }
+    // Idempotency / anti-cross-op-replay: the ack must be for THIS op's request_id.
+    if f.request_id.as_slice() != expected.request_id {
+        return Err(CommitAckError::RequestIdMismatch);
+    }
+    Ok(())
+}
+
+/// Test/lab-only: build the canonically-encoded, validly-signed commit-ACK bytes a conformant anchor
+/// would return. The SINGLE source of the commit-ack wire shape — the slice-6 lab anchor stub reuses it
+/// (anti-drift), exactly as [`test_signed_marks_response_bytes`] is the marks-response source.
+#[cfg(any(test, feature = "lab-agent-smoke"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn test_signed_commit_ack_bytes(
+    signing_key: &ed25519_dalek::SigningKey,
+    chain_id: u64,
+    environment_identifier: &str,
+    epoch: u64,
+    structural_version: u64,
+    marks_digest: [u8; DIGEST_LEN],
+    nonce: [u8; DIGEST_LEN],
+    request_id: Vec<u8>,
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let mut f = crate::agent_cbor::CommitAckFields {
+        version: COMMIT_ACK_VERSION,
+        chain_id,
+        environment_identifier: environment_identifier.to_string(),
+        epoch,
+        structural_version,
+        marks_digest,
+        nonce,
+        request_id,
+        signature: [0u8; 64],
+    };
+    f.signature = signing_key.sign(&commit_ack_signed_preimage(&f)).to_bytes();
+    let map: Vec<(Value, Value)> = vec![
+        (Value::Integer(1.into()), Value::Integer(f.version.into())),
+        (Value::Integer(2.into()), Value::Integer(f.chain_id.into())),
+        (Value::Integer(3.into()), Value::Text(f.environment_identifier.clone())),
+        (Value::Integer(4.into()), Value::Integer(f.epoch.into())),
+        (Value::Integer(5.into()), Value::Integer(f.structural_version.into())),
+        (Value::Integer(6.into()), Value::Bytes(f.marks_digest.to_vec())),
+        (Value::Integer(7.into()), Value::Bytes(f.nonce.to_vec())),
+        (Value::Integer(8.into()), Value::Bytes(f.request_id.clone())),
         (Value::Integer(13.into()), Value::Bytes(f.signature.to_vec())),
     ];
     let mut out = Vec::new();
@@ -1071,5 +1247,185 @@ mod tests {
         if let Ok(m) = crate::agent_cbor::strict_decode_map(&marks) {
             assert!(verify_anchor_response(&m, &TEST_NONCE, &cfg).is_err());
         }
+    }
+
+    // ---- slice-6 per-op commit-ACK verify ----
+
+    const TEST_STRUCTURAL: u64 = 3;
+    const TEST_MARKS_DIGEST: [u8; 32] = [0x5c; 32];
+    const TEST_REQUEST_ID: &[u8] = b"op-req-1";
+
+    fn good_commit_ack() -> Vec<u8> {
+        test_signed_commit_ack_bytes(
+            &anchor_key(),
+            TEST_CHAIN,
+            TEST_ENV,
+            TEST_EPOCH,
+            TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST,
+            TEST_NONCE,
+            TEST_REQUEST_ID.to_vec(),
+        )
+    }
+
+    fn commit_expected() -> ExpectedCommitAck<'static> {
+        ExpectedCommitAck {
+            nonce: &TEST_NONCE,
+            epoch: TEST_EPOCH,
+            structural_version: TEST_STRUCTURAL,
+            marks_digest: &TEST_MARKS_DIGEST,
+            request_id: TEST_REQUEST_ID,
+        }
+    }
+
+    #[test]
+    fn commit_ack_verifies() {
+        assert_eq!(
+            verify_commit_ack_bytes(&good_commit_ack(), &commit_expected(), &test_config()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn commit_ack_rejects_wrong_signer() {
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let bytes = test_signed_commit_ack_bytes(
+            &other, TEST_CHAIN, TEST_ENV, TEST_EPOCH, TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST, TEST_NONCE, TEST_REQUEST_ID.to_vec(),
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&bytes, &commit_expected(), &test_config()),
+            Err(CommitAckError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn commit_ack_rejects_scope_mismatch() {
+        let bad_chain = test_signed_commit_ack_bytes(
+            &anchor_key(), TEST_CHAIN + 1, TEST_ENV, TEST_EPOCH, TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST, TEST_NONCE, TEST_REQUEST_ID.to_vec(),
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&bad_chain, &commit_expected(), &test_config()),
+            Err(CommitAckError::ScopeMismatch)
+        );
+        let bad_env = test_signed_commit_ack_bytes(
+            &anchor_key(), TEST_CHAIN, "other-env", TEST_EPOCH, TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST, TEST_NONCE, TEST_REQUEST_ID.to_vec(),
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&bad_env, &commit_expected(), &test_config()),
+            Err(CommitAckError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn commit_ack_rejects_each_proposed_field_mismatch() {
+        // One validly-signed ack; vary ONE expected field per check. epoch and structural are BOTH u64 —
+        // the named-field ExpectedCommitAck is exactly what makes a transposition impossible here.
+        let cfg = test_config();
+        let good = good_commit_ack();
+        let zero = [0x00u8; 32];
+        assert_eq!(
+            verify_commit_ack_bytes(&good, &ExpectedCommitAck { nonce: &zero, ..commit_expected() }, &cfg),
+            Err(CommitAckError::NonceMismatch)
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&good, &ExpectedCommitAck { epoch: TEST_EPOCH + 1, ..commit_expected() }, &cfg),
+            Err(CommitAckError::EpochMismatch)
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&good, &ExpectedCommitAck { structural_version: TEST_STRUCTURAL + 1, ..commit_expected() }, &cfg),
+            Err(CommitAckError::StructuralMismatch)
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&good, &ExpectedCommitAck { marks_digest: &zero, ..commit_expected() }, &cfg),
+            Err(CommitAckError::MarksMismatch)
+        );
+        assert_eq!(
+            verify_commit_ack_bytes(&good, &ExpectedCommitAck { request_id: b"other-op", ..commit_expected() }, &cfg),
+            Err(CommitAckError::RequestIdMismatch)
+        );
+    }
+
+    #[test]
+    fn commit_ack_rejects_noncanonical_trailing_and_over_cap_request_id() {
+        let cfg = test_config();
+        let good = good_commit_ack();
+        assert_eq!(verify_commit_ack_bytes(&good, &commit_expected(), &cfg), Ok(()));
+        // trailing byte → Malformed (strict outer decode rejects)
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert_eq!(verify_commit_ack_bytes(&trailing, &commit_expected(), &cfg), Err(CommitAckError::Malformed));
+        // request_id over the 64-byte cap → Malformed at decode, BEFORE any field-echo check
+        let big_id = vec![0x41u8; crate::agent_dispatch::MAX_REQUEST_ID_LEN + 1];
+        let over = test_signed_commit_ack_bytes(
+            &anchor_key(), TEST_CHAIN, TEST_ENV, TEST_EPOCH, TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST, TEST_NONCE, big_id,
+        );
+        assert_eq!(verify_commit_ack_bytes(&over, &commit_expected(), &cfg), Err(CommitAckError::Malformed));
+    }
+
+    #[test]
+    fn commit_ack_is_domain_separated_from_marks_and_freshness() {
+        // The distinct COMMIT_ACK_DOMAIN + key-set make a cross-leg signature substitution
+        // unrepresentable: a commit ack must not verify as a marks/freshness response, nor vice-versa.
+        let cfg = test_config();
+        let commit = good_commit_ack();
+        assert!(verify_marks_response_bytes(&commit, &TEST_NONCE, TEST_EPOCH, &cfg).is_err());
+        if let Ok(m) = crate::agent_cbor::strict_decode_map(&commit) {
+            assert!(verify_anchor_response(&m, &TEST_NONCE, &cfg).is_err());
+        }
+        // a marks response does not verify as a commit ack
+        let marks = good_marks_response(&marks_payload_bytes());
+        assert!(verify_commit_ack_bytes(&marks, &commit_expected(), &cfg).is_err());
+        // a freshness response does not verify as a commit ack
+        let freshness_map = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, TEST_EPOCH, 1, [0; 32], TEST_NONCE);
+        let mut freshness_bytes = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(freshness_map), &mut freshness_bytes).unwrap();
+        assert!(verify_commit_ack_bytes(&freshness_bytes, &commit_expected(), &cfg).is_err());
+    }
+
+    #[test]
+    fn commit_request_payload_byte_matches_ack_preimage_body() {
+        // INDEPENDENT anti-drift (compact 7184): the round-trip test reuses commit_ack_signed_preimage on
+        // BOTH sign and verify, so it can't catch a COORDINATED encoder/preimage drift. The 0x45 request
+        // payload (map(8) body) and the ack signed preimage (COMMIT_ACK_DOMAIN ‖ the SAME map(8) body)
+        // MUST be byte-identical after the domain prefix — this asserts the two INDEPENDENT hand-rolled
+        // emitters agree byte-for-byte, so a reorder/type-slip in either is caught here.
+        // (Relies on COMMIT_REQUEST_VERSION == COMMIT_ACK_VERSION; if the version namespaces ever diverge
+        // intentionally, this invariant + test must be revisited — the assert message says so.)
+        let frame = crate::agent_boot_relay::encode_anchor_commit_request(
+            &crate::agent_boot_relay::AnchorCommitRequest {
+                chain_id: TEST_CHAIN,
+                environment_identifier: TEST_ENV,
+                new_epoch: TEST_EPOCH,
+                new_structural_version: TEST_STRUCTURAL,
+                marks_digest: TEST_MARKS_DIGEST,
+                nonce: TEST_NONCE,
+                request_id: TEST_REQUEST_ID,
+            },
+        )
+        .unwrap();
+        let payload = crate::decode_message(&frame).unwrap().payload;
+        let f = crate::agent_cbor::CommitAckFields {
+            version: COMMIT_ACK_VERSION,
+            chain_id: TEST_CHAIN,
+            environment_identifier: TEST_ENV.to_string(),
+            epoch: TEST_EPOCH,
+            structural_version: TEST_STRUCTURAL,
+            marks_digest: TEST_MARKS_DIGEST,
+            nonce: TEST_NONCE,
+            request_id: TEST_REQUEST_ID.to_vec(),
+            signature: [0u8; 64],
+        };
+        let preimage = commit_ack_signed_preimage(&f);
+        assert_eq!(
+            payload.as_slice(),
+            &preimage[COMMIT_ACK_DOMAIN.len()..],
+            "the 0x45 request payload body must byte-match the ack preimage's post-domain bytes — the two \
+             independent map(8) emitters must agree; a divergence is an encoder/preimage drift (revisit \
+             if COMMIT_REQUEST_VERSION and COMMIT_ACK_VERSION ever diverge)"
+        );
     }
 }

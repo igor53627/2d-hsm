@@ -35,8 +35,9 @@ use std::sync::Mutex;
 /// Fixed command-domain string bound in the envelope (spec §10.2, key 3).
 pub const COMMAND_DOMAIN: &str = "2d-hsm/agent-gateway/v1";
 
-/// Max `request_id` length — a small correlation/audit handle, not a payload.
-const MAX_REQUEST_ID_LEN: usize = 64;
+/// Max `request_id` length — a small correlation/audit handle, not a payload. `pub(crate)` so the
+/// slice-6 commit-ack decoder caps the echoed `request_id` to the SAME bound (single source, no drift).
+pub(crate) const MAX_REQUEST_ID_LEN: usize = 64;
 
 /// Agent error band (spec §10.9). Variants collapse distinct internal failures to a single
 /// host-observable code (anti-oracle); the wire code is [`AgentError::code`].

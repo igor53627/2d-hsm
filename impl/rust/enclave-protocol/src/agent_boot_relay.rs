@@ -293,6 +293,129 @@ pub(crate) fn decode_anchor_marks_request(frame: &[u8]) -> Result<DecodedMarksRe
     Ok(DecodedMarksRequest { chain_id, environment_identifier, nonce, epoch })
 }
 
+/// Only commit-request-format version this build understands.
+const COMMIT_REQUEST_VERSION: u64 = 1;
+
+/// The per-op COMMIT request the enclave writes on a rollback-sensitive op (TASK-7.7 slice 6). Borrows
+/// the scope so it shares the `&body.config` lifetime; carries the PROPOSED post-op state (new
+/// `epoch`/`structural_version` + the post-op `marks_digest`), the fresh per-op `nonce`, and the op's
+/// `request_id` — **NO quote** (the attestation was bound on the `0x41` boot leg; serve-time ops run
+/// after a verified boot). The anchor durably records this and returns a signed ACK.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by the 6-3 transport seam
+pub(crate) struct AnchorCommitRequest<'a> {
+    pub chain_id: u64,
+    pub environment_identifier: &'a str,
+    pub new_epoch: u64,
+    pub new_structural_version: u64,
+    pub marks_digest: [u8; 32],
+    pub nonce: [u8; 32],
+    pub request_id: &'a [u8],
+}
+
+/// Owned, decoded commit request — for the untrusted **host relay** (it peeks the type, validates, and
+/// forwards). NOT an enclave trust boundary (the enclave only encodes the request + verifies the signed
+/// ACK); hardened anyway, mirroring [`DecodedMarksRequest`].
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1 (consumed by the relay branch + tests)
+#[derive(Debug)]
+pub(crate) struct DecodedCommitRequest {
+    pub chain_id: u64,
+    pub environment_identifier: String,
+    pub new_epoch: u64,
+    pub new_structural_version: u64,
+    pub marks_digest: [u8; 32],
+    pub nonce: [u8; 32],
+    pub request_id: Vec<u8>,
+}
+
+/// Encode a slice-6 commit-request frame: a canonical int-keyed CBOR map (keys 1..=8) under a
+/// [`crate::MessageType::AgentAnchorCommitRelay`] (`0x45`) frame. NO quote/cert. Built with the same
+/// canonical encoders so a conformant anchor recomputes identical preimage bytes for its ACK signature.
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1; consumed by the 6-3 transport seam
+pub(crate) fn encode_anchor_commit_request(
+    request: &AnchorCommitRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    use crate::agent_capability::{put_bytes, put_text, put_uint};
+    // Defense-in-depth: reject an over-cap request_id at ENCODE — the decoder + ack verifier enforce the
+    // same MAX_REQUEST_ID_LEN, so an over-cap internal caller would otherwise mint a frame this crate
+    // later rejects. Fail-closed before allocating.
+    if request.request_id.len() > crate::agent_dispatch::MAX_REQUEST_ID_LEN {
+        return Err(ProtocolError::WireProtocol("commit request: request_id exceeds MAX_REQUEST_ID_LEN"));
+    }
+    let mut payload = Vec::with_capacity(160 + request.environment_identifier.len() + request.request_id.len());
+    put_uint(&mut payload, 5, 8); // map header: 8 pairs
+    put_uint(&mut payload, 0, 1);
+    put_uint(&mut payload, 0, COMMIT_REQUEST_VERSION);
+    put_uint(&mut payload, 0, 2);
+    put_uint(&mut payload, 0, request.chain_id);
+    put_uint(&mut payload, 0, 3);
+    put_text(&mut payload, request.environment_identifier);
+    put_uint(&mut payload, 0, 4);
+    put_uint(&mut payload, 0, request.new_epoch);
+    put_uint(&mut payload, 0, 5);
+    put_uint(&mut payload, 0, request.new_structural_version);
+    put_uint(&mut payload, 0, 6);
+    put_bytes(&mut payload, &request.marks_digest);
+    put_uint(&mut payload, 0, 7);
+    put_bytes(&mut payload, &request.nonce);
+    put_uint(&mut payload, 0, 8);
+    put_bytes(&mut payload, request.request_id);
+    crate::encode_message(crate::MessageType::AgentAnchorCommitRelay, &payload)
+}
+
+/// Decode + validate a slice-6 commit request frame (for the untrusted host relay + tests). Lenient
+/// ciborium decode is fine (not signature-bound — the enclave verifies only the ACK), but the shape is
+/// strictly enforced: `0x45` type, integer keys exactly `{1..=8}` no dup, version `== 1`, exact-length
+/// marks_digest+nonce (32), `request_id` ≤ [`crate::agent_dispatch::MAX_REQUEST_ID_LEN`]. Every failure
+/// is [`ProtocolError::WireProtocol`].
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-1 (consumed by the relay branch, host_anchor_relay)
+pub(crate) fn decode_anchor_commit_request(frame: &[u8]) -> Result<DecodedCommitRequest, ProtocolError> {
+    use crate::agent_cbor::{as_bytes, as_bytes_n, as_u64, check_strict_keys, map_get};
+    use ciborium::value::Value;
+
+    let framed = crate::decode_message(frame)?;
+    if framed.msg_type != crate::MessageType::AgentAnchorCommitRelay {
+        return Err(ProtocolError::WireProtocol("not an AGENT_ANCHOR_COMMIT_RELAY frame"));
+    }
+    let mut cursor = std::io::Cursor::new(framed.payload.as_slice());
+    let value: Value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|_| ProtocolError::WireProtocol("commit request: bad CBOR"))?;
+    if cursor.position() as usize != framed.payload.len() {
+        return Err(ProtocolError::WireProtocol("commit request: trailing bytes after CBOR"));
+    }
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol("commit request: payload is not a CBOR map"));
+    };
+    if !check_strict_keys(&map, |n| (1..=8).contains(&n)) {
+        return Err(ProtocolError::WireProtocol("commit request: unexpected/missing/duplicate key"));
+    }
+    let req_u64 = |k: u64| map_get(&map, k).and_then(as_u64).ok_or(ProtocolError::WireProtocol("commit request: bad uint"));
+    if req_u64(1)? != COMMIT_REQUEST_VERSION {
+        return Err(ProtocolError::WireProtocol("commit request: unsupported version"));
+    }
+    let chain_id = req_u64(2)?;
+    let environment_identifier = match map_get(&map, 3) {
+        Some(Value::Text(s)) => s.clone(),
+        _ => return Err(ProtocolError::WireProtocol("commit request: env must be text")),
+    };
+    let new_epoch = req_u64(4)?;
+    let new_structural_version = req_u64(5)?;
+    let marks_digest = map_get(&map, 6).and_then(as_bytes_n::<32>).ok_or(ProtocolError::WireProtocol("commit request: marks_digest must be 32 bytes"))?;
+    let nonce = map_get(&map, 7).and_then(as_bytes_n::<32>).ok_or(ProtocolError::WireProtocol("commit request: nonce must be 32 bytes"))?;
+    let request_id = match map_get(&map, 8).and_then(as_bytes) {
+        Some(b) if b.len() <= crate::agent_dispatch::MAX_REQUEST_ID_LEN => b.to_vec(),
+        _ => return Err(ProtocolError::WireProtocol("commit request: request_id missing or over cap")),
+    };
+    Ok(DecodedCommitRequest {
+        chain_id,
+        environment_identifier,
+        new_epoch,
+        new_structural_version,
+        marks_digest,
+        nonce,
+        request_id,
+    })
+}
+
 /// Read the anchor response off a stream: a single 4-byte BE length prefix then exactly that many raw
 /// anchor-signed bytes (no version/type framing — the relay forwards exactly what the anchor signed).
 /// The length is checked against [`MAX_ANCHOR_RESPONSE_LEN`] **before** allocating, so a hostile relay
@@ -985,6 +1108,138 @@ mod tests {
         assert_eq!(d.environment_identifier, "testnet");
         assert_eq!(d.nonce, [0x9a; 32]);
         assert_eq!(d.epoch, 7);
+    }
+
+    #[test]
+    fn commit_request_encodes_and_decodes_round_trip() {
+        let req = AnchorCommitRequest {
+            chain_id: 11565,
+            environment_identifier: "testnet",
+            new_epoch: 8,
+            new_structural_version: 3,
+            marks_digest: [0x5c; 32],
+            nonce: [0x9a; 32],
+            request_id: b"op-req-1",
+        };
+        let frame = encode_anchor_commit_request(&req).unwrap();
+        // It is a 0x45 frame (not 0x41/0x44), and never serve-dispatchable (enclave-initiated).
+        assert_eq!(crate::peek_msg_type_from_frame(&frame), Some(crate::MessageType::AgentAnchorCommitRelay));
+        let d = decode_anchor_commit_request(&frame).unwrap();
+        assert_eq!(d.chain_id, 11565);
+        assert_eq!(d.environment_identifier, "testnet");
+        assert_eq!(d.new_epoch, 8);
+        assert_eq!(d.new_structural_version, 3);
+        assert_eq!(d.marks_digest, [0x5c; 32]);
+        assert_eq!(d.nonce, [0x9a; 32]);
+        assert_eq!(d.request_id, b"op-req-1");
+    }
+
+    #[test]
+    fn commit_request_decode_rejects_wrong_type_over_cap_and_trailing() {
+        // A 0x44 marks-relay frame is NOT a commit request.
+        let marks = encode_anchor_marks_request(&AnchorMarksRequest {
+            chain_id: 1,
+            environment_identifier: "e",
+            nonce: [0; 32],
+            epoch: 0,
+        })
+        .unwrap();
+        assert!(decode_anchor_commit_request(&marks).is_err());
+        // request_id over the 64-byte cap → the ENCODER rejects it (defense-in-depth, never mints a frame
+        // the decoder would reject).
+        let big = vec![0x41u8; crate::agent_dispatch::MAX_REQUEST_ID_LEN + 1];
+        let enc_err = encode_anchor_commit_request(&AnchorCommitRequest {
+            chain_id: 1,
+            environment_identifier: "e",
+            new_epoch: 1,
+            new_structural_version: 1,
+            marks_digest: [0; 32],
+            nonce: [0; 32],
+            request_id: &big,
+        })
+        .unwrap_err();
+        assert!(matches!(enc_err, ProtocolError::WireProtocol(m) if m.contains("request_id")), "got {enc_err:?}");
+        // ... and the DECODER (the trust boundary for untrusted host frames) rejects a HOSTILE over-cap
+        // frame the encoder would never produce — hand-built via ciborium to bypass the encoder cap.
+        use ciborium::value::Value;
+        let hostile = vec![
+            (Value::Integer(1.into()), Value::Integer(1.into())),
+            (Value::Integer(2.into()), Value::Integer(1.into())),
+            (Value::Integer(3.into()), Value::Text("e".into())),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(5.into()), Value::Integer(1.into())),
+            (Value::Integer(6.into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Integer(7.into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Integer(8.into()), Value::Bytes(big)),
+        ];
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(hostile), &mut payload).unwrap();
+        let frame = crate::encode_message(crate::MessageType::AgentAnchorCommitRelay, &payload).unwrap();
+        let dec_err = decode_anchor_commit_request(&frame).unwrap_err();
+        assert!(matches!(dec_err, ProtocolError::WireProtocol(m) if m.contains("request_id")), "got {dec_err:?}");
+        // Trailing bytes INSIDE the framed payload → reject the inner trailing-CBOR guard (re-frame, as
+        // the marks test does, so the frame-length check doesn't reject it first).
+        let frame = encode_anchor_commit_request(&AnchorCommitRequest {
+            chain_id: 1,
+            environment_identifier: "e",
+            new_epoch: 1,
+            new_structural_version: 1,
+            marks_digest: [0; 32],
+            nonce: [0; 32],
+            request_id: b"r",
+        })
+        .unwrap();
+        let mut payload = crate::decode_message(&frame).unwrap().payload;
+        payload.push(0x00);
+        let frame =
+            crate::encode_message(crate::MessageType::AgentAnchorCommitRelay, &payload).unwrap();
+        let err = decode_anchor_commit_request(&frame).unwrap_err();
+        assert!(matches!(err, ProtocolError::WireProtocol(m) if m.contains("trailing bytes")), "got {err:?}");
+    }
+
+    #[test]
+    fn commit_request_and_ack_preimage_are_field_compatible() {
+        // Anti-drift (review wf_16383b1d): the commit-request encoder (here) and the ack preimage
+        // (agent_anchor::commit_ack_signed_preimage) are two independent hand-rolled map(8) emitters that
+        // MUST stay field-compatible — a conformant anchor parses the 0x45 request (keys 1..=8) and
+        // re-emits those exact fields under COMMIT_ACK_DOMAIN to produce the ACK the enclave verifies. A
+        // drift in either (add/reorder/type-slip a signed field) silently breaks every conformant ACK
+        // (fail-closed). This test pins the WHOLE loop — request encode → decode → anchor-signed ACK →
+        // verify Ok — so any such drift fails HERE rather than at runtime against a real anchor.
+        let req = AnchorCommitRequest {
+            chain_id: CHAIN,
+            environment_identifier: ENV,
+            new_epoch: 8,
+            new_structural_version: 3,
+            marks_digest: [0x5c; 32],
+            nonce: [0x9a; 32],
+            request_id: b"op-req-1",
+        };
+        let frame = encode_anchor_commit_request(&req).unwrap();
+        let d = decode_anchor_commit_request(&frame).unwrap();
+        // The conformant anchor echoes the DECODED request fields into a signed ACK ...
+        let ack = crate::agent_anchor::test_signed_commit_ack_bytes(
+            &anchor_key(),
+            d.chain_id,
+            &d.environment_identifier,
+            d.new_epoch,
+            d.new_structural_version,
+            d.marks_digest,
+            d.nonce,
+            d.request_id.clone(),
+        );
+        // ... and the enclave's verifier accepts it against the SAME proposed values.
+        let expected = crate::agent_anchor::ExpectedCommitAck {
+            nonce: &d.nonce,
+            epoch: d.new_epoch,
+            structural_version: d.new_structural_version,
+            marks_digest: &d.marks_digest,
+            request_id: &d.request_id,
+        };
+        assert_eq!(
+            crate::agent_anchor::verify_commit_ack_bytes(&ack, &expected, &test_config()),
+            Ok(())
+        );
     }
 
     #[test]
