@@ -242,8 +242,9 @@ pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
     match crate::peek_msg_type_from_frame(&frame) {
         Some(crate::MessageType::AgentBootRelay) => lab_anchor_freshness_reply(conn, &frame, body, signing_key, deadline),
         Some(crate::MessageType::AgentAnchorMarksRelay) => lab_anchor_marks_reply(conn, &frame, body, signing_key, deadline),
+        Some(crate::MessageType::AgentAnchorCommitRelay) => lab_anchor_commit_reply(conn, &frame, body, signing_key, deadline),
         _ => Err(crate::ProtocolError::WireProtocol(
-            "lab anchor: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) are answerable",
+            "lab anchor: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) / AGENT_ANCHOR_COMMIT_RELAY (0x45) are answerable",
         )),
     }
 }
@@ -321,6 +322,45 @@ fn lab_anchor_marks_reply<S: std::io::Read + std::io::Write>(
         crate::agent_boot_relay::MAX_MARKS_RESPONSE_LEN,
     )?;
     crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before marks response write")?;
+    let mut nonce8 = [0u8; 8];
+    nonce8.copy_from_slice(&req.nonce[..8]);
+    Ok(nonce8)
+}
+
+/// The slice-6 0x45 per-op commit leg: validate + scope-guard, then a signed commit ACK ECHOING the
+/// proposed `(epoch, structural_version, marks_digest, nonce, request_id)` — i.e. the lab anchor
+/// "durably records" EXACTLY what the enclave proposed and signs it, so the guest's
+/// `verify_commit_ack_bytes` accepts. NO quote; the ACK is small → 4096 cap.
+fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
+    conn: &mut S,
+    frame: &[u8],
+    body: &KeystoreBody,
+    signing_key: &ed25519_dalek::SigningKey,
+    deadline: std::time::Instant,
+) -> Result<[u8; 8], crate::ProtocolError> {
+    let req = crate::agent_boot_relay::decode_anchor_commit_request(frame)?;
+    if req.chain_id != body.config.twod_chain_id
+        || req.environment_identifier != body.config.environment_identifier
+    {
+        return Err(crate::ProtocolError::WireProtocol(
+            "lab anchor: commit request scope does not match the provisioned smoke keystore",
+        ));
+    }
+    let response = crate::agent_anchor::test_signed_commit_ack_bytes(
+        signing_key,
+        req.chain_id,
+        &req.environment_identifier,
+        req.new_epoch,
+        req.new_structural_version,
+        req.marks_digest,
+        req.nonce,
+        req.request_id.clone(),
+    );
+    let wire = crate::agent_boot_relay::frame_response_cap(
+        &response,
+        crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN,
+    )?;
+    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before commit ack write")?;
     let mut nonce8 = [0u8; 8];
     nonce8.copy_from_slice(&req.nonce[..8]);
     Ok(nonce8)
@@ -962,6 +1002,52 @@ mod tests {
             crate::agent_anchor::ReconcileDecision::Fresh,
             "the adopted candidate reconciles Fresh — the next handshake reaches Ready"
         );
+    }
+
+    #[test]
+    fn stub_commit_reply_passes_guest_commit_verify() {
+        // slice 6 conformance: the lab stub's 0x45 commit reply, read back through the bounded reader,
+        // must pass the REAL guest verify_commit_ack_bytes against the smoke fixture's sealed anchor_root
+        // — the whole per-op commit channel, deviceless. Makes "the stub can't ACK a commit" unrepresentable.
+        let body = smoke_body();
+        let nonce = [0x77_u8; 32];
+        let proposed_epoch = body.freshness_epoch + 1;
+        let proposed_structural = body.structural_version + 1;
+        let marks_digest = body.compute_local_marks_digest();
+        let request_id: &[u8] = b"op-7";
+        let req = crate::agent_boot_relay::encode_anchor_commit_request(
+            &crate::agent_boot_relay::AnchorCommitRequest {
+                chain_id: body.config.twod_chain_id,
+                environment_identifier: &body.config.environment_identifier,
+                new_epoch: proposed_epoch,
+                new_structural_version: proposed_structural,
+                marks_digest,
+                nonce,
+                request_id,
+            },
+        )
+        .unwrap();
+        let (outcome, written_back) = drive_stub_pump(&body, &req);
+        outcome.expect("stub answers the 0x45 commit request");
+        let ack = crate::agent_boot_relay::read_bounded_anchor_response(
+            &mut std::io::Cursor::new(written_back),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("stub framed the commit ack with the shared 4-byte BE writer");
+        assert!(ack.len() <= crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN);
+        // The guest verifier accepts it against EXACTLY the proposed values.
+        crate::agent_anchor::verify_commit_ack_bytes(
+            &ack,
+            &crate::agent_anchor::ExpectedCommitAck {
+                nonce: &nonce,
+                epoch: proposed_epoch,
+                structural_version: proposed_structural,
+                marks_digest: &marks_digest,
+                request_id,
+            },
+            &body.config,
+        )
+        .expect("stub commit ack passes the REAL guest verify path");
     }
 
     #[test]
