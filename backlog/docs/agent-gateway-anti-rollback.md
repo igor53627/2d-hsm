@@ -1728,9 +1728,12 @@ MUST satisfy; none is a 5b-2a code defect, they are forward obligations on the p
   CHECKED overflow [defense-in-depth, unreachable while the ceiling holds; checked NOT saturating —
   a saturated `Duration::MAX` product would PASS `≤ Duration::MAX`, the exact wrapped-product
   failure named above] → exceeds); the check arithmetic is written in the GENERALIZED leg-sum form
-  (no multiplier literal appears in code — `per_attempt_nominal_cost` sums quote + freshness + marks + ε
-  as named legs; a future distinct-timeout split changes constructor
-  INPUTS, never the formula). The BEFORE-claim ordering pin is now STRUCTURAL:
+  (no multiplier literal in the VALIDATION formula — `per_attempt_nominal_cost` sums quote + freshness +
+  marks + ε as named legs, so a future distinct-timeout split changes its constructor INPUTS, never the
+  formula. The gate-free env-config DERIVE is separate and DOES carry a `3·per_leg` literal —
+  `derive_overall_budget_ms`'s `saturating_mul(3)` + the `3 * attempts` test assertion — which a
+  distinct-timeout split would also have to update; it is sized ≫ ε by design, not a re-derivation of the
+  formula). The BEFORE-claim ordering pin is now STRUCTURAL:
   `HardBoundedQuoteProducer::{new, production}` take `&ValidatedBootBudget` as an ordering witness
   (scope honesty: SOME budget — same-instance binding is `production_transport` for the timeout +
   the recorded (4b) count obligation). Deadline ORIGINATION is
