@@ -133,6 +133,51 @@ impl AgentOpcode {
             Self::PublicIdentity | Self::ProveIdentity => false,
         }
     }
+
+    /// The per-op COMMIT bump class (TASK-7.7 slice 6): which sealed-state fields a committed
+    /// rollback-sensitive op advances at the anchor. SECURITY-LOAD-BEARING. Exhaustive/wildcard-free so a
+    /// new opcode forces a classification; pinned consistent with [`Self::is_rollback_sensitive`] by
+    /// `commit_bump_class_matches_rollback_sensitive`.
+    ///
+    /// `Structural` mutates anchor-UNRECONSTRUCTABLE state NOT captured in the marks digest, so a dropped
+    /// commit-seal reconciles `StructuralGap`→restore on next boot. `EpochOnly`'s full effect IS in the
+    /// anchor's authenticated marks (or is re-presentable recovery material), so a dropped seal
+    /// adopt-forwards. **UNDER-classifying a structural op as epoch-only is the DANGEROUS direction** (a
+    /// dropped seal would silently adopt-forward and LOSE the structural change) — so when in doubt,
+    /// `Structural` (fail-closed-safe).
+    #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-2; consumed by the 6-4 dispatch wiring
+    fn commit_bump_class(self) -> CommitBumpClass {
+        match self {
+            // STRUCTURAL — mutate state NOT captured in the marks digest: GENERATE_KEYS mints new random
+            // key material; CONFIGURE_TREASURY changes faucet CONFIG (limits/breaker — not a marks
+            // surface). A dropped seal of either ⇒ StructuralGap⇒restore (design §3). [GENERATE_KEYS is
+            // the only LIVE handler; CONFIGURE_TREASURY is deferred — its class is re-confirmed when its
+            // handler lands, but Structural is the design-named AND fail-closed-safe value.]
+            Self::GenerateKeys | Self::ConfigureTreasury => CommitBumpClass::Structural,
+            // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
+            // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); EXPORT_BACKUP is a
+            // freshness-gated read (no un-recoverable mutation); RESTORE_BACKUP re-seeds from
+            // re-presentable recovery material + advances the strict_recovery_counter (a marks surface).
+            // [All three handlers are deferred — each class is CONFIRMED at its handler slice; EpochOnly
+            // per the current design.]
+            Self::SignFaucetDispense | Self::ExportBackup | Self::RestoreBackup => CommitBumpClass::EpochOnly,
+            // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
+            Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,
+        }
+    }
+}
+
+/// Which sealed-state a per-op anti-rollback COMMIT advances (TASK-7.7 slice 6). See
+/// [`AgentOpcode::commit_bump_class`].
+#[cfg_attr(not(test), allow(dead_code))] // staged slice-6-2; consumed by the 6-4 dispatch wiring
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitBumpClass {
+    /// Bump `structural_version` + `freshness_epoch` atomically (anchor-unreconstructable mutation).
+    Structural,
+    /// Bump `freshness_epoch` only (effect captured in the marks / re-presentable).
+    EpochOnly,
+    /// Not rollback-sensitive — no per-op commit.
+    NotCommitted,
 }
 
 /// Which role this signer instance runs as (production role isolation, §10.2). A `Producer` signer
@@ -1605,6 +1650,27 @@ mod tests {
             (AgentOpcode::RestoreBackup, true),
         ] {
             assert_eq!(op.is_rollback_sensitive(), expected);
+        }
+    }
+
+    #[test]
+    fn commit_bump_class_exhaustive_and_consistent_with_rollback_sensitive() {
+        for (op, expected) in [
+            (AgentOpcode::GenerateKeys, CommitBumpClass::Structural),
+            (AgentOpcode::ConfigureTreasury, CommitBumpClass::Structural),
+            (AgentOpcode::SignFaucetDispense, CommitBumpClass::EpochOnly),
+            (AgentOpcode::ExportBackup, CommitBumpClass::EpochOnly),
+            (AgentOpcode::RestoreBackup, CommitBumpClass::EpochOnly),
+            (AgentOpcode::SignTransfer, CommitBumpClass::NotCommitted),
+            (AgentOpcode::PublicIdentity, CommitBumpClass::NotCommitted),
+            (AgentOpcode::ProveIdentity, CommitBumpClass::NotCommitted),
+        ] {
+            assert_eq!(op.commit_bump_class(), expected, "{op:?}");
+            // CONSISTENCY: an op is committed (Structural|EpochOnly) IFF it is rollback-sensitive — the
+            // commit path is gated on is_rollback_sensitive, so a NotCommitted op must never commit and
+            // every rollback-sensitive op must carry a bump class.
+            let committed = op.commit_bump_class() != CommitBumpClass::NotCommitted;
+            assert_eq!(committed, op.is_rollback_sensitive(), "{op:?}: committed-ness must match is_rollback_sensitive");
         }
     }
 

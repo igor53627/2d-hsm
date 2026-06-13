@@ -111,6 +111,11 @@ pub enum KeystoreError {
     /// The sealed blob would exceed the vsock `MAX_MESSAGE_SIZE` budget (entries/counters/audit too
     /// large to transmit to the host — Nitro has no persistent enclave storage).
     BlobTooLarge,
+    /// A forward-only monotonic field (`freshness_epoch` or `structural_version`) would overflow `u64`
+    /// on a per-op commit bump (TASK-7.7 slice 6). CHECKED, never wrapping — a wrapped counter would let
+    /// a rolled-back blob masquerade as an adoptable forward gap. Unreachable in practice (one bump per
+    /// op); fail-closed by contract.
+    MonotonicOverflow,
 }
 
 /// `SHA3-256(domain ‖ enclave_measurement)` — the measurement digest bound into the header + AAD.
@@ -565,6 +570,44 @@ impl KeystoreBody {
         self.freshness_epoch = epoch;
         // structural_version DELIBERATELY UNCHANGED (counter/spend-only gap).
         self.validate()
+    }
+
+    /// slice 6-2: advance the body forward for a per-op COMMIT — `freshness_epoch += 1` ALWAYS, and
+    /// (for a STRUCTURAL op) `structural_version += 1`, as ONE atomic checked unit. This is the WRITE-side
+    /// counterpart to `seed_marks_forward`'s read-side advance: it makes `structural_version`
+    /// load-bearing by moving it in lockstep with `freshness_epoch`.
+    ///
+    /// **Atomic, no partial mutation:** BOTH increments are `checked_add(1)` and BOTH are computed
+    /// BEFORE EITHER field is written, so an overflow on either leaves the body UNCHANGED (`Err`). The
+    /// caller runs this on a CANDIDATE clone; the seal (6-4) binds the advanced `freshness_epoch` into
+    /// the AEAD, and the anchor commit records `(new freshness_epoch, new structural_version, post-op
+    /// marks_digest)`. `bumps_structural` comes from [`crate::agent_dispatch::AgentOpcode`]'s
+    /// `commit_bump_class` (Structural ⇒ `true`, EpochOnly ⇒ `false`).
+    ///
+    /// **Why checked, never wrapping:** a wrapped epoch/structural would let a rolled-back blob
+    /// masquerade as an adoptable forward gap — the exact anti-rollback failure. `u64` overflow is
+    /// unreachable in practice (one bump per op), but fail-closed (`MonotonicOverflow`) is the contract.
+    /// Does NOT touch the marks surfaces (counters/spend/recovery) — those are advanced by the op's own
+    /// handler (`advance_counter` etc.) BEFORE the marks digest is computed; epoch/structural are not
+    /// marks surfaces, so this bump leaves `compute_local_marks_digest()` unchanged.
+    #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-2; consumed by the 6-4 dispatch wiring
+    pub(crate) fn advance_commit_epoch(&mut self, bumps_structural: bool) -> Result<(), KeystoreError> {
+        let new_epoch = self.freshness_epoch.checked_add(1).ok_or(KeystoreError::MonotonicOverflow)?;
+        let new_structural = if bumps_structural {
+            Some(
+                self.structural_version
+                    .checked_add(1)
+                    .ok_or(KeystoreError::MonotonicOverflow)?,
+            )
+        } else {
+            None
+        };
+        // Commit BOTH only after both checks passed — no partial mutation on overflow.
+        self.freshness_epoch = new_epoch;
+        if let Some(s) = new_structural {
+            self.structural_version = s;
+        }
+        Ok(())
     }
 }
 
@@ -1621,6 +1664,56 @@ mod tests {
         let sv = b.structural_version;
         b.advance_counter(&[9u8; 32], 0, b"scope-x", 1).unwrap();
         assert_eq!(b.structural_version, sv);
+    }
+
+    // ---- slice 6-2: atomic per-op commit bump ----
+
+    #[test]
+    fn advance_commit_epoch_structural_co_advances_both() {
+        let mut b = sample_body();
+        let (e, s) = (b.freshness_epoch, b.structural_version);
+        b.advance_commit_epoch(true).unwrap();
+        assert_eq!(b.freshness_epoch, e + 1, "structural op advances freshness_epoch");
+        assert_eq!(b.structural_version, s + 1, "... AND structural_version, as one unit");
+    }
+
+    #[test]
+    fn advance_commit_epoch_epoch_only_leaves_structural() {
+        let mut b = sample_body();
+        let (e, s) = (b.freshness_epoch, b.structural_version);
+        b.advance_commit_epoch(false).unwrap();
+        assert_eq!(b.freshness_epoch, e + 1, "epoch-only op advances freshness_epoch");
+        assert_eq!(b.structural_version, s, "... and MUST NOT touch structural_version");
+    }
+
+    #[test]
+    fn advance_commit_epoch_overflow_on_either_aborts_both() {
+        // epoch at u64::MAX → epoch overflow aborts; structural untouched (no partial mutation).
+        let mut b = sample_body();
+        b.freshness_epoch = u64::MAX;
+        let s = b.structural_version;
+        assert_eq!(b.advance_commit_epoch(true), Err(KeystoreError::MonotonicOverflow));
+        assert_eq!(b.freshness_epoch, u64::MAX, "epoch unchanged on overflow");
+        assert_eq!(b.structural_version, s, "structural untouched when epoch overflows");
+        // structural at u64::MAX (epoch fine) → structural overflow aborts; epoch untouched BECAUSE both
+        // increments are computed BEFORE either is written.
+        let mut b = sample_body();
+        b.structural_version = u64::MAX;
+        let e = b.freshness_epoch;
+        assert_eq!(b.advance_commit_epoch(true), Err(KeystoreError::MonotonicOverflow));
+        assert_eq!(b.freshness_epoch, e, "epoch untouched when structural overflows (computed-before-assign)");
+        assert_eq!(b.structural_version, u64::MAX, "no partial mutation");
+    }
+
+    #[test]
+    fn advance_commit_epoch_leaves_marks_digest_unchanged() {
+        // epoch/structural are NOT marks surfaces — the per-op commit records the marks digest (over
+        // counter/spend/recovery, advanced by the op's handler) SEPARATELY from the epoch/structural
+        // bump. A pure bump must therefore leave compute_local_marks_digest() unchanged.
+        let mut b = sample_body();
+        let before = b.compute_local_marks_digest();
+        b.advance_commit_epoch(true).unwrap();
+        assert_eq!(b.compute_local_marks_digest(), before, "epoch/structural are not marks surfaces");
     }
 
     #[test]
