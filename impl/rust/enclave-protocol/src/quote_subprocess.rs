@@ -2263,6 +2263,15 @@ mod tests {
                 self.seen.borrow_mut().push(request_frame.to_vec());
                 Ok(self.reply.clone())
             }
+            fn marks_round_trip(
+                &mut self,
+                request_frame: &[u8],
+                _deadline: Instant,
+            ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+                // This composition test drives only the freshness leg; capture + echo for symmetry.
+                self.seen.borrow_mut().push(request_frame.to_vec());
+                Ok(self.reply.clone())
+            }
         }
         let seen = Rc::new(RefCell::new(Vec::new()));
         let channel = CapturingChannel { seen: Rc::clone(&seen), reply: vec![0xAB; 64] };
@@ -2508,6 +2517,13 @@ mod tests {
                 _deadline: Instant,
             ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
                 panic!("composition test never round-trips");
+            }
+            fn marks_round_trip(
+                &mut self,
+                _request_frame: &[u8],
+                _deadline: Instant,
+            ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+                panic!("composition test never round-trips (marks)");
             }
         }
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();

@@ -370,6 +370,15 @@ pub(crate) trait BootRelayChannel {
         request_frame: &[u8],
         deadline: std::time::Instant,
     ) -> Result<Vec<u8>, AnchorTransportError>;
+
+    /// 5b-2e: the raw-marks round-trip — identical obligations to [`round_trip`], but the response is
+    /// bounded by [`MAX_MARKS_RESPONSE_LEN`] (a marks payload is multi-KiB) instead of the 4096
+    /// freshness cap. Used ONLY on the `AdoptForward` path.
+    fn marks_round_trip(
+        &mut self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, AnchorTransportError>;
 }
 
 /// The SNP-quote seam: fetch a quote committing to `report_data`, returning `(report, cert_chain)`. The
@@ -482,6 +491,17 @@ impl<Q: BootQuoteProducer, C: BootRelayChannel> AnchorBootTransport for RelayAnc
             .map_err(|_| AnchorTransportError("anchor relay: request encode failed"))?;
         // The returned bytes are UNTRUSTED and returned verbatim — verified downstream by the driver.
         self.channel.round_trip(&frame, std::time::Instant::now() + self.timeout)
+    }
+
+    fn marks_round_trip(
+        &mut self,
+        request: &AnchorMarksRequest,
+    ) -> Result<Vec<u8>, AnchorTransportError> {
+        // The marks leg carries NO quote (the attestation was bound on the freshness leg this attempt),
+        // so it is a pure channel round-trip under its OWN `timeout` budget — no quote-fetch sub-leg.
+        let frame = encode_anchor_marks_request(request)
+            .map_err(|_| AnchorTransportError("anchor relay: marks request encode failed"))?;
+        self.channel.marks_round_trip(&frame, std::time::Instant::now() + self.timeout)
     }
 }
 
@@ -785,15 +805,16 @@ impl VsockBootRelayChannel {
         &self,
         request_frame: &[u8],
         deadline: std::time::Instant,
+        cap: usize,
     ) -> Result<Vec<u8>, ProtocolError> {
         let mut stream = connect_bounded(self.host_cid, self.port, deadline)?;
         // TIGHT per-syscall deadline: DeadlineSocket reapplies SO_RCVTIMEO/SO_SNDTIMEO = the budget
         // REMAINING to `deadline` before EVERY read/write — so a syscall that begins late in the framed
         // exchange cannot block past the absolute deadline (a once-set timeout could overrun by up to one
         // socket-timeout; see §8 "Exact-bound caveat"). The in-fn deadline re-checks in
-        // relay_round_trip_over_stream still bound the loop; together the leg is bounded by ~`deadline`.
+        // relay_round_trip_over_stream_cap still bound the loop; together the leg is bounded by ~`deadline`.
         let mut socket = DeadlineSocket { inner: &mut stream, deadline };
-        relay_round_trip_over_stream(&mut socket, request_frame, deadline)
+        relay_round_trip_over_stream_cap(&mut socket, request_frame, deadline, cap)
     }
 }
 
@@ -853,8 +874,18 @@ impl BootRelayChannel for VsockBootRelayChannel {
         // Blanket map: EVERY ProtocolError (incl. a deadline-lapse WireProtocol, which reads as
         // "malformed" but is a timeout) folds to the always-retryable AnchorTransportError. Do NOT key
         // terminal-vs-retryable off the variant (see deadline_guarded_write's variant caveat).
-        self.round_trip_inner(request_frame, deadline)
+        self.round_trip_inner(request_frame, deadline, MAX_ANCHOR_RESPONSE_LEN)
             .map_err(|_| AnchorTransportError("anchor relay: vsock channel round-trip failed"))
+    }
+
+    fn marks_round_trip(
+        &mut self,
+        request_frame: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, AnchorTransportError> {
+        // Same channel mechanics; only the response cap differs (marks payloads are multi-KiB).
+        self.round_trip_inner(request_frame, deadline, MAX_MARKS_RESPONSE_LEN)
+            .map_err(|_| AnchorTransportError("anchor relay: vsock marks round-trip failed"))
     }
 }
 
@@ -1147,6 +1178,16 @@ mod tests {
                 }
             };
             Ok(bytes)
+        }
+
+        fn marks_round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, AnchorTransportError> {
+            // These RelayAnchorTransport composition tests exercise only the FRESHNESS leg; the marks
+            // leg is driven by the driver-level execute-arm tests (agent_boot_driver TestTransport).
+            Err(AnchorTransportError("mock channel: marks_round_trip not scripted"))
         }
     }
 
@@ -1452,13 +1493,13 @@ mod tests {
     #[test]
     fn driver_ready_through_relay_transport() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::SignFresh { epoch: 7, sv: 2, marks }]),
         );
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 7),
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -1471,13 +1512,13 @@ mod tests {
         // frame_anchor_response → read_bounded_anchor_response — so the 4-byte-prefix response framing is
         // exercised in the full composition, not bypassed by returning raw bytes.
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::SignFreshFramed { epoch: 7, sv: 2, marks }]),
         );
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 7),
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -1487,13 +1528,13 @@ mod tests {
     #[test]
     fn driver_retry_then_ready_uses_fresh_nonce_each_attempt() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::Err, ChAct::SignFresh { epoch: 7, sv: 2, marks }]),
         );
-        assert!(matches!(run_boot_anti_rollback_handshake(&mut t, &body, 5), BootDriverOutcome::Ready(_)));
+        assert!(matches!(run_boot_anti_rollback_handshake(&mut t, &mut body, 5), BootDriverOutcome::Ready(_)));
         assert_eq!(t.channel.connects, 2, "one channel error then success = 2 connects");
         assert_ne!(t.channel.seen_nonces[0], t.channel.seen_nonces[1], "a fresh nonce per attempt");
     }
@@ -1501,13 +1542,13 @@ mod tests {
     #[test]
     fn driver_wrong_nonce_reply_is_terminal() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let mut t = transport(
             FakeQuote::ok(),
             MockChannel::new(vec![ChAct::SignWrongNonce { epoch: 7, sv: 2, marks }]),
         );
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyNonceMismatch)) => {}
             other => panic!("expected VerifyNonceMismatch, got {other:?}"),
         }
@@ -1726,11 +1767,11 @@ mod tests {
     #[test]
     fn driver_oversize_quote_response_garbage_is_terminal_malformed() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // A garbage (non-CBOR) reply -> driver -> verify -> Malformed (terminal). Confirms untrusted
         // bytes are safely rejected downstream, not by the transport.
         let mut t = transport(FakeQuote::ok(), MockChannel::new(vec![ChAct::Raw(vec![0xff, 0xff])]));
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyMalformed)) => {}
             other => panic!("expected VerifyMalformed, got {other:?}"),
         }

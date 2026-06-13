@@ -124,6 +124,16 @@ pub(crate) trait AnchorBootTransport {
         &mut self,
         request: &AnchorBootRequest,
     ) -> Result<Vec<u8>, AnchorTransportError>;
+
+    /// 5b-2e: the SECOND enclave-initiated round-trip, on the `AdoptForward` path only — relay the
+    /// scope + same fresh nonce + adopted epoch (NO quote: the attestation was bound on the
+    /// `anchor_round_trip` leg this attempt) to the anchor, return the anchor's signed raw-marks
+    /// response bytes (UNTRUSTED, verified downstream by `execute_adopt_forward`). Same bounding +
+    /// always-retryable-error contract as [`anchor_round_trip`].
+    fn marks_round_trip(
+        &mut self,
+        request: &crate::agent_boot_relay::AnchorMarksRequest,
+    ) -> Result<Vec<u8>, AnchorTransportError>;
 }
 
 /// The ONLY error the seam can raise. Deliberately coarse + opaque — every transport error is
@@ -160,10 +170,13 @@ pub(crate) enum BootDriverFail {
     /// A terminal reconcile verdict from [`crate::agent_boot::boot_reconcile_anti_rollback`]
     /// (host-reachable verify verdict, operator condition, or internal defect — all terminal here).
     Reconcile(crate::agent_boot::BootFailReason),
-    /// `AdoptForward` was required but is NOT executable in slice 5b-1 (no `anchor_root`-signed
-    /// raw-marks channel yet). §8 fail-closed; carries the [`AnchorState`](crate::agent_anchor::AnchorState)
-    /// for the operator log. Returned immediately (never retried).
-    AdoptForwardUnsupported(crate::agent_anchor::AnchorState),
+    /// `AdoptForward` was required and the executable adopt (5b-2e: fetch the `anchor_root`-signed raw
+    /// marks → hash-equality gate → seed → re-seal-forward) FAILED CLOSED — a forged/mismatched marks
+    /// set (`HashMismatch`), a non-monotone belt trip, a decode/verify reject, or a marks-leg verdict.
+    /// Carries the [`AnchorState`](crate::agent_anchor::AnchorState) + the precise
+    /// [`AdoptForwardFail`](crate::agent_boot::AdoptForwardFail) for the operator log. Terminal; a
+    /// *successful* adopt produces `Ready` via the re-run `Fresh` arm, never this.
+    AdoptForwardFailed(crate::agent_anchor::AnchorState, crate::agent_boot::AdoptForwardFail),
     /// `max_attempts` transport (retryable) failures in a row — the bound was hit. Carries the last
     /// transport cause string.
     RetriesExhausted(&'static str),
@@ -181,9 +194,17 @@ pub(crate) enum BootDriverFail {
 /// [`BootDriverOutcome`] for the boot caller to feed to [`agent_anti_rollback_serve_gate`].
 ///
 /// The driver installs nothing (reconcile installs the binding on its `Fresh` arm) and does not serve.
+/// `body` is taken **`&mut`** (5b-2e): a successful `AdoptForward` SEEDS it forward in place (the
+/// authenticated marks + the advanced `freshness_epoch`), so the *next* loop iteration reconciles the
+/// seeded body — which reconciles `Fresh` and reaches `Ready`. The caller (the boot wrapper) then MOVEs
+/// THIS now-seeded body into `install_agent_keystore`, so a stale (un-adopted) body never installs.
+/// On any non-`Ready` outcome the (possibly-seeded) body is simply not installed (the wrapper aborts
+/// on the `?`), so an in-place seed that never reached `Fresh` is harmless. The original body is
+/// untouched on a forged-marks reject (`execute_adopt_forward` clones internally; the rebind happens
+/// only on `Ok`).
 pub(crate) fn run_boot_anti_rollback_handshake(
     transport: &mut impl AnchorBootTransport,
-    body: &crate::agent_keystore::KeystoreBody,
+    body: &mut crate::agent_keystore::KeystoreBody,
     max_attempts: u32,
 ) -> BootDriverOutcome {
     // Distinct messages per cause for operator triage (a misconfigured bound is not a runtime fault).
@@ -197,13 +218,14 @@ pub(crate) fn run_boot_anti_rollback_handshake(
         ));
     }
     let chain = body.config.twod_chain_id;
-    let env = body.config.environment_identifier.as_str();
+    // Owned (not borrowed): the loop mutates `*body` on an adopt, so the scope string can't borrow it.
+    let env = body.config.environment_identifier.clone();
     let mut last_transport: &'static str = "no attempt completed";
 
     for _attempt in 1..=max_attempts {
         // Fresh challenge per attempt: fresh CSPRNG nonce -> fresh report_data -> fresh quote. Scope is
         // the SEALED config, never a host override.
-        let challenge = match crate::agent_challenge::issue_challenge(chain, env) {
+        let challenge = match crate::agent_challenge::issue_challenge(chain, &env) {
             Ok(c) => c,
             // CSPRNG dead: every attempt would fail identically -> terminal, do not loop.
             Err(_) => {
@@ -216,7 +238,7 @@ pub(crate) fn run_boot_anti_rollback_handshake(
         // nonce, and the report_data commitment. All public (they transit the host to the anchor).
         let request = AnchorBootRequest {
             chain_id: chain,
-            environment_identifier: env,
+            environment_identifier: &env,
             nonce: *challenge.nonce(),
             report_data: challenge.report_data(),
         };
@@ -239,13 +261,38 @@ pub(crate) fn run_boot_anti_rollback_handshake(
             crate::agent_boot::BootAntiRollbackOutcome::Ready(state) => {
                 return BootDriverOutcome::Ready(state);
             }
-            // §8: no anchor_root-signed raw-marks channel exists yet, so adopting forward would risk
-            // seeding forged marks. Fail closed (terminal), returned immediately — never retried (a
-            // continuously-advancing anchor must not spin the loop to exhaustion).
-            crate::agent_boot::BootAntiRollbackOutcome::AdoptForwardRequired { state, .. } => {
-                // 5b-2e commit 6 replaces this terminal arm with the marks-fetch + execute_adopt_forward
-                // + re-run path; until then AdoptForward stays terminal (the nonce is carried but unused).
-                return BootDriverOutcome::FailClosed(BootDriverFail::AdoptForwardUnsupported(state));
+            // 5b-2e: AdoptForward is now EXECUTABLE. Fetch the anchor_root-signed raw marks bound to the
+            // SAME freshness nonce + the adopted epoch, run the hash-equality gate (execute_adopt_forward),
+            // and on success SEED `*body` forward in place. The re-run is the NEXT loop iteration (adopt
+            // consumes ONE attempt — a continuously-advancing anchor exhausts the bound, never an infinite
+            // loop). A marks-leg TRANSPORT flap retries like the freshness leg; a marks VERDICT (sig/scope/
+            // nonce/epoch) or the hash gate / belt is TERMINAL.
+            crate::agent_boot::BootAntiRollbackOutcome::AdoptForwardRequired { state, nonce } => {
+                let marks_req = crate::agent_boot_relay::AnchorMarksRequest {
+                    chain_id: chain,
+                    environment_identifier: &env,
+                    nonce,
+                    epoch: state.epoch,
+                };
+                let marks_bytes = match transport.marks_round_trip(&marks_req) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Marks-leg transport flap → retry the FULL ceremony (fresh challenge next iter).
+                        last_transport = e.0;
+                        continue;
+                    }
+                };
+                match crate::agent_boot::execute_adopt_forward(&marks_bytes, body, &state, &nonce) {
+                    Ok(seeded) => {
+                        *body = seeded; // adopt: the next iteration reconciles the seeded body → Fresh
+                        continue;
+                    }
+                    Err(cause) => {
+                        return BootDriverOutcome::FailClosed(BootDriverFail::AdoptForwardFailed(
+                            state, cause,
+                        ));
+                    }
+                }
             }
             // Every reconcile fail reason is TERMINAL: host-reachable verify verdicts are NOT retried
             // (anti-grind), and operator/internal reasons are deterministic given this body.
@@ -255,7 +302,8 @@ pub(crate) fn run_boot_anti_rollback_handshake(
         }
     }
 
-    // Bound exhausted: only transport flaps reach here (every reconcile outcome returns above).
+    // Bound exhausted: transport flaps (freshness OR marks leg) AND continuously-advancing-anchor adopts
+    // reach here (every terminal reconcile/adopt outcome returns above).
     BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(last_transport))
 }
 
@@ -405,21 +453,40 @@ mod tests {
     /// Mock [`AnchorBootTransport`] driven by a scripted action queue; records every `report_data` it
     /// is handed and the live nonce at that moment (always peeked, even on transport errors), so the
     /// tests can assert fresh-per-attempt + report_data↔nonce binding.
+    /// 5b-2e scripted marks-leg behaviour (the `AdoptForward` raw-marks fetch).
+    #[derive(Clone)]
+    enum MarksAct {
+        /// Transient marks-leg transport failure -> retryable.
+        Transport,
+        /// A signed marks response carrying this payload, echoing the request's scope+nonce+epoch.
+        Sign(Vec<u8>),
+    }
+
     struct TestTransport {
         actions: VecDeque<MockAction>,
+        marks_actions: VecDeque<MarksAct>,
         attempts: u32,
+        marks_attempts: u32,
         seen_report_data: Vec<[u8; 64]>,
         seen_nonce: Vec<[u8; 32]>,
+        seen_marks_nonce: Vec<[u8; 32]>,
     }
 
     impl TestTransport {
         fn new(actions: Vec<MockAction>) -> Self {
             Self {
                 actions: actions.into(),
+                marks_actions: VecDeque::new(),
                 attempts: 0,
+                marks_attempts: 0,
                 seen_report_data: Vec::new(),
                 seen_nonce: Vec::new(),
+                seen_marks_nonce: Vec::new(),
             }
+        }
+        fn with_marks(mut self, marks: Vec<MarksAct>) -> Self {
+            self.marks_actions = marks.into();
+            self
         }
     }
 
@@ -480,6 +547,29 @@ mod tests {
             };
             Ok(r)
         }
+
+        fn marks_round_trip(
+            &mut self,
+            request: &crate::agent_boot_relay::AnchorMarksRequest,
+        ) -> Result<Vec<u8>, AnchorTransportError> {
+            self.marks_attempts += 1;
+            self.seen_marks_nonce.push(request.nonce);
+            match self.marks_actions.pop_front() {
+                None => Err(AnchorTransportError("mock: marks over-attempted (no scripted action)")),
+                Some(MarksAct::Transport) => Err(AnchorTransportError("mock marks transport")),
+                // Echo the request's scope+nonce+epoch so the guest's marks-verify accepts; the payload
+                // is whatever the test scripted (it must hash to the freshness `marks` digest to pass
+                // the hash gate).
+                Some(MarksAct::Sign(payload)) => Ok(crate::agent_anchor::test_signed_marks_response_bytes(
+                    &anchor_key(),
+                    request.chain_id,
+                    request.environment_identifier,
+                    request.epoch,
+                    request.nonce,
+                    payload,
+                )),
+            }
+        }
     }
 
     /// A `Sign` action that reconciles `Fresh` against `body` (epoch + structural + marks all match).
@@ -496,9 +586,9 @@ mod tests {
     #[test]
     fn ready_first_attempt_installs_and_consumes() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let mut t = TestTransport::new(vec![fresh(&body)]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::Ready(st) => {
                 assert_eq!(st.epoch, 7);
                 assert_eq!(st.structural_version, 2);
@@ -515,28 +605,67 @@ mod tests {
     // ---- AdoptForward + the no-install sweep ----
 
     #[test]
-    fn adopt_forward_fail_closed_no_retry() {
+    fn adopt_forward_executes_seeds_and_reaches_ready() {
+        // 5b-2e: AdoptForward is now EXECUTABLE. attempt 1 reconciles AdoptForward (anchor epoch ahead,
+        // same structural); the driver fetches the signed raw marks (= the body's OWN marks payload, so
+        // it hashes to the freshness digest), seeds the body forward to epoch 6, and the re-run (attempt
+        // 2) reconciles Fresh → Ready + binding installed. Adopt consumes ONE attempt.
         let _g = test_lock();
-        let body = test_body(5, 2);
-        // Anchor epoch ahead, same structural ⇒ AdoptForward; 5b-1 returns it terminal, no retry.
-        let mut t = TestTransport::new(vec![MockAction::Sign { epoch: 6, sv: 2, marks: [0x00; 32] }]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
-            BootDriverOutcome::FailClosed(BootDriverFail::AdoptForwardUnsupported(st)) => {
-                assert_eq!(st.epoch, 6);
-            }
-            other => panic!("expected AdoptForwardUnsupported, got {other:?}"),
+        let mut body = test_body(5, 2);
+        let payload = body.encode_marks_payload();
+        let digest = body.compute_local_marks_digest();
+        let mut t = TestTransport::new(vec![
+            MockAction::Sign { epoch: 6, sv: 2, marks: digest }, // AdoptForward (epoch 6 > local 5)
+            MockAction::Sign { epoch: 6, sv: 2, marks: digest }, // re-run after seeding → Fresh
+        ])
+        .with_marks(vec![MarksAct::Sign(payload)]);
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
+            BootDriverOutcome::Ready(st) => assert_eq!(st.epoch, 6),
+            other => panic!("expected Ready after adopt+re-run, got {other:?}"),
         }
-        assert_eq!(t.attempts, 1, "AdoptForward is terminal, not retried");
-        assert!(!is_anti_rollback_configured(), "AdoptForward installs nothing");
+        assert_eq!(t.attempts, 2, "adopt consumes one attempt; the re-run is the second");
+        assert_eq!(t.marks_attempts, 1, "one marks fetch on the adopt");
+        assert_eq!(body.freshness_epoch, 6, "the installed body was seeded forward");
+        assert!(is_anti_rollback_configured(), "the re-run Fresh arm installed the binding");
+    }
+
+    #[test]
+    fn adopt_forward_hash_mismatch_fails_closed_no_install() {
+        // The anchor commits digest D over GENUINE marks, but the host relays a validly-signed marks
+        // message carrying a DIFFERENT payload (hash != D) → execute_adopt_forward fails the hash gate →
+        // AdoptForwardFailed(HashMismatch), terminal, nothing installed. (The forged-marks REJECTION is
+        // unit-pinned in agent_boot::execute_adopt_forward_rejects_forged_marks_the_belt_would_admit;
+        // this pins the DRIVER surfaces it terminally.)
+        let _g = test_lock();
+        let mut body = test_body(5, 2);
+        let digest = body.compute_local_marks_digest();
+        // a different (still-canonical) marks payload: same shape but a non-zero spend → different hash.
+        let forged = {
+            let mut b = test_body(5, 2);
+            b.faucet.cumulative_native_spend = [0xff; 32];
+            b.encode_marks_payload()
+        };
+        let mut t = TestTransport::new(vec![MockAction::Sign { epoch: 6, sv: 2, marks: digest }])
+            .with_marks(vec![MarksAct::Sign(forged)]);
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
+            BootDriverOutcome::FailClosed(BootDriverFail::AdoptForwardFailed(st, cause)) => {
+                assert_eq!(st.epoch, 6);
+                assert_eq!(cause, crate::agent_boot::AdoptForwardFail::HashMismatch);
+            }
+            other => panic!("expected AdoptForwardFailed(HashMismatch), got {other:?}"),
+        }
+        assert!(!is_anti_rollback_configured(), "a hash-mismatch adopt installs nothing");
     }
 
     #[test]
     fn driver_never_installs_on_any_failclosed() {
         let _g = test_lock();
-        let body = test_body(5, 2);
+        let mut body = test_body(5, 2);
         // Each scenario, run under the same lock, must leave the binding slot empty throughout.
         let scenarios: Vec<MockAction> = vec![
-            MockAction::Sign { epoch: 6, sv: 2, marks: [0x00; 32] }, // AdoptForward
+            // AdoptForward with NO marks scripted (1 attempt) → the marks fetch fails → exhausts →
+            // RetriesExhausted, nothing installed. (The executable adopt → Ready is pinned separately.)
+            MockAction::Sign { epoch: 6, sv: 2, marks: [0x00; 32] },
             MockAction::Sign { epoch: 4, sv: 2, marks: [0x00; 32] }, // AnchorBehind
             MockAction::Sign { epoch: 7, sv: 3, marks: [0x00; 32] }, // StructuralGap
             MockAction::Sign { epoch: 5, sv: 2, marks: [0x00; 32] }, // Inconsistent (marks differ)
@@ -548,7 +677,7 @@ mod tests {
         ];
         for action in scenarios {
             let mut t = TestTransport::new(vec![action]);
-            let outcome = run_boot_anti_rollback_handshake(&mut t, &body, 1);
+            let outcome = run_boot_anti_rollback_handshake(&mut t, &mut body, 1);
             assert!(
                 matches!(outcome, BootDriverOutcome::FailClosed(_)),
                 "expected FailClosed, got {outcome:?}"
@@ -562,10 +691,10 @@ mod tests {
     #[test]
     fn transport_retry_to_success() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let mut t = TestTransport::new(vec![MockAction::Transport, fresh(&body)]);
         assert!(matches!(
-            run_boot_anti_rollback_handshake(&mut t, &body, 5),
+            run_boot_anti_rollback_handshake(&mut t, &mut body, 5),
             BootDriverOutcome::Ready(_)
         ));
         assert_eq!(t.attempts, 2, "one transport flap then success");
@@ -576,13 +705,13 @@ mod tests {
     #[test]
     fn transport_exhaustion_fails_closed() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let mut t = TestTransport::new(vec![
             MockAction::Transport,
             MockAction::Transport,
             MockAction::Transport,
         ]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, 3) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 3) {
             BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(_)) => {}
             other => panic!("expected RetriesExhausted, got {other:?}"),
         }
@@ -597,11 +726,11 @@ mod tests {
     #[test]
     fn bounded_never_infinite() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         for n in [1u32, 2, 5] {
             let actions: Vec<MockAction> = (0..n).map(|_| MockAction::Transport).collect();
             let mut t = TestTransport::new(actions);
-            let outcome = run_boot_anti_rollback_handshake(&mut t, &body, n);
+            let outcome = run_boot_anti_rollback_handshake(&mut t, &mut body, n);
             assert!(matches!(
                 outcome,
                 BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(_))
@@ -611,29 +740,33 @@ mod tests {
     }
 
     #[test]
-    fn advancing_anchor_terminates_immediately() {
+    fn advancing_anchor_terminates_bounded() {
+        // 5b-2e DoS defense: a continuously-advancing anchor (always an AdoptForward) must NOT spin the
+        // loop forever. Adopt consumes ONE attempt; here every attempt's marks fetch flaps (transport),
+        // so the body never seeds, the anchor stays "ahead", and the loop exhausts `max_attempts` →
+        // RetriesExhausted (FINITE, NOT attempts==1, NOT infinite). The marks-leg flap is the cheapest
+        // way to keep it AdoptForward every iteration; a genuinely-advancing (higher-epoch-each-time)
+        // anchor that DID adopt would likewise never reach Fresh and exhaust the same bound.
         let _g = test_lock();
-        let body = test_body(5, 2);
-        // A continuously-advancing anchor (always an AdoptForward) must NOT spin the loop: the first
-        // AdoptForward is terminal.
-        let mut t = TestTransport::new(vec![
-            MockAction::Sign { epoch: 6, sv: 2, marks: [0x00; 32] },
-            MockAction::Sign { epoch: 7, sv: 2, marks: [0x00; 32] },
-            MockAction::Sign { epoch: 8, sv: 2, marks: [0x00; 32] },
-        ]);
+        let mut body = test_body(5, 2);
+        let signs = vec![MockAction::Sign { epoch: 6, sv: 2, marks: [0x00; 32] }; 5];
+        let flaps = vec![MarksAct::Transport; 5];
+        let mut t = TestTransport::new(signs).with_marks(flaps);
         assert!(matches!(
-            run_boot_anti_rollback_handshake(&mut t, &body, 5),
-            BootDriverOutcome::FailClosed(BootDriverFail::AdoptForwardUnsupported(_))
+            run_boot_anti_rollback_handshake(&mut t, &mut body, 5),
+            BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(_))
         ));
-        assert_eq!(t.attempts, 1, "advancing anchor is fail-closed at attempt 1, not looped");
+        assert_eq!(t.attempts, 5, "the loop runs exactly max_attempts times — bounded, not infinite");
+        assert_eq!(t.marks_attempts, 5, "each attempt fetched (and flapped on) the marks leg");
+        assert!(!is_anti_rollback_configured());
     }
 
     #[test]
     fn max_attempts_zero_unstartable() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let mut t = TestTransport::new(vec![]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, 0) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 0) {
             BootDriverOutcome::FailClosed(BootDriverFail::Unstartable(_)) => {}
             other => panic!("expected Unstartable, got {other:?}"),
         }
@@ -644,11 +777,11 @@ mod tests {
     #[test]
     fn max_attempts_above_ceiling_unstartable() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // A pathological count is a caller config error -> Unstartable BEFORE any challenge/transport,
         // so the loop bound is self-contained (not dependent on a well-behaved caller).
         let mut t = TestTransport::new(vec![]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, MAX_BOOT_ATTEMPTS_CEILING + 1) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, MAX_BOOT_ATTEMPTS_CEILING + 1) {
             BootDriverOutcome::FailClosed(BootDriverFail::Unstartable(_)) => {}
             other => panic!("expected Unstartable above the ceiling, got {other:?}"),
         }
@@ -658,7 +791,7 @@ mod tests {
         // mock still succeeds (proves the boundary is inclusive, not off-by-one).
         let mut t2 = TestTransport::new(vec![fresh(&body)]);
         assert!(matches!(
-            run_boot_anti_rollback_handshake(&mut t2, &body, MAX_BOOT_ATTEMPTS_CEILING),
+            run_boot_anti_rollback_handshake(&mut t2, &mut body, MAX_BOOT_ATTEMPTS_CEILING),
             BootDriverOutcome::Ready(_)
         ));
         assert_eq!(t2.attempts, 1);
@@ -669,14 +802,14 @@ mod tests {
     #[test]
     fn challenge_fresh_each_attempt_and_no_leak() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let mut t = TestTransport::new(vec![
             MockAction::Transport,
             MockAction::Transport,
             fresh(&body),
         ]);
         assert!(matches!(
-            run_boot_anti_rollback_handshake(&mut t, &body, 5),
+            run_boot_anti_rollback_handshake(&mut t, &mut body, 5),
             BootDriverOutcome::Ready(_)
         ));
         // every report_data the seam saw is distinct (fresh nonce -> fresh report_data)
@@ -690,14 +823,14 @@ mod tests {
     #[test]
     fn report_data_binds_issued_nonce_and_body_scope() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // Two transport flaps then success — three attempts to check.
         let mut t = TestTransport::new(vec![
             MockAction::Transport,
             MockAction::Transport,
             fresh(&body),
         ]);
-        let _ = run_boot_anti_rollback_handshake(&mut t, &body, 5);
+        let _ = run_boot_anti_rollback_handshake(&mut t, &mut body, 5);
         assert_eq!(t.seen_report_data.len(), 3);
         for (rd, nonce) in t.seen_report_data.iter().zip(t.seen_nonce.iter()) {
             assert_eq!(
@@ -711,11 +844,11 @@ mod tests {
     #[test]
     fn scope_sourced_from_body_not_host() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // A response signed for a DIFFERENT chain scope ⇒ ScopeMismatch (proves the driver issues +
         // verifies against body.config scope, not a host-chosen one).
         let mut t = TestTransport::new(vec![MockAction::SignWrongScope { epoch: 7, sv: 2, marks: [0u8; 32] }]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::VerifyScopeMismatch)) => {}
             other => panic!("expected VerifyScopeMismatch, got {other:?}"),
         }
@@ -726,7 +859,8 @@ mod tests {
 
     fn assert_terminal_one_attempt(action: MockAction, body: &KeystoreBody, want: BootFailReason) {
         let mut t = TestTransport::new(vec![action]);
-        match run_boot_anti_rollback_handshake(&mut t, body, 5) {
+        let mut body = body.clone(); // the driver takes &mut (5b-2e); these verdicts never mutate it
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(got)) => assert_eq!(got, want),
             other => panic!("expected Reconcile({want:?}), got {other:?}"),
         }
@@ -800,12 +934,12 @@ mod tests {
     #[test]
     fn terminal_binding_install_no_retry() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // Pre-install a binding (sequencing-bug sim): a Fresh reconcile then hits install-once -> false
         // -> BindingInstall. Terminal, one attempt.
         assert!(install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: true }));
         let mut t = TestTransport::new(vec![fresh(&body)]);
-        match run_boot_anti_rollback_handshake(&mut t, &body, 5) {
+        match run_boot_anti_rollback_handshake(&mut t, &mut body, 5) {
             BootDriverOutcome::FailClosed(BootDriverFail::Reconcile(BootFailReason::BindingInstall)) => {}
             other => panic!("expected BindingInstall, got {other:?}"),
         }
@@ -815,10 +949,10 @@ mod tests {
     #[test]
     fn transport_error_single_attempt_retires_challenge() {
         let _g = test_lock();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let mut t = TestTransport::new(vec![MockAction::Transport]);
         assert!(matches!(
-            run_boot_anti_rollback_handshake(&mut t, &body, 1),
+            run_boot_anti_rollback_handshake(&mut t, &mut body, 1),
             BootDriverOutcome::FailClosed(BootDriverFail::RetriesExhausted(_))
         ));
         assert!(!has_outstanding_challenge(), "transport-error branch retires the challenge on exit");
@@ -884,7 +1018,7 @@ mod tests {
         let fails = [
             BootDriverFail::Reconcile(BootFailReason::AnchorBehind),
             BootDriverFail::Reconcile(BootFailReason::VerifySignatureInvalid),
-            BootDriverFail::AdoptForwardUnsupported(an_state(9)),
+            BootDriverFail::AdoptForwardFailed(an_state(9), crate::agent_boot::AdoptForwardFail::HashMismatch),
             BootDriverFail::RetriesExhausted("flap"),
             BootDriverFail::Unstartable("zero"),
         ];

@@ -195,7 +195,7 @@ fn run_boot_handshake_core<S, C>(
     overall_boot_budget: Duration,
     spawn: S,
     channel: C,
-    body: &crate::agent_keystore::KeystoreBody,
+    body: &mut crate::agent_keystore::KeystoreBody,
     require_real: bool,
     emit: &mut dyn FnMut(AgentBootEvent),
 ) -> Result<crate::agent_anchor::AnchorState, ProtocolError>
@@ -277,7 +277,7 @@ pub(crate) fn run_boot_handshake_wired<C: crate::agent_boot_relay::BootRelayChan
     per_leg_timeout: Duration,
     overall_boot_budget: Duration,
     channel: C,
-    body: &crate::agent_keystore::KeystoreBody,
+    body: &mut crate::agent_keystore::KeystoreBody,
     require_real: bool,
     emit: &mut dyn FnMut(AgentBootEvent),
 ) -> Result<crate::agent_anchor::AnchorState, ProtocolError> {
@@ -325,8 +325,9 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
     // (A) agent provisioning root FIRST (install-once).
     crate::boot_agent_keystore::boot_configure_agent_seal_root()?;
     // (B) PURE source→unseal→return — does NOT install, does NOT judge freshness (the handshake's
-    //     reconcile does, on &body, BEFORE install).
-    let (body, measurement) = crate::boot_agent_keystore::unseal_agent_keystore_at_boot()?;
+    //     reconcile does, on &mut body, BEFORE install). `mut` (5b-2e): a successful AdoptForward SEEDS
+    //     `body` forward in place inside the handshake, so install MOVES the (possibly-seeded) body.
+    let (mut body, measurement) = crate::boot_agent_keystore::unseal_agent_keystore_at_boot()?;
     // (C) operator-config → budget triplet (validate() PARAM ORDER; parse + derive-by-default only —
     //     ValidatedBootBudget::validate inside the handshake is the sole fail-closed band judge).
     let (max_attempts, per_leg_timeout, overall_boot_budget) =
@@ -364,19 +365,22 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
         };
         let _ = writeln!(std::io::stderr(), "[{priority}] {ev}");
     };
-    // (F) ONE wired handshake; decide_serve is INSIDE; &body is BORROWED here. require_real HARDCODED.
+    // (F) ONE wired handshake; decide_serve is INSIDE; &mut body is BORROWED here (5b-2e: an AdoptForward
+    //     seeds body forward in place). require_real HARDCODED. The &mut borrow ends when this returns,
+    //     so (G) can MOVE the now-(possibly-seeded) body into install.
     let _ready: crate::agent_anchor::AnchorState = run_boot_handshake_wired(
         max_attempts,
         per_leg_timeout,
         overall_boot_budget,
         channel,
-        &body,
+        &mut body,
         cfg!(release_build),
         &mut emit,
     )?;
-    // (G) install the keystore LAST (MOVES body). false (overwrite / empty-measurement / poison) is
-    //     FATAL — abort, never log-and-serve (install-AFTER-Ready: a stale-but-valid keystore is never
-    //     written to the process-global before the freshness gate).
+    // (G) install the keystore LAST (MOVES the post-handshake body — the SEEDED one on an adopt, the
+    //     original on a plain Fresh; a non-Ready outcome aborts at the `?` above, never reaching here).
+    //     false (overwrite / empty-measurement / poison) is FATAL — abort, never log-and-serve
+    //     (install-AFTER-Ready: a stale-but-valid keystore is never process-global before the gate).
     if !crate::agent_dispatch::install_agent_keystore(body, &measurement) {
         return Err(ProtocolError::PqSigningUnavailable(
             "agent boot: install_agent_keystore returned false (already installed / empty \
@@ -674,6 +678,14 @@ mod tests {
                 "wired test channel error",
             ))
         }
+        fn marks_round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            // These wired-boot tests exercise the FRESHNESS path only; the marks leg is unscripted.
+            Err(crate::agent_boot_driver::AnchorTransportError("wired test channel: marks not scripted"))
+        }
     }
 
     /// Signing channel: decodes the request via `decode_anchor_boot_request` to recover the live
@@ -704,6 +716,14 @@ mod tests {
                 decoded.nonce,
             ))
         }
+        fn marks_round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            // These wired-boot tests exercise the FRESHNESS path only; the marks leg is unscripted.
+            Err(crate::agent_boot_driver::AnchorTransportError("wired test channel: marks not scripted"))
+        }
     }
 
     #[test]
@@ -713,7 +733,7 @@ mod tests {
         // (install-on-Fresh provenance reaches the wired serve decision). Honesty: quote↔report_data
         // binding is producer/anchor-side coverage, not this test's.
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let marks = body.compute_local_marks_digest();
         let spawn = EchoChildSpawn::new();
         let spawns = Rc::clone(&spawn.spawns);
@@ -731,7 +751,7 @@ mod tests {
             Duration::from_secs(10),
             spawn,
             channel,
-            &body,
+            &mut body,
             true,
             &mut |e| events.push(e),
         )
@@ -775,7 +795,7 @@ mod tests {
         // producer-then-channel, so echo-succeeding spawn + always-Err channel ⇒ spawns == N AND
         // round_trips == N.
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         // Distinctive count: ≠ the ceiling (64), ≠ any default.
         let spawn = EchoChildSpawn::new();
         let spawns = Rc::clone(&spawn.spawns);
@@ -790,7 +810,7 @@ mod tests {
             Duration::from_secs(10),
             spawn,
             channel,
-            &body,
+            &mut body,
             false,
             &mut |e| events.push(e),
         )
@@ -837,7 +857,7 @@ mod tests {
         // operator the numbers (the static error strings carry none by the house anti-oracle
         // pattern). Drives the WRAPPER — safe under the TEST RULE: validate fails before any spawn.
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let t = Duration::from_millis(200);
         let overall = Duration::from_secs(10);
         let round_trips = Rc::new(Cell::new(0));
@@ -846,7 +866,7 @@ mod tests {
         };
         let mut events: Vec<AgentBootEvent> = Vec::new();
         let err =
-            run_boot_handshake_wired(0, t, overall, channel, &body, true, &mut |e| events.push(e))
+            run_boot_handshake_wired(0, t, overall, channel, &mut body, true, &mut |e| events.push(e))
                 .expect_err("max_attempts=0 must refuse at validate");
         assert!(
             matches!(
@@ -884,7 +904,7 @@ mod tests {
         // when wiring fails later). Safe under the TEST RULE: the pre-burned claim refuses before
         // any spawn.
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let t = Duration::from_millis(200);
         let n = 3u32;
         let nominal = nominal_product(n, t);
@@ -900,7 +920,7 @@ mod tests {
         };
         let mut events: Vec<AgentBootEvent> = Vec::new();
         let err =
-            run_boot_handshake_wired(n, t, overall, channel, &body, true, &mut |e| events.push(e))
+            run_boot_handshake_wired(n, t, overall, channel, &mut body, true, &mut |e| events.push(e))
                 .expect_err("burned claim must refuse the wired wrapper");
         assert!(
             matches!(
@@ -950,7 +970,7 @@ mod tests {
         // definition and deserves a WARN-level line; the classification is library-owned, not bin
         // prose.
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let t = Duration::from_millis(200);
         let nominal = nominal_product(1, t);
         let overall = nominal; // EXACTLY the const-derived nominal: zero slack, still validates.
@@ -961,7 +981,7 @@ mod tests {
             round_trips: Rc::clone(&round_trips),
         };
         let mut events: Vec<AgentBootEvent> = Vec::new();
-        let _ = run_boot_handshake_core(1, t, overall, spawn, channel, &body, false, &mut |e| {
+        let _ = run_boot_handshake_core(1, t, overall, spawn, channel, &mut body, false, &mut |e| {
             events.push(e)
         })
         .expect_err("always-Err channel fails closed — but zero slack must NOT refuse validation");
@@ -1010,7 +1030,7 @@ mod tests {
         // pre-driver), never folded into the retryable class (which would spin the attempt budget
         // on a permanent refusal).
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let body = test_body(7, 2);
+        let mut body = test_body(7, 2);
         let t = Duration::from_millis(200);
         let overall = Duration::from_secs(10);
         let round_trips = Rc::new(Cell::new(0));
@@ -1023,7 +1043,7 @@ mod tests {
             AlwaysErrChannel {
                 round_trips: Rc::clone(&round_trips),
             },
-            &body,
+            &mut body,
             false,
             &mut |e| first_events.push(e),
         )
@@ -1042,7 +1062,7 @@ mod tests {
             AlwaysErrChannel {
                 round_trips: Rc::clone(&round_trips),
             },
-            &body,
+            &mut body,
             false,
             &mut |e| events.push(e),
         )
