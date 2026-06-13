@@ -657,34 +657,44 @@ const COMMIT_ROUND_TRIP_BUDGET: std::time::Duration = std::time::Duration::from_
 
 /// Process-global slot holding the boot-installed channel to the host anchor relay, used by the
 /// seal-before-emit per-op commit. Installed once at boot AFTER the keystore (so a commit can never run
-/// before a verified boot). `Send` so it can live in the static; accessed ONLY under the
-/// `INSTALLED_KEYSTORE` lock (which the serial serve loop holds), so the round-trip is serialized and
-/// the two-lock order is always KEYSTORE→COMMIT_CHANNEL (never reversed → no deadlock).
+/// before a verified boot). `Send` so it can live in the static. The PER-OP COMMIT
+/// ([`commit_candidate_to_anchor`]) acquires this lock while ALREADY holding `INSTALLED_KEYSTORE` (the
+/// serial serve loop's lock), so per-op commits are serialized; `install_commit_channel` /
+/// `reset_commit_channel_for_tests` acquire it STANDALONE (NOT under `INSTALLED_KEYSTORE`). No path ever
+/// acquires COMMIT_CHANNEL and THEN `INSTALLED_KEYSTORE`, so the only nested order is
+/// KEYSTORE→COMMIT_CHANNEL (never reversed → no deadlock).
 static INSTALLED_COMMIT_CHANNEL: Mutex<
     Option<Box<dyn crate::agent_boot_relay::BootRelayChannel + Send>>,
 > = Mutex::new(None);
 
 /// Install the boot channel to the host anchor relay for per-op commits (agent-profile boot, slice 6-4b).
-/// Install-once: returns `false` if a channel is already installed (boot race / caller mistake).
+/// Install-once: returns `false` ONLY when a channel is already installed (boot race / caller mistake).
 #[cfg_attr(not(test), allow(dead_code))] // staged 6-4a; the boot caller lands in 6-4b
 #[must_use]
 pub(crate) fn install_commit_channel(
     channel: Box<dyn crate::agent_boot_relay::BootRelayChannel + Send>,
 ) -> bool {
-    match INSTALLED_COMMIT_CHANNEL.lock() {
-        Ok(mut guard) if guard.is_none() => {
-            *guard = Some(channel);
-            true
-        }
-        _ => false,
+    // Recover a poisoned lock (consistent with `commit_candidate_to_anchor` and the other global-state
+    // installers) so a poison from an unrelated panic can't masquerade as a duplicate-install: `false`
+    // means EXACTLY "already installed", never "lock was poisoned".
+    let mut guard = INSTALLED_COMMIT_CHANNEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(channel);
+        true
+    } else {
+        false
     }
 }
 
 #[cfg(test)]
 pub(crate) fn reset_commit_channel_for_tests() {
-    if let Ok(mut guard) = INSTALLED_COMMIT_CHANNEL.lock() {
-        *guard = None;
-    }
+    // Recover a poisoned lock so a poison from one test can't leak into the next (mirrors
+    // `reset_anti_rollback_binding_for_tests`).
+    *INSTALLED_COMMIT_CHANNEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 /// Draw a fresh 32-byte CSPRNG nonce for ONE per-op commit. Anti-replay: a captured ACK cannot replay
