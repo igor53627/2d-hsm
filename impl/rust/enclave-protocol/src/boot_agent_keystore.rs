@@ -538,6 +538,12 @@ mod tests {
                 other => panic!("mapper must yield PqSigningUnavailable, got {other:?}"),
             }
         }
+        // Pin the DISTINCT MonotonicOverflow label EXACTLY (it must not regress to the generic
+        // "invalid keystore body" bucket — a runtime capacity condition reads differently in a log).
+        assert_eq!(
+            map_keystore_error(K::MonotonicOverflow),
+            ProtocolError::PqSigningUnavailable("agent keystore: monotonic counter overflow"),
+        );
     }
 
     #[test]
