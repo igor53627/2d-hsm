@@ -207,11 +207,13 @@ pub enum AgentResponse {
     /// correlation is implicit at the synchronous 0x40 frame layer.)
     ProveIdentity(IdentityProof),
     /// GENERATE_KEYS result: the generated public key material PLUS the mutated `candidate` keystore
-    /// (counter advanced + new entries + the atomic epoch/structural bump). The frame layer COMMITS the
-    /// candidate's post-op state to the anchor (TASK-7.7 slice 6-4, seal-before-emit) THEN seals it,
-    /// returns the sealed blob for the host to persist, and swaps it into the live slot
-    /// (clone→commit→seal→persist→swap, §7.2). `request_id` is the op's envelope (key-4) request_id,
-    /// carried here so the frame-layer commit can key the anchor record by it (idempotency).
+    /// (counter advanced + new entries + the atomic epoch/structural bump). The frame layer SEALS the
+    /// candidate (side-effect-free compute), then COMMITS its post-op state to the anchor (TASK-7.7
+    /// slice 6-4, seal-before-emit), then returns the sealed blob for the host to persist and swaps it
+    /// into the live slot (clone→seal→commit→persist→swap, §7.2 — seal precedes commit so a
+    /// deterministic seal failure fails closed WITHOUT advancing the anchor). `request_id` is the op's
+    /// envelope (key-4) request_id, carried here so the frame-layer commit can key the anchor record by
+    /// it (idempotency).
     GenerateKeys {
         keys: Vec<GeneratedKey>,
         candidate: Box<KeystoreBody>,
@@ -705,13 +707,16 @@ fn draw_commit_nonce() -> Result<[u8; 32], AgentError> {
     Ok(nonce)
 }
 
-/// TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT: COMMIT the candidate's post-op state to the anchor BEFORE the
-/// frame layer seals it. Draws a fresh per-op nonce, builds the [`crate::agent_boot_relay::AnchorCommit`]
-/// from the candidate's advanced `(freshness_epoch, structural_version)` + post-op marks digest + the
-/// op's `request_id`, and runs the round-trip + ack-verify. `Ok(())` is the GO signal (the anchor durably
-/// recorded EXACTLY the proposed state); ANY failure — no channel installed, transport, ack mismatch,
-/// getrandom — ⇒ `Err(SealFailed)`, and the caller MUST NOT seal / swap / emit (no offline window). The
-/// coarse fail-closed `SealFailed` keeps the anti-oracle surface minimal. Called under the
+/// TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT: durably COMMIT the candidate's post-op state to the anchor
+/// AFTER the frame layer has computed the sealed blob but BEFORE it swaps/emits. (The seal is a
+/// side-effect-free computation, so the caller computes it FIRST — a deterministic seal failure then
+/// fails closed without ever reaching this commit; see [`handle_agent_gateway_frame`].) Draws a fresh
+/// per-op nonce, builds the [`crate::agent_boot_relay::AnchorCommit`] from the candidate's advanced
+/// `(freshness_epoch, structural_version)` + post-op marks digest + the op's `request_id`, and runs the
+/// round-trip + ack-verify. `Ok(())` is the GO signal (the anchor durably recorded EXACTLY the proposed
+/// state); ANY failure — no channel installed, transport, ack mismatch, getrandom — ⇒ `Err(SealFailed)`,
+/// and the caller MUST NOT swap / emit and MUST discard the already-computed sealed blob (no offline
+/// window). The coarse fail-closed `SealFailed` keeps the anti-oracle surface minimal. Called under the
 /// `INSTALLED_KEYSTORE` lock, so the commit-channel round-trip is serialized.
 fn commit_candidate_to_anchor(candidate: &KeystoreBody, request_id: &[u8]) -> Result<(), AgentError> {
     let nonce = draw_commit_nonce()?;
