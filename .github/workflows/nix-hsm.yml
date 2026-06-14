@@ -86,6 +86,16 @@ jobs:
           cargo test --features vsock-transport,agent-gateway,lab-agent-smoke --lib lab_agent_smoke
           cargo build --features vsock-transport,agent-gateway,lab-agent-smoke --bin twod-hsm-lab-anchor --bin twod-hsm-agent-smoke-client
 
+      # TASK-7.7 6-7b: the WRITE-path smoke combo (lab-agent-smoke + agent-keygen-exec-preview). On this
+      # Linux runner the lib test runs the BINDING `keygen_client_drives_real_generate_keys_against_shipped_serve_glue`
+      # cross-val — a real signed GENERATE_KEYS through the shipped serve glue proving seal→commit→swap→emit
+      # DEVICELESS, so the SNP write-path smoke (6-7b-ii) rests on a CI-checked protocol contract (the
+      # 6-4b CI-gap lesson: that gap was a boot/SNP-pinned path, this one is deviceless ⇒ CI-coverable).
+      - name: 6-7b lab WRITE-path smoke surface — keygen client cross-val + bin (lab-agent-smoke + preview)
+        run: |
+          cargo test --features vsock-transport,agent-gateway,lab-agent-smoke,agent-keygen-exec-preview --lib lab_agent_smoke
+          cargo build --features vsock-transport,agent-gateway,lab-agent-smoke,agent-keygen-exec-preview --bin twod-hsm-agent-keygen-smoke-client
+
       # TASK-7.7 5b-2c-iii: the agent-bin refusal arms (ii) validation-refusal + (iii) outcome-
       # refusal (the doc-pinned acceptance split BY PATH), deviceless — off-SNP the quote child
       # fails BEFORE any dial. Runs the existing arms (a)/(b) too (same integration file).

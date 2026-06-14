@@ -211,6 +211,14 @@ name = "twod-hsm-agent-smoke-client"
 path = "src/bin/twod_hsm_agent_smoke_client.rs"
 required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke"]
 
+# 6-7b host-side WRITE-PATH smoke client (TASK-7.7). Drives a real signed GENERATE_KEYS over AF_VSOCK
+# (linux-only at runtime; non-linux main exits 2). ADDS agent-keygen-exec-preview to the read-client's
+# feature set — that gate is what makes the guest actually execute GENERATE_KEYS (seal→commit→swap→emit).
+[[bin]]
+name = "twod-hsm-agent-keygen-smoke-client"
+path = "src/bin/twod_hsm_agent_keygen_smoke_client.rs"
+required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke", "agent-keygen-exec-preview"]
+
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 
 [[example]]

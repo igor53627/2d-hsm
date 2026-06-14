@@ -472,8 +472,9 @@ fn handle_prove_identity(
 
 /// Canonical CBOR of the GENERATE_KEYS command params `{1: purpose, 2: count}` (RFC 8949 shortest
 /// form) — the exact bytes hashed into `payload_binding`. Shared by the handler and the tests so the
-/// two cannot drift on the wire layout.
-fn generate_keys_canonical_params(purpose_code: u64, count: u64) -> Vec<u8> {
+/// two cannot drift on the wire layout. `pub(crate)` so the release-banned `lab-agent-smoke` write-path
+/// client (slice 6-7b) builds its cap's `payload_binding` from the SAME preimage the handler verifies.
+pub(crate) fn generate_keys_canonical_params(purpose_code: u64, count: u64) -> Vec<u8> {
     let mut out = Vec::new();
     crate::agent_capability::put_uint(&mut out, 5, 2); // 2-entry map header
     crate::agent_capability::put_uint(&mut out, 0, 1);

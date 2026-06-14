@@ -425,7 +425,10 @@ pub(crate) fn payload_binding(
 }
 
 /// Encode a parsed [`Capability`] back to its inner-envelope key-5 CBOR map (keys 1..13).
-#[cfg(test)]
+/// Same gate as its sole caller [`test_signed_capability`] (slice 6-7b): `test` OR the write-path
+/// smoke combo `lab-agent-smoke ∧ agent-keygen-exec-preview` — so the read-path lab-bin lane does not
+/// compile it as dead code.
+#[cfg(any(test, all(feature = "lab-agent-smoke", feature = "agent-keygen-exec-preview")))]
 fn cap_to_map(c: &Capability) -> Vec<(Value, Value)> {
     let mut m: Vec<(Value, Value)> = vec![
         (Value::Integer(1.into()), Value::Integer(c.cap_format_version.into())),
@@ -450,7 +453,14 @@ fn cap_to_map(c: &Capability) -> Vec<(Value, Value)> {
 /// Build a fully-valid signed capability map for tests (other modules' integration tests use this to
 /// exercise the wired dispatch seam). `key_purpose`/`payload_binding` use fixed placeholders since
 /// the verify-only path does not check them.
-#[cfg(test)]
+///
+/// Also reachable under the release-banned `lab-agent-smoke` + `agent-keygen-exec-preview` combo
+/// (slice 6-7b): the lab write-path smoke client mints a valid GENERATE_KEYS cap against the smoke
+/// keystore's known admin seed through this exact builder, so the smoke's cap and the enclave's
+/// verifier are single-sourced. The gate matches that lone consumer (`smoke_generate_keys_envelope`,
+/// itself preview-gated) — NOT plain `lab-agent-smoke` — so the read-path lab-bin lane (smoke without
+/// preview) does not compile this as dead code.
+#[cfg(any(test, all(feature = "lab-agent-smoke", feature = "agent-keygen-exec-preview")))]
 #[allow(clippy::too_many_arguments)] // a test fixture mirroring the §10.5 capability fields
 pub(crate) fn test_signed_capability(
     signing_key: &ed25519_dalek::SigningKey,
