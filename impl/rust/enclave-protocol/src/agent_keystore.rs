@@ -1691,6 +1691,76 @@ mod tests {
         assert_eq!(b.structural_version, s, "... and MUST NOT touch structural_version");
     }
 
+    /// slice 6-6: the co-advance invariant pinned END-TO-END to `reconcile`'s asymmetry (this is what
+    /// 6-6 delivers — the invariant + asymmetry tests; the gate itself was already live). The 6-2 atomic
+    /// `advance_commit_epoch` advances epoch+structural TOGETHER (structural op) or epoch ALONE
+    /// (epoch-only), NEVER structural alone — so a state advanced from `local` reconciles strictly by its
+    /// op CLASS: an EpochOnly advance keeps `local`'s structural ⇒ `AdoptForward` (NO false StructuralGap),
+    /// a structural advance moves structural ahead ⇒ `StructuralGap` ⇒ fail-closed/restore. (Pre-6-4 a
+    /// structural-ONLY bump could move structural without epoch → a FALSE StructuralGap; the atomic
+    /// co-advance removes that mis-fire.) `advance_commit_epoch` leaves the marks digest unchanged
+    /// (pinned above), so every anchor here shares `local`'s marks — isolating the structural asymmetry.
+    #[test]
+    fn co_advance_invariant_drives_reconcile_asymmetry() {
+        use crate::agent_anchor::{reconcile, AnchorState, FailReason, ReconcileDecision};
+        let local = sample_body();
+        let (le, ls) = (local.freshness_epoch, local.structural_version);
+        let lmarks = local.compute_local_marks_digest();
+        let anchor_of = |b: &KeystoreBody| AnchorState {
+            epoch: b.freshness_epoch,
+            structural_version: b.structural_version,
+            marks_digest: b.compute_local_marks_digest(),
+            chain_height: None,
+            chain_block_hash: None,
+        };
+
+        // EPOCH-ONLY (counter/spend) advance + dropped seal ⇒ anchor ahead by epoch, SAME structural ⇒
+        // AdoptForward. The co-advance guarantees structural stayed put, so this never mis-fires.
+        let mut epoch_only = local.clone();
+        epoch_only.advance_commit_epoch(false).unwrap();
+        assert_eq!(epoch_only.structural_version, ls, "epoch-only kept structural (co-advance invariant)");
+        assert_eq!(
+            reconcile(le, ls, &lmarks, &anchor_of(&epoch_only)),
+            ReconcileDecision::AdoptForward { epoch: le + 1 },
+            "epoch-only advance ⇒ AdoptForward, never a false StructuralGap"
+        );
+
+        // A RUN of epoch-only advances: epoch climbs, structural never moves ⇒ still AdoptForward (a run
+        // of counter/spend ops cannot accumulate into a structural gap).
+        let mut many = local.clone();
+        for _ in 0..5 {
+            many.advance_commit_epoch(false).unwrap();
+        }
+        assert_eq!(many.structural_version, ls, "5 epoch-only advances still keep structural");
+        assert_eq!(
+            reconcile(le, ls, &lmarks, &anchor_of(&many)),
+            ReconcileDecision::AdoptForward { epoch: le + 5 },
+            "a run of epoch-only advances stays adopt-forwardable"
+        );
+
+        // STRUCTURAL (GENERATE_KEYS/CONFIGURE) advance ⇒ epoch AND structural move ⇒ the anchor can't
+        // supply the new key/config material ⇒ StructuralGap ⇒ fail-closed/restore. THIS is the asymmetry.
+        let mut structural = local.clone();
+        structural.advance_commit_epoch(true).unwrap();
+        assert_eq!(structural.structural_version, ls + 1, "structural op co-advanced structural");
+        assert_eq!(
+            reconcile(le, ls, &lmarks, &anchor_of(&structural)),
+            ReconcileDecision::FailClosed(FailReason::StructuralGap),
+            "structural advance ⇒ StructuralGap ⇒ restore (asymmetric vs epoch-only)"
+        );
+
+        // The invariant's contrapositive: two states AT the same epoch MUST share structural; a structural
+        // divergence at equal epoch is impossible-legit (a bump without the matching epoch) ⇒ corruption ⇒
+        // Inconsistent, never silently trusted.
+        let mut diverged = local.clone();
+        diverged.structural_version = ls + 1;
+        assert_eq!(
+            reconcile(le, ls, &lmarks, &anchor_of(&diverged)),
+            ReconcileDecision::FailClosed(FailReason::Inconsistent),
+            "same epoch + diverged structural ⇒ Inconsistent"
+        );
+    }
+
     #[test]
     fn advance_commit_epoch_overflow_on_either_aborts_both() {
         // epoch at u64::MAX → epoch overflow aborts; structural untouched (no partial mutation).
