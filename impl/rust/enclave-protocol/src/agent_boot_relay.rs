@@ -417,9 +417,10 @@ pub(crate) fn decode_anchor_commit_request(frame: &[u8]) -> Result<DecodedCommit
 }
 
 /// Why a per-op anchor COMMIT failed — coarse, always-FAIL-CLOSED band (slice 6). On ANY variant the
-/// caller MUST fail the op closed: no seal, no signature/refs emitted (seal-before-emit; there is no
-/// offline window for fund custody). No "retryable vs terminal" split at this layer — a failed commit
-/// means the op did NOT durably commit, full stop.
+/// caller MUST fail the op closed: discard the already-computed sealed blob, NO swap, NO signature/refs
+/// emitted (seal-before-emit — the seal is computed first but is durably nothing until this commit
+/// succeeds; there is no offline window for fund custody). No "retryable vs terminal" split at this
+/// layer — a failed commit means the op did NOT durably commit, full stop.
 #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
 #[derive(Debug)]
 pub(crate) enum CommitFailure {
@@ -454,10 +455,13 @@ pub(crate) struct AnchorCommit<'a> {
 /// signed ACK against the proposed values via [`crate::agent_anchor::verify_commit_ack_bytes`]. Returns
 /// `Ok(())` ONLY when the anchor durably recorded EXACTLY the proposed `(epoch, structural, marks)` under
 /// the op's `nonce` + `request_id` — that `Ok(())` is the seal-before-emit GO signal. ANY failure
-/// ([`CommitFailure`]) ⇒ the caller fails the op CLOSED (no seal, no emit). Pure over the channel seam:
+/// ([`CommitFailure`]) ⇒ the caller fails the op CLOSED (discard the already-computed seal, no swap/emit).
+/// Pure over the channel seam:
 /// the request and the expected-ack are built from the ONE [`AnchorCommit`], so a drift is unrepresentable.
+// `C: ?Sized` so the 6-4 dispatch wiring can pass a `&mut dyn BootRelayChannel` from the process-global
+// commit-channel slot (`Box<dyn BootRelayChannel>`), not only a concrete type.
 #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-3; consumed by the 6-4 dispatch wiring
-pub(crate) fn run_anchor_commit<C: BootRelayChannel>(
+pub(crate) fn run_anchor_commit<C: BootRelayChannel + ?Sized>(
     channel: &mut C,
     commit: &AnchorCommit,
     config: &crate::agent_keystore::KeystoreConfig,

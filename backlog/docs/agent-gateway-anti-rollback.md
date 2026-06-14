@@ -382,10 +382,14 @@ CONFIGURE_TREASURY sub-op (that handler is deferred; its sub-op classifier MUST 
 with no wildcard so a new sub-op can't default into the wrong class). MUST NOT bump on counter/spend
 advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT be aliased
 onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
-**ATOMICITY/INERT invariant:** the GENERATE_KEYS bump is **LOCAL-ONLY and currently INERT** — it MUST
-advance atomically with `freshness_epoch` + the anchor ack in the deferred seal-before-emit co-slice;
-`reconcile` is unwired at boot, so nothing reads `structural_version` yet (an inert write cannot trigger
-`Inconsistent`).
+**ATOMICITY invariant (LIVE — slice 6-4a):** the GENERATE_KEYS bump advances atomically with
+`freshness_epoch` (`advance_commit_epoch`); the frame layer then computes the sealed blob FIRST
+(side-effect-free) and commits exactly that `{epoch, structural, marks}` through the anchor BEFORE the
+swap/emit (the "seal-before-emit" order is seal→commit→swap→emit, so a deterministic seal failure fails
+closed without advancing the anchor); boot `reconcile` reads `structural_version` (structural-ahead →
+`StructuralGap`). It remains behind the
+off-by-default `agent-keygen-exec-preview` gate until the boot channel install (6-4b) + the request_id
+idempotency/crash-reconcile proof (6-5) land and TASK-18 un-gates production keygen.
 
 **`strict_recovery_counter` (marks key 4) — FROZEN v1.** A `u64` in the sealed body, init **0** (genuine
 genesis; anchor baseline 0 normative), forward-only, encoded as a CBOR major-0 uint at marks key 4. Its

@@ -446,10 +446,15 @@ pub struct KeystoreBody {
     /// each key/config-changing CONFIGURE_TREASURY sub-op (that handler is deferred). MUST NOT bump on
     /// counter/spend advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change,
     /// and MUST NOT be aliased onto [`KeystoreConfig::monotonic_treasury_config_version`]. Overflow:
-    /// `checked_add` → fail closed (never wrap). The GENERATE_KEYS bump is **LOCAL-ONLY and currently
-    /// INERT**: advancing `freshness_epoch` + the anchor ack atomically with this bump (seal-before-emit)
-    /// and the boot `reconcile` that reads this field are the deferred co-slice — nothing reads
-    /// `structural_version` at boot yet.
+    /// `checked_add` → fail closed (never wrap). The GENERATE_KEYS bump is **LIVE** (TASK-7.7 slice
+    /// 6-4a): `advance_commit_epoch` advances `freshness_epoch` + `structural_version` atomically; the
+    /// frame layer then computes the sealed blob FIRST (side-effect-free) and commits exactly that
+    /// `{epoch, structural, marks}` through the anchor BEFORE the swap/emit (the "seal-before-emit" order
+    /// is seal→commit→swap→emit); boot `reconcile` already reads this field (structural-ahead →
+    /// `StructuralGap`).
+    /// Still gated behind the off-by-default `agent-keygen-exec-preview` until the boot channel install
+    /// (6-4b) + the request_id idempotency/crash-reconcile proof (6-5) land and TASK-18 un-gates
+    /// production keygen.
     pub structural_version: u64,
     /// Strict recovery counter (TASK-7.7 §1 item 5, anchor marks key 4). **Required** (no
     /// `serde(default)`). Init **0** (genuine genesis: zero recoveries performed; anchor baseline 0).
