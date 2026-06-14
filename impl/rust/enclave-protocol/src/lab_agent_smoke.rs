@@ -935,7 +935,7 @@ mod tests {
     }
 
     /// Like [`drive_stub_pump`] but threads a caller-owned commit ledger, so a SEQUENCE of pumps shares
-    /// the anchor's durable `(request_id, epoch)` state (slice 6-5 idempotency/conflict tests).
+    /// the anchor's durable per-`request_id` commit state (slice 6-5 idempotency/conflict tests).
     fn drive_stub_pump_with_ledger(
         body: &KeystoreBody,
         request_frame: &[u8],
