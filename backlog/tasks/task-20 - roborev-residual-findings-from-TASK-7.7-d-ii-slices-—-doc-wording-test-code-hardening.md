@@ -60,4 +60,15 @@ The 6-4b branch compact (roborev job 7314) re-surfaced one **High-labelled** fin
 **Parked OPTIONAL hardening (defense-in-depth vs the host-DoS variant; NOT required for safety):** bind `0x45` commit requests to the boot-attested enclave session — e.g. an enclave-held ephemeral MAC/signing key derived during the attested boot handshake, which the anchor verifies before any durable commit/ACK. This is a `0x45` wire + **anchor-side** protocol change (6-1-level, and it requires the anchor implementation to enforce it), so it belongs with a future anchor-protocol hardening pass, not the preview-gated boot wiring. User decision (2026-06-14): accept the documented DoS-only residual, merge 6-4b, park this hardening here.
 
 Source: PR #74 compact job 7314 + the 2-agent adversarial verification (DoS-only, no wrong-accept/rollback).
+
+---
+
+### 6-5 residuals (from the PR #75 /code-review, 2026-06-14)
+
+The /code-review (after the compact caught + fixed the real `(request_id,epoch)`→`request_id` keying bug + the compile break) confirmed the corrected keying is correct; these are the parked low-severity test-altitude items (all fail-closed-safe / non-blocking):
+
+- **[fail-closed-linkage, Low]** The 6-5 conflict test (`stub_commit_idempotent_per_request_id_and_rejects_conflict`) asserts the lab stub writes NO ack on a conflict (`w.is_empty()`), and `run_anchor_commit_ok_and_fail_closed_paths` (agent_boot_relay.rs) independently proves the enclave fails closed on Transport/forged/empty via synthetic `CommitMock` channels — but the two halves are NOT bridged: no test feeds the stub's actual empty/EOF-on-conflict output into `run_anchor_commit` to prove the end-to-end "stub rejects → enclave fails closed". Both halves are independently sound; a bridging test (or the 6-7 lab write-path SNP smoke driving a real conflict) would close it.
+- **[request_id-stability, Low]** No enclave-side test pins that `commit_candidate_to_anchor` forwards `env.request_id` VERBATIM (stable across a retry of the same logical op). Today it does (no mutation), and the anchor's request_id-keyed dedup relies on it; if a future change derived/mutated the request_id, two attempts of the same op would carry different ids → the anchor stops deduplicating → silent re-advance, with no test failing. Add a capturing-channel test asserting the commit-wire (key-8) request_id == the envelope (key-4) request_id.
+
+Source: PR #75 /code-review (3 finder agents); the corrected keying + the new design-doc normative anchor-idempotency contract (agent-gateway-anti-rollback.md §3) address the substantive findings.
 <!-- SECTION:DESCRIPTION:END -->

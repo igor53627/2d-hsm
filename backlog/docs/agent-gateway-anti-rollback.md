@@ -147,6 +147,13 @@ epoch + counter/spend marks, so a dropped `GENERATE_KEYS`/`CONFIGURE_TREASURY` s
 reconstructable) — fails closed for operator intervention (restore from backup). This preserves
 no-over-dispense without a permanent self-wedge on a single dropped ack.
 
+**Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
+1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.
+2. **An idempotent retry RE-SIGNS for the CURRENT (fresh per-op) nonce.** A duplicate commit under an already-recorded `request_id` with **matching** `{epoch, structural, marks}` MUST return an ack **re-signed for the attempt's fresh nonce** (NOT a replay of the original ack) — the enclave's `verify_commit_ack_bytes` echoes the *current* op's nonce, so a replayed original ack fails `NonceMismatch` and wedges the retry. The durable record is NOT advanced again.
+3. **Conflict ⇒ reject.** A commit under an already-recorded `request_id` proposing **any different** `{epoch, structural, marks}` MUST be rejected; the enclave then fails closed (no seal/emit).
+
+**Precondition (admin/orchestrator obligation):** distinct logical ops MUST carry distinct request_ids. The TEE-enforced per-op sequencer is the capability **counter** (strict-contiguous); the `request_id` is an opaque admin-chosen value bound into the capability signature but NOT checked for uniqueness by the enclave. Reusing one request_id across two genuinely-distinct ops makes the second reject as a conflict (a fail-closed availability loss, never a custody breach) — so request_id-per-op-uniqueness is an explicit admin prohibition, not a TEE invariant.
+
 **Coverage (AC#2).** The same epoch gate protects **both** the capability counter high-water table
 and the faucet spend counters (both live in the one sealed keystore whose epoch the anchor pins);
 the strict recovery counter is likewise pinned.

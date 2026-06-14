@@ -1575,7 +1575,8 @@ mod tests {
     }
 
     /// slice 6-5 VALIDATION PIN: the per-op commit reuses `env.request_id` VERBATIM as the anchor's
-    /// `(request_id, epoch)` idempotency key with NO length check of its own — its SOLE guard is this
+    /// `request_id` idempotency key (the LOGICAL-op identity — keyed ALONE, NOT `(request_id, epoch)`)
+    /// with NO length check of its own — its SOLE guard is this
     /// envelope (key-4) decode bound, `MAX_REQUEST_ID_LEN`=64. Pin that dependency: a 65-byte request_id
     /// is rejected `Malformed` at decode (so it never reaches the commit); a 64-byte and an EMPTY (len 0)
     /// request_id decode fine (the op proceeds to its own outcome, not `Malformed`). An empty id is
