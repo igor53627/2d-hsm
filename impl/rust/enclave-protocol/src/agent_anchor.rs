@@ -911,12 +911,18 @@ mod tests {
             reconcile(5, 3, &marks, &anchor(5, 2, marks)),
             ReconcileDecision::FailClosed(FailReason::Inconsistent)
         );
-        // Anchor ahead, same structural ⇒ AdoptForward (counter/spend gap).
+        // Anchor ahead, same structural ⇒ AdoptForward (counter/spend gap). This IS the slice-6-5
+        // post-commit-crash EpochOnly case: a counter/spend op committed epoch N+1 to the anchor then
+        // the enclave crashed before persist/swap, so on reboot sealed@N < anchor@(N+1) with the same
+        // structural_version ⇒ adopt the anchor's marks forward (recoverable).
         assert_eq!(
             reconcile(5, 2, &marks, &anchor(6, 2, [0x00; 32])),
             ReconcileDecision::AdoptForward { epoch: 6 }
         );
-        // Anchor ahead but structural ahead ⇒ StructuralGap (restore).
+        // Anchor ahead but structural ahead ⇒ StructuralGap (restore). This IS the slice-6-5
+        // post-commit-crash STRUCTURAL case: a GENERATE_KEYS (structural) op committed N+1 then crashed
+        // before swap ⇒ sealed@N < anchor@(N+1) with structural ahead ⇒ a gap the anchor can't supply
+        // (key material) ⇒ fail closed → restore.
         assert_eq!(
             reconcile(5, 2, &marks, &anchor(7, 3, [0x00; 32])),
             ReconcileDecision::FailClosed(FailReason::StructuralGap)

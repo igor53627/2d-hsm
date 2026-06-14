@@ -1574,6 +1574,46 @@ mod tests {
         );
     }
 
+    /// slice 6-5 VALIDATION PIN: the per-op commit reuses `env.request_id` VERBATIM as the anchor's
+    /// `(request_id, epoch)` idempotency key with NO length check of its own — its SOLE guard is this
+    /// envelope (key-4) decode bound, `MAX_REQUEST_ID_LEN`=64. Pin that dependency: a 65-byte request_id
+    /// is rejected `Malformed` at decode (so it never reaches the commit); a 64-byte and an EMPTY (len 0)
+    /// request_id decode fine (the op proceeds to its own outcome, not `Malformed`). An empty id is
+    /// admin-signed-capability-bound (the key-10 echo + payload_binding), NOT a host-substitute attack —
+    /// so the weakest legal id still requires admin authorship, never a host forgery.
+    #[test]
+    fn envelope_request_id_decode_bound_pins_the_anchor_idempotency_key() {
+        let body = base_body();
+        // A PUBLIC_IDENTITY (opcode 2) read envelope with a custom key-4 request_id and an unknown
+        // key_ref — drives the decode without needing a signed capability.
+        let read_env = |rid: Vec<u8>| {
+            enc(Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
+                (Value::Integer(2.into()), Value::Integer(2u64.into())),
+                (Value::Integer(3.into()), Value::Text(COMMAND_DOMAIN.to_string())),
+                (Value::Integer(4.into()), Value::Bytes(rid)),
+                (Value::Integer(6.into()), Value::Bytes(vec![0xfe; 32])),
+            ]))
+        };
+        // 65 bytes ⇒ Malformed (the >64 reject the anchor keying depends on — never reaches the commit).
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &read_env(vec![0x41; MAX_REQUEST_ID_LEN + 1]), &body)
+                .err(),
+            Some(AgentError::Malformed),
+            "a request_id over MAX_REQUEST_ID_LEN must fail closed at decode"
+        );
+        // 64-byte (boundary) and EMPTY both decode fine: the op proceeds to its own outcome (an unknown
+        // key_ref ⇒ NOT Malformed). Confirms the bound admits exactly [0, 64], incl the empty id.
+        for rid in [vec![0x41; MAX_REQUEST_ID_LEN], Vec::new()] {
+            assert_ne!(
+                dispatch_agent(Profile::AgentGateway, &read_env(rid.clone()), &body).err(),
+                Some(AgentError::Malformed),
+                "a request_id of len {} must decode (admin-cap-bound; not a Malformed reject)",
+                rid.len()
+            );
+        }
+    }
+
     #[test]
     fn generate_keys_request_id_mismatch_rejected() {
         use ed25519_dalek::SigningKey;

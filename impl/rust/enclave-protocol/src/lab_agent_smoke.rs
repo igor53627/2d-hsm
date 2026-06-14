@@ -237,12 +237,13 @@ pub(crate) fn lab_anchor_pump_one<S: std::io::Read + std::io::Write>(
     body: &KeystoreBody,
     signing_key: &ed25519_dalek::SigningKey,
     deadline: std::time::Instant,
+    ledger: &mut LabCommitLedger,
 ) -> Result<[u8; 8], crate::ProtocolError> {
     let frame = crate::read_framed_message_with_idle_deadline(conn, Some(deadline))?;
     match crate::peek_msg_type_from_frame(&frame) {
         Some(crate::MessageType::AgentBootRelay) => lab_anchor_freshness_reply(conn, &frame, body, signing_key, deadline),
         Some(crate::MessageType::AgentAnchorMarksRelay) => lab_anchor_marks_reply(conn, &frame, body, signing_key, deadline),
-        Some(crate::MessageType::AgentAnchorCommitRelay) => lab_anchor_commit_reply(conn, &frame, body, signing_key, deadline),
+        Some(crate::MessageType::AgentAnchorCommitRelay) => lab_anchor_commit_reply(conn, &frame, body, signing_key, deadline, ledger),
         _ => Err(crate::ProtocolError::WireProtocol(
             "lab anchor: only AGENT_BOOT_RELAY (0x41) / AGENT_ANCHOR_MARKS_RELAY (0x44) / AGENT_ANCHOR_COMMIT_RELAY (0x45) are answerable",
         )),
@@ -327,16 +328,29 @@ fn lab_anchor_marks_reply<S: std::io::Read + std::io::Write>(
     Ok(nonce8)
 }
 
+/// The lab anchor's durable commit record (slice 6-5): `(request_id, epoch) → (structural_version,
+/// marks_digest)`. Models the real anchor's idempotency/conflict contract so the deviceless tests can
+/// exercise the enclave's retry behaviour. (request_id, epoch) is the idempotency key; the nonce is
+/// deliberately NOT part of it (it is per-attempt, fresh).
+pub(crate) type LabCommitLedger = std::collections::HashMap<(Vec<u8>, u64), (u64, [u8; 32])>;
+
 /// The slice-6 0x45 per-op commit leg: validate + scope-guard, then a signed commit ACK ECHOING the
-/// proposed `(epoch, structural_version, marks_digest, nonce, request_id)` — i.e. the lab anchor
-/// "durably records" EXACTLY what the enclave proposed and signs it, so the guest's
-/// `verify_commit_ack_bytes` accepts. NO quote; the ACK is small → 4096 cap.
+/// proposed `(epoch, structural_version, marks_digest, nonce, request_id)`. slice 6-5 makes the lab
+/// anchor STATEFUL so it models the idempotency contract: it durably records the post-op
+/// `(structural_version, marks_digest)` keyed by `(request_id, epoch)` and
+/// - a retry under the SAME key with the SAME `{structural, marks}` is **idempotent** — it re-signs an
+///   ACK for the CURRENT (fresh per-op) nonce so the enclave's anti-replay echo passes, but does NOT
+///   advance the durable record again (no double-advance);
+/// - a second commit under the SAME key proposing DIFFERENT `{structural, marks}` is a **conflict** ⇒
+///   reject (the enclave then fails closed).
+/// NO quote; the ACK is small → 4096 cap.
 fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
     conn: &mut S,
     frame: &[u8],
     body: &KeystoreBody,
     signing_key: &ed25519_dalek::SigningKey,
     deadline: std::time::Instant,
+    ledger: &mut LabCommitLedger,
 ) -> Result<[u8; 8], crate::ProtocolError> {
     let req = crate::agent_boot_relay::decode_anchor_commit_request(frame)?;
     if req.chain_id != body.config.twod_chain_id
@@ -345,6 +359,22 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
         return Err(crate::ProtocolError::WireProtocol(
             "lab anchor: commit request scope does not match the provisioned smoke keystore",
         ));
+    }
+    // slice 6-5 idempotency/conflict on the (request_id, epoch) durability key. `.copied()` ends the
+    // immutable borrow so the None arm can insert; (u64, [u8;32]) is Copy.
+    let key = (req.request_id.clone(), req.new_epoch);
+    let proposed = (req.new_structural_version, req.marks_digest);
+    match ledger.get(&key).copied() {
+        Some(recorded) if recorded != proposed => {
+            return Err(crate::ProtocolError::WireProtocol(
+                "lab anchor: commit conflict — (request_id, epoch) already durably recorded with a \
+                 different (structural_version, marks_digest)",
+            ));
+        }
+        Some(_) => { /* idempotent retry: durable record UNCHANGED; re-sign with the current nonce below */ }
+        None => {
+            ledger.insert(key, proposed);
+        }
     }
     let response = crate::agent_anchor::test_signed_commit_ack_bytes(
         signing_key,
@@ -428,6 +458,9 @@ pub fn run_lab_anchor_stub() -> Result<std::convert::Infallible, crate::Protocol
         crate::ProtocolError::PqSigningUnavailable("lab anchor: TCP bind failed (see prior log line)")
     })?;
     stub_log(format_args!("listening on {listen}"));
+    // slice 6-5: ONE durable commit ledger across all connections — the anchor's idempotency/conflict
+    // state must survive per-connection lifetimes (a retry arrives on a fresh connection).
+    let mut commit_ledger = LabCommitLedger::new();
     for accepted in listener.incoming() {
         let mut conn = match accepted {
             Ok(conn) => conn,
@@ -446,7 +479,7 @@ pub fn run_lab_anchor_stub() -> Result<std::convert::Infallible, crate::Protocol
             continue;
         }
         let deadline = std::time::Instant::now() + STUB_PUMP_BUDGET;
-        match lab_anchor_pump_one(&mut conn, &body, &signing_key, deadline) {
+        match lab_anchor_pump_one(&mut conn, &body, &signing_key, deadline, &mut commit_ledger) {
             Ok(nonce8) => {
                 let mut hex8 = String::with_capacity(16);
                 for b in nonce8 {
@@ -887,9 +920,22 @@ mod tests {
 
     /// Drive ONE real stub pump over an in-memory stream pair: write `request_frame` into the
     /// peer end, run [`lab_anchor_pump_one`], return (pump result, every byte the stub wrote back).
+    /// Each call gets a FRESH commit ledger (a single commit is always first-seen), so existing
+    /// single-pump callers are unchanged; the idempotency test drives multiple pumps through a SHARED
+    /// ledger via [`drive_stub_pump_with_ledger`].
     fn drive_stub_pump(
         body: &KeystoreBody,
         request_frame: &[u8],
+    ) -> (Result<[u8; 8], crate::ProtocolError>, Vec<u8>) {
+        drive_stub_pump_with_ledger(body, request_frame, &mut LabCommitLedger::new())
+    }
+
+    /// Like [`drive_stub_pump`] but threads a caller-owned commit ledger, so a SEQUENCE of pumps shares
+    /// the anchor's durable `(request_id, epoch)` state (slice 6-5 idempotency/conflict tests).
+    fn drive_stub_pump_with_ledger(
+        body: &KeystoreBody,
+        request_frame: &[u8],
+        ledger: &mut LabCommitLedger,
     ) -> (Result<[u8; 8], crate::ProtocolError>, Vec<u8>) {
         use std::io::{Read as _, Write as _};
         let (mut stub_end, mut peer_end) =
@@ -901,7 +947,7 @@ mod tests {
         peer_end.write_all(request_frame).and_then(|()| peer_end.flush()).expect("write request");
         let key = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let outcome = lab_anchor_pump_one(&mut stub_end, body, &key, deadline);
+        let outcome = lab_anchor_pump_one(&mut stub_end, body, &key, deadline, ledger);
         drop(stub_end); // close-on-fault / close-after-response either way → peer sees EOF
         let mut written_back = Vec::new();
         let _ = peer_end.read_to_end(&mut written_back);
@@ -1048,6 +1094,74 @@ mod tests {
             &body.config,
         )
         .expect("stub commit ack passes the REAL guest verify path");
+    }
+
+    /// slice 6-5 idempotency + conflict: the lab anchor durably records `(request_id, epoch) →
+    /// {structural, marks}`. A RETRY of the same op (same key + same `{structural,marks}`) with a FRESH
+    /// nonce re-signs an ack the guest verifies for THAT nonce — no double-advance of the durable
+    /// record. A second commit under the same key proposing DIFFERENT marks is a CONFLICT the anchor
+    /// rejects (no ack), which the enclave's `run_anchor_commit` would surface as a commit failure ⇒
+    /// fail closed. (request_id, epoch) is the idempotency key; the nonce is per-attempt, never part of it.
+    #[test]
+    fn stub_commit_idempotent_per_request_id_and_rejects_conflict() {
+        let body = smoke_body();
+        let chain_id = body.config.twod_chain_id;
+        let env = body.config.environment_identifier.clone();
+        let epoch = body.freshness_epoch + 1;
+        let structural = body.structural_version + 1;
+        let marks = body.compute_local_marks_digest();
+        let request_id: &[u8] = b"op-idem";
+        let commit_frame = |marks: [u8; 32], nonce: [u8; 32]| {
+            crate::agent_boot_relay::encode_anchor_commit_request(
+                &crate::agent_boot_relay::AnchorCommitRequest {
+                    chain_id,
+                    environment_identifier: &env,
+                    new_epoch: epoch,
+                    new_structural_version: structural,
+                    marks_digest: marks,
+                    nonce,
+                    request_id,
+                },
+            )
+            .unwrap()
+        };
+        let verify = |written: Vec<u8>, nonce: &[u8; 32], marks: &[u8; 32]| {
+            let ack = crate::agent_boot_relay::read_bounded_anchor_response(
+                &mut std::io::Cursor::new(written),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect("stub framed an ack");
+            crate::agent_anchor::verify_commit_ack_bytes(
+                &ack,
+                &crate::agent_anchor::ExpectedCommitAck {
+                    nonce,
+                    epoch,
+                    structural_version: structural,
+                    marks_digest: marks,
+                    request_id,
+                },
+                &body.config,
+            )
+        };
+
+        let mut ledger = LabCommitLedger::new();
+        let (n_a, n_b) = ([0xa1_u8; 32], [0xb2_u8; 32]);
+        // (1) First commit (nonce A) → first-seen: recorded + signed; verifies for A.
+        let (o1, w1) = drive_stub_pump_with_ledger(&body, &commit_frame(marks, n_a), &mut ledger);
+        o1.expect("first commit ok");
+        verify(w1, &n_a, &marks).expect("first ack verifies for nonce A");
+        // (2) RETRY same op (same key + same {structural,marks}) with FRESH nonce B → idempotent:
+        //     re-signed for B, durable record UNCHANGED.
+        let (o2, w2) = drive_stub_pump_with_ledger(&body, &commit_frame(marks, n_b), &mut ledger);
+        o2.expect("idempotent retry ok");
+        verify(w2, &n_b, &marks).expect("retry ack is re-signed for the CURRENT nonce B");
+        assert_eq!(ledger.len(), 1, "an idempotent retry does NOT add a second durable record");
+        // (3) CONFLICT: same (request_id, epoch) but DIFFERENT marks ⇒ the anchor REJECTS (no ack).
+        let conflicting = [0xcc_u8; 32];
+        let (o3, w3) = drive_stub_pump_with_ledger(&body, &commit_frame(conflicting, n_a), &mut ledger);
+        assert!(o3.is_err(), "a conflicting proposal under the same (request_id, epoch) is rejected");
+        assert!(w3.is_empty(), "a rejected conflict writes NO ack (the enclave then fails closed)");
+        assert_eq!(ledger.len(), 1, "the conflicting commit did NOT alter the durable record");
     }
 
     #[test]
