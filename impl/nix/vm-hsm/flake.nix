@@ -38,6 +38,11 @@
         enclave-agent-gateway = pkgs.callPackage ./enclave.nix {
           profile = "agent-gateway";
         };
+        # TASK-7.7 6-7b-ii: the SAME serve bin built WITH agent-keygen-exec-preview — so the guest
+        # executes GENERATE_KEYS (write-path smoke). SEPARATE derivation (preview is release-banned).
+        enclave-agent-gateway-keygen = pkgs.callPackage ./enclave.nix {
+          profile = "agent-gateway-keygen";
+        };
         # TASK-1.1: SNP firmware-derived pq-seal provisioning root boot helper.
         snp-derive-root = pkgs.callPackage ./snp-derive-root.nix { };
         flakeMeta = {
@@ -159,6 +164,23 @@
           guestProfile = "production-lab";
           agentGatewayPackage = enclave-agent-gateway;
         };
+        # TASK-7.7 6-7b-ii: the WRITE-path smoke image — identical to the read-path agent-gateway image
+        # but the serve unit runs the agent-keygen-exec-preview build, so the host's
+        # twod-hsm-agent-keygen-smoke-client can drive a real GENERATE_KEYS (see
+        # run-nix-snp-agent-keygen-smoke.sh). The serve unit already provisions
+        # TWOD_HSM_PQ_SEAL_V1_ROOT_FILE = the lab reference root (= SMOKE_SEAL_ROOT), so the guest's
+        # resealed blob unseals under the same root the host client expects.
+        diskProductionLabAgentKeygenSmoke = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
+          guestProfile = "production-lab";
+          agentGatewayPackage = enclave-agent-gateway-keygen;
+        };
         ceremonySignerPath = ./ceremony-sealed-signer.bin;
         diskProductionLabSnpRooted = import ./disk-image.nix {
           inherit
@@ -185,6 +207,9 @@
           # its long-running unit + journald witness).
           inherit enclave-agent-gateway;
           disk-production-lab-agent-gateway = diskProductionLabAgentGateway;
+          # TASK-7.7 6-7b-ii write-path (GENERATE_KEYS) live smoke: preview serve bin + bootable image.
+          inherit enclave-agent-gateway-keygen;
+          disk-production-lab-agent-keygen-smoke = diskProductionLabAgentKeygenSmoke;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;

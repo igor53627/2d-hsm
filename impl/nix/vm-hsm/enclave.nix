@@ -17,10 +17,17 @@ let
   # (the only wired keystore source today; release-banned ⇒ this MUST stay a debug build) — and
   # NOT lab-agent-smoke (that feature gates HOST-side smoke tooling, never a guest bin).
   agentGateway = profile == "agent-gateway";
+  # TASK-7.7 6-7b-ii: the WRITE-path smoke build — the SAME `twod-hsm-agent-gateway` bin as
+  # `agent-gateway`, but with `agent-keygen-exec-preview` ADDED so the guest actually executes
+  # GENERATE_KEYS (seal→commit→swap→emit) and installs the per-op commit channel at boot (6-4b's
+  # cfg-gated step G'). preview is release-banned (compile_error under STRICT_RELEASE_GUARDS), so this
+  # stays a debug build for the same reason as `agent-gateway`. A SEPARATE profile (not a flag on the
+  # read-path image) keeps the preview feature off the read-path smoke.
+  agentGatewayKeygen = profile == "agent-gateway-keygen";
   pname =
     if staging then "enclave-vsock-staging"
     else if quoteSmoke then "twod-hsm-quote-smoke"
-    else if agentGateway then "twod-hsm-agent-gateway"
+    else if (agentGateway || agentGatewayKeygen) then "twod-hsm-agent-gateway"
     else "enclave-vsock";
   buildFeatures =
     if staging then
@@ -29,14 +36,17 @@ let
       [ "lab-production-vsock" ]
     else if quoteSmoke then
       [ "agent-gateway" "vsock-transport" "lab-quote-smoke" ]
+    else if agentGatewayKeygen then
+      [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" "agent-keygen-exec-preview" ]
     else if agentGateway then
       [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" ]
     else
       [ "production-vsock" ];
-  # quoteSmoke/agentGateway MUST stay debug builds: lab-quote-smoke / lab-agent-keystore-from-file are
-  # release-banned (lib.rs compile_errors), and debug ⇒ TWOD_HSM_STRICT_RELEASE_GUARDS unset ⇒ the
-  # bans do not trip (by design). The release-built agent spawn shape stays the recorded 5b-2c residual.
-  debugBuild = staging || labProd || transportSmoke || quoteSmoke || agentGateway;
+  # quoteSmoke/agentGateway/agentGatewayKeygen MUST stay debug builds: lab-quote-smoke /
+  # lab-agent-keystore-from-file / agent-keygen-exec-preview are release-banned (lib.rs compile_errors),
+  # and debug ⇒ TWOD_HSM_STRICT_RELEASE_GUARDS unset ⇒ the bans do not trip (by design). The
+  # release-built agent spawn shape stays the recorded 5b-2c residual.
+  debugBuild = staging || labProd || transportSmoke || quoteSmoke || agentGateway || agentGatewayKeygen;
 in
 
 rustPlatform.buildRustPackage {

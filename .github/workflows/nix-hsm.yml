@@ -212,6 +212,8 @@ jobs:
           # smoke image (exercises the lab-only eval asserts' PASS side on every CI run).
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-quote-smoke.drvPath
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-gateway.drvPath
+          # TASK-7.7 6-7b-ii: the WRITE-path (GENERATE_KEYS) smoke image — same agent unit, preview build.
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-keygen-smoke.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).
