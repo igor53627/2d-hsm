@@ -451,8 +451,10 @@ fn cap_to_map(c: &Capability) -> Vec<(Value, Value)> {
 }
 
 /// Build a fully-valid signed capability map for tests (other modules' integration tests use this to
-/// exercise the wired dispatch seam). `key_purpose`/`payload_binding` use fixed placeholders since
-/// the verify-only path does not check them.
+/// exercise the wired dispatch seam). `key_purpose` and `payload_binding` are caller-supplied: callers
+/// that only exercise the verify-only path may pass placeholders, but the GENERATE_KEYS exec path
+/// (`handle_generate_keys`) DOES check both (purpose → 0x42, payload_binding → 0x43 on mismatch), so the
+/// 6-7b lab write-path client passes the genuine purpose + the matching `payload_binding`.
 ///
 /// Also reachable under the release-banned `lab-agent-smoke` + `agent-keygen-exec-preview` combo
 /// (slice 6-7b): the lab write-path smoke client mints a valid GENERATE_KEYS cap against the smoke

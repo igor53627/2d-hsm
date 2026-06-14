@@ -913,13 +913,14 @@ fn assert_generate_keys_success(
     if list.len() != count {
         return Err(format!("expected {count} minted keys, got {}", list.len()));
     }
+    let mut minted_refs: Vec<Vec<u8>> = Vec::with_capacity(count);
     for (i, entry) in list.iter().enumerate() {
         let em = match entry {
             Value::Map(em) => em.as_slice(),
             _ => return Err(format!("minted key {i} is not a CBOR map")),
         };
         match map_get(em, 1) {
-            Some(Value::Bytes(b)) if b.len() == 32 => {}
+            Some(Value::Bytes(b)) if b.len() == 32 => minted_refs.push(b.clone()),
             _ => return Err(format!("minted key {i}: key_ref (entry key 1) is not 32 bytes")),
         }
         match map_get(em, 2) {
@@ -930,6 +931,17 @@ fn assert_generate_keys_success(
         if purpose != Some(SMOKE_KEYGEN_PURPOSE) {
             return Err(format!("minted key {i}: purpose (entry key 5) != transfer (got {purpose:?})"));
         }
+    }
+    // The minted key_refs must be mutually DISTINCT and distinct from the seeded SMOKE_KEY_REF — else a
+    // regression that minted colliding refs (or re-emitted the seeded one) would slip past the count check.
+    let mut uniq = minted_refs.clone();
+    uniq.sort();
+    uniq.dedup();
+    if uniq.len() != minted_refs.len() {
+        return Err("minted key_refs are not mutually distinct".to_string());
+    }
+    if minted_refs.iter().any(|r| r.as_slice() == SMOKE_KEY_REF.as_slice()) {
+        return Err("a minted key_ref collides with the seeded SMOKE_KEY_REF".to_string());
     }
     let blob = match map_get(m, 2) {
         Some(Value::Bytes(b)) => b.as_slice(),
@@ -948,6 +960,11 @@ fn assert_generate_keys_success(
             resealed.entries.len(),
             base.entries.len()
         ));
+    }
+    // The pre-existing seeded entry MUST survive the swap (the op APPENDS; a regression that clobbered or
+    // dropped it while minting an extra key would still hit the count above — pin it explicitly).
+    if !resealed.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF) {
+        return Err("the seeded SMOKE_KEY_REF entry did not survive the GENERATE_KEYS swap".to_string());
     }
     // 6-4: GENERATE_KEYS is a Structural op ⇒ the ATOMIC per-op bump advances structural_version AND
     // freshness_epoch together by exactly +1, regardless of `count`.
@@ -1011,20 +1028,22 @@ where
         let env = smoke_generate_keys_envelope(b"keygen-smoke-w1", 1, 2, &admin);
         let m = smoke_round_trip(&mut conn, &env)?;
         assert_generate_keys_success(&m, 2)?;
-        Ok("2 transfer keys minted; resealed blob unseals with entries+1op, structural+1, epoch+1 \
-            (seal→commit→ack→swap→emit held)"
+        Ok("2 transfer keys minted; resealed blob unseals with entries+2, structural+1, epoch+1 \
+            (one Structural op; seal→commit→ack→swap→emit held)"
             .to_string())
     });
 
     // W2: the auth gate stays live-pinned — a cap signed by the WRONG key is rejected 0x43 BEFORE any
-    // seal/commit (fail-closed), so a forged authority can never reach the anchor. The 0x43 is
-    // DETERMINISTIC even though W1 just advanced the live keystore: verify_capability's Ed25519
-    // verify_strict rejects the wrong-key signature AHEAD OF / INDEPENDENT OF any state-dependent check
-    // (the contiguous-counter monotonicity check), so this can never collapse to a counter/cap-state code.
+    // seal/commit (fail-closed), so a forged authority can never reach the anchor. counter=2 is
+    // LOAD-BEARING for non-vacuity: W1 consumed counter 1 on this scope, so 2 is the NEXT-CONTIGUOUS the
+    // counter check would ACCEPT. Thus the ONLY thing that can reject this cap is the signature check —
+    // a regression that bypassed or reordered verify_capability's Ed25519 verify ahead of the counter
+    // check would let this cap EXECUTE (return a success body), failing this phase. (A stale counter=1
+    // would have rejected 0x43 via the contiguity check even with the signature gate broken, hiding it.)
     phase!("generate-keys-bad-cap", {
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let wrong = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32]);
-        let env = smoke_generate_keys_envelope(b"keygen-smoke-w2", 1, 1, &wrong);
+        let env = smoke_generate_keys_envelope(b"keygen-smoke-w2", 2, 1, &wrong);
         let m = smoke_round_trip(&mut conn, &env)?;
         match (map_u64(&m, 1), map_get_text(&m, 2)) {
             (Some(code), Some(reason))
@@ -1709,7 +1728,10 @@ mod tests {
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         // commit_before_emit seals via resolve_provisioning_root(); force the None→reference-root
         // fallthrough so the seal uses SMOKE_SEAL_ROOT and the client's unseal matches (guarded against
-        // a stale platform root a serialized agent-global test may have left set).
+        // a stale platform root a serialized agent-global test may have left set). NB the seal root is a
+        // `seal_root`-module global (NOT one of the agent globals `lock_and_reset_agent_process_globals`
+        // manages), so it is reset HERE; resetting to None leaves it in the process-start PRISTINE state
+        // (const-init None), so this is symmetric-by-default — no teardown restore is owed.
         crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
         assert!(crate::agent_dispatch::install_agent_keystore(
             smoke_body(),
