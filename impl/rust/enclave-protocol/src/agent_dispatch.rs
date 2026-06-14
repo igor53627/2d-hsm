@@ -864,6 +864,51 @@ fn sealed_optout_acknowledged(_keystore: &KeystoreBody) -> bool {
     false
 }
 
+/// TASK-7.7 slice 6-7 shared SEAL-BEFORE-EMIT seam: the ONE audited seal → anchor-commit → swap → emit
+/// ordering over a mutated CANDIDATE body, so every mutating opcode goes through it instead of
+/// copy-pasting the order (GENERATE_KEYS today; the deferred CONFIGURE_TREASURY / EXPORT_BACKUP /
+/// RESTORE_BACKUP handlers reuse it when they land). `encode_response` is the ONLY per-opcode part — it
+/// builds the success body from the sealed blob and is called ONLY AFTER the commit succeeds, so nothing
+/// op-specific is emitted before the anchor durably records the advance.
+///
+/// Order: SEAL (compute) → COMMIT (durable anchor advance) → SWAP → EMIT. The seal is computed FIRST
+/// because it is SIDE-EFFECT-FREE — it validates + CBOR-encodes + AEADs into a local buffer, persisting
+/// and emitting NOTHING. Doing it before the commit makes any DETERMINISTIC seal failure (`BlobTooLarge`
+/// for an over-cap batch, or a `validate()` reject) fail closed (0x46) with NO anchor commit, so the
+/// anchor can never advance to a structural state that was never sealed (which would force a spurious
+/// next-boot StructuralGap→restore). The COMMIT still strictly precedes the SWAP/EMIT, so the anchor
+/// never lags the emitted state — the anti-rollback invariant (anchor ≥ any sealed/emitted state) holds.
+/// ANY commit failure (no channel, transport, ack mismatch) ⇒ fail closed: live state UNTOUCHED, NO swap,
+/// NO signature/refs emitted (no offline window). Called UNDER the `INSTALLED_KEYSTORE` guard (serial) —
+/// the two-lock order is KEYSTORE→COMMIT_CHANNEL. A crash AFTER the ack but BEFORE the swap leaves the
+/// anchor ahead → next-boot reconcile StructuralGap→restore (the structural-op case), recoverable, never
+/// a silent loss. INVARIANT: `candidate` is read by BOTH `seal_body` and `commit_candidate_to_anchor`;
+/// the committed `{epoch, structural, marks}` MUST equal the sealed body's, so it is NOT mutated between
+/// them here (and a future caller MUST pass a candidate already finalized).
+fn commit_before_emit<F: FnOnce(&[u8]) -> Vec<u8>>(
+    candidate: Box<KeystoreBody>,
+    request_id: &[u8],
+    measurement: Vec<u8>,
+    guard: &mut Option<InstalledAgentKeystore>,
+    encode_response: F,
+) -> Vec<u8> {
+    let sealed = match crate::seal_root::resolve_provisioning_root() {
+        Ok(root) => match seal_body(&candidate, &root, &measurement) {
+            Ok(blob) => blob,
+            Err(_) => return encode_agent_error(AgentError::SealFailed),
+        },
+        Err(_) => return encode_agent_error(AgentError::SealFailed),
+    };
+    if let Err(e) = commit_candidate_to_anchor(&candidate, request_id) {
+        return encode_agent_error(e);
+    }
+    let body = encode_response(&sealed);
+    // Swap the live in-memory slot so subsequent commands see the advanced state; durability is the
+    // host's job (it persists the sealed blob returned in `body`).
+    *guard = Some(InstalledAgentKeystore { body: *candidate, measurement });
+    body
+}
+
 /// Frame-layer entry point: dispatch a `0x40` inner-envelope `payload` against the installed
 /// keystore and return the encoded response BODY — a per-opcode success map or a §10.9 error map.
 /// Always returns a body (never errors out of band), so the wire layer just frames it. Profile is
@@ -896,39 +941,12 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
     };
     match outcome {
         Ok(AgentResponse::GenerateKeys { keys, candidate, request_id }) => {
-            // TASK-7.7 slice 6-4 SEAL-BEFORE-EMIT. Order: SEAL (compute) → COMMIT (durable anchor
-            // advance) → SWAP → EMIT. The seal is computed FIRST because it is SIDE-EFFECT-FREE — it
-            // validates + CBOR-encodes + AEADs into a local buffer, persisting and emitting NOTHING.
-            // Doing it before the commit makes any DETERMINISTIC seal failure — `BlobTooLarge` for an
-            // over-cap keygen batch (host-influenced count), or a `validate()` reject — fail closed
-            // (0x46) with NO anchor commit, so an oversize request can no longer durably advance the
-            // anchor to a structural state that was never sealed (which would force a spurious next-boot
-            // StructuralGap→restore for a recoverable condition). The COMMIT still strictly precedes the
-            // SWAP/EMIT, so the anchor never lags the emitted state — the anti-rollback invariant
-            // (anchor ≥ any sealed/emitted state) is preserved. ANY commit failure (no channel,
-            // transport, ack mismatch) ⇒ fail closed: live state UNTOUCHED, NO swap, NO signature/refs
-            // emitted (no offline window). Runs under the INSTALLED_KEYSTORE `guard` (serial) — the
-            // two-lock order is KEYSTORE→COMMIT_CHANNEL. A crash AFTER the ack but BEFORE the swap
-            // leaves the anchor ahead → next-boot reconcile StructuralGap→restore (the structural-op
-            // case), recoverable, never a silent loss. [Reached only under agent-keygen-exec-preview.]
-            // INVARIANT for any future edit (e.g. the 6-7 shared seam): `candidate` is read by BOTH
-            // `seal_body` and `commit_candidate_to_anchor`; the committed `{epoch, structural, marks}`
-            // MUST equal the sealed body's, so do NOT mutate `candidate` between the seal and the commit.
-            let sealed = match crate::seal_root::resolve_provisioning_root() {
-                Ok(root) => match seal_body(&candidate, &root, &measurement) {
-                    Ok(blob) => blob,
-                    Err(_) => return encode_agent_error(AgentError::SealFailed),
-                },
-                Err(_) => return encode_agent_error(AgentError::SealFailed),
-            };
-            if let Err(e) = commit_candidate_to_anchor(&candidate, &request_id) {
-                return encode_agent_error(e);
-            }
-            let body = encode_generate_keys_response(&keys, &sealed);
-            // Swap the live in-memory slot so subsequent commands see the advanced counter + new
-            // keys; durability is the host's job (it persists `sealed`, returned above).
-            *guard = Some(InstalledAgentKeystore { body: *candidate, measurement });
-            body
+            // GENERATE_KEYS (the only LIVE mutating opcode, agent-keygen-exec-preview) goes through the
+            // shared seal-before-emit seam. The only op-specific part is the success-body encoder
+            // (key list + the sealed blob), invoked by the seam ONLY after the anchor commit succeeds.
+            commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
+                encode_generate_keys_response(&keys, sealed)
+            })
         }
         Ok(resp) => encode_agent_response(&resp),
         Err(e) => encode_agent_error(e),
