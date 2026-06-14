@@ -836,7 +836,7 @@ const SMOKE_KEYGEN_PURPOSE: u64 = 1;
 #[cfg(feature = "agent-keygen-exec-preview")]
 const EXPECTED_CAP_REJECTED_CODE: u64 = 0x43;
 /// The scope_target the write-path smoke commits its GENERATE_KEYS batch under (the per-authority
-/// contiguous-counter key); a single in-repo constant so the cap and any future multi-op phase agree.
+/// contiguous-counter key); a single in-repo constant for the cap's scope binding.
 #[cfg(feature = "agent-keygen-exec-preview")]
 const SMOKE_KEYGEN_SCOPE_TARGET: &[u8] = b"smoke-generate-transfer";
 
@@ -999,6 +999,10 @@ where
         }};
     }
 
+    // Each phase uses a DISTINCT envelope request_id (`keygen-smoke-w1` / `-w2`): per-op uniqueness is
+    // the 6-5 anchor-idempotency contract (a REUSED id would conflate the op — the anchor would idempotently
+    // re-sign for the recorded state instead of recording a fresh advance), and only W1 commits.
+
     // W1: the core acceptance — a REAL signed GENERATE_KEYS (count=2) executes the full
     // seal→commit→ack-verify→swap→emit path and returns the minted keys + the resealed blob.
     phase!("generate-keys", {
@@ -1013,7 +1017,10 @@ where
     });
 
     // W2: the auth gate stays live-pinned — a cap signed by the WRONG key is rejected 0x43 BEFORE any
-    // seal/commit (fail-closed), so a forged authority can never reach the anchor.
+    // seal/commit (fail-closed), so a forged authority can never reach the anchor. The 0x43 is
+    // DETERMINISTIC even though W1 just advanced the live keystore: verify_capability's Ed25519
+    // verify_strict rejects the wrong-key signature AHEAD OF / INDEPENDENT OF any state-dependent check
+    // (the contiguous-counter monotonicity check), so this can never collapse to a counter/cap-state code.
     phase!("generate-keys-bad-cap", {
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let wrong = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32]);
@@ -1642,7 +1649,11 @@ mod tests {
     /// The deviceless per-op commit channel: signs commit ACKs with the smoke `anchor_root`
     /// ([`LAB_ANCHOR_TEST_SEED`]) via the SAME pure [`lab_commit_ack_for_request`] the aya
     /// `twod-hsm-lab-anchor` stub runs — so the in-process write-path proof and the live anchor can
-    /// never drift on the commit semantics.
+    /// never drift on the commit semantics. `body` is the STATIC `smoke_body()` (epoch/structural at
+    /// boot): correct here because W1 is the ONLY committing phase (W2's cap is rejected pre-commit) and
+    /// the commit leg only scope-guards + signs the enclave's PROPOSED state — it does not re-derive
+    /// state from `body`. A future SECOND committing phase would need the channel to track post-commit
+    /// advancement (or re-derive its body) so its scope-guard still matches.
     #[cfg(feature = "agent-keygen-exec-preview")]
     struct LabCommitChannel {
         body: KeystoreBody,
