@@ -44,4 +44,20 @@ The max-effort review (27 candidates → 13 verified) found **0 critical/high an
 - **[liveness coupling, Low — documented]** `marks_dominate_local` belt fail-closes a hash-gate-PASSING adopt if the (not-yet-frozen) anchor data model ever legitimately prunes/lowers a local counter row. Never a wrong-accept (the hash gate authenticated first); availability-only. Revisit when the anchor data model freezes (already noted in the belt's doc-comment).
 
 Source: PR #69 code-review-max workflow wf_36523dbd (40 agents). The Medium + the host-relay bucket were fixed in-PR; these Lows are the parked residual.
+
+---
+
+### 6-4b residual (from the PR #74 compact, 2026-06-14)
+
+The 6-4b branch compact (roborev job 7314) re-surfaced one **High-labelled** finding: the `0x45` anchor-commit REQUEST carries only `{scope, proposed state, nonce, request_id}` with **no enclave-authenticated MAC/signature or boot-attested session binding**, so a compromised host/relay can forge/substitute well-formed commit requests and make the anchor durably advance/sign attacker-chosen state.
+
+**Adversarially verified DoS-only (2 independent agents) — NOT a wrong-accept / rollback, NOT a 6-4b regression, accepted residual:**
+- **No wrong-accept:** the enclave seals/swaps/emits ONLY after `verify_commit_ack_bytes` passes — Ed25519 `verify_strict` against the **sealed** `anchor_root` + echo of the enclave's OWN fresh per-op CSPRNG nonce (`draw_commit_nonce`) + `{epoch, structural, marks, request_id}`. A host holds only the public `anchor_root` (verify-only) so it cannot mint any valid ACK; a replayed genuine ACK fails the fresh-nonce echo. The enclave never adopts host-proposed state.
+- **No rollback:** the anchor is forward-only (`advance_commit_epoch` checked, monotone); a forged commit can only ADVANCE it → next-boot `reconcile` → `FailClosed(StructuralGap|AnchorBehind)` (recoverable, fail-closed). LOWERING the anchor is an anchor-side capability, not the host's — the documented residual is "a compromised operator who can ALSO roll the anchor back" (`agent-gateway-anti-rollback.md §3/§7`).
+- **DoS-only + already conceded:** the host already relays all enclave↔anchor traffic + controls VM scheduling, so it can already wedge custody by dropping commits — the explicitly **accepted** "liveness-DoS availability residual" (§7: "fail-closed — no fund loss, no rollback, and the host gains nothing"). Forging adds no new power.
+- **Design property, not new:** "the request is not signature-bound" is a deliberate decision (§5, same model as the `0x41` boot request); the `0x45` request format was FROZEN in slice 6-1 (PR #70). 6-4b only makes the path REACHABLE — under the OFF-BY-DEFAULT, release-banned `agent-keygen-exec-preview` gate (non-production).
+
+**Parked OPTIONAL hardening (defense-in-depth vs the host-DoS variant; NOT required for safety):** bind `0x45` commit requests to the boot-attested enclave session — e.g. an enclave-held ephemeral MAC/signing key derived during the attested boot handshake, which the anchor verifies before any durable commit/ACK. This is a `0x45` wire + **anchor-side** protocol change (6-1-level, and it requires the anchor implementation to enforce it), so it belongs with a future anchor-protocol hardening pass, not the preview-gated boot wiring. User decision (2026-06-14): accept the documented DoS-only residual, merge 6-4b, park this hardening here.
+
+Source: PR #74 compact job 7314 + the 2-agent adversarial verification (DoS-only, no wrong-accept/rollback).
 <!-- SECTION:DESCRIPTION:END -->
