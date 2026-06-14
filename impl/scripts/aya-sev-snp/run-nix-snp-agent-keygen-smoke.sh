@@ -168,9 +168,12 @@ grep -aq 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" || { echo "[FAIL] 
 (( R2_PASS == 1 )) || { fail_dump; exit 1; }
 echo "      R2 boot-to-Ready OK (handshake forwarded, signed, Ready before serve)"
 
-# Snapshot the boot-leg counts so R3 can require the W1 per-op COMMIT to add a NEW anchor sign + relay pump.
-ANCHOR_SIGNS_PRE="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null || echo 0)"
-RELAY_PUMPS_PRE="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null || echo 0)"
+# Snapshot the boot-leg counts so R3 can require a NEW anchor sign + relay pump after boot.
+# `|| true` (NOT `|| echo 0`): `grep -c` already prints `0` and exits non-zero on no-match — chaining
+# `echo 0` would yield the two-line value "0\n0" and break the later `(( ))` compare (a latent bug the
+# R2 gate masks today since both counts are already ≥1). `|| true` keeps grep's own `0`.
+ANCHOR_SIGNS_PRE="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null || true)"
+RELAY_PUMPS_PRE="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null || true)"
 
 # R3: the write-path client phases (fresh connection per phase; each commits via the relay+anchor).
 set +e
@@ -189,23 +192,36 @@ fi
 echo "      R3 client phases OK"
 grep -a 'twod-hsm-agent-keygen-smoke: PHASE ' "$CLIENT_LOG" | sed 's/^/        /' || true
 
-# R3 commit-witness: W1's per-op commit MUST have round-tripped a NEW 0x45 through relay+anchor (the
-# seal→COMMIT→swap proof on the wire, not just the client's in-band assertion). Bounded wait — the
-# guest writes the anchor/relay lines asynchronously after the client's W1 reply.
-R3_COMMIT_OK=0
+# R3 wire-liveness belt: require a NEW anchor sign + relay pump AFTER the boot snapshot — evidence the
+# guest exercised the anchor/relay transport again post-boot (which the W1 GENERATE_KEYS commit does).
+#
+# SCOPE (honest, per the matrix review): this is a BELT, NOT a commit-isolated proof. The lab anchor
+# stub logs one generic "signed response" for every leg, so a count delta alone cannot attribute the
+# round-trip to W1 specifically vs. a crash-loop boot-freshness re-run or a (broken-auth) W2 commit.
+# The AUTHORITATIVE write-path proofs are the client's IN-BAND per-phase assertions, already required
+# above by `RESULT PASS phases=2`:
+#   - W1 (`generate-keys`): the reply's resealed blob UNSEALS to entries+2/structural+1/epoch+1 — which,
+#     by `commit_before_emit`'s strict seal→COMMIT→swap→emit ordering (agent_dispatch.rs), the guest can
+#     only have produced if the per-op anchor commit succeeded on the wire.
+#   - W2 (`generate-keys-bad-cap`): the exact `0x43` proves the wrong-key cap was rejected at
+#     verify_capability BEFORE any commit (a commit would have returned success, failing the phase).
+# A positively-attributed wire witness (snapshot BETWEEN W1 and W2 + a commit-specific stub marker,
+# asserting +1 after W1 and NO further increase after W2) is a worthwhile NEXT-iteration hardening —
+# it would need a stub log change + a re-run, so it is deferred, not blocking (the in-band gate dominates).
+R3_WIRE_OK=0
 for _ in $(seq 1 20); do
-  ANCHOR_SIGNS_NOW="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null || echo 0)"
-  RELAY_PUMPS_NOW="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null || echo 0)"
+  ANCHOR_SIGNS_NOW="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null || true)"
+  RELAY_PUMPS_NOW="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null || true)"
   if (( ANCHOR_SIGNS_NOW > ANCHOR_SIGNS_PRE && RELAY_PUMPS_NOW > RELAY_PUMPS_PRE )); then
-    R3_COMMIT_OK=1; break
+    R3_WIRE_OK=1; break
   fi
   sleep 1
 done
-if (( R3_COMMIT_OK != 1 )); then
-  echo "[FAIL] R3: no NEW anchor-signed commit ACK + relay pump after boot — the W1 GENERATE_KEYS did not commit through the relay" >&2
+if (( R3_WIRE_OK != 1 )); then
+  echo "[FAIL] R3: no NEW anchor sign + relay pump after boot — the guest never re-exercised the commit transport (the in-band RESULT PASS above is the authoritative proof; this belt should also hold)" >&2
   fail_dump; exit 1
 fi
-echo "      R3 commit-witness OK (W1 per-op commit round-tripped a fresh 0x45 via relay+anchor)"
+echo "      R3 wire-liveness belt OK (a fresh post-boot anchor/relay round-trip occurred; W1's in-band unseal is the authoritative commit proof)"
 
 # R4 witnesses (bounded wait for the in-guest journald witness + clean close; no idle phase here).
 for _ in $(seq 1 30); do

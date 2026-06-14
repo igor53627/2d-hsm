@@ -109,7 +109,7 @@ composition 1+0 on real AF_VSOCK.**
 
 | Script | Flake disk | Pass signals |
 |--------|------------|--------------|
-| `run-nix-snp-agent-keygen-smoke.sh` | `.#disk-production-lab-agent-keygen-smoke` (the SAME serve unit, built WITH `agent-keygen-exec-preview`) | R1–R4 all hold (script header): anchor stub + relay up BEFORE qemu; R2 boot evidence (budget events, `[info] boot handshake outcome:` BEFORE the serve marker, relay `pump ok` + anchor `signed response`); R3 = the host client's **`RESULT PASS phases=2`** AND a commit-witness (a NEW anchor `signed response` + relay `pump ok` AFTER boot = the W1 per-op 0x45 commit round-tripped); R4 = in-guest `journald-serve PASS` + NO `connection fault`. |
+| `run-nix-snp-agent-keygen-smoke.sh` | `.#disk-production-lab-agent-keygen-smoke` (the SAME serve unit, built WITH `agent-keygen-exec-preview`) | R1–R4 all hold (script header): anchor stub + relay up BEFORE qemu; R2 boot evidence (budget events, `[info] boot handshake outcome:` BEFORE the serve marker, relay `pump ok` + anchor `signed response`); R3 = the host client's **`RESULT PASS phases=2`** (the AUTHORITATIVE write-path proof — W1's in-band resealed-blob unseal) PLUS a post-boot anchor/relay wire-liveness belt; R4 = in-guest `journald-serve PASS` + NO `connection fault`. |
 | `DISK_ATTR=disk-production-lab-agent-keygen-smoke run-kvm-agent-refusal.sh` | same image | **EXPECTED REFUSAL** (same boot wrapper as the read-path image): handshake `[warn]` + `[err] agent-gateway boot failed:` + restart evidence + NO `serving on vsock`. |
 
 ### 6-7b-ii acceptance checklist
@@ -126,9 +126,13 @@ validated by the build getting past `twod-hsm-lab-agent-smoke-keystore.drv`.
   preview `twod-hsm-agent-gateway` bin on a real SEV-SNP launch (client phase `generate-keys`) — the
   reply's minted key list + a resealed blob that UNSEALS to entries+2 / structural+1 / epoch+1 (the
   Structural-op atomic bump = the seal→commit→ack-verify→swap→emit witness).
-- [x] **The per-op commit went over the wire:** R3's commit-witness — a NEW anchor-signed 0x45 ACK +
-  relay pump AFTER the boot freshness leg (so the COMMIT is proven on the wire, not only in the
-  client's in-band unseal assertion).
+- [x] **The per-op commit succeeded (authoritative = in-band):** W1's resealed-blob unseal to the
+  ADVANCED body proves the commit, since `commit_before_emit` emits the swapped blob only AFTER the
+  anchor commit returns Ok. R3 also runs a **wire-liveness BELT** (a NEW anchor sign + relay pump after
+  the boot snapshot) — honest scope: a generic-marker count delta, NOT W1-attributed (a crash-loop
+  boot-freshness or broken-auth W2 commit could also satisfy it); the in-band assertion is the gate. A
+  positively-attributed wire witness (between-W1/W2 snapshot + a commit-specific stub marker) is a
+  deferred next-iteration hardening (would need a stub change + re-run).
 - [x] **Auth gate live + isolated:** client phase `generate-keys-bad-cap` → exact `0x43` (counter=2 so
   ONLY the signature check can reject — see the 6-7b-i compact finding).
 - [x] **Production seal-root resolution exercised:** the guest seals the candidate under the
