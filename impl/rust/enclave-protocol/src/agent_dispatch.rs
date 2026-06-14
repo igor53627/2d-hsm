@@ -672,7 +672,13 @@ static INSTALLED_COMMIT_CHANNEL: Mutex<
 
 /// Install the boot channel to the host anchor relay for per-op commits (agent-profile boot, slice 6-4b).
 /// Install-once: returns `false` ONLY when a channel is already installed (boot race / caller mistake).
-#[cfg_attr(not(test), allow(dead_code))] // staged 6-4a; the boot caller lands in 6-4b
+// Conditionally wired: the only NON-test caller is `agent_gateway_boot::install_serve_time_commit_channel`
+// (needs `agent-keygen-exec-preview` + `vsock-transport` + linux); the only test callers are the 6-4a
+// `agent-keygen-exec-preview` frame tests. So whether it is "used" depends on `test ∨ (preview ∧ vsock ∧
+// linux)` — no single `cfg_attr` expresses that cleanly, and the prior `not(test)` mis-fired in the
+// no-preview test build. An unconditional `allow(dead_code)` is the correct shape for this staged-then-
+// conditionally-wired fn (harmless no-op wherever it IS used).
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn install_commit_channel(
     channel: Box<dyn crate::agent_boot_relay::BootRelayChannel + Send>,
