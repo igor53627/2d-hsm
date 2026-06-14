@@ -387,9 +387,48 @@ fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolEr
              measurement) — fatal",
         ));
     }
+    // (G') slice 6-4b: install the per-op anchor-COMMIT channel — a SECOND `VsockBootRelayChannel` to the
+    //      SAME host relay (the boot handshake CONSUMED its own at step F; the channel opens a FRESH vsock
+    //      connection per `round_trip` and stores no fd — stale-reply isolation — so the two instances
+    //      share nothing). Gated under `agent-keygen-exec-preview` because the preview GENERATE_KEYS exec
+    //      path is the channel's ONLY consumer: a non-preview build installs nothing and GENERATE_KEYS
+    //      stays NotConfigured. Placed AFTER the keystore install and BEFORE serve, so no frame can race
+    //      the two installs (the serve loop starts only after BOTH) and the KEYSTORE→COMMIT_CHANNEL lock
+    //      order is respected. `false` ⇒ FATAL (already installed = double-boot / bug; see the helper).
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    install_serve_time_commit_channel(Box::new(
+        crate::agent_boot_relay::VsockBootRelayChannel::new(
+            crate::vsock_addr::VMADDR_CID_HOST,
+            relay_port,
+        ),
+    ))?;
     // (H) SERVE the agent 0x40 command loop. Diverges (Ok never constructed). 5b-2c-i ships a
     //     fail-closed stub; 5b-2c-ii implements the real bind+accept+pump.
     run_agent_serve_loop()
+}
+
+/// slice 6-4b: install the process-global per-op anchor-COMMIT channel — consumed by the preview-gated
+/// GENERATE_KEYS seal-before-emit path — BEFORE the serve loop starts, so the first keygen can durably
+/// commit its advanced `{epoch, structural, marks}` to the anchor. Takes the channel as an OWNED trait
+/// object (the boot caller boxes the concrete [`crate::agent_boot_relay::VsockBootRelayChannel`]) so this
+/// install-once + fail-closed logic stays deviceless-unit-testable with a `Send` mock — the real channel
+/// is only constructed at the SNP-pinned call site. **Install-once:** a `false` return means a channel is
+/// ALREADY installed (a double-boot / caller bug — structurally impossible on a clean single boot) ⇒
+/// FATAL, fail closed (never serve the preview keygen path against a duplicate/unknown channel; mirrors
+/// the `install_agent_keystore` false=FATAL contract). **SAFETY:** the channel is PURE TRANSPORT — the
+/// trust anchor is the sealed `anchor_root` verified against the commit ACK signature
+/// (`verify_commit_ack_bytes`), so a bad/host-controlled channel can only fail an op CLOSED, never cause a
+/// wrong-accept.
+#[cfg(feature = "agent-keygen-exec-preview")]
+fn install_serve_time_commit_channel(
+    channel: Box<dyn crate::agent_boot_relay::BootRelayChannel + Send>,
+) -> Result<(), ProtocolError> {
+    if !crate::agent_dispatch::install_commit_channel(channel) {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "agent boot: install_commit_channel returned false (already installed) — fatal",
+        ));
+    }
+    Ok(())
 }
 
 /// A pump `Err` that is a PROTOCOL-LEVEL reject of PEER input — every case an UNAUTHENTICATED peer can trip
@@ -686,6 +725,53 @@ mod tests {
             // These wired-boot tests exercise the FRESHNESS path only; the marks leg is unscripted.
             Err(crate::agent_boot_driver::AnchorTransportError("wired test channel: marks not scripted"))
         }
+    }
+
+    /// slice 6-4b: a `Send` commit-channel mock for the boot-time install test. The install-once test
+    /// only INSTALLS it (never round-trips), so both transport legs are unreachable. (`AlwaysErrChannel`/
+    /// `SigningChannel` hold `Rc`/`Cell` for test introspection and so are NOT `Send` — they cannot box
+    /// into `Box<dyn BootRelayChannel + Send>`, which is what the process-global commit slot stores.)
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    struct UnusedSendCommitChannel;
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    impl crate::agent_boot_relay::BootRelayChannel for UnusedSendCommitChannel {
+        fn round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            unreachable!("the 6-4b install-once test never round-trips the channel")
+        }
+        fn marks_round_trip(
+            &mut self,
+            _request_frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            unreachable!("the 6-4b install-once test never round-trips the channel")
+        }
+    }
+
+    /// slice 6-4b: the boot-time per-op commit-channel install is install-once + fail-closed. The FIRST
+    /// install succeeds on the empty slot; a SECOND (a double-boot) returns the FATAL already-installed
+    /// `ProtocolError` so boot aborts rather than serving the preview keygen path against a duplicate
+    /// channel. (The real `VsockBootRelayChannel` construction at the boot call site is SNP-pinned; this
+    /// pins the install-once + false=FATAL contract deviceless via a `Send` mock.)
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn serve_time_commit_channel_installs_once_then_fatal_on_double_install() {
+        // The guard resets ALL agent process-globals (incl. the commit channel slot) for isolation.
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        assert!(
+            install_serve_time_commit_channel(Box::new(UnusedSendCommitChannel)).is_ok(),
+            "first boot install succeeds on the empty slot"
+        );
+        let err = install_serve_time_commit_channel(Box::new(UnusedSendCommitChannel))
+            .expect_err("a second install (double-boot) must fail closed, not silently overwrite");
+        assert!(
+            matches!(&err, ProtocolError::PqSigningUnavailable(s) if s.contains("install_commit_channel returned false")),
+            "double-install is the fatal already-installed error, got {err:?}"
+        );
+        crate::agent_dispatch::reset_commit_channel_for_tests();
     }
 
     /// Signing channel: decodes the request via `decode_anchor_boot_request` to recover the live
