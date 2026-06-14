@@ -14,6 +14,11 @@
 # client. The guest dials the relay during boot AND for each per-op commit, so the relay + the (now
 # COMMIT-capable, 6-5 stateful) lab anchor stub are started FIRST.
 #
+# MUTUALLY EXCLUSIVE with the read-path run-nix-snp-agent-smoke.sh: both bake the SAME guest serve/relay
+# ports (5002/5001) + GUEST_CID 42 + ANCHOR_LISTEN 127.0.0.1:5003, so they cannot coexist on one host
+# anyway — and this script's `twod_hsm_stop_stale_qemu` + the `$BIN_DIR`-scoped helper pkill will reap a
+# concurrent read-path run. Run ONE smoke at a time (the single-tenant aya validation model).
+#
 # HOST-SIDE PASS = R1-R4 all hold:
 #   R1 preflight  — anchor 'listening', relay 'listening on vsock relay port', image ensured
 #   R2 boot-ready — serial: budget events, '[info] boot handshake outcome:' BEFORE the serve marker,
@@ -46,8 +51,11 @@ RELAY_PORT="${RELAY_PORT:-5001}"
 ANCHOR_LISTEN="${ANCHOR_LISTEN:-127.0.0.1:5003}"
 # Boot-to-Ready budget (cached image build + boot + possible early crash-loop cycles).
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-300}"
-# Client budget: two fast round-trips, each including a host-relayed commit leg. No idle phase.
-CLIENT_TIMEOUT_SEC="${CLIENT_TIMEOUT_SEC:-120}"
+# Client budget: two phases, each a FRESH connection with the client's own 60 s per-connection read
+# timeout (twod_hsm_agent_keygen_smoke_client.rs) + a host-relayed commit leg. Must comfortably exceed
+# 2×60 s so a legitimately-slow commit trips the CLIENT's clean per-phase FAIL, not this outer `timeout`
+# (which would surface only an ambiguous RC 124). 240 s = ~2× margin. (Observed runs finish in seconds.)
+CLIENT_TIMEOUT_SEC="${CLIENT_TIMEOUT_SEC:-240}"
 
 if [[ "$SEV_MODE" != "snp" ]]; then
   echo "[skip] SEV_MODE=$SEV_MODE: the keygen write-path smoke is the SNP acceptance run." >&2
@@ -231,8 +239,12 @@ if (( R3_WIRE_OK != 1 )); then
 fi
 echo "      R3 wire-liveness belt OK (a fresh post-boot anchor/relay round-trip occurred; W1's in-band unseal is the authoritative commit proof)"
 
-# R4 witnesses (bounded wait for the in-guest journald witness + clean close; no idle phase here).
-for _ in $(seq 1 30); do
+# R4 witnesses (bounded wait for the in-guest journald witness). The witness oneshot is `After=` (not
+# gating) the serve unit and retry-greps for up to ~120 s before emitting PASS/FAIL — and unlike the
+# read-path smoke there is NO 300 s idle phase to give it slack, so R4 is reached within seconds of the
+# serve marker. Wait the witness's FULL retry budget (120 s, not the sibling's incidental 30 s) so a
+# slow/crash-looped boot's late-starting witness is not mistaken for a FAIL.
+for _ in $(seq 1 120); do
   grep -aq 'twod-hsm-agent-smoke: journald-serve ' "$LOG" 2>/dev/null && break
   sleep 1
 done
