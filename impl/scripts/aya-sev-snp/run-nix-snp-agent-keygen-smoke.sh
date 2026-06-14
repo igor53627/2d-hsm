@@ -87,8 +87,10 @@ GUEST_CID="$GUEST_CID" twod_hsm_stop_stale_qemu
 # Also reap stale host helpers a previously ABORTED (SIGKILL / dropped-ssh) run may have left holding
 # the anchor TCP / relay vsock ports — a clean exit's cleanup trap already reaps them, so this only
 # matters for re-runs after a hard abort (otherwise the new bind fails and the run cleanly FAILs).
-pkill -f twod-hsm-lab-anchor 2>/dev/null || true
-pkill -f twod-hsm-host-anchor-relay 2>/dev/null || true
+# Match the EXACT bin path ($BIN_DIR/…) — NOT a bare name — so a concurrent run from a different
+# BIN_DIR (or any unrelated process) is never caught.
+pkill -f "$BIN_DIR/twod-hsm-lab-anchor" 2>/dev/null || true
+pkill -f "$BIN_DIR/twod-hsm-host-anchor-relay" 2>/dev/null || true
 QPID=""; ANCHOR_PID=""; RELAY_PID=""
 cleanup() {
   for pid in "$QPID" "$RELAY_PID" "$ANCHOR_PID"; do
