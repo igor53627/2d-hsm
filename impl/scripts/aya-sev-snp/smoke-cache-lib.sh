@@ -48,13 +48,15 @@ twod_hsm_nix_outlink_hit() {
       return 1
       ;;
     disk-production | disk-production-lab | disk-production-lab-selftest | \
-      disk-production-lab-quote-smoke | disk-production-lab-agent-gateway)
+      disk-production-lab-quote-smoke | disk-production-lab-agent-gateway | \
+      disk-production-lab-agent-keygen-smoke)
       # make-disk-image emits a bootable qcow2 under the out path (TASK-5 AC#5;
       # disk-production-lab-selftest adds the TASK-1.1 derived-root self-check oneshot;
       # disk-production-lab-quote-smoke adds the TASK-7.7 (4c) quote-smoke oneshot;
-      # disk-production-lab-agent-gateway adds the TASK-7.7 5b-2c-iii agent serve unit — the build
-      # stamp already hashes all enclave-protocol src/*.rs + Cargo.* + testvectors + the smoke
-      # scripts, so editing the smoke Rust/fixtures auto-invalidates the cached image).
+      # disk-production-lab-agent-gateway adds the TASK-7.7 5b-2c-iii agent serve unit;
+      # disk-production-lab-agent-keygen-smoke adds the TASK-7.7 6-7b-ii WRITE-path serve unit
+      # (the preview build) — the build stamp already hashes all enclave-protocol src/*.rs + Cargo.* +
+      # testvectors + the smoke scripts, so editing the smoke Rust/fixtures auto-invalidates the cached image).
       local c
       for c in "${link}"/*.qcow2; do
         [[ -e "$c" ]] && return 0
