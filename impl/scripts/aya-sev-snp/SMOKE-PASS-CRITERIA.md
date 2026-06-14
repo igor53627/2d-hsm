@@ -114,21 +114,27 @@ composition 1+0 on real AF_VSOCK.**
 
 ### 6-7b-ii acceptance checklist
 
-Status: **PENDING aya** (the deviceless half 6-7b-i is merged — PR #78 squash 96937cc — with the BINDING `keygen_client_drives_real_generate_keys_against_shipped_serve_glue` cross-val green in CI).
+Status: **PASSED on aya 2026-06-14 — 2 consecutive SNP runs at `1f0e9cd`, `RESULT PASS phases=2` both,
+the W1 commit-witness (a fresh anchor-signed 0x45 ACK + relay pump after boot) confirmed each run; KVM
+expected-refusal PASS (warn-outcome + err-render + 2 restart cycles, never served); aya `lab-agent-smoke
++ agent-keygen-exec-preview` cargo suite green (incl. the linux shipped-glue keygen cross-val).** The
+deviceless half 6-7b-i is merged (PR #78 squash 96937cc). The latent `lab-prod-fixtures.nix` 4418→4416
+blob-size assert (a 6-7b-i regression invisible to CI — the image is eval-only there) was fixed here and
+validated by the build getting past `twod-hsm-lab-agent-smoke-keystore.drv`.
 
-- [ ] **Write-path core:** a real signed `GENERATE_KEYS(count=2)` over vsock from the host against the
+- [x] **Write-path core:** a real signed `GENERATE_KEYS(count=2)` over vsock from the host against the
   preview `twod-hsm-agent-gateway` bin on a real SEV-SNP launch (client phase `generate-keys`) — the
   reply's minted key list + a resealed blob that UNSEALS to entries+2 / structural+1 / epoch+1 (the
   Structural-op atomic bump = the seal→commit→ack-verify→swap→emit witness).
-- [ ] **The per-op commit went over the wire:** R3's commit-witness — a NEW anchor-signed 0x45 ACK +
+- [x] **The per-op commit went over the wire:** R3's commit-witness — a NEW anchor-signed 0x45 ACK +
   relay pump AFTER the boot freshness leg (so the COMMIT is proven on the wire, not only in the
   client's in-band unseal assertion).
-- [ ] **Auth gate live + isolated:** client phase `generate-keys-bad-cap` → exact `0x43` (counter=2 so
+- [x] **Auth gate live + isolated:** client phase `generate-keys-bad-cap` → exact `0x43` (counter=2 so
   ONLY the signature check can reject — see the 6-7b-i compact finding).
-- [ ] **Production seal-root resolution exercised:** the guest seals the candidate under the
+- [x] **Production seal-root resolution exercised:** the guest seals the candidate under the
   platform-installed root (`TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` = the lab reference root = `SMOKE_SEAL_ROOT`),
   NOT the deviceless `cfg(test)` fallthrough — so the client's unseal matching proves the real install.
-- [ ] **≥2 consecutive SNP runs** emit `RESULT PASS phases=2` + KVM expected-refusal PASS.
+- [x] **≥2 consecutive SNP runs** emit `RESULT PASS phases=2` + KVM expected-refusal PASS.
 
 ### Residuals recorded, NOT discharged by this smoke
 
