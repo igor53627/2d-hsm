@@ -328,21 +328,24 @@ fn lab_anchor_marks_reply<S: std::io::Read + std::io::Write>(
     Ok(nonce8)
 }
 
-/// The lab anchor's durable commit record (slice 6-5): `(request_id, epoch) → (structural_version,
+/// The lab anchor's durable commit record (slice 6-5): `request_id → (epoch, structural_version,
 /// marks_digest)`. Models the real anchor's idempotency/conflict contract so the deviceless tests can
-/// exercise the enclave's retry behaviour. (request_id, epoch) is the idempotency key; the nonce is
-/// deliberately NOT part of it (it is per-attempt, fresh).
-pub(crate) type LabCommitLedger = std::collections::HashMap<(Vec<u8>, u64), (u64, [u8; 32])>;
+/// exercise the enclave's retry behaviour. The KEY is the `request_id` ALONE — it identifies a LOGICAL
+/// op, which must commit AT MOST ONCE; the nonce is deliberately NOT part of the record (per-attempt,
+/// fresh — the ack is re-signed for it).
+pub(crate) type LabCommitLedger = std::collections::HashMap<Vec<u8>, (u64, u64, [u8; 32])>;
 
 /// The slice-6 0x45 per-op commit leg: validate + scope-guard, then a signed commit ACK ECHOING the
 /// proposed `(epoch, structural_version, marks_digest, nonce, request_id)`. slice 6-5 makes the lab
 /// anchor STATEFUL so it models the idempotency contract: it durably records the post-op
-/// `(structural_version, marks_digest)` keyed by `(request_id, epoch)` and
-/// - a retry under the SAME key with the SAME `{structural, marks}` is **idempotent** — it re-signs an
-///   ACK for the CURRENT (fresh per-op) nonce so the enclave's anti-replay echo passes, but does NOT
-///   advance the durable record again (no double-advance);
-/// - a second commit under the SAME key proposing DIFFERENT `{structural, marks}` is a **conflict** ⇒
-///   reject (the enclave then fails closed).
+/// `(epoch, structural_version, marks_digest)` keyed by the `request_id` and
+/// - a retry under the SAME request_id with the SAME `{epoch, structural, marks}` is **idempotent** — it
+///   re-signs an ACK for the CURRENT (fresh per-op) nonce so the enclave's anti-replay echo passes, but
+///   does NOT advance the durable record again (no double-advance);
+/// - a re-commit under the SAME request_id proposing ANY DIFFERENT `{epoch, structural, marks}` is a
+///   **conflict** ⇒ reject (the enclave then fails closed). A DIFFERENT epoch is included deliberately:
+///   that is the double-advance a post-`AdoptForward` re-issue of the same logical op would attempt, and
+///   keying by `(request_id, epoch)` would WRONGLY admit it as a fresh entry.
 /// NO quote; the ACK is small → 4096 cap.
 fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
     conn: &mut S,
@@ -360,15 +363,16 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
             "lab anchor: commit request scope does not match the provisioned smoke keystore",
         ));
     }
-    // slice 6-5 idempotency/conflict on the (request_id, epoch) durability key. `.copied()` ends the
-    // immutable borrow so the None arm can insert; (u64, [u8;32]) is Copy.
-    let key = (req.request_id.clone(), req.new_epoch);
-    let proposed = (req.new_structural_version, req.marks_digest);
+    // slice 6-5 idempotency/conflict on the `request_id` durability key (the logical-op identity,
+    // commit-at-most-once). `.copied()` ends the immutable borrow so the None arm can insert;
+    // (u64, u64, [u8;32]) is Copy.
+    let key = req.request_id.clone();
+    let proposed = (req.new_epoch, req.new_structural_version, req.marks_digest);
     match ledger.get(&key).copied() {
         Some(recorded) if recorded != proposed => {
             return Err(crate::ProtocolError::WireProtocol(
-                "lab anchor: commit conflict — (request_id, epoch) already durably recorded with a \
-                 different (structural_version, marks_digest)",
+                "lab anchor: commit conflict — request_id already durably recorded with a different \
+                 (epoch, structural_version, marks_digest)",
             ));
         }
         Some(_) => { /* idempotent retry: durable record UNCHANGED; re-sign with the current nonce below */ }
@@ -1096,12 +1100,14 @@ mod tests {
         .expect("stub commit ack passes the REAL guest verify path");
     }
 
-    /// slice 6-5 idempotency + conflict: the lab anchor durably records `(request_id, epoch) →
-    /// {structural, marks}`. A RETRY of the same op (same key + same `{structural,marks}`) with a FRESH
-    /// nonce re-signs an ack the guest verifies for THAT nonce — no double-advance of the durable
-    /// record. A second commit under the same key proposing DIFFERENT marks is a CONFLICT the anchor
-    /// rejects (no ack), which the enclave's `run_anchor_commit` would surface as a commit failure ⇒
-    /// fail closed. (request_id, epoch) is the idempotency key; the nonce is per-attempt, never part of it.
+    /// slice 6-5 idempotency + conflict: the lab anchor durably records `request_id → (epoch, structural,
+    /// marks)` — `request_id` is the LOGICAL-op identity, commit-at-most-once. A RETRY of the same op
+    /// (same request_id + same `{epoch,structural,marks}`) with a FRESH nonce re-signs an ack the guest
+    /// verifies for THAT nonce — no double-advance. A re-commit under the same request_id proposing ANY
+    /// different `{epoch, structural, marks}` (different marks, OR a different epoch — the cross-crash
+    /// double-advance a post-AdoptForward re-issue would attempt) is a CONFLICT the anchor rejects (no
+    /// ack), which `run_anchor_commit` surfaces as a commit failure ⇒ fail closed. The nonce is
+    /// per-attempt, never part of the record.
     #[test]
     fn stub_commit_idempotent_per_request_id_and_rejects_conflict() {
         let body = smoke_body();
@@ -1111,7 +1117,7 @@ mod tests {
         let structural = body.structural_version + 1;
         let marks = body.compute_local_marks_digest();
         let request_id: &[u8] = b"op-idem";
-        let commit_frame = |marks: [u8; 32], nonce: [u8; 32]| {
+        let commit_frame = |epoch: u64, marks: [u8; 32], nonce: [u8; 32]| {
             crate::agent_boot_relay::encode_anchor_commit_request(
                 &crate::agent_boot_relay::AnchorCommitRequest {
                     chain_id,
@@ -1143,25 +1149,32 @@ mod tests {
                 &body.config,
             )
         };
+        let expect_rejected = |o: Result<[u8; 8], crate::ProtocolError>, w: Vec<u8>, ledger: &LabCommitLedger, why: &str| {
+            assert!(o.is_err(), "{why}: conflict must be rejected");
+            assert!(w.is_empty(), "{why}: a rejected conflict writes NO ack (the enclave then fails closed)");
+            assert_eq!(ledger.len(), 1, "{why}: a rejected conflict does NOT alter the durable record");
+        };
 
         let mut ledger = LabCommitLedger::new();
         let (n_a, n_b) = ([0xa1_u8; 32], [0xb2_u8; 32]);
         // (1) First commit (nonce A) → first-seen: recorded + signed; verifies for A.
-        let (o1, w1) = drive_stub_pump_with_ledger(&body, &commit_frame(marks, n_a), &mut ledger);
+        let (o1, w1) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch, marks, n_a), &mut ledger);
         o1.expect("first commit ok");
         verify(w1, &n_a, &marks).expect("first ack verifies for nonce A");
-        // (2) RETRY same op (same key + same {structural,marks}) with FRESH nonce B → idempotent:
-        //     re-signed for B, durable record UNCHANGED.
-        let (o2, w2) = drive_stub_pump_with_ledger(&body, &commit_frame(marks, n_b), &mut ledger);
+        // (2) RETRY same op (same request_id + same {epoch,structural,marks}) with FRESH nonce B →
+        //     idempotent: re-signed for B, durable record UNCHANGED.
+        let (o2, w2) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch, marks, n_b), &mut ledger);
         o2.expect("idempotent retry ok");
         verify(w2, &n_b, &marks).expect("retry ack is re-signed for the CURRENT nonce B");
         assert_eq!(ledger.len(), 1, "an idempotent retry does NOT add a second durable record");
-        // (3) CONFLICT: same (request_id, epoch) but DIFFERENT marks ⇒ the anchor REJECTS (no ack).
-        let conflicting = [0xcc_u8; 32];
-        let (o3, w3) = drive_stub_pump_with_ledger(&body, &commit_frame(conflicting, n_a), &mut ledger);
-        assert!(o3.is_err(), "a conflicting proposal under the same (request_id, epoch) is rejected");
-        assert!(w3.is_empty(), "a rejected conflict writes NO ack (the enclave then fails closed)");
-        assert_eq!(ledger.len(), 1, "the conflicting commit did NOT alter the durable record");
+        // (3) CONFLICT — same request_id, same epoch, DIFFERENT marks ⇒ reject.
+        let (o3, w3) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch, [0xcc; 32], n_a), &mut ledger);
+        expect_rejected(o3, w3, &ledger, "different marks under the same request_id");
+        // (4) CONFLICT — same request_id, DIFFERENT epoch ⇒ reject. THIS is the cross-crash double-advance
+        //     a post-AdoptForward re-issue of the SAME logical op would attempt; keying by request_id
+        //     ALONE (not (request_id, epoch)) catches it, so the same op cannot commit twice.
+        let (o4, w4) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch + 1, marks, n_a), &mut ledger);
+        expect_rejected(o4, w4, &ledger, "different epoch under the same request_id");
     }
 
     #[test]

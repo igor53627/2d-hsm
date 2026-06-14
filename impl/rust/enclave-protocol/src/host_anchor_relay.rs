@@ -1127,7 +1127,10 @@ mod tests {
             let key = ed25519_dalek::SigningKey::from_bytes(
                 &crate::lab_agent_smoke::LAB_ANCHOR_TEST_SEED,
             );
-            crate::lab_agent_smoke::lab_anchor_pump_one(&mut conn, &stub_body, &key, deadline())
+            // slice 6-5: the pump now threads the anchor's durable commit ledger; this one-request
+            // loopback test only needs a fresh (empty) ledger.
+            let mut ledger = crate::lab_agent_smoke::LabCommitLedger::new();
+            crate::lab_agent_smoke::lab_anchor_pump_one(&mut conn, &stub_body, &key, deadline(), &mut ledger)
                 .expect("the real stub pump signs the relayed request");
         });
 
