@@ -263,6 +263,14 @@ mod lab_agent_smoke;
 pub use lab_agent_smoke::{
     run_agent_smoke_client, run_lab_anchor_stub, SMOKE_CLIENT_IDLE_READ_TIMEOUT,
 };
+// slice 6-7b WRITE-PATH client — additionally gated on `agent-keygen-exec-preview` (the only build
+// where the enclave executes GENERATE_KEYS), so the `twod-hsm-agent-keygen-smoke-client` bin reaches it.
+#[cfg(all(
+    feature = "agent-gateway",
+    feature = "lab-agent-smoke",
+    feature = "agent-keygen-exec-preview"
+))]
+pub use lab_agent_smoke::run_agent_keygen_smoke_client;
 mod wire;
 
 use serde::{Deserialize, Serialize};

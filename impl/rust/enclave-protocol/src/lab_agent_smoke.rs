@@ -44,6 +44,14 @@ pub(crate) const SMOKE_SECRET_SCALAR: [u8; 32] = [0x77; 32];
 /// Distinct from every genesis literal so a mixed-up fixture fails loudly.
 pub(crate) const SMOKE_KEY_REF: [u8; 32] = [0x11; 32];
 
+/// **TEST KEYS ONLY** — public in-repo Ed25519 seed for the smoke keystore's ADMIN authority
+/// (slice 6-7b write path). The sealed `admin_authority_pk` below is this seed's verifying key, so
+/// the write-path smoke client (and only a holder of this public constant) can sign GENERATE_KEYS
+/// capabilities the smoke guest's `verify_capability` accepts. Distinct from `LAB_ANCHOR_TEST_SEED`
+/// (`[0x42; 32]`, the anchor signer) — the two authorities are independent. No secrecy claim; the
+/// enclosing feature is release-banned.
+pub(crate) const SMOKE_ADMIN_SEED: [u8; 32] = [0x0a; 32];
+
 /// Fixed seal nonce → byte-stable smoke golden blob (the only randomness in the seal).
 /// Distinct from the genesis nonce (`[0x5d; 24]`).
 pub(crate) const SMOKE_SEAL_NONCE: [u8; 24] = [0x5e; 24];
@@ -70,6 +78,12 @@ pub(crate) fn smoke_body() -> KeystoreBody {
     let anchor_root = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED)
         .verifying_key()
         .to_bytes();
+    // 6-7b write path: the admin authority is a KNOWN test seed so the smoke client can sign a valid
+    // GENERATE_KEYS capability. Derived through ed25519-dalek (never a pasted literal) so the fixture
+    // and the client's signer can never split.
+    let admin_authority_pk = ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED)
+        .verifying_key()
+        .to_bytes();
     // On-curve by construction: derive the public identity through the crate's own secp256k1 path,
     // never pasted hex (a stale literal here would split the fixture from the client expectations).
     let keypair = crate::secp256k1::Keypair::from_secret_bytes(&SMOKE_SECRET_SCALAR)
@@ -78,8 +92,9 @@ pub(crate) fn smoke_body() -> KeystoreBody {
         config: KeystoreConfig {
             twod_chain_id: SMOKE_CHAIN_ID,
             environment_identifier: SMOKE_ENVIRONMENT.to_string(),
-            // Distinct from the genesis `[0xa3; 32]` literals so fixture mix-ups fail loudly.
-            admin_authority_pk: [0xa1; 32],
+            // 6-7b: a REAL verifying key (was placeholder `[0xa1; 32]`) so the write-path client can
+            // forge a valid GENERATE_KEYS cap; recovery stays a placeholder (RESTORE is NotConfigured).
+            admin_authority_pk,
             recovery_authority_pk: [0xa2; 32],
             backup_recovery_wrapping_pubkey: vec![0x33; 1568],
             monotonic_treasury_config_version: 0,
@@ -346,6 +361,7 @@ pub(crate) type LabCommitLedger = std::collections::HashMap<Vec<u8>, (u64, u64, 
 ///   **conflict** ⇒ reject (the enclave then fails closed). A DIFFERENT epoch is included deliberately:
 ///   that is the double-advance a post-`AdoptForward` re-issue of the same logical op would attempt, and
 ///   keying by `(request_id, epoch)` would WRONGLY admit it as a fresh entry.
+///
 /// NO quote; the ACK is small → 4096 cap.
 fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
     conn: &mut S,
@@ -355,6 +371,30 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
     deadline: std::time::Instant,
     ledger: &mut LabCommitLedger,
 ) -> Result<[u8; 8], crate::ProtocolError> {
+    // The decode + scope-guard + ledger + sign logic is the ONE pure `lab_commit_ack_for_request`
+    // (shared with the deviceless write-path `LabCommitChannel`); this stub wrapper only adds the
+    // stream framing + bounded write.
+    let (response, nonce8) = lab_commit_ack_for_request(frame, body, signing_key, ledger)?;
+    let wire = crate::agent_boot_relay::frame_response_cap(
+        &response,
+        crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN,
+    )?;
+    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before commit ack write")?;
+    Ok(nonce8)
+}
+
+/// The PURE 0x45 commit-ack computation: decode the request, scope-guard it against `body`, apply the
+/// slice-6-5 `request_id`-keyed idempotency/conflict ledger, then return the UNFRAMED signed commit ACK
+/// (what `BootRelayChannel::round_trip` hands back to the enclave) plus the `nonce8` log breadcrumb.
+/// The SINGLE source shared by the stream stub ([`lab_anchor_commit_reply`], which frames + writes it)
+/// and the deviceless write-path commit channel ([`LabCommitChannel`], which returns it verbatim) — so
+/// the aya stub and the in-process cross-validation can never drift on the anchor's commit semantics.
+pub(crate) fn lab_commit_ack_for_request(
+    frame: &[u8],
+    body: &KeystoreBody,
+    signing_key: &ed25519_dalek::SigningKey,
+    ledger: &mut LabCommitLedger,
+) -> Result<(Vec<u8>, [u8; 8]), crate::ProtocolError> {
     let req = crate::agent_boot_relay::decode_anchor_commit_request(frame)?;
     if req.chain_id != body.config.twod_chain_id
         || req.environment_identifier != body.config.environment_identifier
@@ -380,6 +420,8 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
             ledger.insert(key, proposed);
         }
     }
+    let mut nonce8 = [0u8; 8];
+    nonce8.copy_from_slice(&req.nonce[..8]);
     let response = crate::agent_anchor::test_signed_commit_ack_bytes(
         signing_key,
         req.chain_id,
@@ -390,14 +432,7 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
         req.nonce,
         req.request_id, // moved (not cloned) — req.request_id is unused after this; req.nonce is Copy
     );
-    let wire = crate::agent_boot_relay::frame_response_cap(
-        &response,
-        crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN,
-    )?;
-    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before commit ack write")?;
-    let mut nonce8 = [0u8; 8];
-    nonce8.copy_from_slice(&req.nonce[..8]);
-    Ok(nonce8)
+    Ok((response, nonce8))
 }
 
 /// Env-driven lab anchor stub entrypoint (the `twod-hsm-lab-anchor` bin's sole call). Fail-closed
@@ -781,6 +816,251 @@ fn map_get_text(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// slice 6-7b WRITE-PATH smoke (GENERATE_KEYS). Gated on `agent-keygen-exec-preview` — the ONLY build
+// where the enclave actually executes GENERATE_KEYS (`seal → 0x45 commit → ack-verify → swap → emit`);
+// without it the dispatch routes GENERATE_KEYS to NotConfigured. The client mints a VALID admin
+// capability against the smoke keystore's KNOWN admin seed ([`SMOKE_ADMIN_SEED`]) and asserts the
+// success reply carries the minted key list AND a resealed keystore blob that UNSEALS to a body whose
+// entries + structural_version + freshness_epoch all advanced — which can only hold if the full
+// seal-before-emit sequence completed end-to-end against the (anchor_root-signed) commit ACK.
+// ---------------------------------------------------------------------------------------------
+
+/// GENERATE_KEYS opcode (1) — the dispatch enum is the authority; transcribed locally.
+#[cfg(feature = "agent-keygen-exec-preview")]
+const OPCODE_GENERATE_KEYS: u8 = 1;
+/// AgentTransferK1 purpose code (1) — the smoke mints transfer keys (the seeded entry's purpose).
+#[cfg(feature = "agent-keygen-exec-preview")]
+const SMOKE_KEYGEN_PURPOSE: u64 = 1;
+/// `AGENT_CAPABILITY_REJECTED` (0x43) — the deterministic code for a cap that fails verification.
+#[cfg(feature = "agent-keygen-exec-preview")]
+const EXPECTED_CAP_REJECTED_CODE: u64 = 0x43;
+/// The scope_target the write-path smoke commits its GENERATE_KEYS batch under (the per-authority
+/// contiguous-counter key); a single in-repo constant for the cap's scope binding.
+#[cfg(feature = "agent-keygen-exec-preview")]
+const SMOKE_KEYGEN_SCOPE_TARGET: &[u8] = b"smoke-generate-transfer";
+
+/// Build a strict-canonical 0x40 GENERATE_KEYS request envelope for the smoke scope, signing the
+/// capability with `signer` (the W1 success path passes the [`SMOKE_ADMIN_SEED`] key whose verifying
+/// key IS the sealed `admin_authority_pk`; the negative phase passes a WRONG key so the Ed25519 verify
+/// fails → 0x43 with no commit). The cap binds `{opcode, scope, counter, request_id, payload}` and the
+/// payload `{1: purpose, 2: count}` is built from the SAME `generate_keys_canonical_params` the handler
+/// re-derives, so a binding mismatch is unrepresentable. Mirrors the dispatch test envelope shape
+/// (keys 1,2,3,4,5,7 ascending) — already proven decoder-accepted by the wired GenerateKeys tests.
+#[cfg(feature = "agent-keygen-exec-preview")]
+fn smoke_generate_keys_envelope(
+    request_id: &[u8],
+    counter: u64,
+    count: u64,
+    signer: &ed25519_dalek::SigningKey,
+) -> Vec<u8> {
+    use ciborium::value::Value;
+    let pb = crate::agent_capability::payload_binding(
+        OPCODE_GENERATE_KEYS,
+        None,
+        request_id,
+        &crate::agent_dispatch::generate_keys_canonical_params(SMOKE_KEYGEN_PURPOSE, count),
+    );
+    let cap = crate::agent_capability::test_signed_capability(
+        signer,
+        OPCODE_GENERATE_KEYS,
+        request_id,
+        counter,
+        false, // not a recovery cap
+        SMOKE_CHAIN_ID,
+        SMOKE_ENVIRONMENT,
+        0, // scope_class
+        SMOKE_KEYGEN_SCOPE_TARGET,
+        SMOKE_KEYGEN_PURPOSE as u8,
+        pb,
+    );
+    let payload = vec![
+        (Value::Integer(1.into()), Value::Integer(SMOKE_KEYGEN_PURPOSE.into())),
+        (Value::Integer(2.into()), Value::Integer(count.into())),
+    ];
+    let m = vec![
+        (
+            Value::Integer(1.into()),
+            Value::Integer(u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION).into()),
+        ),
+        (Value::Integer(2.into()), Value::Integer(u64::from(OPCODE_GENERATE_KEYS).into())),
+        (Value::Integer(3.into()), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
+        (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
+        (Value::Integer(5.into()), Value::Map(cap)),
+        (Value::Integer(7.into()), Value::Map(payload)),
+    ];
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(m), &mut buf).expect("keygen envelope encodes");
+    buf
+}
+
+/// Assert a GENERATE_KEYS SUCCESS reply `{1: [key…], 2: sealed_blob}` (§10.4): `count` minted transfer
+/// keys, AND the resealed blob UNSEALS (under the smoke root + placeholder measurement) to a body whose
+/// `entries` grew by `count` and whose `structural_version`/`freshness_epoch` each advanced +1 — the
+/// observable end-to-end witness that seal→commit→ack-verify→swap→emit completed (a fail-closed op would
+/// have returned a `{1: code, 2: reason}` error map, never this).
+#[cfg(feature = "agent-keygen-exec-preview")]
+fn assert_generate_keys_success(
+    m: &[(ciborium::value::Value, ciborium::value::Value)],
+    count: usize,
+) -> Result<(), String> {
+    use crate::agent_cbor::map_get;
+    use ciborium::value::Value;
+    let list = match map_get(m, 1) {
+        Some(Value::Array(a)) => a,
+        other => return Err(format!("key 1 (key list) is not an array: {other:?}")),
+    };
+    if list.len() != count {
+        return Err(format!("expected {count} minted keys, got {}", list.len()));
+    }
+    let mut minted_refs: Vec<Vec<u8>> = Vec::with_capacity(count);
+    for (i, entry) in list.iter().enumerate() {
+        let em = match entry {
+            Value::Map(em) => em.as_slice(),
+            _ => return Err(format!("minted key {i} is not a CBOR map")),
+        };
+        match map_get(em, 1) {
+            Some(Value::Bytes(b)) if b.len() == 32 => minted_refs.push(b.clone()),
+            _ => return Err(format!("minted key {i}: key_ref (entry key 1) is not 32 bytes")),
+        }
+        match map_get(em, 2) {
+            Some(Value::Bytes(b)) if b.len() == 65 && b.first() == Some(&0x04) => {}
+            _ => return Err(format!("minted key {i}: pubkey (entry key 2) is not 65B uncompressed")),
+        }
+        let purpose = map_get(em, 5).and_then(crate::agent_cbor::as_u64);
+        if purpose != Some(SMOKE_KEYGEN_PURPOSE) {
+            return Err(format!("minted key {i}: purpose (entry key 5) != transfer (got {purpose:?})"));
+        }
+    }
+    // The minted key_refs must be mutually DISTINCT and distinct from the seeded SMOKE_KEY_REF — else a
+    // regression that minted colliding refs (or re-emitted the seeded one) would slip past the count check.
+    let mut uniq = minted_refs.clone();
+    uniq.sort();
+    uniq.dedup();
+    if uniq.len() != minted_refs.len() {
+        return Err("minted key_refs are not mutually distinct".to_string());
+    }
+    if minted_refs.iter().any(|r| r.as_slice() == SMOKE_KEY_REF.as_slice()) {
+        return Err("a minted key_ref collides with the seeded SMOKE_KEY_REF".to_string());
+    }
+    let blob = match map_get(m, 2) {
+        Some(Value::Bytes(b)) => b.as_slice(),
+        _ => return Err("key 2 (resealed keystore blob) missing or not bytes".into()),
+    };
+    let resealed = crate::agent_keystore::unseal_body(
+        blob,
+        SMOKE_SEAL_ROOT,
+        AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+    )
+    .map_err(|e| format!("returned blob does NOT unseal under the smoke root/measurement: {e:?}"))?;
+    let base = smoke_body();
+    if resealed.entries.len() != base.entries.len() + count {
+        return Err(format!(
+            "resealed entries {} != base {} + minted {count}",
+            resealed.entries.len(),
+            base.entries.len()
+        ));
+    }
+    // The pre-existing seeded entry MUST survive the swap (the op APPENDS; a regression that clobbered or
+    // dropped it while minting an extra key would still hit the count above — pin it explicitly).
+    if !resealed.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF) {
+        return Err("the seeded SMOKE_KEY_REF entry did not survive the GENERATE_KEYS swap".to_string());
+    }
+    // 6-4: GENERATE_KEYS is a Structural op ⇒ the ATOMIC per-op bump advances structural_version AND
+    // freshness_epoch together by exactly +1, regardless of `count`.
+    if resealed.structural_version != base.structural_version + 1 {
+        return Err(format!(
+            "structural_version {} != base {} + 1",
+            resealed.structural_version, base.structural_version
+        ));
+    }
+    if resealed.freshness_epoch != base.freshness_epoch + 1 {
+        return Err(format!(
+            "freshness_epoch {} != base {} + 1",
+            resealed.freshness_epoch, base.freshness_epoch
+        ));
+    }
+    Ok(())
+}
+
+/// The slice-6-7b WRITE-PATH smoke client core (mirrors [`run_agent_smoke_client`]'s marker grammar,
+/// but for the GENERATE_KEYS seal→commit→swap→emit path; targets the `agent-keygen-exec-preview`
+/// image). `connect` opens a FRESH stream per phase. Emits
+/// `twod-hsm-agent-keygen-smoke: PHASE <name> PASS|FAIL <detail>` then a terminal
+/// `RESULT PASS phases=N`; first failure stops the run. Returns `true` iff every phase passed.
+#[cfg(feature = "agent-keygen-exec-preview")]
+pub fn run_agent_keygen_smoke_client<S, C, W>(mut connect: C, sink: &mut W) -> bool
+where
+    S: std::io::Read + std::io::Write,
+    C: FnMut() -> std::io::Result<S>,
+    W: std::io::Write,
+{
+    let mut mark = |args: std::fmt::Arguments<'_>| {
+        let _ = writeln!(sink, "twod-hsm-agent-keygen-smoke: {args}");
+    };
+    let mut phases_passed: u32 = 0;
+    macro_rules! phase {
+        ($name:expr, $body:expr) => {{
+            let outcome: Result<String, String> = (|| $body)();
+            match outcome {
+                Ok(detail) => {
+                    mark(format_args!("PHASE {} PASS {detail}", $name));
+                    phases_passed += 1;
+                }
+                Err(detail) => {
+                    mark(format_args!("PHASE {} FAIL {detail}", $name));
+                    mark(format_args!("RESULT FAIL phase={}", $name));
+                    return false;
+                }
+            }
+        }};
+    }
+
+    // Each phase uses a DISTINCT envelope request_id (`keygen-smoke-w1` / `-w2`): per-op uniqueness is
+    // the 6-5 anchor-idempotency contract (a REUSED id would conflate the op — the anchor would idempotently
+    // re-sign for the recorded state instead of recording a fresh advance), and only W1 commits.
+
+    // W1: the core acceptance — a REAL signed GENERATE_KEYS (count=2) executes the full
+    // seal→commit→ack-verify→swap→emit path and returns the minted keys + the resealed blob.
+    phase!("generate-keys", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let admin = ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED);
+        let env = smoke_generate_keys_envelope(b"keygen-smoke-w1", 1, 2, &admin);
+        let m = smoke_round_trip(&mut conn, &env)?;
+        assert_generate_keys_success(&m, 2)?;
+        Ok("2 transfer keys minted; resealed blob unseals with entries+2, structural+1, epoch+1 \
+            (one Structural op; seal→commit→ack→swap→emit held)"
+            .to_string())
+    });
+
+    // W2: the auth gate stays live-pinned — a cap signed by the WRONG key is rejected 0x43 BEFORE any
+    // seal/commit (fail-closed), so a forged authority can never reach the anchor. counter=2 is
+    // LOAD-BEARING for non-vacuity: W1 consumed counter 1 on this scope, so 2 is the NEXT-CONTIGUOUS the
+    // counter check would ACCEPT. Thus the ONLY thing that can reject this cap is the signature check —
+    // a regression that bypassed or reordered verify_capability's Ed25519 verify ahead of the counter
+    // check would let this cap EXECUTE (return a success body), failing this phase. (A stale counter=1
+    // would have rejected 0x43 via the contiguity check even with the signature gate broken, hiding it.)
+    phase!("generate-keys-bad-cap", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32]);
+        let env = smoke_generate_keys_envelope(b"keygen-smoke-w2", 2, 1, &wrong);
+        let m = smoke_round_trip(&mut conn, &env)?;
+        match (map_u64(&m, 1), map_get_text(&m, 2)) {
+            (Some(code), Some(reason))
+                if code == EXPECTED_CAP_REJECTED_CODE && reason.starts_with("agent: ") =>
+            {
+                Ok(format!("code=0x{code:02x}"))
+            }
+            (code, reason) => Err(format!(
+                "expected {{1: 0x43, 2: \"agent: …\"}}, got code={code:?} reason={reason:?}"
+            )),
+        }
+    });
+
+    mark(format_args!("RESULT PASS phases={phases_passed}"));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +1177,16 @@ mod tests {
             v["smoke_identity"]["anchor_root_hex"].as_str(),
             Some(hex(&body.config.anchor_root).as_str()),
             "anchor_root_hex drift"
+        );
+        assert_eq!(
+            v["smoke_identity"]["admin_seed_hex"].as_str(),
+            Some(hex(&SMOKE_ADMIN_SEED).as_str()),
+            "admin_seed_hex drift"
+        );
+        assert_eq!(
+            v["smoke_identity"]["admin_authority_pk_hex"].as_str(),
+            Some(hex(&body.config.admin_authority_pk).as_str()),
+            "admin_authority_pk_hex drift — the write-path client signs caps against this key"
         );
         assert_eq!(
             v["smoke_identity"]["key_ref_hex"].as_str(),
@@ -1372,6 +1662,152 @@ mod tests {
         assert!(log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"), "log:\n{log}");
     }
 
+    // ---- slice 6-7b WRITE-PATH cross-validation (deviceless; proves seal→commit→swap→emit in-process
+    //      before any SNP run, exactly as the read-path cross-val proves the read path) ----
+
+    /// The deviceless per-op commit channel: signs commit ACKs with the smoke `anchor_root`
+    /// ([`LAB_ANCHOR_TEST_SEED`]) via the SAME pure [`lab_commit_ack_for_request`] the aya
+    /// `twod-hsm-lab-anchor` stub runs — so the in-process write-path proof and the live anchor can
+    /// never drift on the commit semantics. `body` is the STATIC `smoke_body()` (epoch/structural at
+    /// boot): correct here because W1 is the ONLY committing phase (W2's cap is rejected pre-commit) and
+    /// the commit leg only scope-guards + signs the enclave's PROPOSED state — it does not re-derive
+    /// state from `body`. A future SECOND committing phase would need the channel to track post-commit
+    /// advancement (or re-derive its body) so its scope-guard still matches.
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    struct LabCommitChannel {
+        body: KeystoreBody,
+        signing_key: ed25519_dalek::SigningKey,
+        ledger: LabCommitLedger,
+    }
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    impl LabCommitChannel {
+        fn new() -> Self {
+            Self {
+                body: smoke_body(),
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED),
+                ledger: LabCommitLedger::new(),
+            }
+        }
+    }
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    impl crate::agent_boot_relay::BootRelayChannel for LabCommitChannel {
+        fn round_trip(
+            &mut self,
+            frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            // Return the UNFRAMED signed ACK (what the enclave's `run_anchor_commit` expects back); any
+            // local failure maps to the coarse always-retryable transport error ⇒ the enclave fails the
+            // op CLOSED (it never reaches swap/emit), matching the production channel contract.
+            match lab_commit_ack_for_request(frame, &self.body, &self.signing_key, &mut self.ledger) {
+                Ok((ack, _nonce8)) => Ok(ack),
+                Err(_) => Err(crate::agent_boot_driver::AnchorTransportError(
+                    "lab commit channel: ack computation failed",
+                )),
+            }
+        }
+        fn marks_round_trip(
+            &mut self,
+            _frame: &[u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+            // Unreachable by construction (the GENERATE_KEYS commit path calls ONLY round_trip). A
+            // propagated Err — not unreachable!() — because this channel runs inside the SPAWNED
+            // serve_framed_pump thread: a panic here would kill that thread and surface as a cryptic
+            // client-side connection reset, whereas an Err fails the op closed and is reported cleanly.
+            Err(crate::agent_boot_driver::AnchorTransportError(
+                "lab commit channel: marks_round_trip must not be called on the per-op commit channel",
+            ))
+        }
+    }
+
+    /// Drive the WRITE-path client core against `router` served by the REAL `serve_framed_pump`, with
+    /// the process globals a booted preview guest would hold: the installed smoke keystore, the
+    /// anti-rollback binding (boot installs it on a Fresh reconcile — here installed directly, exactly
+    /// as `boot_reconcile_anti_rollback` does), and the per-op [`LabCommitChannel`]. The seal root is
+    /// reset to the cfg(test) reference root (= [`SMOKE_SEAL_ROOT`]) so the client can unseal the
+    /// returned blob. Returns (client verdict, captured marker log).
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    fn run_keygen_client_against_router(
+        router: fn(&[u8]) -> Result<Vec<u8>, crate::ProtocolError>,
+    ) -> (bool, String) {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        // commit_before_emit seals via resolve_provisioning_root(); force the None→reference-root
+        // fallthrough so the seal uses SMOKE_SEAL_ROOT and the client's unseal matches (guarded against
+        // a stale platform root a serialized agent-global test may have left set). NB the seal root is a
+        // `seal_root`-module global (NOT one of the agent globals `lock_and_reset_agent_process_globals`
+        // manages), so it is reset HERE; resetting to None leaves it in the process-start PRISTINE state
+        // (const-init None), so this is symmetric-by-default — no teardown restore is owed.
+        crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
+        assert!(crate::agent_dispatch::install_agent_keystore(
+            smoke_body(),
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT
+        ));
+        assert!(crate::agent_dispatch::install_anti_rollback_binding(
+            crate::agent_dispatch::AntiRollbackBinding { epoch: 1, active: true }
+        ));
+        assert!(crate::agent_dispatch::install_commit_channel(Box::new(LabCommitChannel::new())));
+        let connect = move || -> std::io::Result<std::os::unix::net::UnixStream> {
+            let (client, mut server) = std::os::unix::net::UnixStream::pair()?;
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            client.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            server.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+            server.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            std::thread::spawn(move || {
+                let _ = crate::enclave_serve::serve_framed_pump(
+                    &mut server,
+                    router,
+                    std::time::Duration::from_secs(5),
+                );
+            });
+            Ok(client)
+        };
+        let mut sink = Vec::new();
+        let ok = run_agent_keygen_smoke_client(connect, &mut sink);
+        (ok, String::from_utf8_lossy(&sink).into_owned())
+    }
+
+    /// Darwin-runnable write-path cross-val (the replica router, mirroring
+    /// `client_phases_pass_against_replica_router`): a real GENERATE_KEYS executes the full
+    /// seal→commit→swap→emit path and the negative phase stays fail-closed.
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn keygen_client_drives_real_generate_keys_against_replica_router() {
+        let (ok, log) = run_keygen_client_against_router(replica_agent_serve_one_frame);
+        assert!(ok, "keygen client phases failed:\n{log}");
+        assert!(
+            log.contains("twod-hsm-agent-keygen-smoke: PHASE generate-keys PASS"),
+            "log:\n{log}"
+        );
+        assert!(
+            log.contains("twod-hsm-agent-keygen-smoke: PHASE generate-keys-bad-cap PASS"),
+            "log:\n{log}"
+        );
+        assert!(
+            log.contains("twod-hsm-agent-keygen-smoke: RESULT PASS phases=2"),
+            "log:\n{log}"
+        );
+    }
+
+    /// The BINDING write-path cross-val: the same against the SHIPPED `agent_serve_one_frame` glue +
+    /// real serve kernel (linux+vsock lane + aya). This is the deviceless proof the 6-7b SNP smoke
+    /// rests on — protocol drift between the write-path client and the enclave is caught HERE.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "vsock-transport",
+        feature = "agent-keygen-exec-preview"
+    ))]
+    #[test]
+    fn keygen_client_drives_real_generate_keys_against_shipped_serve_glue() {
+        let (ok, log) =
+            run_keygen_client_against_router(crate::agent_gateway_boot::agent_serve_one_frame);
+        assert!(ok, "keygen client failed against the SHIPPED glue:\n{log}");
+        assert!(
+            log.contains("twod-hsm-agent-keygen-smoke: RESULT PASS phases=2"),
+            "log:\n{log}"
+        );
+    }
+
     /// REGEN (manual): `cargo test --features agent-gateway,lab-agent-smoke \
     /// regen_agent_smoke_golden_vector -- --ignored --nocapture`, then commit BOTH files and re-run
     /// the suite (`git diff --exit-code` over `testvectors/` must be clean on a second regen —
@@ -1418,6 +1854,8 @@ mod tests {
             "smoke_identity": {
                 "anchor_test_seed_hex": hex(&LAB_ANCHOR_TEST_SEED),
                 "anchor_root_hex": hex(&body.config.anchor_root),
+                "admin_seed_hex": hex(&SMOKE_ADMIN_SEED),
+                "admin_authority_pk_hex": hex(&body.config.admin_authority_pk),
                 "key_ref_hex": hex(&SMOKE_KEY_REF),
                 "secret_scalar_hex": hex(&SMOKE_SECRET_SCALAR),
                 "public_identity_hex": hex(&keypair.public_key_uncompressed()),
