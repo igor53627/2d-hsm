@@ -1711,7 +1711,13 @@ mod tests {
             _frame: &[u8],
             _deadline: std::time::Instant,
         ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
-            unreachable!("the per-op commit channel never fetches marks")
+            // Unreachable by construction (the GENERATE_KEYS commit path calls ONLY round_trip). A
+            // propagated Err — not unreachable!() — because this channel runs inside the SPAWNED
+            // serve_framed_pump thread: a panic here would kill that thread and surface as a cryptic
+            // client-side connection reset, whereas an Err fails the op closed and is reported cleanly.
+            Err(crate::agent_boot_driver::AnchorTransportError(
+                "lab commit channel: marks_round_trip must not be called on the per-op commit channel",
+            ))
         }
     }
 
