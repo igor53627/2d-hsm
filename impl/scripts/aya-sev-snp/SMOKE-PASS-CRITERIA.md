@@ -105,6 +105,41 @@ composition 1+0 on real AF_VSOCK.**
   (real CID_ANY bind + shipped relay pump + the REAL lab anchor stub; discharges the bind-CID-ANY
   reality item, seeds TASK-21).
 
+## Agent-gateway WRITE-path (GENERATE_KEYS) smoke (TASK-7.7 6-7b-ii)
+
+| Script | Flake disk | Pass signals |
+|--------|------------|--------------|
+| `run-nix-snp-agent-keygen-smoke.sh` | `.#disk-production-lab-agent-keygen-smoke` (the SAME serve unit, built WITH `agent-keygen-exec-preview`) | R1–R4 all hold (script header): anchor stub + relay up BEFORE qemu; R2 boot evidence (budget events, `[info] boot handshake outcome:` BEFORE the serve marker, relay `pump ok` + anchor `signed response`); R3 = the host client's **`RESULT PASS phases=2`** (the AUTHORITATIVE write-path proof — W1's in-band resealed-blob unseal) PLUS a post-boot anchor/relay wire-liveness belt; R4 = in-guest `journald-serve PASS` + NO `connection fault`. |
+| `DISK_ATTR=disk-production-lab-agent-keygen-smoke run-kvm-agent-refusal.sh` | same image | **EXPECTED REFUSAL** (same boot wrapper as the read-path image): handshake `[warn]` + `[err] agent-gateway boot failed:` + restart evidence + NO `serving on vsock`. |
+
+### 6-7b-ii acceptance checklist
+
+Status: **PASSED on aya 2026-06-14 — 2 consecutive SNP runs at `1f0e9cd`, `RESULT PASS phases=2` both,
+the post-boot anchor/relay wire-liveness belt held each run (W1's in-band resealed-blob unseal is the authoritative commit proof, NOT the count delta); KVM
+expected-refusal PASS (warn-outcome + err-render + 2 restart cycles, never served); aya `lab-agent-smoke
++ agent-keygen-exec-preview` cargo suite green (incl. the linux shipped-glue keygen cross-val).** The
+deviceless half 6-7b-i is merged (PR #78 squash 96937cc). The latent `lab-prod-fixtures.nix` 4418→4416
+blob-size assert (a 6-7b-i regression invisible to CI — the image is eval-only there) was fixed here and
+validated by the build getting past `twod-hsm-lab-agent-smoke-keystore.drv`.
+
+- [x] **Write-path core:** a real signed `GENERATE_KEYS(count=2)` over vsock from the host against the
+  preview `twod-hsm-agent-gateway` bin on a real SEV-SNP launch (client phase `generate-keys`) — the
+  reply's minted key list + a resealed blob that UNSEALS to entries+2 / structural+1 / epoch+1 (the
+  Structural-op atomic bump = the seal→commit→ack-verify→swap→emit witness).
+- [x] **The per-op commit succeeded (authoritative = in-band):** W1's resealed-blob unseal to the
+  ADVANCED body proves the commit, since `commit_before_emit` emits the swapped blob only AFTER the
+  anchor commit returns Ok. R3 also runs a **wire-liveness BELT** (a NEW anchor sign + relay pump after
+  the boot snapshot) — honest scope: a generic-marker count delta, NOT W1-attributed (a crash-loop
+  boot-freshness or broken-auth W2 commit could also satisfy it); the in-band assertion is the gate. A
+  positively-attributed wire witness (between-W1/W2 snapshot + a commit-specific stub marker) is a
+  deferred next-iteration hardening (would need a stub change + re-run).
+- [x] **Auth gate live + isolated:** client phase `generate-keys-bad-cap` → exact `0x43` (counter=2 so
+  ONLY the signature check can reject — see the 6-7b-i compact finding).
+- [x] **Production seal-root resolution exercised:** the guest seals the candidate under the
+  platform-installed root (`TWOD_HSM_PQ_SEAL_V1_ROOT_FILE` = the lab reference root = `SMOKE_SEAL_ROOT`),
+  NOT the deviceless `cfg(test)` fallthrough — so the client's unseal matching proves the real install.
+- [x] **≥2 consecutive SNP runs** emit `RESULT PASS phases=2` + KVM expected-refusal PASS.
+
 ### Residuals recorded, NOT discharged by this smoke
 
 - **Release-bin spawn shape** — this smoke is DEBUG by mechanical necessity

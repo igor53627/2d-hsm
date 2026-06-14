@@ -34,8 +34,11 @@ in
   agentSealedKeystoreFile = pkgs.runCommand "twod-hsm-lab-agent-smoke-keystore" { } ''
     cp ${tv}/agent-gateway/agent_keystore_smoke_v1.sealed.bin $out
     sz=$(wc -c < "$out" | tr -d ' ')
-    if [ "$sz" != "4418" ]; then
-      echo "expected the 4418-byte smoke agent keystore blob (format_version 2), got $sz" >&2
+    # 4416 since 6-7b-i (was 4418): the real admin_authority_pk shrank the CBOR by 2 bytes vs the old
+    # all-0xa1 placeholder. The disk image is eval-only in CI, so this BUILD-time assert is the guard
+    # caught only on aya — keep it in lockstep with the regenerated blob.
+    if [ "$sz" != "4416" ]; then
+      echo "expected the 4416-byte smoke agent keystore blob (format_version 2), got $sz" >&2
       exit 1
     fi
   '';
