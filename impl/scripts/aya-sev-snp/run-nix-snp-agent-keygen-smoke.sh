@@ -18,8 +18,9 @@
 #   R1 preflight  — anchor 'listening', relay 'listening on vsock relay port', image ensured
 #   R2 boot-ready — serial: budget events, '[info] boot handshake outcome:' BEFORE the serve marker,
 #                   relay 'pump ok', anchor 'signed response' (the boot freshness leg)
-#   R3 client     — 'twod-hsm-agent-keygen-smoke: RESULT PASS phases=2' AND the anchor signed a SECOND
-#                   response (the W1 per-op commit ACK) + the relay forwarded a second pump
+#   R3 client     — 'twod-hsm-agent-keygen-smoke: RESULT PASS phases=2' (the AUTHORITATIVE write-path
+#                   proof: W1's in-band resealed-blob unseal to the advanced body) PLUS a post-boot
+#                   anchor/relay wire-liveness BELT (a fresh round-trip occurred; NOT W1-attributed)
 #   R4 witnesses  — in-guest journald-serve PASS, no '[warn] ... connection fault'
 #
 # SELF-MATCH GUARD: this script never echoes the grepped witness literals.

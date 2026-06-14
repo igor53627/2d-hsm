@@ -115,7 +115,7 @@ composition 1+0 on real AF_VSOCK.**
 ### 6-7b-ii acceptance checklist
 
 Status: **PASSED on aya 2026-06-14 — 2 consecutive SNP runs at `1f0e9cd`, `RESULT PASS phases=2` both,
-the W1 commit-witness (a fresh anchor-signed 0x45 ACK + relay pump after boot) confirmed each run; KVM
+the post-boot anchor/relay wire-liveness belt held each run (W1's in-band resealed-blob unseal is the authoritative commit proof, NOT the count delta); KVM
 expected-refusal PASS (warn-outcome + err-render + 2 restart cycles, never served); aya `lab-agent-smoke
 + agent-keygen-exec-preview` cargo suite green (incl. the linux shipped-glue keygen cross-val).** The
 deviceless half 6-7b-i is merged (PR #78 squash 96937cc). The latent `lab-prod-fixtures.nix` 4418→4416
