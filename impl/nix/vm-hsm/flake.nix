@@ -331,6 +331,7 @@
             # to WHNF is lazy and would not trigger the throw.
             assert !((builtins.tryEval ((gp (funding "operator-signed-boot" { })).agentAntiRollbackMode)).success);
             assert !((builtins.tryEval ((gp (funding "remote-conter" { })).agentAntiRollbackMode)).success); # typo ⇒ throws
+            assert !((builtins.tryEval ((gp (funding 42 { })).agentAntiRollbackMode)).success); # non-string ⇒ throws cleanly (typeOf-guarded msg, no coerce error)
             # DIRECT-module fail-closed (compact 7539): on the path that bypasses guest-profile's enum
             # throw, the predicate must FAIL for any non-sanctioned mode (allowlist, not just != "none").
             assert !(directGate "none");
