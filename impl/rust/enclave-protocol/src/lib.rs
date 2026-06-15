@@ -103,6 +103,16 @@ compile_error!(
      release builds until anti-rollback (TASK-7.7), scope_target-binding, and audit land"
 );
 
+// Live AGENT_K1_SIGN_TRANSFER signing emits fund-moving transfer signatures. SIGN_TRANSFER itself is
+// NOT rollback-sensitive (it mutates no sealed state), so it carries no TASK-7.7 anti-rollback
+// obligation — the ban is the production fund-CUSTODY-readiness gate: it stays fail-closed until the
+// AC#5 production funding profile is provisioned and TASK-18 un-gates. Hard-ban it from release builds.
+#[cfg(all(release_build, feature = "agent-sign-transfer-preview"))]
+compile_error!(
+    "`agent-sign-transfer-preview` (live AGENT_K1_SIGN_TRANSFER signing) must not be enabled in \
+     release builds until the AC#5 production funding profile is armed and TASK-18 un-gates"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
@@ -208,6 +218,14 @@ pub use boot_agent_keystore::{
 // Agent Gateway identity proof (TASK-7.6.3). EIP-191 0x19 PROVE_IDENTITY preimage + signer.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_identity;
+// Minimal hand-rolled RLP encoder (TASK-7.6.4). Encode-only; no new crate. The byte-exact 2D
+// `Chain.Crypto.Envelope` preimage builder for the structured EIP-155 transfer signer.
+#[cfg(feature = "agent-gateway")]
+mod rlp;
+// Agent Gateway structured ordinary-transfer signing (TASK-7.6.4). EIP-155 RLP preimage + signer,
+// mirroring `agent_identity`. The SIGN_TRANSFER dispatch handler is `agent-sign-transfer-preview`-gated.
+#[cfg(feature = "agent-gateway")]
+pub mod agent_transfer;
 // Agent Gateway key generation (TASK-7.6.3). GENERATE_KEYS keystore-mutation core.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_keygen;

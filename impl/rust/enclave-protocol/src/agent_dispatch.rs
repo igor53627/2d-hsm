@@ -26,6 +26,7 @@
 use crate::agent_identity::{
     public_identity_from_entry, IdentityProof, PublicIdentity, AGENT_GATEWAY_VERSION,
 };
+use crate::agent_transfer::SignedTransfer;
 use crate::agent_capability::VerifiedCapability;
 use crate::agent_keygen::{generate_keys, GenerateKeysError, GeneratedKey};
 use crate::agent_keystore::{seal_body, CreationMetadata, KeyPurpose, KeystoreBody};
@@ -206,6 +207,10 @@ pub enum AgentResponse {
     /// A signed identity proof for the requested key. (The response body does not echo `request_id`;
     /// correlation is implicit at the synchronous 0x40 frame layer.)
     ProveIdentity(IdentityProof),
+    /// SIGN_TRANSFER result: the broadcastable EIP-155 signed transaction + its `(r, s, recovery_id,
+    /// v)` and the derived `from`. Non-mutating (NotCommitted) — no sealed-state change, so it does NOT
+    /// go through the seal-before-emit seam; the frame layer encodes it directly.
+    SignTransfer(SignedTransfer),
     /// GENERATE_KEYS result: the generated public key material PLUS the mutated `candidate` keystore
     /// (counter advanced + new entries + the atomic epoch/structural bump). The frame layer SEALS the
     /// candidate (side-effect-free compute), then COMMITS its post-op state to the anchor (TASK-7.7
@@ -404,10 +409,25 @@ pub fn dispatch_agent(
                 Err(AgentError::NotConfigured)
             }
         }
-        // Runtime signing (4/5) lands in TASK-7.6.4.
-        AgentOpcode::SignTransfer | AgentOpcode::SignFaucetDispense => {
-            Err(AgentError::NotConfigured)
+        // SIGN_TRANSFER(4): structured EIP-155 ordinary-transfer signing (TASK-7.6.4 / slice 15-1).
+        // PRODUCTION-GATED as a fund-custody-readiness gate (it is NOT rollback-sensitive, so this is
+        // NOT an anti-rollback gate): fund-moving signing stays fail-closed until the AC#5 funding
+        // profile is provisioned and TASK-18 un-gates. Enabled only via `agent-sign-transfer-preview`;
+        // otherwise fail closed.
+        AgentOpcode::SignTransfer => {
+            #[cfg(feature = "agent-sign-transfer-preview")]
+            {
+                handle_sign_transfer(&env, keystore)
+            }
+            #[cfg(not(feature = "agent-sign-transfer-preview"))]
+            {
+                let _ = &env;
+                Err(AgentError::NotConfigured)
+            }
         }
+        // SIGN_FAUCET_DISPENSE(5) lands in TASK-15 slice 15-3 (rollback-sensitive: dual-counter debit
+        // through the seal-before-emit seam). Fail closed until then.
+        AgentOpcode::SignFaucetDispense => Err(AgentError::NotConfigured),
         // Privileged opcodes handled above; unreachable here.
         _ => Err(AgentError::Malformed),
     }
@@ -426,6 +446,25 @@ fn handle_public_identity(
     Ok(AgentResponse::PublicIdentity(identity))
 }
 
+/// Load the signing `Keypair` for a sealed `KeyEntry`: copy its 32-byte secret scalar into a
+/// `Zeroizing` buffer (scrubbed on drop / early return, AC#15 — a plain `[u8; 32]` would linger on the
+/// enclave stack) and rebuild the keypair. A wrong-length or invalid scalar collapses to
+/// `KeyPurposeMismatch` (0x42, the per-key anti-oracle bucket — never reveal loaded-key detail).
+/// Shared by PROVE_IDENTITY and SIGN_TRANSFER (and slice 15-3 SIGN_FAUCET_DISPENSE) so the secret-scrub
+/// and error-collapse discipline lives in ONE place. The `len() != 32` guard MUST precede the
+/// `copy_from_slice` (which panics on a length mismatch); `secret_scalar` is a `Zeroizing<Vec<u8>>`.
+#[cfg(any(feature = "agent-prove-identity-preview", feature = "agent-sign-transfer-preview"))]
+fn load_keypair_for(
+    entry: &crate::agent_keystore::KeyEntry,
+) -> Result<crate::secp256k1::Keypair, AgentError> {
+    if entry.secret_scalar.len() != 32 {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    secret.copy_from_slice(&entry.secret_scalar);
+    crate::secp256k1::Keypair::from_secret_bytes(&secret).map_err(|_| AgentError::KeyPurposeMismatch)
+}
+
 /// PROVE_IDENTITY(3): sign the EIP-191 identity proof for `key_ref` over the verifier-supplied
 /// nonce, binding the sealed chain_id/environment_identifier. Gated by the production preview
 /// feature (see the dispatch gate).
@@ -435,7 +474,6 @@ fn handle_prove_identity(
     keystore: &KeystoreBody,
 ) -> Result<AgentResponse, AgentError> {
     use crate::agent_identity::sign_identity_proof;
-    use crate::secp256k1::Keypair;
     let key_ref = env.key_ref.ok_or(AgentError::Malformed)?;
     // payload (envelope key 7) = strict `{ 1: verifier_nonce(32B) }` (no other/dup keys).
     let payload = env.payload.as_deref().ok_or(AgentError::Malformed)?;
@@ -448,14 +486,7 @@ fn handle_prove_identity(
     };
     let entry =
         crate::agent_identity::find_entry(keystore, &key_ref).ok_or(AgentError::KeyPurposeMismatch)?;
-    // Hold the loaded scalar in Zeroizing so it is scrubbed on drop / early return (7.2 AC#15) —
-    // a plain `[u8; 32]` would linger on the enclave stack.
-    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-    if entry.secret_scalar.len() != 32 {
-        return Err(AgentError::KeyPurposeMismatch);
-    }
-    secret.copy_from_slice(&entry.secret_scalar);
-    let keypair = Keypair::from_secret_bytes(&secret).map_err(|_| AgentError::KeyPurposeMismatch)?;
+    let keypair = load_keypair_for(entry)?;
     let proof = sign_identity_proof(
         &keypair,
         keystore.config.twod_chain_id,
@@ -468,6 +499,73 @@ fn handle_prove_identity(
     // (0x46 = atomic sealed-commit failed; reserved for the GENERATE_KEYS/CONFIGURE_TREASURY path).
     .map_err(|_| AgentError::KeyPurposeMismatch)?;
     Ok(AgentResponse::ProveIdentity(proof))
+}
+
+/// SIGN_TRANSFER(4): structured EIP-155 ordinary-transfer signing for `key_ref` (an `agent_transfer_k1`
+/// key only). Decodes the semantic-field payload, runs the §1 pre-build checks (sealed chain_id, `from`
+/// == derived address, empty `data`) BEFORE building any preimage, then builds the canonical EIP-155
+/// preimage internally (never a caller digest), signs low-S, and returns the broadcastable signed
+/// transaction. Non-mutating: no seal, no anti-rollback commit. Gated by `agent-sign-transfer-preview`.
+///
+/// Capability absence is NOT re-checked here: the caller [`dispatch_agent`] rejects a runtime opcode
+/// carrying an envelope capability (`env.capability.is_some()` → `Malformed`) and `decode_envelope`
+/// strict-checks the outer keys `1..=7` — so a SIGN_TRANSFER frame with a capability or an unknown
+/// outer key never reaches this handler (covered by `rejects_capability_on_runtime_op` /
+/// `rejects_extra_outer_envelope_key`).
+#[cfg(feature = "agent-sign-transfer-preview")]
+fn handle_sign_transfer(
+    env: &AgentEnvelope,
+    keystore: &KeystoreBody,
+) -> Result<AgentResponse, AgentError> {
+    use crate::agent_cbor::{as_bytes_n, as_u256_minimal_be};
+    use crate::agent_transfer::{sign_transfer, EthTransferFields};
+    let key_ref = env.key_ref.ok_or(AgentError::Malformed)?;
+    // payload (envelope key 7) = strict EXACTLY
+    // `{1: chain_id, 2: from(20B), 3: to(20B), 4: amount, 5: nonce, 6: gas_limit, 7: gas_price, 8: data}`.
+    let payload = env.payload.as_deref().ok_or(AgentError::Malformed)?;
+    if payload.len() != 8 || !check_strict_keys(payload, |n| (1..=8).contains(&n)) {
+        return Err(AgentError::Malformed);
+    }
+    let req_chain_id = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let req_from = map_get(payload, 2).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
+    let to = map_get(payload, 3).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
+    let value_be = map_get(payload, 4).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+    let nonce = map_get(payload, 5).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let gas_limit = map_get(payload, 6).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let gas_price_be = map_get(payload, 7).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+    // data MUST be present and empty (MVP — non-empty calldata is a separate, semantically-parsed
+    // command; §1). A precomputed-digest / arbitrary-bytes request can only land here as `data`, and a
+    // non-empty `data` fails closed → there is no generic-digest signing path.
+    let data = map_get(payload, 8).and_then(as_bytes).ok_or(AgentError::Malformed)?;
+    if !data.is_empty() {
+        return Err(AgentError::Malformed);
+    }
+    // §1 pre-build check 1: chain_id MUST equal the sealed 2D chain_id (never request-authoritative).
+    if req_chain_id != keystore.config.twod_chain_id {
+        return Err(AgentError::Malformed);
+    }
+    // Key-purpose: SIGN_TRANSFER accepts ONLY agent_transfer_k1. not-found ≡ wrong-purpose → 0x42
+    // (anti-oracle, §4 / §10.9): an absent key and a faucet/treasury key are indistinguishable.
+    let entry = crate::agent_identity::find_entry(keystore, &key_ref)
+        .ok_or(AgentError::KeyPurposeMismatch)?;
+    if entry.purpose != KeyPurpose::AgentTransferK1 {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    let keypair = load_keypair_for(entry)?;
+    // §1 pre-build check 2: `from` MUST equal the selected key_ref's derived eth address. Collapse a
+    // mismatch into the per-KEY bucket (0x42), NOT Malformed: reaching here means the key exists AND is
+    // a transfer key, so a distinct code would be a key-existence/purpose oracle vs the 0x42 returned for
+    // not-found / wrong-purpose. Request-SHAPE errors (chain_id, data, widths) stay 0x40; everything
+    // key-related is uniformly 0x42 (anti-oracle, §10.9).
+    if req_from != keypair.eth_address() {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    let fields = EthTransferFields { chain_id: req_chain_id, nonce, gas_limit, to, value_be, gas_price_be };
+    // Collapse any signing failure (the ~2^-128 x-reduced recovery_id rejection, or the
+    // recovery==from invariant) to the per-key bucket — SIGN_TRANSFER never seals, so NOT SealFailed
+    // (0x46). ValueTooWide/ChainIdOverflow are unreachable here (caps pre-validated above).
+    let signed = sign_transfer(&keypair, &fields).map_err(|_| AgentError::KeyPurposeMismatch)?;
+    Ok(AgentResponse::SignTransfer(signed))
 }
 
 /// Canonical CBOR of the GENERATE_KEYS command params `{1: purpose, 2: count}` (RFC 8949 shortest
@@ -991,6 +1089,18 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
             (Value::Integer(4.into()), Value::Bytes(proof.address.to_vec())),
             (Value::Integer(5.into()), Value::Bytes(proof.pubkey_uncompressed.to_vec())),
         ]),
+        // SIGN_TRANSFER response (TASK-7.6.4 — the spec left the response map open): the broadcastable
+        // signed transaction + its components. Key 1 = `signed_rlp` (BYTES), so a success body is
+        // distinguishable from a `{1: code(int)}` error body (cf. `decode_agent_error_code`).
+        AgentResponse::SignTransfer(t) => encode_body(vec![
+            (Value::Integer(1.into()), Value::Bytes(t.signed_rlp.clone())),
+            (Value::Integer(2.into()), Value::Bytes(t.signature.r.to_vec())),
+            (Value::Integer(3.into()), Value::Bytes(t.signature.s.to_vec())),
+            (Value::Integer(4.into()), Value::Integer((t.signature.recovery_id as u64).into())),
+            (Value::Integer(5.into()), Value::Integer(t.v.into())),
+            (Value::Integer(6.into()), Value::Bytes(t.signing_hash.to_vec())),
+            (Value::Integer(7.into()), Value::Bytes(t.from.to_vec())),
+        ]),
         // GENERATE_KEYS MUST be encoded by the frame layer WITH its sealed blob
         // (`encode_generate_keys_response`). Reaching the generic encoder means a mis-routed mutation;
         // fail closed to an error body rather than fabricate a persist-less success the host can't
@@ -1058,10 +1168,15 @@ mod tests {
     use crate::agent_keystore::{
         AuditRing, CreationMetadata, FaucetState, KeyPurpose, KeystoreConfig,
     };
+    // KeyEntry construction is shared by the keygen-exec and sign-transfer preview test blocks; the
+    // `any(..)` gate avoids a duplicate import when both previews are enabled.
+    #[cfg(any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-sign-transfer-preview"
+    ))]
+    use crate::agent_keystore::{BackupExportMetadata, KeyAlgorithm, KeyEntry};
     #[cfg(feature = "agent-keygen-exec-preview")]
-    use crate::agent_keystore::{
-        BackupExportMetadata, KeyAlgorithm, KeyEntry, MAX_TOTAL_KEY_ENTRIES,
-    };
+    use crate::agent_keystore::MAX_TOTAL_KEY_ENTRIES;
 
     fn base_body() -> KeystoreBody {
         KeystoreBody {
@@ -1739,12 +1854,20 @@ mod tests {
     fn runtime_signing_opcodes_not_configured() {
         let _g = gate_unconfigured(); // op 5 is rollback-sensitive — serialize the binding global
         let (body, _) = body_with_key();
-        for op in [4u8, 5u8] {
-            assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &envelope(op, vec![]), &body).err(),
-                Some(AgentError::NotConfigured)
-            );
-        }
+        // SIGN_FAUCET_DISPENSE(5) is rollback-sensitive: the anti-rollback gate fail-closes it
+        // (NotConfigured) when unconfigured — independent of any preview feature (until slice 15-3).
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &envelope(5, vec![]), &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+        // SIGN_TRANSFER(4): production fail-closed (NotConfigured) WITHOUT the preview feature; WITH it
+        // the opcode is LIVE, so an empty payload reaches the handler and is rejected as Malformed (not
+        // NotConfigured) — that distinction is exactly what proves the production gate opened.
+        let err4 = dispatch_agent(Profile::AgentGateway, &envelope(4, vec![]), &body).err();
+        #[cfg(not(feature = "agent-sign-transfer-preview"))]
+        assert_eq!(err4, Some(AgentError::NotConfigured));
+        #[cfg(feature = "agent-sign-transfer-preview")]
+        assert_eq!(err4, Some(AgentError::Malformed));
     }
 
     #[test]
@@ -2173,12 +2296,16 @@ mod tests {
         let body = base_body();
         assert!(!AgentOpcode::SignTransfer.is_rollback_sensitive(), "transfer carries no rollback state");
         assert!(AgentOpcode::SignFaucetDispense.is_rollback_sensitive(), "faucet dispense debits spend");
-        // Both currently return NotConfigured (op4 via the runtime arm even unconfigured; op5 via the
-        // gate when unconfigured); the classification above locks the 4/5 split against a refactor.
-        assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &envelope(4, vec![]), &body).err(),
-            Some(AgentError::NotConfigured)
-        );
+        // SIGN_TRANSFER(4) is NOT anti-rollback-gated (the classification above is the lock). When the
+        // gate is unconfigured it is therefore NOT blocked by the gate: without the preview it falls
+        // through to the production fail-closed NotConfigured; WITH the preview it is live, so an empty
+        // payload is Malformed — proving it passed the (unconfigured) gate rather than being blocked by it.
+        let err4 = dispatch_agent(Profile::AgentGateway, &envelope(4, vec![]), &body).err();
+        #[cfg(not(feature = "agent-sign-transfer-preview"))]
+        assert_eq!(err4, Some(AgentError::NotConfigured));
+        #[cfg(feature = "agent-sign-transfer-preview")]
+        assert_eq!(err4, Some(AgentError::Malformed), "transfer is live — not gate-blocked");
+        // SIGN_FAUCET_DISPENSE(5) IS gated → NotConfigured when the binding is unconfigured.
         assert_eq!(
             dispatch_agent(Profile::AgentGateway, &envelope(5, vec![]), &body).err(),
             Some(AgentError::NotConfigured)
@@ -2234,5 +2361,409 @@ mod tests {
         let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&env)), Some(0x45));
         reset_agent_keystore_for_tests();
+    }
+
+    /// SIGN_TRANSFER(4) dispatch handler (TASK-15 slice 15-1) — golden reproduction + §6 rejections.
+    #[cfg(feature = "agent-sign-transfer-preview")]
+    mod sign_transfer_dispatch {
+        use super::*;
+
+        const KEYS: &str = include_str!("../testvectors/agent-gateway/keys.json");
+        const ORD: &str = include_str!("../testvectors/agent-gateway/ordinary_tx_v1.json");
+
+        fn unhex(s: &str) -> Vec<u8> {
+            hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap()
+        }
+        fn arr20(s: &str) -> [u8; 20] {
+            unhex(s).try_into().unwrap()
+        }
+        /// Minimal big-endian bytes of a u64 (the canonical u256 wire form for values that fit u64).
+        fn min_be(x: u64) -> Vec<u8> {
+            let b = x.to_be_bytes();
+            let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+            b[i..].to_vec()
+        }
+
+        /// A keystore body carrying a specific secp256k1 key (golden test vectors) under `purpose`.
+        /// Returns (body, key_ref, derived-from-address).
+        fn body_with_key(name: &str, purpose: KeyPurpose) -> (KeystoreBody, [u8; 32], [u8; 20]) {
+            let k: serde_json::Value = serde_json::from_str(KEYS).unwrap();
+            let key_ref = [0x33u8; 32];
+            let mut body = base_body();
+            body.entries.push(KeyEntry {
+                key_ref,
+                purpose,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity: unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+                secret_scalar: zeroize::Zeroizing::new(unhex(k[name]["privkey"].as_str().unwrap())),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                backup_export_metadata: BackupExportMetadata::default(),
+            });
+            (body, key_ref, arr20(k[name]["eth_address"].as_str().unwrap()))
+        }
+
+        /// Build a SIGN_TRANSFER request envelope from explicit field values (each test perturbs one).
+        /// `value`/`gas_price`/`data` are passed as raw `Value`s so a test can inject a non-`bstr` /
+        /// non-minimal / over-width encoding.
+        #[allow(clippy::too_many_arguments)]
+        fn request(
+            key_ref: &[u8; 32],
+            chain_id: u64,
+            from: &[u8; 20],
+            to: &[u8; 20],
+            value: Value,
+            nonce: u64,
+            gas_limit: u64,
+            gas_price: Value,
+            data: Value,
+        ) -> Vec<u8> {
+            let payload = Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(chain_id.into())),
+                (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                (Value::Integer(4.into()), value),
+                (Value::Integer(5.into()), Value::Integer(nonce.into())),
+                (Value::Integer(6.into()), Value::Integer(gas_limit.into())),
+                (Value::Integer(7.into()), gas_price),
+                (Value::Integer(8.into()), data),
+            ]);
+            envelope(
+                4,
+                vec![
+                    (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                    (Value::Integer(7.into()), payload),
+                ],
+            )
+        }
+
+        /// The golden request reproducing `ordinary_tx_v1` for the given key.
+        fn golden_request(key_ref: &[u8; 32], from: &[u8; 20]) -> Vec<u8> {
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let f = &o["fields"];
+            request(
+                key_ref,
+                o["chain_id"].as_u64().unwrap(),
+                from,
+                &arr20(f["to"].as_str().unwrap()),
+                Value::Bytes(min_be(f["value"].as_u64().unwrap())),
+                f["nonce"].as_u64().unwrap(),
+                f["gas_limit"].as_u64().unwrap(),
+                Value::Bytes(min_be(f["gas_price"].as_u64().unwrap())),
+                Value::Bytes(vec![]),
+            )
+        }
+
+        fn resp_map(body: &[u8]) -> Vec<(Value, Value)> {
+            match ciborium::de::from_reader::<Value, _>(body).unwrap() {
+                Value::Map(m) => m,
+                _ => panic!("response is not a CBOR map"),
+            }
+        }
+
+        #[test]
+        fn dispatch_matches_golden() {
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let resp = dispatch_agent(Profile::AgentGateway, &golden_request(&key_ref, &from), &body)
+                .expect("golden SIGN_TRANSFER must succeed");
+            let m = resp_map(&encode_agent_response(&resp));
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let bytes = |k: u64| as_bytes(map_get(&m, k).unwrap()).unwrap().to_vec();
+            let uint = |k: u64| as_u64(map_get(&m, k).unwrap()).unwrap();
+            assert_eq!(bytes(1), unhex(o["signed_rlp"].as_str().unwrap()), "signed_rlp");
+            assert_eq!(bytes(2), unhex(o["signature"]["r"].as_str().unwrap()), "r");
+            assert_eq!(bytes(3), unhex(o["signature"]["s"].as_str().unwrap()), "s");
+            assert_eq!(uint(4), o["signature"]["recovery_id"].as_u64().unwrap(), "recovery_id");
+            assert_eq!(uint(5), o["signature"]["v_eip155"].as_u64().unwrap(), "v");
+            assert_eq!(bytes(6), unhex(o["signing_hash_keccak256"].as_str().unwrap()), "signing_hash");
+            assert_eq!(bytes(7), from.to_vec(), "from");
+        }
+
+        /// The full wire path (frame layer + installed keystore) yields the same golden signed tx.
+        #[test]
+        fn frame_path_matches_golden() {
+            let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            assert!(install_agent_keystore(body, b"meas"));
+            let out = handle_agent_gateway_frame(&golden_request(&key_ref, &from));
+            // A success body has BYTES at key 1 (signed_rlp), so the error-code decoder returns None.
+            assert_eq!(decode_agent_error_code(&out), None, "must be a success body, not an error");
+            let m = resp_map(&out);
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            assert_eq!(
+                as_bytes(map_get(&m, 1).unwrap()).unwrap().to_vec(),
+                unhex(o["signed_rlp"].as_str().unwrap()),
+                "frame-path signed_rlp"
+            );
+            // Symmetric teardown: the guard's NEXT acquirer full-resets anyway, but reset here too so
+            // this test leaves no installed keystore behind (mirrors the lock_and_reset entry).
+            crate::agent_dispatch::reset_agent_keystore_for_tests();
+        }
+
+        #[test]
+        fn rejects_invalid_requests() {
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let to = arr20(o["fields"]["to"].as_str().unwrap());
+            let cid = o["chain_id"].as_u64().unwrap();
+            let val = || Value::Bytes(min_be(o["fields"]["value"].as_u64().unwrap()));
+            let gp = || Value::Bytes(min_be(o["fields"]["gas_price"].as_u64().unwrap()));
+            let empty = || Value::Bytes(vec![]);
+            let err = |req: &[u8]| dispatch_agent(Profile::AgentGateway, req, &body).err();
+
+            // wrong chain_id (never request-authoritative) → Malformed
+            assert_eq!(
+                err(&request(&key_ref, cid + 1, &from, &to, val(), 0, 21000, gp(), empty())),
+                Some(AgentError::Malformed),
+                "wrong chain_id"
+            );
+            // `from` != the key's derived address → KeyPurposeMismatch (key-related → uniform 0x42,
+            // anti-oracle: reaching the from-check means the key exists + is a transfer key).
+            let mut bad_from = from;
+            bad_from[0] ^= 0xff;
+            assert_eq!(
+                err(&request(&key_ref, cid, &bad_from, &to, val(), 0, 21000, gp(), empty())),
+                Some(AgentError::KeyPurposeMismatch),
+                "from != derived"
+            );
+            // non-empty `data` (no generic-digest / calldata path in MVP) → Malformed
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, gp(), Value::Bytes(vec![0xde, 0xad]))),
+                Some(AgentError::Malformed),
+                "non-empty data"
+            );
+            // over-width amount (33 bytes > u256) → Malformed (never truncated, §2 AC#8)
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, Value::Bytes(vec![0x01; 33]), 0, 21000, gp(), empty())),
+                Some(AgentError::Malformed),
+                "over-width amount"
+            );
+            // non-minimal amount (leading zero byte) → Malformed (canonical u256 wire form)
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, Value::Bytes(vec![0x00, 0x01]), 0, 21000, gp(), empty())),
+                Some(AgentError::Malformed),
+                "non-minimal amount"
+            );
+            // amount as a CBOR uint (not a byte string) → Malformed (u256 fields are byte strings)
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, Value::Integer(5.into()), 0, 21000, gp(), empty())),
+                Some(AgentError::Malformed),
+                "amount not a bstr"
+            );
+            // unknown key_ref → KeyPurposeMismatch (anti-oracle: not-found ≡ wrong-purpose)
+            assert_eq!(
+                err(&request(&[0x99; 32], cid, &from, &to, val(), 0, 21000, gp(), empty())),
+                Some(AgentError::KeyPurposeMismatch),
+                "unknown key_ref"
+            );
+            // the SAME malformed u256 encodings on `gas_price` (key 7) → Malformed — symmetric with
+            // `amount` (key 4); both decode through `as_u256_minimal_be`, so this pins key 7's wiring.
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, Value::Bytes(vec![0x01; 33]), empty())),
+                Some(AgentError::Malformed),
+                "over-width gas_price"
+            );
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, Value::Bytes(vec![0x00, 0x01]), empty())),
+                Some(AgentError::Malformed),
+                "non-minimal gas_price"
+            );
+            assert_eq!(
+                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, Value::Integer(5.into()), empty())),
+                Some(AgentError::Malformed),
+                "gas_price not a bstr"
+            );
+        }
+
+        #[test]
+        fn rejects_wrong_key_purpose() {
+            // A faucet-treasury key under SIGN_TRANSFER → KeyPurposeMismatch (cross-use, §4). Collapses
+            // with key-not-found so the host cannot tell "wrong purpose" from "absent".
+            let (body, key_ref, from) = body_with_key("treasury_key", KeyPurpose::AgentFaucetTreasuryK1);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &golden_request(&key_ref, &from), &body).err(),
+                Some(AgentError::KeyPurposeMismatch)
+            );
+        }
+
+        #[test]
+        fn rejects_capability_on_runtime_op() {
+            // SIGN_TRANSFER is a runtime op; a capability (envelope key 5) is forbidden → Malformed.
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let to = arr20(o["fields"]["to"].as_str().unwrap());
+            let payload = Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(o["chain_id"].as_u64().unwrap().into())),
+                (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                (Value::Integer(4.into()), Value::Bytes(min_be(o["fields"]["value"].as_u64().unwrap()))),
+                (Value::Integer(5.into()), Value::Integer(0.into())),
+                (Value::Integer(6.into()), Value::Integer(21000.into())),
+                (Value::Integer(7.into()), Value::Bytes(min_be(o["fields"]["gas_price"].as_u64().unwrap()))),
+                (Value::Integer(8.into()), Value::Bytes(vec![])),
+            ]);
+            let req = envelope(
+                4,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(vec![(Value::Integer(1.into()), Value::Integer(1.into()))])),
+                    (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                    (Value::Integer(7.into()), payload),
+                ],
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &req, &body).err(),
+                Some(AgentError::Malformed)
+            );
+        }
+
+        #[test]
+        fn rejects_missing_and_extra_payload_keys() {
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let to = arr20(o["fields"]["to"].as_str().unwrap());
+            // Missing key 8 (data): only 7 keys → Malformed.
+            let missing = envelope(
+                4,
+                vec![
+                    (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                    (
+                        Value::Integer(7.into()),
+                        Value::Map(vec![
+                            (Value::Integer(1.into()), Value::Integer(o["chain_id"].as_u64().unwrap().into())),
+                            (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                            (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                            (Value::Integer(4.into()), Value::Bytes(min_be(1))),
+                            (Value::Integer(5.into()), Value::Integer(0.into())),
+                            (Value::Integer(6.into()), Value::Integer(21000.into())),
+                            (Value::Integer(7.into()), Value::Bytes(min_be(1))),
+                        ]),
+                    ),
+                ],
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &missing, &body).err(),
+                Some(AgentError::Malformed),
+                "missing data key"
+            );
+            // Extra key 9 → Malformed (strict allow-list 1..=8).
+            let extra = envelope(
+                4,
+                vec![
+                    (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                    (
+                        Value::Integer(7.into()),
+                        Value::Map(vec![
+                            (Value::Integer(1.into()), Value::Integer(o["chain_id"].as_u64().unwrap().into())),
+                            (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                            (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                            (Value::Integer(4.into()), Value::Bytes(min_be(1))),
+                            (Value::Integer(5.into()), Value::Integer(0.into())),
+                            (Value::Integer(6.into()), Value::Integer(21000.into())),
+                            (Value::Integer(7.into()), Value::Bytes(min_be(1))),
+                            (Value::Integer(8.into()), Value::Bytes(vec![])),
+                            (Value::Integer(9.into()), Value::Integer(0.into())),
+                        ]),
+                    ),
+                ],
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &extra, &body).err(),
+                Some(AgentError::Malformed),
+                "extra payload key"
+            );
+        }
+
+        #[test]
+        fn rejects_wrong_length_to_and_from() {
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let to = arr20(o["fields"]["to"].as_str().unwrap());
+            let cid = o["chain_id"].as_u64().unwrap();
+            let val = min_be(o["fields"]["value"].as_u64().unwrap());
+            let gp = min_be(o["fields"]["gas_price"].as_u64().unwrap());
+            // Build a request with arbitrary (possibly wrong-length) `from`/`to` byte strings.
+            let build = |from_v: Value, to_v: Value| -> Vec<u8> {
+                let payload = Value::Map(vec![
+                    (Value::Integer(1.into()), Value::Integer(cid.into())),
+                    (Value::Integer(2.into()), from_v),
+                    (Value::Integer(3.into()), to_v),
+                    (Value::Integer(4.into()), Value::Bytes(val.clone())),
+                    (Value::Integer(5.into()), Value::Integer(0.into())),
+                    (Value::Integer(6.into()), Value::Integer(21000.into())),
+                    (Value::Integer(7.into()), Value::Bytes(gp.clone())),
+                    (Value::Integer(8.into()), Value::Bytes(vec![])),
+                ]);
+                envelope(
+                    4,
+                    vec![
+                        (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                        (Value::Integer(7.into()), payload),
+                    ],
+                )
+            };
+            // 19/21-byte `to` → Malformed (as_bytes_n::<20> rejects; never silently padded/truncated).
+            for bad_to in [vec![0u8; 19], vec![0u8; 21]] {
+                let req = build(Value::Bytes(from.to_vec()), Value::Bytes(bad_to));
+                assert_eq!(
+                    dispatch_agent(Profile::AgentGateway, &req, &body).err(),
+                    Some(AgentError::Malformed),
+                    "wrong-length to"
+                );
+            }
+            // 19-byte `from` → Malformed (a SHAPE error caught at decode, before the semantic
+            // from!=derived 0x42 check) — pins the shape-vs-key band split for `from`.
+            let req = build(Value::Bytes(vec![0u8; 19]), Value::Bytes(to.to_vec()));
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &req, &body).err(),
+                Some(AgentError::Malformed),
+                "wrong-length from"
+            );
+        }
+
+        #[test]
+        fn signs_zero_value_and_gas_price() {
+            // A zero-value, zero-gas_price transfer is a valid signed artifact (empty bstr = canonical
+            // zero → RLP 0x80). Exercises the empty-bytes branch through the real dispatch + encoder.
+            let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            let to = arr20(o["fields"]["to"].as_str().unwrap());
+            let cid = o["chain_id"].as_u64().unwrap();
+            let req = request(
+                &key_ref,
+                cid,
+                &from,
+                &to,
+                Value::Bytes(vec![]), // value = 0
+                0,
+                21000,
+                Value::Bytes(vec![]), // gas_price = 0
+                Value::Bytes(vec![]),
+            );
+            let resp = dispatch_agent(Profile::AgentGateway, &req, &body)
+                .expect("zero-value transfer must sign");
+            let m = resp_map(&encode_agent_response(&resp));
+            assert_eq!(as_bytes(map_get(&m, 7).unwrap()).unwrap().to_vec(), from.to_vec(), "from");
+            assert!(!as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(), "signed_rlp present");
+        }
+
+        #[test]
+        fn rejects_extra_outer_envelope_key() {
+            // grok lock-in: decode_envelope strict-checks outer keys 1..=7, so an unknown OUTER key (8)
+            // is Malformed before the handler — a SIGN_TRANSFER frame cannot smuggle extra outer fields
+            // (the capability-at-key-5 case is covered by rejects_capability_on_runtime_op).
+            let (body, _, _) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
+            let extra_outer = envelope(
+                4,
+                vec![
+                    (Value::Integer(6.into()), Value::Bytes([0x33u8; 32].to_vec())),
+                    (Value::Integer(7.into()), Value::Map(vec![])),
+                    (Value::Integer(8.into()), Value::Integer(0.into())),
+                ],
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &extra_outer, &body).err(),
+                Some(AgentError::Malformed),
+                "unknown outer envelope key"
+            );
+        }
     }
 }

@@ -49,6 +49,26 @@ pub(crate) fn as_bytes32(v: &Value) -> Option<[u8; 32]> {
     as_bytes_n::<32>(v)
 }
 
+/// A `u256`-domain wire field (`amount` / `gas_price`, TASK-7.4 §1/§2) as its CANONICAL minimal
+/// big-endian bytes: a CBOR byte string of length `0..=32` with **no leading zero byte** (empty =
+/// zero), so each value has exactly one wire encoding. Returns `None` for a non-`bstr`, an over-width
+/// value (`> 32` bytes — fail-closed per §2 AC#8, **never** truncated), or a non-minimal encoding (a
+/// leading zero byte). The caller maps `None` onto its own `Malformed` band. This is the SINGLE source
+/// of the `u256` canonical wire form so the SIGN_TRANSFER and (slice 15-3) SIGN_FAUCET_DISPENSE
+/// decoders cannot drift on what "canonical" means. `#[allow(dead_code)]`: the sole consumers are the
+/// preview-gated signing handlers, so the base `agent-gateway` lib build (preview off) has no caller.
+#[allow(dead_code)]
+pub(crate) fn as_u256_minimal_be(v: &Value) -> Option<Vec<u8>> {
+    let bytes = as_bytes(v)?;
+    if bytes.len() > 32 {
+        return None; // over-width u256 — fail closed, never truncate
+    }
+    if !bytes.is_empty() && bytes[0] == 0 {
+        return None; // non-minimal (leading zero byte)
+    }
+    Some(bytes.to_vec())
+}
+
 /// Strict integer-key check for a decoded wire map: every key is an integer accepted by `allowed`
 /// and **no key repeats**. Returns `false` on any violation so the caller can map it to its own
 /// `Malformed` band. Supports keys in `1..=64` (every agent-gateway schema uses keys ≤ 13; the bound
@@ -639,6 +659,27 @@ mod tests {
         assert!(!check_strict_keys(&[(int(0), int(0))], |_| true));
         // an empty map is vacuously strict.
         assert!(check_strict_keys(&[], |n: u64| (1..=7).contains(&n)));
+    }
+
+    #[test]
+    fn as_u256_minimal_be_canonical_form() {
+        // empty bstr = zero
+        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![])), Some(vec![]));
+        // minimal non-zero accepted, returned verbatim
+        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x01])), Some(vec![0x01]));
+        assert_eq!(
+            as_u256_minimal_be(&Value::Bytes(vec![0xde, 0xad])),
+            Some(vec![0xde, 0xad])
+        );
+        // full 32-byte width accepted (boundary)
+        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x01; 32])).map(|v| v.len()), Some(32));
+        // leading zero (non-minimal) rejected
+        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x00])), None);
+        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x00, 0x01])), None);
+        // over-width (33 bytes) rejected — never truncated
+        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x01; 33])), None);
+        // non-bstr rejected
+        assert_eq!(as_u256_minimal_be(&Value::Integer(5.into())), None);
     }
 
     #[test]
