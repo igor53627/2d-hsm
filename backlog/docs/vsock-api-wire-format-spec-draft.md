@@ -672,12 +672,21 @@ and `EXPORT_BACKUP`/`RESTORE_BACKUP` by TASK-7.2 — each consuming this envelop
 and error contract, with the per-command map carried at envelope key 7:
 
 - **`AGENT_K1_SIGN_TRANSFER`** (runtime; `agent_transfer_k1` only) — *semantic fields,
-  never a caller digest*: `{1: chain_id(=11565), 2: from, 3: to(20B), 4: amount,
-  5: nonce, 6: gas_limit, 7: gas_price, 8: data(empty in MVP)}`. The enclave builds the
-  canonical EIP-155 preimage (`RLP([nonce, gas_price, gas, to, value, data, 11565, «», «»])`),
-  hashes with keccak256, and returns a **low-S** signature + recovery id
-  (`v = 11565*2+35+recovery_id ∈ {23165, 23166}`). Pinned by
-  `testvectors/agent-gateway/ordinary_tx_v1.*`.
+  never a caller digest*: `{1: chain_id, 2: from, 3: to(20B), 4: amount,
+  5: nonce, 6: gas_limit, 7: gas_price, 8: data(empty in MVP)}`. **`chain_id` is NOT a
+  hardcoded protocol constant**: the request `chain_id` MUST equal the **sealed
+  `KeystoreConfig.twod_chain_id`** (the per-deployment value provisioned into the measured/sealed
+  config — never request-authoritative), and the enclave rejects any other value. `11565` below is the
+  **current 2D deployment / golden-vector value**, not a literal. The enclave builds the canonical
+  EIP-155 preimage (`RLP([nonce, gas_price, gas, to, value, data, <sealed chain_id>, «», «»])`), hashes
+  with keccak256, and returns a **low-S** signature + recovery id
+  (`v = <sealed chain_id>*2+35+recovery_id`; e.g. `∈ {23165, 23166}` for chain_id 11565). Pinned by
+  `testvectors/agent-gateway/ordinary_tx_v1.*`. **The exact CBOR wire types** — `amount`/`gas_price`
+  as canonical minimal-big-endian `u256` byte strings (`0..=32` bytes, no leading zero; over-width
+  rejected, never truncated), the success-response map `{1: signed_rlp, 2: r, 3: s, 4: recovery_id,
+  5: v, 6: signing_hash, 7: from}`, and the §10.9 error-code split (request-shape → 0x40, key-related
+  → 0x42) — are the TASK-15 impl decisions pinned in **`agent-gateway-transfer-faucet-signing.md` §1**,
+  the source of truth for the SIGN_TRANSFER / SIGN_FAUCET_DISPENSE wire encoding.
 - **`AGENT_K1_SIGN_FAUCET_DISPENSE`** (`agent_faucet_treasury_k1` only) — pure native
   transfer, `data` empty; `to` MUST match a known `agent_transfer_k1` identity in the
   keystore. TEE caps over worst-case `amount + gas_limit * effective_max_fee_rate`

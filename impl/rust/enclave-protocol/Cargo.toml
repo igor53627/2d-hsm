@@ -66,6 +66,14 @@ agent-prove-identity-preview = ["agent-gateway"]
 # land. Without this feature GENERATE_KEYS verifies the capability then fails closed
 # (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs). Never enable in production.
 agent-keygen-exec-preview = ["agent-gateway"]
+# Enables LIVE AGENT_K1_SIGN_TRANSFER execution (structured EIP-155 ordinary-transfer signing with an
+# `agent_transfer_k1` key). **Production-gated OFF** as a fund-CUSTODY-readiness gate: SIGN_TRANSFER
+# mutates no sealed state (it is NOT rollback-sensitive, so it carries no TASK-7.7 anti-rollback
+# obligation), but it emits fund-moving signatures, so it stays fail-closed in production until the
+# AC#5 production funding profile is provisioned (TASK-15) and TASK-18 un-gates. Without this feature
+# SIGN_TRANSFER fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs). Never enable
+# in production.
+agent-sign-transfer-preview = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []

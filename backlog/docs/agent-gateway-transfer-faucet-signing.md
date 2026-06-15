@@ -29,7 +29,10 @@ Opcode 4, **runtime** tier (no admin capability; reachable by any vsock caller),
 8: data}`.
 
 **Pre-build checks (fail closed, before any preimage build — AC#3):**
-- `chain_id` **must equal the sealed 2D chain_id `11565`** (never request-authoritative).
+- `chain_id` **must equal the sealed `KeystoreConfig.twod_chain_id`** (never request-authoritative;
+  `11565` is the current 2D deployment / golden-vector value, **not** a hardcoded protocol constant —
+  a different sealed deployment binds a different chain_id, and the enclave rejects any request value
+  that differs from the sealed one).
 - `from` **must equal the selected `key_ref`'s derived eth address** (`keccak256(X‖Y)[12:32]`).
 - `data` **must be empty** in the MVP (non-empty calldata requires a separate,
   semantically-parsed command with per-method TEE limits).
@@ -56,6 +59,42 @@ rejected); `recovery_id ∈ {0,1}`; `v = chain_id*2 + 35 + recovery_id ∈ {2316
 **Post-sign invariant (AC#3):** recovery of the produced `(r,s,recovery_id)` over the signing
 hash must recover `from` (the 2D verifier's path; pinned `recovered_from`
 `0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266`).
+
+**Wire encoding (TASK-15 / 7.6.4 impl decisions — §10.4 left these open).** The request map is
+`{1: chain_id(uint), 2: from(20B bstr), 3: to(20B bstr), 4: amount, 5: nonce(uint), 6: gas_limit(uint),
+7: gas_price, 8: data(bstr, empty in MVP)}`. The `u256` fields (`amount`, `gas_price`) are CBOR **byte
+strings in CANONICAL minimal big-endian** — length `0..=32`, **no leading zero byte**, so each value has
+exactly one wire encoding (empty = zero). An over-width value (> 32 bytes) or a non-minimal/non-`bstr`
+encoding ⇒ `AGENT_MALFORMED` (0x40) — the §2 AC#8 "exceeding its width is rejected, never truncated"
+rule, applied at decode. `chain_id`/`nonce`/`gas_limit` are CBOR uints (`u64`). The faucet slice reuses
+this same `u256` wire form. The **success response** map is
+`{1: signed_rlp(bstr), 2: r(32B), 3: s(32B), 4: recovery_id(uint), 5: v(uint), 6: signing_hash(32B),
+7: from(20B)}`; key 1 is bytes so a success body is distinguishable from a `{1: code(uint), 2: reason}`
+§10.9 error body.
+
+**Error-code mapping (anti-oracle, §10.9).** Request-SHAPE failures that need no keystore — bad CBOR,
+`chain_id` ≠ sealed (a public constant), non-empty `data`, a non-minimal/over-width integer — collapse
+to `AGENT_MALFORMED` (0x40). Everything KEY-related — `key_ref` not found, wrong key purpose, and
+`from` ≠ the key's derived address — collapses uniformly to `AGENT_KEY_PURPOSE_MISMATCH` (0x42), so the
+error code never distinguishes "absent" from "present-but-…". `0x42` is therefore the **key-band /
+internal-signing bucket**, not strictly a "purpose mismatch": a (≈2⁻¹²⁸) signing failure (the x-reduced
+`recovery_id` rejection or the post-sign `recovery==from` invariant) also maps to 0x42 — SIGN_TRANSFER
+never seals, so **not** the seal-reserved 0x46. The `u256` width/minimality rule above is the **same**
+one §2 AC#8 defines, applied uniformly to both opcodes (one canonical wire form for `amount`/`gas_price`).
+
+**Security boundary — transfer-tier non-goals (NOT the faucet tier).** SIGN_TRANSFER signs whatever
+`(nonce, value, to)` the host supplies for a funded `agent_transfer_k1` key. The transfer tier enforces
+**no spend cap, no anti-replay, and no recipient allowlist** — those are the *faucet* tier's
+AC#5/AC#6/§2.1 contract (§2). It is **not** rollback-sensitive (it mutates no sealed counter), so it
+carries no TASK-7.7 anti-rollback obligation; "not rollback-sensitive" must **not** be read as
+"spend-bounded". Fund-custody safety for a transfer key rests entirely on the **AC#5 production funding
+profile** + host-side nonce management — which is exactly why the opcode is production-gated
+(`agent-sign-transfer-preview`, release-banned) until TASK-18 un-gates. `to` is always **exactly 20
+bytes** (ordinary transfers only): contract-creation (empty `to`) is structurally unrepresentable and
+out of scope. Semantically-valid-but-useless transfers (zero `amount`, zero `gas_limit`, self-transfer,
+duplicate nonce) are **accepted** — they are host / on-chain concerns (the host owns nonce sequencing,
+§Documented residuals), not TEE-enforced policy; the enclave signs them rather than inventing
+inconsistent TEE-side rules.
 
 ## §2 `AGENT_K1_SIGN_FAUCET_DISPENSE` signing + cap contract (AC#5, AC#6, AC#8)
 

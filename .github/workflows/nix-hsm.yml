@@ -108,6 +108,13 @@ jobs:
       - name: Agent Gateway incl. GENERATE_KEYS exec preview (TASK-7.6.x)
         run: cargo test --features agent-keygen-exec-preview
 
+      # TASK-15 slice 15-1: SIGN_TRANSFER dispatch handler (golden e2e + §6 rejections) is gated behind
+      # agent-sign-transfer-preview; the pure rlp/agent_transfer logic is already covered by the base
+      # agent-gateway lane above, but the handler tests need this feature on. Cheap unit tests (no
+      # boot/SNP) — mirrors the prove-identity / keygen-exec preview lanes.
+      - name: Agent Gateway incl. SIGN_TRANSFER preview (TASK-7.6.4 / slice 15-1)
+        run: cargo test --features agent-sign-transfer-preview
+
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 
