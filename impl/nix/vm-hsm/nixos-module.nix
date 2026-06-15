@@ -138,11 +138,12 @@ in
     }
     {
       # AC#5 Layer-1 funding gate (TASK-7.7 §5, TASK-16) — ALWAYS-PRESENT (belt-and-suspenders: the
-      # predicate is self-guarded by its own `productionMode &&` term, a no-op for non-funding/non-prod
+      # predicate is self-guarded by its own `productionMode` term, a no-op for non-funding/non-prod
       # profiles, but being OUTSIDE the isProd wrapper it fires even if the coupling invariant above were
       # ever weakened). `agentAntiRollbackGatePass` is DERIVED in the `let` above from this module's own
-      # raw params via the single-source ./ac5-funding-gate.nix (= !(productionMode && agentAntiRollbackEnabled
-      # && mode == "none" && !antiRollbackResidualOptOut)) — fail-closed for a direct consumer + drift-proof
+      # raw params via the single-source ./ac5-funding-gate.nix — FAIL-CLOSED BY ALLOWLIST (a productionMode
+      # funding build passes ONLY for an EXACT sanctioned mode {remote-counter, external-ledger} or the
+      # audited opt-out; any other value incl. an unvalidated direct-consumer string fails) — and drift-proof
       # vs the flake check. A productionMode FUNDING profile (installs an operational faucet/transfer signer
       # ⇒ agentAntiRollbackEnabled) with mode "none" FAILS the build unless the audited measured/sealed
       # residual opt-out (verbatim TASK-7.2 AC#10 ack) is recorded — the ONLY escape, never silent. No
