@@ -289,6 +289,16 @@
               # isProd = enclaveMode == "production") — closes the isProd/productionMode decoupling
               # fail-open (review mechanism A). true = the coupling assertion passes.
               couplingOk = args: let s = gp args; in (s.enclaveMode == "production") || !s.productionMode;
+              # DIRECT-module path: apply the shared predicate to a synthetic armed funding build with an
+              # arbitrary mode string, BYPASSING guest-profile.nix's enum `throw` — exactly what a direct
+              # `nixos-module.nix` consumer could do. Proves the predicate is fail-closed by ALLOWLIST
+              # (compact job 7539), not merely `!= "none"`.
+              directGate = mode: import ./ac5-funding-gate.nix {
+                productionMode = true;
+                agentAntiRollbackEnabled = true;
+                agentAntiRollbackMode = mode;
+                antiRollbackResidualOptOut = false;
+              };
             in
             # A production funding profile with mode "none" + no opt-out FAILS the gate (must not deploy).
             assert !(gate (funding "none" { }));
@@ -321,6 +331,14 @@
             # to WHNF is lazy and would not trigger the throw.
             assert !((builtins.tryEval ((gp (funding "operator-signed-boot" { })).agentAntiRollbackMode)).success);
             assert !((builtins.tryEval ((gp (funding "remote-conter" { })).agentAntiRollbackMode)).success); # typo ⇒ throws
+            # DIRECT-module fail-closed (compact 7539): on the path that bypasses guest-profile's enum
+            # throw, the predicate must FAIL for any non-sanctioned mode (allowlist, not just != "none").
+            assert !(directGate "none");
+            assert !(directGate "remote-conter"); # typo ⇒ fails closed (NOT a no-op pass)
+            assert !(directGate "operator-signed-boot"); # §5-forbidden standalone ⇒ fails closed
+            assert !(directGate ""); # empty/garbage ⇒ fails closed
+            assert directGate "remote-counter"; # sanctioned ⇒ passes
+            assert directGate "external-ledger"; # sanctioned ⇒ passes
             pkgs.runCommand "twod-hsm-agent-anti-rollback-gate-check" { } "echo ac5-layer1-gate-ok > $out";
         };
 
