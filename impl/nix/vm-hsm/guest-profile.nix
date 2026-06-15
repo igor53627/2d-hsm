@@ -109,7 +109,7 @@ let
     if builtins.elem agentAntiRollbackMode [ "none" "remote-counter" "external-ledger" ] then
       agentAntiRollbackMode
     else
-      throw "guest-profile.nix: invalid agentAntiRollbackMode '${agentAntiRollbackMode}' (expected none | remote-counter | external-ledger)";
+      throw "guest-profile.nix: invalid agentAntiRollbackMode '${toString agentAntiRollbackMode}' (expected none | remote-counter | external-ledger)";
   agentAntiRollbackEnabled = agentTransferFaucetSignerPackage != null;
 in
 {
