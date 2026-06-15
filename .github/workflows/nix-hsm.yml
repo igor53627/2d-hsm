@@ -220,6 +220,12 @@ jobs:
       - name: Check mainnet gate (AC#10)
         run: nix build --no-update-lock-file .#checks.x86_64-linux.mainnet-gate --print-out-paths
 
+      # TASK-7.7 §5 / TASK-16: exercise the AC#5 Layer-1 funding-gate logic (a productionMode funding
+      # profile with anti-rollback mode "none" + no opt-out must FAIL the build). No funding profile ships
+      # yet (TASK-15), so this check is the only place both polarities of the gate are evaluated.
+      - name: Check AC#5 funding gate (Layer-1, TASK-7.7)
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.agent-anti-rollback-gate --print-out-paths
+
       - name: Build measurement manifest
         run: |
           nix build --no-update-lock-file .#measurement-manifest --out-link result

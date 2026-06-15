@@ -34,6 +34,16 @@
   # the lab keystore file source). Default off — only the disk-production-lab-agent-gateway image
   # sets it. Lab-only by the eval assert below (the keystore source feature is release-banned).
   agentGatewayPackage ? null,
+  # AC#5 Layer-1 funding gate (TASK-7.7 §5, TASK-16). guest-profile.nix derives these: a productionMode
+  # FUNDING profile (installs an operational faucet/transfer signer ⇒ agentAntiRollbackEnabled) with
+  # agentAntiRollbackMode "none" FAILS the build unless antiRollbackResidualOptOut is recorded (assertion
+  # below). All default to the hard-block-safe values so non-funding profiles pass unchanged.
+  agentAntiRollbackMode ? "none",
+  agentAntiRollbackEnabled ? false,
+  antiRollbackResidualOptOut ? false,
+  # The single-sourced AC#5 Layer-1 gate predicate from guest-profile.nix (true = build may pass). The
+  # assertion below uses THIS (not a re-derived copy) so the module + the flake check can't drift.
+  agentAntiRollbackGatePass ? true,
   ...
 }:
 
@@ -106,7 +116,43 @@ in
   # The lab/dev outputs (vm-production*, disk-production*) keep productionMode = false and
   # remain explicitly non-mainnet. Operator-provisioned trust comes from a sealed store /
   # build-time secret injection (guest-profile *Override args), never from vsock — AC#2.
-  assertions = lib.optionals isProd [
+  assertions = [
+    {
+      # AC#5/AC#10 coupling invariant (review wf_a2cce791 mechanism A): productionMode (mainnet intent)
+      # MUST imply a production/production-lab guestProfile (isProd). Otherwise the entire
+      # `lib.optionals isProd [...]` list below — the mainnet trust/seal gates AND the AC#5 funding gate —
+      # would be SILENTLY dropped for a productionMode=true build on a non-prod guestProfile (the guard
+      # variable `isProd`/guestProfile is decoupled from the trigger `productionMode`). ALWAYS-PRESENT (not
+      # isProd-wrapped) so it catches exactly that decoupling, hardening every productionMode-keyed gate.
+      assertion = isProd || !productionMode;
+      message =
+        "twod-hsm: productionMode (mainnet intent) requires a production/production-lab guestProfile "
+        + "(enclaveMode == \"production\"). A productionMode build on a non-prod guestProfile would "
+        + "SILENTLY skip the isProd-gated mainnet trust/seal + AC#5 funding assertions. See "
+        + "nix/vm-hsm/guest-profile.nix + backlog/docs/agent-gateway-anti-rollback.md §5.";
+    }
+    {
+      # AC#5 Layer-1 funding gate (TASK-7.7 §5, TASK-16) — ALWAYS-PRESENT (belt-and-suspenders: the
+      # predicate is self-guarded by its own `productionMode &&` term, a no-op for non-funding/non-prod
+      # profiles, but being OUTSIDE the isProd wrapper it fires even if the coupling invariant above were
+      # ever weakened). `agentAntiRollbackGatePass` is the SINGLE-SOURCED predicate from guest-profile.nix
+      # (= !(productionMode && agentAntiRollbackEnabled && mode == "none" && !antiRollbackResidualOptOut)),
+      # so the module assertion and the flake check cannot drift. A productionMode FUNDING profile (installs
+      # an operational faucet/transfer signer ⇒ agentAntiRollbackEnabled) with mode "none" FAILS the build
+      # unless the audited measured/sealed residual opt-out (verbatim TASK-7.2 AC#10 ack) is recorded — the
+      # ONLY escape, never silent. No funding profile exists yet (TASK-15) so this is a dormant tripwire;
+      # checks.agent-anti-rollback-gate exercises both polarities. (Runtime Layer-2b is already live.)
+      assertion = agentAntiRollbackGatePass;
+      message =
+        "twod-hsm: AC#5 funding gate (TASK-7.7 §5) — a productionMode funding profile (one that installs "
+        + "a faucet/transfer signer) must set agentAntiRollbackMode to remote-counter | external-ledger, "
+        + "or record the audited antiRollbackResidualOptOut (the verbatim TASK-7.2 AC#10 residual-risk "
+        + "acknowledgment, captured in the measured/sealed config). mode \"none\" with no opt-out is a "
+        + "hard block — fund custody must not deploy without an anti-rollback mechanism. "
+        + "See backlog/docs/agent-gateway-anti-rollback.md §5.";
+    }
+  ]
+  ++ lib.optionals isProd [
     {
       assertion = !(productionMode && labFixtures);
       message =

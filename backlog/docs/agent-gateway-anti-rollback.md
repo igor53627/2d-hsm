@@ -192,7 +192,8 @@ active-active or HA topology; its per-dispense append is effectively the synchro
 
 Two fail-closed layers mirroring the existing TASK-5 `productionMode` pattern, plus a runbook gate.
 
-**Layer 1 — Nix build/eval gate** (mirrors `nixos-module.nix` / `guest-profile.nix` `assertions =
+**Layer 1 — Nix build/eval gate.** *(IMPLEMENTED — TASK-16: `guest-profile.nix` adds the
+`agentAntiRollbackMode ? "none"` param + the derived `agentAntiRollbackEnabled` (`= agentTransferFaucetSignerPackage != null`, so a funding profile can't bypass) + `antiRollbackResidualOptOut ? false`; `nixos-module.nix` adds the assertion below to the `lib.optionals isProd` list; `flake.nix` adds `checks.agent-anti-rollback-gate` exercising both polarities + the derivation, wired into CI alongside the mainnet gate. No funding profile ships yet (TASK-15), so the assertion is a dormant tripwire on every output and the flake check is where it is verified. The `agentAntiRollbackMode` is a BUILD-TIME guest-profile param captured in the measured image — NOT a runtime env channel a host can flip — so the §1406 env-channel measured-boot obligation is satisfied by construction for the mode itself; the broader disk-image measurement coverage is the TASK-1.1 chain. The lab-stub-endpoint-counts-as-none `usesLab` downgrade is forward-declared for when a real anti-rollback endpoint + its lab fixture land with TASK-15.)* (mirrors `nixos-module.nix` / `guest-profile.nix` `assertions =
 lib.optionals isProd [...]`, like `!(productionMode && labFixtures)`). Add a guest-profile param
 `agentAntiRollbackMode ? "none"` (enum `none | remote-counter | external-ledger`) + its
 endpoint/credential override args. **`operator-signed-boot` is NOT a standalone passing mode** (it is
