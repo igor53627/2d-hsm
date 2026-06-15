@@ -41,15 +41,20 @@
   agentAntiRollbackMode ? "none",
   agentAntiRollbackEnabled ? false,
   antiRollbackResidualOptOut ? false,
-  # The single-sourced AC#5 Layer-1 gate predicate from guest-profile.nix (true = build may pass). The
-  # assertion below uses THIS (not a re-derived copy) so the module + the flake check can't drift.
-  agentAntiRollbackGatePass ? true,
   ...
 }:
 
 let
   mode = enclaveMode;
   isProd = mode == "production";
+  # AC#5 Layer-1 funding-gate predicate — DERIVED HERE from the module's OWN primitive args via the
+  # single-source ./ac5-funding-gate.nix (the SAME function the flake `checks.agent-anti-rollback-gate`
+  # imports), so (a) the formula can't drift between the module assertion and the self-test, and (b) a
+  # direct module consumer cannot fail the gate OPEN by omitting a pre-computed flag — the assertion is
+  # computed from the raw params the module already holds (review job 7523 codex / wf_a2cce791 mech B).
+  agentAntiRollbackGatePass = import ./ac5-funding-gate.nix {
+    inherit productionMode agentAntiRollbackEnabled agentAntiRollbackMode antiRollbackResidualOptOut;
+  };
   binName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
   unitName = if isProd then "enclave-vsock" else "enclave-vsock-staging";
   # Sealed-boot loop: the SNP-derived root lands here on tmpfs (written by the derive oneshot,
@@ -135,13 +140,14 @@ in
       # AC#5 Layer-1 funding gate (TASK-7.7 §5, TASK-16) — ALWAYS-PRESENT (belt-and-suspenders: the
       # predicate is self-guarded by its own `productionMode &&` term, a no-op for non-funding/non-prod
       # profiles, but being OUTSIDE the isProd wrapper it fires even if the coupling invariant above were
-      # ever weakened). `agentAntiRollbackGatePass` is the SINGLE-SOURCED predicate from guest-profile.nix
-      # (= !(productionMode && agentAntiRollbackEnabled && mode == "none" && !antiRollbackResidualOptOut)),
-      # so the module assertion and the flake check cannot drift. A productionMode FUNDING profile (installs
-      # an operational faucet/transfer signer ⇒ agentAntiRollbackEnabled) with mode "none" FAILS the build
-      # unless the audited measured/sealed residual opt-out (verbatim TASK-7.2 AC#10 ack) is recorded — the
-      # ONLY escape, never silent. No funding profile exists yet (TASK-15) so this is a dormant tripwire;
-      # checks.agent-anti-rollback-gate exercises both polarities. (Runtime Layer-2b is already live.)
+      # ever weakened). `agentAntiRollbackGatePass` is DERIVED in the `let` above from this module's own
+      # raw params via the single-source ./ac5-funding-gate.nix (= !(productionMode && agentAntiRollbackEnabled
+      # && mode == "none" && !antiRollbackResidualOptOut)) — fail-closed for a direct consumer + drift-proof
+      # vs the flake check. A productionMode FUNDING profile (installs an operational faucet/transfer signer
+      # ⇒ agentAntiRollbackEnabled) with mode "none" FAILS the build unless the audited measured/sealed
+      # residual opt-out (verbatim TASK-7.2 AC#10 ack) is recorded — the ONLY escape, never silent. No
+      # funding profile exists yet (TASK-15) so this is a dormant tripwire; checks.agent-anti-rollback-gate
+      # exercises both polarities. (Runtime Layer-2b is already live.)
       assertion = agentAntiRollbackGatePass;
       message =
         "twod-hsm: AC#5 funding gate (TASK-7.7 §5) — a productionMode funding profile (one that installs "

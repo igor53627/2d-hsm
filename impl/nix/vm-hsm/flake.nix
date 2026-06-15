@@ -277,9 +277,14 @@
                 agentTransferFaucetSignerPackage = enclave-production-lab; # any non-null ⇒ gate armed
                 agentAntiRollbackMode = mode;
               } // extra;
-              # The Layer-1 predicate — consume the SINGLE-SOURCED value the nixos-module asserts (NOT a
-              # re-implemented copy), so the check and the live assertion cannot drift (review mechanism B).
-              gate = args: (gp args).agentAntiRollbackGatePass;
+              # The Layer-1 predicate — apply the SAME single-source ./ac5-funding-gate.nix function the
+              # nixos-module derives its assertion from (to guest-profile's primitives), so the check and the
+              # live assertion are the SAME formula by construction (review mechanism B / job 7523).
+              gate = args:
+                let s = gp args; in
+                import ./ac5-funding-gate.nix {
+                  inherit (s) productionMode agentAntiRollbackEnabled agentAntiRollbackMode antiRollbackResidualOptOut;
+                };
               # The ALWAYS-PRESENT coupling invariant the nixos-module asserts (productionMode ⇒ isProd,
               # isProd = enclaveMode == "production") — closes the isProd/productionMode decoupling
               # fail-open (review mechanism A). true = the coupling assertion passes.
@@ -299,6 +304,11 @@
             assert gate (funding "none" { productionMode = false; });
             # agentAntiRollbackEnabled is genuinely DERIVED from the signer package (not a free-defaulting param).
             assert (gp (funding "remote-counter" { })).agentAntiRollbackEnabled;
+            # DORMANCY PIN: every SHIPPED guest profile leaves the gate DISARMED (no funding signer wired
+            # until TASK-15) — so the gate is a true dormant tripwire and these images can't trip it. If a
+            # future profile inadvertently arms it, this fails loudly rather than silently arming.
+            assert !((gp (base "staging")).agentAntiRollbackEnabled);
+            assert !((gp (base "production")).agentAntiRollbackEnabled);
             assert !((gp (base "production-lab")).agentAntiRollbackEnabled);
             # Coupling invariant: a coherent prod profile PASSES; a productionMode build on a non-prod
             # guestProfile (staging) FAILS the coupling assertion (which would otherwise silently drop the

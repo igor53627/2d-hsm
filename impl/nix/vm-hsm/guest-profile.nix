@@ -111,12 +111,6 @@ let
     else
       throw "guest-profile.nix: invalid agentAntiRollbackMode '${agentAntiRollbackMode}' (expected none | remote-counter | external-ledger)";
   agentAntiRollbackEnabled = agentTransferFaucetSignerPackage != null;
-  # SINGLE-SOURCED gate predicate (true = the build may pass; false = a productionMode funding profile
-  # with no mechanism + no opt-out, which the nixos-module assertion turns into a build failure). Defined
-  # ONCE here so the nixos-module assertion AND the flake `checks.agent-anti-rollback-gate` self-test
-  # consume the SAME expression — the two can never drift (review wf_a2cce791 mechanism B).
-  agentAntiRollbackGatePass =
-    !(productionMode && agentAntiRollbackEnabled && validatedAntiRollbackMode == "none" && !antiRollbackResidualOptOut);
 in
 {
   inherit system;
@@ -132,9 +126,10 @@ in
       labFixtures
       agentAntiRollbackEnabled
       antiRollbackResidualOptOut
-      agentAntiRollbackGatePass
       ;
-    # AC#5 Layer-1 (TASK-7.7 §5): the validated mode (enum-checked above). nixos-module asserts the gate.
+    # AC#5 Layer-1 (TASK-7.7 §5): the validated mode (enum-checked above). nixos-module DERIVES the gate
+    # predicate from these primitives via ./ac5-funding-gate.nix (the single source) — it does NOT trust a
+    # passed/defaultable pre-computed flag, so a direct module consumer can't fail the gate open.
     agentAntiRollbackMode = validatedAntiRollbackMode;
     # nixos-module declares these (TASK-1.1 derived-root self-check + sealed-boot loop); the NixOS
     # module system requires every module arg to be present in specialArgs. Defaults here keep the
