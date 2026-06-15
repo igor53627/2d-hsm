@@ -222,6 +222,11 @@ pub mod agent_identity;
 // `Chain.Crypto.Envelope` preimage builder for the structured EIP-155 transfer signer.
 #[cfg(feature = "agent-gateway")]
 mod rlp;
+// Checked 256-bit arithmetic over big-endian [u8;32] (TASK-15, TASK-7.4 §2). Pure, no new crate;
+// checked add/mul fail closed on overflow so the faucet worst-case cost (composed in slice 15-3, the
+// consumer) can never wrap a spend under a sealed cap.
+#[cfg(feature = "agent-gateway")]
+mod u256;
 // Agent Gateway structured ordinary-transfer signing (TASK-7.6.4). EIP-155 RLP preimage + signer,
 // mirroring `agent_identity`. The SIGN_TRANSFER dispatch handler is `agent-sign-transfer-preview`-gated.
 #[cfg(feature = "agent-gateway")]
