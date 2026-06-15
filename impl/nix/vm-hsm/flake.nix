@@ -331,7 +331,11 @@
             # to WHNF is lazy and would not trigger the throw.
             assert !((builtins.tryEval ((gp (funding "operator-signed-boot" { })).agentAntiRollbackMode)).success);
             assert !((builtins.tryEval ((gp (funding "remote-conter" { })).agentAntiRollbackMode)).success); # typo ⇒ throws
-            assert !((builtins.tryEval ((gp (funding 42 { })).agentAntiRollbackMode)).success); # non-string ⇒ throws cleanly (typeOf-guarded msg, no coerce error)
+            # non-string mode ⇒ REJECTED (throws). NB `builtins.tryEval` only reports success/failure, not
+            # WHICH error, so it can't distinguish the intended enum diagnostic from a `toString` coerce
+            # error — that the message is the typeOf-guarded enum diagnostic (not a coerce crash) is ensured
+            # by the `isString`/`typeOf` guard in guest-profile.nix at the code level, not asserted here.
+            assert !((builtins.tryEval ((gp (funding 42 { })).agentAntiRollbackMode)).success);
             # DIRECT-module fail-closed (compact 7539): on the path that bypasses guest-profile's enum
             # throw, the predicate must FAIL for any non-sanctioned mode (allowlist, not just != "none").
             assert !(directGate "none");
