@@ -26,6 +26,21 @@
   trustFileOverride ? null,
   pqSealRootOverride ? null,
   pqSealedSignerOverride ? null,
+  # AC#5 Layer-1 funding gate (TASK-7.7 §5, TASK-16). The anti-rollback mechanism mode is provisioned
+  # at BUILD TIME (captured in the measured/sealed config — NEVER a runtime/host-settable input; a host
+  # cannot flip it). A productionMode FUNDING profile (one that installs an operational faucet/transfer
+  # signer ⇒ `agentAntiRollbackEnabled` below) with mode "none" FAILS the build (nixos-module assertion),
+  # unless the audited `antiRollbackResidualOptOut` is recorded. See backlog/docs/agent-gateway-anti-rollback.md §5.
+  #   enum: none | remote-counter | external-ledger. ("operator-signed-boot" is NOT a standalone passing
+  #   mode — §3 replay-vulnerable alone — only a challenge-response sub-mode of remote-counter.)
+  agentAntiRollbackMode ? "none",
+  # The measured/sealed audited opt-out (verbatim TASK-7.2 AC#10 residual-risk acknowledgment, build-time,
+  # captured in the enclave measurement). The ONLY way the gate passes with mode "none". Default = hard block.
+  antiRollbackResidualOptOut ? false,
+  # Forward-declared (TASK-15 transfer/faucet signing): the operational funding-signer package. Its
+  # presence DERIVES `agentAntiRollbackEnabled = true`, so a new funding profile can never silently leave
+  # the gate disabled (Nix optional params default falsy). null today ⇒ no funding profile ⇒ gate dormant.
+  agentTransferFaucetSignerPackage ? null,
 }:
 
 let
@@ -84,6 +99,22 @@ let
     (isProd && usesLab trustFileOverride labFx.producerAttestationTrustFile)
     || (isProdLab && usesLab pqSealRootOverride labFx.pqSealProvisioningRootFile)
     || (isProdLab && usesLab pqSealedSignerOverride labFx.pqSealedSignerFile);
+
+  # AC#5 Layer-1 (TASK-7.7 §5, TASK-16). Validate the mode enum at eval; surface the gate inputs for the
+  # nixos-module assertion. `agentAntiRollbackEnabled` is DERIVED (the gate is armed iff a funding signer
+  # is installed) — never a free-defaulting param a funding profile could forget to set. No funding signer
+  # exists yet (TASK-15), so this is `false` for every current profile and the gate is a dormant tripwire
+  # that the `checks.agent-anti-rollback-gate` flake check still exercises with synthetic funding args.
+  validatedAntiRollbackMode =
+    if builtins.elem agentAntiRollbackMode [ "none" "remote-counter" "external-ledger" ] then
+      agentAntiRollbackMode
+    else
+      throw "guest-profile.nix: invalid agentAntiRollbackMode ${
+        if builtins.isString agentAntiRollbackMode
+        then "'${agentAntiRollbackMode}'"
+        else "(non-string value, type ${builtins.typeOf agentAntiRollbackMode})"
+      } (expected none | remote-counter | external-ledger)";
+  agentAntiRollbackEnabled = agentTransferFaucetSignerPackage != null;
 in
 {
   inherit system;
@@ -97,7 +128,13 @@ in
       enclaveTransportOnly
       productionMode
       labFixtures
+      agentAntiRollbackEnabled
+      antiRollbackResidualOptOut
       ;
+    # AC#5 Layer-1 (TASK-7.7 §5): the validated mode (enum-checked above). nixos-module DERIVES the gate
+    # predicate from these primitives via ./ac5-funding-gate.nix (the single source) — it does NOT trust a
+    # passed/defaultable pre-computed flag, so a direct module consumer can't fail the gate open.
+    agentAntiRollbackMode = validatedAntiRollbackMode;
     # nixos-module declares these (TASK-1.1 derived-root self-check + sealed-boot loop); the NixOS
     # module system requires every module arg to be present in specialArgs. Defaults here keep the
     # existing behavior (file-based root, no self-check/ceremony); disk-image.nix overrides them for

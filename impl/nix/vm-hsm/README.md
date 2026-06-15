@@ -149,6 +149,16 @@ not a silent boot): with `productionMode = true` it refuses
 - any **lab fixture** in use (`labFixtures` — lab trust VK / lab PQ seal), and
 - a **transport-only** profile (no operational signer).
 
+**AC#5 — the funding gate (TASK-7.7 §5 / TASK-16).** The same `nixos-module.nix` adds two
+always-present assertions: (1) a `productionMode ⇒ isProd` coupling invariant (so a `productionMode`
+build on a non-prod `guestProfile` can't silently drop the isProd-gated mainnet + funding assertions),
+and (2) the **AC#5 funding gate** — a `productionMode` profile that installs an operational
+faucet/transfer signer (⇒ the derived `agentAntiRollbackEnabled`) with `agentAntiRollbackMode = "none"`
+fails the build unless the audited `antiRollbackResidualOptOut` is recorded. The predicate is the
+single-source `ac5-funding-gate.nix` (the module derives it from its own params — no fail-open default).
+No funding profile ships yet (TASK-15), so it is a dormant tripwire regression-tested by
+`checks.agent-anti-rollback-gate`. See `backlog/docs/agent-gateway-anti-rollback.md` §5.
+
 `guest-profile.nix` derives `labFixtures` and threads `productionMode` into the module.
 `labFixtures` is true when an override is absent **or points back at the in-repo lab fixture**
 (compared by store path), so the gate can't be bypassed by aiming an override at the lab file.

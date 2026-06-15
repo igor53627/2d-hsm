@@ -252,6 +252,99 @@
             assert !(labOf (labArgs "production-lab" // real));                    # full real override ⇒ not lab
             assert labOf (labArgs "production-lab" // real // { trustFileOverride = labTrust; }); # override AT lab file ⇒ still lab (no bypass)
             pkgs.runCommand "twod-hsm-mainnet-gate-check" { } "echo gate-logic-ok > $out";
+
+          # AC#5 Layer-1 funding gate (TASK-7.7 §5, TASK-16). Exercise the build-time gate logic at eval —
+          # no funding profile exists yet (TASK-15), so the nixos-module assertion is a dormant tripwire on
+          # every shipped output; this check is where its BOTH polarities are verified, so a regression in
+          # the derivation / assertion can't slip through unexercised (the mainnet-gate precedent).
+          agent-anti-rollback-gate =
+            let
+              gp = args: (import ./guest-profile.nix args).specialArgs;
+              base = guestProfile: {
+                inherit
+                  nixpkgs
+                  enclave
+                  enclave-staging
+                  enclave-production-lab
+                  enclave-production-transport
+                  guestProfile
+                  ;
+              };
+              # Synthesize a production FUNDING profile: a non-null funding-signer package DERIVES
+              # agentAntiRollbackEnabled = true (TASK-15 wires the real package); productionMode on.
+              funding = mode: extra: base "production-lab" // {
+                productionMode = true;
+                agentTransferFaucetSignerPackage = enclave-production-lab; # any non-null ⇒ gate armed
+                agentAntiRollbackMode = mode;
+              } // extra;
+              # The Layer-1 predicate — apply the SAME single-source ./ac5-funding-gate.nix function the
+              # nixos-module derives its assertion from (to guest-profile's primitives), so the check and the
+              # live assertion are the SAME formula by construction (review mechanism B / job 7523).
+              gate = args:
+                let s = gp args; in
+                import ./ac5-funding-gate.nix {
+                  inherit (s) productionMode agentAntiRollbackEnabled agentAntiRollbackMode antiRollbackResidualOptOut;
+                };
+              # The ALWAYS-PRESENT coupling invariant the nixos-module asserts (productionMode ⇒ isProd,
+              # isProd = enclaveMode == "production") — closes the isProd/productionMode decoupling
+              # fail-open (review mechanism A). true = the coupling assertion passes.
+              couplingOk = args: let s = gp args; in (s.enclaveMode == "production") || !s.productionMode;
+              # DIRECT-module path: apply the shared predicate to a synthetic armed funding build with an
+              # arbitrary mode string, BYPASSING guest-profile.nix's enum `throw` — exactly what a direct
+              # `nixos-module.nix` consumer could do. Proves the predicate is fail-closed by ALLOWLIST
+              # (compact job 7539), not merely `!= "none"`.
+              directGate = mode: import ./ac5-funding-gate.nix {
+                productionMode = true;
+                agentAntiRollbackEnabled = true;
+                agentAntiRollbackMode = mode;
+                antiRollbackResidualOptOut = false;
+              };
+            in
+            # A production funding profile with mode "none" + no opt-out FAILS the gate (must not deploy).
+            assert !(gate (funding "none" { }));
+            # A configured mechanism PASSES.
+            assert gate (funding "remote-counter" { });
+            assert gate (funding "external-ledger" { });
+            # mode "none" WITH the audited opt-out PASSES — the ONLY escape.
+            assert gate (funding "none" { antiRollbackResidualOptOut = true; });
+            # A NON-funding profile (no signer ⇒ gate NOT armed) PASSES even at mode "none" — the gate
+            # guards fund custody only, not read/attestation profiles.
+            assert gate (base "production-lab" // { productionMode = true; });
+            # productionMode = false (lab/dev) PASSES even when armed+none — Layer-1 is a productionMode control.
+            assert gate (funding "none" { productionMode = false; });
+            # agentAntiRollbackEnabled is genuinely DERIVED from the signer package (not a free-defaulting param).
+            assert (gp (funding "remote-counter" { })).agentAntiRollbackEnabled;
+            # DORMANCY PIN: every SHIPPED guest profile leaves the gate DISARMED (no funding signer wired
+            # until TASK-15) — so the gate is a true dormant tripwire and these images can't trip it. If a
+            # future profile inadvertently arms it, this fails loudly rather than silently arming.
+            assert !((gp (base "staging")).agentAntiRollbackEnabled);
+            assert !((gp (base "production")).agentAntiRollbackEnabled);
+            assert !((gp (base "production-lab")).agentAntiRollbackEnabled);
+            # Coupling invariant: a coherent prod profile PASSES; a productionMode build on a non-prod
+            # guestProfile (staging) FAILS the coupling assertion (which would otherwise silently drop the
+            # whole isProd-gated assertion list — funding gate included).
+            assert couplingOk (funding "remote-counter" { });
+            assert !(couplingOk (base "staging" // { productionMode = true; }));
+            # The enum-throw rejects any non-listed mode — incl. the §5-forbidden standalone "operator-signed-boot"
+            # and any typo — so a passing (non-"none") mode is always one of the three sanctioned mechanisms.
+            # tryEval must FORCE the throwing value (the validated mode); forcing the bare specialArgs attrset
+            # to WHNF is lazy and would not trigger the throw.
+            assert !((builtins.tryEval ((gp (funding "operator-signed-boot" { })).agentAntiRollbackMode)).success);
+            assert !((builtins.tryEval ((gp (funding "remote-conter" { })).agentAntiRollbackMode)).success); # typo ⇒ throws
+            # non-string mode ⇒ REJECTED (throws). NB `builtins.tryEval` only reports success/failure, not
+            # WHICH error, so it can't distinguish the intended enum diagnostic from a `toString` coerce
+            # error — that the message is the typeOf-guarded enum diagnostic (not a coerce crash) is ensured
+            # by the `isString`/`typeOf` guard in guest-profile.nix at the code level, not asserted here.
+            assert !((builtins.tryEval ((gp (funding 42 { })).agentAntiRollbackMode)).success);
+            # DIRECT-module fail-closed (compact 7539): on the path that bypasses guest-profile's enum
+            # throw, the predicate must FAIL for any non-sanctioned mode (allowlist, not just != "none").
+            assert !(directGate "none");
+            assert !(directGate "remote-conter"); # typo ⇒ fails closed (NOT a no-op pass)
+            assert !(directGate "operator-signed-boot"); # §5-forbidden standalone ⇒ fails closed
+            assert !(directGate ""); # empty/garbage ⇒ fails closed
+            assert directGate "remote-counter"; # sanctioned ⇒ passes
+            assert directGate "external-ledger"; # sanctioned ⇒ passes
+            pkgs.runCommand "twod-hsm-agent-anti-rollback-gate-check" { } "echo ac5-layer1-gate-ok > $out";
         };
 
         devShells.default = pkgs.mkShell {
