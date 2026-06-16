@@ -102,6 +102,26 @@ Opcode 5, **faucet-treasury** tier, the singleton `agent_faucet_treasury_k1` key
 preimage / `from` / `chain_id` machinery as §1 (`from` = treasury key's derived address).
 Differs by recipient allowlist + spend caps + sealed counter debit.
 
+**Wire encoding + preview gate (TASK-15 / 7.6.4 impl decisions; slice 15-3b).** The request map is the
+**identical strict 8-field map** as SIGN_TRANSFER (§1) — `{1: chain_id, 2: from(20B), 3: to(20B),
+4: amount, 5: nonce, 6: gas_limit, 7: gas_price, 8: data(empty)}`, same canonical minimal-BE `u256` form
+for `amount`/`gas_price`, same `chain_id == sealed twod_chain_id` rule (a faucet dispense IS a pure native
+transfer). The **success response** appends the sealed blob to the transfer response: `{1: signed_rlp,
+2: r, 3: s, 4: recovery_id, 5: v, 6: signing_hash, 7: from, 8: sealed_keystore_blob}` — keys 1–7 are the
+broadcastable signed dispense tx (byte-for-byte the SIGN_TRANSFER layout); **key 8 is the new sealed
+keystore the host MUST persist** (the debited faucet state, mirroring GENERATE_KEYS key 2). Key 1 is BYTES,
+so a success body is distinguishable from a `{1: code(int)}` §10.9 error body. **Error bands** (anti-oracle
+§10.9, in handler order): request-SHAPE → 0x40; everything key/recipient-related — signer `key_ref`
+absent, wrong purpose, `from` ≠ derived, AND **`to` not a known transfer identity** — collapses uniformly
+to 0x42 (the recipient allowlist runs in the same band, so the host cannot probe keystore membership); any
+§2 cap/budget/breaker/overflow → 0x44; a seal/anchor-commit failure → 0x46. The §2 checks run only AFTER
+the key+recipient checks pass, so a 0x44 reveals nothing a valid dispense would not. Production-gated behind
+the release-banned **`agent-sign-faucet-preview`** feature (fund-CUSTODY readiness, ON TOP OF the runtime
+anti-rollback gate — SIGN_FAUCET_DISPENSE is rollback-sensitive); fails closed (`AGENT_NOT_CONFIGURED`)
+without it. It is a **mutating, EpochOnly** op: the debited candidate goes through the slice-6
+`commit_before_emit` seam (seal → anchor-commit → swap → emit), so the signature is emitted ONLY after the
+debit is durably committed (§3).
+
 - **Recipient allowlist (AC#5):** `to` **must match an active `agent_transfer_k1` public
   identity in the keystore**. This blocks one-command faucet→external spend, but **not**
   two-step exfiltration (host dispenses to a transfer key, then signs a transfer out) until
