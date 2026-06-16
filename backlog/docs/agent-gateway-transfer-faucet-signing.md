@@ -114,11 +114,13 @@ transfer). The **success response** appends the sealed blob to the transfer resp
 broadcastable signed dispense tx (byte-for-byte the SIGN_TRANSFER layout); **key 8 is the new sealed
 keystore the host MUST persist** (the debited faucet state, mirroring GENERATE_KEYS key 2). Key 1 is BYTES,
 so a success body is distinguishable from a `{1: code(int)}` §10.9 error body. **Error bands** (anti-oracle
-§10.9, in handler order): request-SHAPE → 0x40; everything key/recipient-related — signer `key_ref`
-absent, wrong purpose, `from` ≠ derived, `to` not a known transfer identity, **and a (≈2⁻¹²⁸,
-non-host-controllable) signing failure** — collapses uniformly to 0x42; any §2 cap/budget/breaker/overflow
-→ 0x44; a seal / anchor-commit failure **and the (unreachable: needs `freshness_epoch == u64::MAX`)
-candidate epoch-bump overflow** → 0x46. The §2 checks run only AFTER the key+recipient checks pass, so a
+§10.9, in handler order): request-SHAPE — bad CBOR, **an ABSENT signer `key_ref`** (envelope key 6 omitted
+= a structurally-incomplete request, host-observable from its own bytes), chain_id ≠ sealed, non-empty
+`data`, over-width/non-minimal u256 — → 0x40; everything key/recipient-related for a `key_ref` that IS
+present — `key_ref` **present-but-not-found**, wrong purpose, `from` ≠ derived, `to` not a known transfer
+identity, **and a (≈2⁻¹²⁸, non-host-controllable) signing failure** — collapses uniformly to 0x42; any §2
+cap/budget/breaker/overflow → 0x44; a seal / anchor-commit failure **and the (unreachable: needs
+`freshness_epoch == u64::MAX`) candidate epoch-bump overflow** → 0x46. The §2 checks run only AFTER the key+recipient checks pass, so a
 0x44 reveals nothing a valid dispense would not. **Membership-probe scope (precise).** Collapsing
 recipient-not-found into 0x42 hides keystore membership from a host **without** valid treasury credentials
 (it cannot tell recipient-not-found from a missing/mis-purposed treasury key). A host **with** valid
