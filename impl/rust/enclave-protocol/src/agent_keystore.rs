@@ -742,17 +742,19 @@ impl KeystoreBody {
     /// [`Self::advance_commit_epoch`]: that fn moves `freshness_epoch` (+ `structural_version` for a
     /// STRUCTURAL op) but deliberately does NOT touch `monotonic_treasury_config_version`.
     ///
-    /// `config_version` is NOT a marks surface (absent from [`Self::encode_marks_payload`]) and MUST NOT
-    /// be aliased onto `structural_version` — their independence is part of the anti-rollback contract.
-    /// For the `{set_limits, refill_budget, raise_lifetime_breaker}` (Structural) sub-ops `config_version`
-    /// rides ALONGSIDE the `structural_version` bump, so a rolled-back config is caught as the
-    /// `StructuralGap` that bump produces; `reset_lifetime_breaker` is EpochOnly (its full effect is in
-    /// the marks `lifetime_spend`/`strict_recovery_counter`), so there `config_version` advances WITHOUT a
-    /// `structural_version` bump.
+    /// `config_version` is NOT a marks surface (absent from [`Self::encode_marks_payload`]) and is an
+    /// audit/version stamp (snapshotted into `CreationMetadata.config_version`), **not itself a rollback
+    /// control** — rollback of an old sealed blob is caught by the `freshness_epoch`/`structural_version`
+    /// anti-rollback (`AnchorBehind`/`StructuralGap`), not by `config_version`. ALL FOUR CONFIGURE_TREASURY
+    /// sub-ops are Structural, so `config_version` always rides ALONGSIDE the `structural_version` bump
+    /// (including `reset_lifetime_breaker` — Structural per the TASK-15 15-4 review, see
+    /// `agent_dispatch::configure_treasury_sub_op_bump_class`): a dropped config seal is therefore caught
+    /// as `StructuralGap`→restore, which re-presents `config_version` from backup (it never silently rolls
+    /// back across a crash, since no CONFIGURE sub-op is EpochOnly/adopt-forwardable).
     ///
-    /// **Checked, never wraps:** a wrapped config_version would let a superseded/loosened config be
-    /// re-applied via rollback undetected, so overflow fails closed (`MonotonicOverflow`) — the handler
-    /// maps it to `SealFailed`/0x46. `u64` overflow is unreachable in practice (one bump per config op).
+    /// **Checked, never wraps:** monotonicity is the audit-trail contract; overflow fails closed
+    /// (`MonotonicOverflow`) — the handler maps it to `SealFailed`/0x46. `u64` overflow is unreachable in
+    /// practice (one bump per config op).
     #[cfg_attr(not(feature = "agent-configure-treasury-preview"), allow(dead_code))]
     pub(crate) fn advance_treasury_config_version(&mut self) -> Result<(), KeystoreError> {
         self.config.monotonic_treasury_config_version = self

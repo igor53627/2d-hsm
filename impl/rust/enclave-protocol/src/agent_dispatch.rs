@@ -149,15 +149,16 @@ impl AgentOpcode {
     #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-2; consumed by the 6-4 dispatch wiring
     fn commit_bump_class(self) -> CommitBumpClass {
         match self {
-            // STRUCTURAL — mutate state NOT captured in the marks digest: GENERATE_KEYS mints new random
-            // key material; CONFIGURE_TREASURY changes faucet CONFIG (limits/breaker — not a marks
-            // surface). A dropped seal of either ⇒ StructuralGap⇒restore (design §3). [GENERATE_KEYS is
-            // the only LIVE handler; CONFIGURE_TREASURY is deferred — its class is re-confirmed when its
-            // handler lands, but Structural is the design-named AND fail-closed-safe value. CAVEAT for the
-            // CONFIGURE handler: opcode-level granularity OVER-classifies the `reset_lifetime_breaker`
-            // sub-op (marks-only: spend resets + strict_recovery_counter) as Structural — fail-closed-SAFE
-            // (a dropped seal fails to restore rather than silently adopting), but the handler will need a
-            // sub-op-level classifier (set_limits/refill/raise = Structural; reset = EpochOnly).]
+            // STRUCTURAL — mutate state NOT captured in the marks digest (OR a marks surface that the op
+            // DECREASES, which AdoptForward's monotone-up belt cannot reconstruct): GENERATE_KEYS mints new
+            // random key material; CONFIGURE_TREASURY changes faucet CONFIG (limits / refillable budget /
+            // breaker — not marks surfaces) AND, for `reset_lifetime_breaker`, LOWERS `lifetime_spend` (a
+            // marks surface) + clears the breaker + bumps `config_version`. A dropped seal of either ⇒
+            // StructuralGap⇒restore (design §3). The CONFIGURE handler uses a sub-op classifier
+            // [`configure_treasury_sub_op_bump_class`] that re-confirms ALL FOUR sub-ops Structural — the
+            // earlier note here (that `reset_lifetime_breaker` is "marks-only ⇒ EpochOnly") was WRONG
+            // (TASK-15 15-4 review): reset LOWERS a marks surface, which `marks_dominate_local` rejects, so
+            // EpochOnly would wedge the recovery op on a crash-before-swap. See that classifier's docs.
             Self::GenerateKeys | Self::ConfigureTreasury => CommitBumpClass::Structural,
             // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
             // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); EXPORT_BACKUP is a
@@ -192,23 +193,30 @@ pub(crate) enum CommitBumpClass {
     NotCommitted,
 }
 
-/// Slice 15-4: the SUB-OP-level commit-bump classifier for CONFIGURE_TREASURY. The opcode-level
-/// [`AgentOpcode::commit_bump_class`] returns `Structural` for the whole opcode (fail-closed-safe), but
-/// that OVER-classifies `reset_lifetime_breaker(3)`, whose full effect IS in the anchor's authenticated
-/// marks (`lifetime_spend` + `strict_recovery_counter`) ⇒ EpochOnly. The config sub-ops
-/// `{0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker}` mutate anchor-UNRECONSTRUCTABLE faucet
-/// config (limits / refillable budget ceiling / breaker threshold — none a marks surface), so a dropped
-/// seal must `StructuralGap`→restore ⇒ Structural. UNDER-classifying any of {0,1,2} as EpochOnly is the
-/// DANGEROUS direction (a dropped seal would adopt-forward and silently LOSE the config change); the
-/// match is therefore explicit per sub-op, and the wildcard defaults to the fail-closed-safe `Structural`
-/// (unreachable — the handler validates `sub_op ∈ 0..=3` before calling).
+/// Slice 15-4: the SUB-OP-level commit-bump classifier for CONFIGURE_TREASURY. **ALL FOUR sub-ops are
+/// `Structural`** — same as the opcode-level [`AgentOpcode::commit_bump_class`]. This fn is kept as the
+/// per-sub-op extension point (and to single-source the handler's `bumps_structural`), but each sub-op is
+/// re-confirmed Structural here:
+/// - `{0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker}` mutate anchor-UNRECONSTRUCTABLE faucet
+///   CONFIG (the limit triple / the refillable budget ceiling / the breaker threshold — none a marks
+///   surface), so a dropped seal must `StructuralGap`→restore.
+/// - `3 reset_lifetime_breaker` was INITIALLY thought EpochOnly ("its effect is in the marks"), but that
+///   is **wrong** (TASK-15 15-4 review, all reviewers): it (a) LOWERS `lifetime_spend`, a marks surface —
+///   and `AdoptForward`'s `marks_dominate_local` belt REQUIRES adopted marks ≥ local, so a lowered
+///   `lifetime_spend` fails the belt (`BeltRegression`) and the op can NEVER adopt-forward; (b) CLEARS
+///   `circuit_breaker_threshold` and (c) BUMPS `config_version` — neither a marks surface, so the
+///   AdoptForward seeder (`seed_marks_forward`) silently drops them. So reset's full effect is NOT
+///   marks-captured and NOT AdoptForward-reconstructable ⇒ it MUST be `Structural` (a dropped seal →
+///   `StructuralGap`→restore re-presents the whole body from backup, incl. the lowered spend, cleared
+///   breaker, and bumped version). EpochOnly is the DANGEROUS direction for EVERY sub-op here (a dropped
+///   seal would adopt-forward and either wedge on the belt or silently lose state); the wildcard defaults
+///   to the fail-closed-safe `Structural` (unreachable — the handler validates `sub_op ∈ 0..=3`).
 #[cfg_attr(not(feature = "agent-configure-treasury-preview"), allow(dead_code))]
 fn configure_treasury_sub_op_bump_class(sub_op: u8) -> CommitBumpClass {
     match sub_op {
-        // set_limits / refill_budget / raise_lifetime_breaker — anchor-unreconstructable faucet config.
-        0..=2 => CommitBumpClass::Structural,
-        // reset_lifetime_breaker — marks-only (lifetime_spend + strict_recovery_counter).
-        3 => CommitBumpClass::EpochOnly,
+        // ALL CONFIGURE_TREASURY sub-ops are Structural — none has an AdoptForward-safe effect (see the
+        // doc above for why reset_lifetime_breaker(3), despite touching marks, is Structural not EpochOnly).
+        0..=3 => CommitBumpClass::Structural,
         // Unreachable (sub_op validated to 0..=3 by the handler); default to fail-closed-safe Structural.
         _ => CommitBumpClass::Structural,
     }
@@ -260,8 +268,8 @@ pub enum AgentResponse {
     },
     /// CONFIGURE_TREASURY result (slice 15-4): the mutated `candidate` keystore after one faucet-config
     /// sub-op — `{set_limits, refill_budget, raise_lifetime_breaker, reset_lifetime_breaker}` — plus the
-    /// monotonic `config_version` bump and the sub-op's commit-epoch bump (Structural for the first three,
-    /// EpochOnly for `reset_lifetime_breaker`). Like GENERATE_KEYS it is MUTATING but emits NO
+    /// monotonic `config_version` bump and the sub-op's commit-epoch bump (Structural for ALL FOUR
+    /// sub-ops — see `configure_treasury_sub_op_bump_class`). Like GENERATE_KEYS it is MUTATING but emits NO
     /// secret/signature — a config op signs nothing. The frame layer SEALS the candidate, COMMITS the
     /// post-config state to the anchor (seal-before-emit), SWAPS it into the live slot and returns ONLY the
     /// sealed blob (the sole durable artifact). `request_id` is carried so the frame-layer commit can key
@@ -1098,8 +1106,11 @@ fn handle_configure_treasury(
             // Recovery-tier: clears the breaker and LOWERS `lifetime_spend` to a recovery target. `target`
             // can only LOWER (≤ current) — raising `lifetime_spend` is not a reset (and would be a covert
             // spend deflation/inflation of the lifetime total) ⇒ 0x44 on target > current. Advances the
-            // forward-only `strict_recovery_counter` (a marks surface) so the recovery is
-            // anchor-authenticated (EpochOnly: its full effect is in the marks).
+            // `strict_recovery_counter`. This op is STRUCTURAL (not EpochOnly): it LOWERS `lifetime_spend`
+            // (a marks surface), which `AdoptForward`'s `marks_dominate_local` belt would reject, and it
+            // also mutates non-marks state (the breaker + `config_version`) — so its effect is NOT
+            // AdoptForward-reconstructable and a dropped seal must `StructuralGap`→restore (TASK-15 15-4
+            // review; see `configure_treasury_sub_op_bump_class`).
             if target_lifetime_spend > candidate.faucet.lifetime_spend {
                 return Err(AgentError::CapExceeded);
             }
@@ -1131,10 +1142,10 @@ fn handle_configure_treasury(
     // rollback).
     candidate.advance_treasury_config_version().map_err(|_| AgentError::SealFailed)?;
 
-    // Anti-rollback commit-epoch bump from the SUB-OP-level classifier (NOT the opcode-level one):
-    // {set_limits, refill_budget, raise_lifetime_breaker} are Structural (freshness_epoch +
-    // structural_version); reset_lifetime_breaker is EpochOnly (freshness_epoch only — its effect is in
-    // the marks). Overflow ⇒ 0x46, no swap.
+    // Anti-rollback commit-epoch bump from the SUB-OP-level classifier. ALL FOUR sub-ops are Structural
+    // (freshness_epoch + structural_version together) — including reset_lifetime_breaker, whose
+    // marks-DECREASE + non-marks mutations are not AdoptForward-reconstructable (see the classifier docs).
+    // A dropped seal therefore reconciles StructuralGap→restore for every sub-op. Overflow ⇒ 0x46, no swap.
     let bumps_structural =
         matches!(configure_treasury_sub_op_bump_class(sub_op), CommitBumpClass::Structural);
     candidate.advance_commit_epoch(bumps_structural).map_err(|_| AgentError::SealFailed)?;
@@ -1521,8 +1532,7 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             })
         }
         Ok(AgentResponse::ConfigureTreasury { candidate, request_id }) => {
-            // CONFIGURE_TREASURY (rollback-sensitive; Structural for {set_limits, refill_budget,
-            // raise_lifetime_breaker}, EpochOnly for reset_lifetime_breaker) goes through the SAME shared
+            // CONFIGURE_TREASURY (rollback-sensitive; Structural for ALL FOUR sub-ops) goes through the SAME shared
             // seal-before-emit seam. A config op signs nothing — the only op-specific part is the
             // success-body encoder (just the sealed blob), invoked by the seam ONLY after the anchor commit
             // succeeds, so the new config is durably recorded before the host sees success.
@@ -3719,17 +3729,21 @@ mod tests {
 
     // ===================== slice 15-4: CONFIGURE_TREASURY =====================
 
-    /// Pure classifier test (no feature needed): the SUB-OP commit-bump divergence. set_limits/refill/raise
-    /// = Structural; reset_lifetime_breaker = EpochOnly. The opcode-level class OVER-classifies reset as
-    /// Structural (fail-closed-safe) — the handler uses the sub-op classifier to avoid the spurious
-    /// StructuralGap on a dropped reset seal.
+    /// Pure classifier test (no feature needed): ALL FOUR CONFIGURE_TREASURY sub-ops are Structural,
+    /// matching the opcode-level class. reset_lifetime_breaker(3) is Structural — NOT EpochOnly — because
+    /// it LOWERS `lifetime_spend` (a marks surface the AdoptForward `marks_dominate_local` belt would
+    /// reject) and mutates non-marks state (breaker + config_version); its effect is not
+    /// AdoptForward-reconstructable, so a dropped seal must `StructuralGap`→restore (TASK-15 15-4 review).
     #[test]
-    fn configure_treasury_sub_op_bump_class_exhaustive_and_caveat_consistent() {
-        assert_eq!(configure_treasury_sub_op_bump_class(0), CommitBumpClass::Structural);
-        assert_eq!(configure_treasury_sub_op_bump_class(1), CommitBumpClass::Structural);
-        assert_eq!(configure_treasury_sub_op_bump_class(2), CommitBumpClass::Structural);
-        assert_eq!(configure_treasury_sub_op_bump_class(3), CommitBumpClass::EpochOnly);
-        // The opcode-level granularity OVER-classifies reset(3); the sub-op classifier is authoritative.
+    fn configure_treasury_sub_op_bump_class_all_structural() {
+        for sub_op in 0u8..=3 {
+            assert_eq!(
+                configure_treasury_sub_op_bump_class(sub_op),
+                CommitBumpClass::Structural,
+                "sub_op={sub_op} must be Structural (no CONFIGURE sub-op is AdoptForward-safe)"
+            );
+        }
+        // Consistent with the opcode-level class (Structural for the whole opcode).
         assert_eq!(AgentOpcode::ConfigureTreasury.commit_bump_class(), CommitBumpClass::Structural);
     }
 
@@ -3897,7 +3911,7 @@ mod tests {
         }
 
         #[test]
-        fn reset_breaker_is_epoch_only_recovery_tier() {
+        fn reset_breaker_is_structural_recovery_tier() {
             let _g = gate_configured();
             let (admin, recovery) = (admin_key(), recovery_key());
             let mut body = body_with_authorities(&admin, &recovery);
@@ -3919,9 +3933,12 @@ mod tests {
                         body.config.monotonic_treasury_config_version + 1,
                         "config_version still bumps"
                     );
+                    // STRUCTURAL (not EpochOnly): reset LOWERS lifetime_spend (a marks surface the
+                    // AdoptForward belt rejects) + clears the breaker + bumps config_version, so a dropped
+                    // seal must StructuralGap→restore — structural_version MUST advance.
                     assert_eq!(
-                        candidate.structural_version, body.structural_version,
-                        "EpochOnly: structural_version UNCHANGED"
+                        candidate.structural_version, body.structural_version + 1,
+                        "Structural: structural_version advances (TASK-15 15-4 review fix)"
                     );
                     assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "epoch advanced");
                 }
@@ -3933,6 +3950,67 @@ mod tests {
                 dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
                 Some(AgentError::CapExceeded),
                 "reset target above current lifetime_spend ⇒ 0x44"
+            );
+        }
+
+        /// CRASH-RECONCILE PROOF (the TASK-15 15-4 review's missing test): a dropped reset_lifetime_breaker
+        /// seal (committed to the anchor, crash before swap) must reconcile **StructuralGap → restore**, NOT
+        /// the AdoptForward path whose `marks_dominate_local` belt would WEDGE on the LOWERED `lifetime_spend`.
+        /// This is the load-bearing reason reset is Structural (not EpochOnly): because it advances
+        /// `structural_version`, reconcile routes epoch+structural-ahead → StructuralGap, never the belt.
+        #[test]
+        fn reset_dropped_seal_reconciles_structural_gap_not_adopt_forward_wedge() {
+            use crate::agent_anchor::{reconcile, AnchorState, FailReason, ReconcileDecision};
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.faucet.lifetime_spend = crate::u256::from_u64(10_000);
+            body.faucet.circuit_breaker_threshold = Some(crate::u256::from_u64(12_000));
+            let (le, ls) = (body.freshness_epoch, body.structural_version);
+            let lmarks = body.compute_local_marks_digest();
+
+            // Drive the REAL handler to get the post-reset candidate (lifetime lowered to 2000).
+            let (cap, pay) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
+            let candidate = match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, .. } => candidate,
+                _ => panic!("expected ConfigureTreasury"),
+            };
+            assert_eq!(candidate.structural_version, ls + 1, "reset is Structural — structural advanced");
+            assert!(candidate.faucet.lifetime_spend < body.faucet.lifetime_spend, "reset LOWERED lifetime_spend (the marks decrease)");
+
+            let anchor_of = |b: &KeystoreBody| AnchorState {
+                epoch: b.freshness_epoch,
+                structural_version: b.structural_version,
+                marks_digest: b.compute_local_marks_digest(),
+                chain_height: None,
+                chain_block_hash: None,
+            };
+            // THE FIX: anchor ahead by epoch AND structural ⇒ StructuralGap ⇒ restore-from-backup
+            // re-presents the lowered spend + cleared breaker + bumped config_version. No belt, no wedge.
+            assert_eq!(
+                reconcile(le, ls, &lmarks, &anchor_of(&candidate)),
+                ReconcileDecision::FailClosed(FailReason::StructuralGap),
+                "dropped reset seal ⇒ StructuralGap (restore), the safe recovery path"
+            );
+
+            // COUNTERFACTUAL — why EpochOnly was wrong: simulate the rejected EpochOnly class by presenting
+            // the candidate's LOWERED marks at the OLD structural_version. reconcile then routes to
+            // AdoptForward (epoch-ahead, structural-equal) — where `execute_adopt_forward`'s
+            // `marks_dominate_local` belt REJECTS the lowered lifetime_spend (`BeltRegression`), wedging the
+            // recovery op fail-closed. (The belt rejection itself is pinned by
+            // `execute_adopt_forward_belt_rejects_non_monotone_below_hash_gate` in agent_boot.) Reaching
+            // AdoptForward at all with a marks DECREASE is the bug; Structural avoids it.
+            let epoch_only_anchor = AnchorState {
+                epoch: candidate.freshness_epoch,
+                structural_version: ls, // EpochOnly would have left structural untouched
+                marks_digest: candidate.compute_local_marks_digest(),
+                chain_height: None,
+                chain_block_hash: None,
+            };
+            assert_eq!(
+                reconcile(le, ls, &lmarks, &epoch_only_anchor),
+                ReconcileDecision::AdoptForward { epoch: candidate.freshness_epoch },
+                "an EpochOnly reset would route to AdoptForward — where the belt wedges on the lowered spend"
             );
         }
 

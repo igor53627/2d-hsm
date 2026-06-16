@@ -714,9 +714,12 @@ and error contract, with the per-command map carried at envelope key 7:
   canonical params are the canonical CBOR of this exact map (sub_op at key 1), and the handler ALSO
   asserts `request.sub_op == cap.treasury_sub_op` directly (§10.5 — load-bearing for tier separation, so an
   admin cap cannot drive the recovery-tier reset via a baked `payload_binding`). Success response =
-  `{1: sealed_keystore_blob}`. EVERY sub-op bumps the monotonic `config_version`; `{0,1,2}` are
-  **Structural** (also bump `structural_version`), `3` is **EpochOnly** (its full effect is the marks
-  `lifetime_spend`/`strict_recovery_counter`). Mutating / rollback-sensitive ⇒ routes through the
+  `{1: sealed_keystore_blob}`. EVERY sub-op bumps the monotonic `config_version` AND is **Structural** (also
+  bumps `structural_version`) — including `3 reset_lifetime_breaker`: it LOWERS `lifetime_spend` (a marks
+  surface the `AdoptForward` `marks_dominate_local` belt would reject) and clears the breaker + bumps
+  `config_version` (non-marks), so its effect is NOT AdoptForward-reconstructable and a dropped seal must
+  `StructuralGap`→restore (TASK-15 15-4 review — it was briefly mis-classified EpochOnly). Mutating /
+  rollback-sensitive ⇒ routes through the
   seal→anchor-commit→swap→emit seam; production-gated behind the release-banned
   `agent-configure-treasury-preview` feature. Error bands (anti-oracle, §10.9): request shape → 0x40;
   sub-op binding / `payload_binding` / non-enclave scope → 0x43; quantitative (zero budget / breaker
@@ -803,10 +806,16 @@ host-controlled).
 
 `AGENT_K1_CONFIGURE_TREASURY` sub-ops map to tiers: `set_limits`/`refill_budget`/
 `raise_lifetime_breaker` = treasury-admin; `reset_lifetime_breaker` = recovery/quorum
-(bound to a strict recovery counter and target value). Config version is monotonic and
-sealed; a normal config bump does **not** reset cumulative spend. Two sealed faucet
-counters (refillable cumulative budget + optional lifetime breaker). Enclave-scoped unless
-a global remote monotonic ledger is specified (AC#12). All writes sealed before success.
+(bound to a strict recovery counter and target value — see §10.6 for the recovery-counter
+rule, deferred to TASK-18 un-gate; the live handler currently sequences it on the admin
+contiguous counter). Config version is monotonic and sealed (an audit/version stamp, not a
+rollback control). `set_limits`/`raise_lifetime_breaker` do **not** touch the spend
+counters; `refill_budget` deliberately **resets the refillable `cumulative_native_spend` →
+0** (a fresh budget window — the field is the refillable counter) while leaving the
+genesis-from-zero `lifetime_spend` untouched; only the recovery `reset_lifetime_breaker`
+lowers `lifetime_spend`. Two sealed faucet counters (refillable cumulative budget +
+optional lifetime breaker). Enclave-scoped unless a global remote monotonic ledger is
+specified (AC#12). All writes sealed before success.
 
 ### 10.8 Identity proof + read policy (AC#15, AC#16)
 

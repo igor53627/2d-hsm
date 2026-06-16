@@ -149,16 +149,22 @@ no-over-dispense without a permanent self-wedge on a single dropped ack.
 
 **`CONFIGURE_TREASURY` sub-op commit classifier (slice 15-4).** The opcode-level commit class is
 `Structural`, but the handler classifies PER SUB-OP (fail-closed-safe over-classification is corrected
-only in the direction that is safe): `set_limits` / `refill_budget` / `raise_lifetime_breaker` mutate
-anchor-UNRECONSTRUCTABLE faucet **config** (limits / budget ceiling / breaker threshold — none a marks
-surface) ⇒ **Structural** (a dropped seal ⇒ `StructuralGap`→restore, never silently lost);
-`reset_lifetime_breaker` mutates ONLY marks surfaces (`lifetime_spend` + `strict_recovery_counter`) ⇒
-**EpochOnly** (a dropped seal `AdoptForward`s from the anchor's authenticated marks). UNDER-classifying a
-config sub-op as EpochOnly would be the dangerous direction (a dropped seal would adopt-forward and lose
-the config change), so the classifier is explicit per sub-op. EVERY sub-op also bumps the monotonic
-`config_version` (a checked add, NOT a marks surface, never aliased onto `structural_version`); for the
-Structural sub-ops it rides alongside the `structural_version` bump, for `reset_lifetime_breaker` it
-advances without one.
+only in the direction that is safe): **ALL FOUR sub-ops are `Structural`** (a dropped seal ⇒
+`StructuralGap`→restore, never silently lost / never a belt wedge). `set_limits` / `refill_budget` /
+`raise_lifetime_breaker` mutate anchor-UNRECONSTRUCTABLE faucet **config** (limits / budget ceiling /
+breaker threshold — none a marks surface), so they are Structural. `reset_lifetime_breaker` is ALSO
+Structural — it was INITIALLY thought EpochOnly ("its effect is in the marks"), but that is **wrong**
+(TASK-15 15-4 review): it (a) **LOWERS** `lifetime_spend`, a marks surface — and `AdoptForward`'s
+`marks_dominate_local` belt REQUIRES adopted marks ≥ local, so a *decreasing* marks value fails the belt
+(`BeltRegression`) and the op can NEVER adopt-forward; (b) clears `circuit_breaker_threshold` and (c) bumps
+`config_version` — neither a marks surface, so the AdoptForward seeder (`seed_marks_forward`) would silently
+drop them. So reset's effect is NOT marks-captured and NOT AdoptForward-reconstructable ⇒ it MUST be
+Structural (a dropped seal → `StructuralGap`→restore re-presents the whole body from backup, incl. the
+lowered spend, cleared breaker, and bumped version). EVERY sub-op also bumps the monotonic `config_version`
+(a checked add, NOT a marks surface, never aliased onto `structural_version`) — for ALL FOUR it rides
+alongside the `structural_version` bump. (`config_version` is an audit/version stamp, NOT itself a rollback
+control — rollback of an old sealed blob is caught by the epoch/`structural_version` anti-rollback, not by
+`config_version`.)
 
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
 1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.
