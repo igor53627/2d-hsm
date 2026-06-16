@@ -225,6 +225,17 @@ pub enum AgentResponse {
         candidate: Box<KeystoreBody>,
         request_id: Vec<u8>,
     },
+    /// SIGN_FAUCET_DISPENSE result: the broadcastable signed dispense transaction PLUS the mutated
+    /// `candidate` keystore (faucet dual-counter debit + the atomic EpochOnly epoch bump). Like
+    /// GENERATE_KEYS it is MUTATING — the frame layer SEALS the candidate, COMMITS the post-debit state to
+    /// the anchor (seal-before-emit), then SWAPS it into the live slot and EMITS the signed tx + sealed
+    /// blob; the signature is withheld until the debit is durably committed (§3 unbroadcast-burn).
+    /// `request_id` is carried so the frame-layer commit can key the anchor record by it (idempotency).
+    SignFaucetDispense {
+        signed: SignedTransfer,
+        candidate: Box<KeystoreBody>,
+        request_id: Vec<u8>,
+    },
 }
 
 /// The decoded Agent Gateway envelope (§10.2). The capability (key 5) is captured as the raw CBOR
@@ -338,7 +349,16 @@ fn verify_capability(
 ///
 /// Read opcodes are served here; privileged opcodes route through the fail-closed capability seam;
 /// runtime-signing opcodes are deferred (TASK-7.6.4). Errors carry the §10.9 collapsed code.
-pub fn dispatch_agent(
+///
+/// **`pub(crate)`, NOT `pub`** (TASK-15 15-3b hardening): the mutating outcomes carry the to-be-emitted
+/// artifact BEFORE the seal-before-emit commit — `SignFaucetDispense` carries the broadcastable `signed`
+/// dispense tx and `GenerateKeys` carries the new key material — which is durable/emittable ONLY after
+/// [`handle_agent_gateway_frame`] runs `commit_before_emit` (seal → anchor-commit → swap). Exposing this
+/// as `pub` would let an out-of-crate caller extract a fund-moving signature (or minted keys) WITHOUT the
+/// debit/counter being sealed and committed — a seal-before-emit bypass. The public frame entry point is
+/// [`handle_agent_gateway_frame`]; `dispatch_agent` is an internal step reachable only in-crate (the frame
+/// handler + tests).
+pub(crate) fn dispatch_agent(
     profile: Profile,
     payload: &[u8],
     keystore: &KeystoreBody,
@@ -425,9 +445,22 @@ pub fn dispatch_agent(
                 Err(AgentError::NotConfigured)
             }
         }
-        // SIGN_FAUCET_DISPENSE(5) lands in TASK-15 slice 15-3 (rollback-sensitive: dual-counter debit
-        // through the seal-before-emit seam). Fail closed until then.
-        AgentOpcode::SignFaucetDispense => Err(AgentError::NotConfigured),
+        // SIGN_FAUCET_DISPENSE(5): treasury→known-transfer-key native dispense (TASK-15 slice 15-3b). It
+        // is ROLLBACK-SENSITIVE (debits sealed faucet counters), so the anti-rollback fund-custody gate
+        // above ALREADY fails it closed (NotConfigured) when the boot binding is unconfigured — this arm
+        // is reached only past that gate. PRODUCTION-GATED behind `agent-sign-faucet-preview` (fund-custody
+        // readiness, on top of the runtime gate); otherwise fail closed. Mirrors the SIGN_TRANSFER arm.
+        AgentOpcode::SignFaucetDispense => {
+            #[cfg(feature = "agent-sign-faucet-preview")]
+            {
+                handle_sign_faucet_dispense(&env, keystore)
+            }
+            #[cfg(not(feature = "agent-sign-faucet-preview"))]
+            {
+                let _ = &env;
+                Err(AgentError::NotConfigured)
+            }
+        }
         // Privileged opcodes handled above; unreachable here.
         _ => Err(AgentError::Malformed),
     }
@@ -453,7 +486,11 @@ fn handle_public_identity(
 /// Shared by PROVE_IDENTITY and SIGN_TRANSFER (and slice 15-3 SIGN_FAUCET_DISPENSE) so the secret-scrub
 /// and error-collapse discipline lives in ONE place. The `len() != 32` guard MUST precede the
 /// `copy_from_slice` (which panics on a length mismatch); `secret_scalar` is a `Zeroizing<Vec<u8>>`.
-#[cfg(any(feature = "agent-prove-identity-preview", feature = "agent-sign-transfer-preview"))]
+#[cfg(any(
+    feature = "agent-prove-identity-preview",
+    feature = "agent-sign-transfer-preview",
+    feature = "agent-sign-faucet-preview"
+))]
 fn load_keypair_for(
     entry: &crate::agent_keystore::KeyEntry,
 ) -> Result<crate::secp256k1::Keypair, AgentError> {
@@ -566,6 +603,147 @@ fn handle_sign_transfer(
     // (0x46). ValueTooWide/ChainIdOverflow are unreachable here (caps pre-validated above).
     let signed = sign_transfer(&keypair, &fields).map_err(|_| AgentError::KeyPurposeMismatch)?;
     Ok(AgentResponse::SignTransfer(signed))
+}
+
+/// §2 faucet recipient allowlist (AC#5): is `to` the derived eth address of SOME stored
+/// `agent_transfer_k1` key? **"Allowlisted" == "present in the keystore as a transfer key"** — there is no
+/// key-revocation/deactivation surface yet, so every stored transfer key is an eligible recipient (a
+/// future revocation slice MUST revisit this predicate). Each candidate address is derived straight from
+/// the entry's stored uncompressed public key — **no secret load** — and the tron form is deliberately not
+/// computed (only the eth address is compared) to avoid wasted base58 work per scanned entry. The on-curve
+/// re-validation inside `eth_address_from_uncompressed` is defense-in-depth (consistent with
+/// `public_identity_from_entry`); a malformed stored entry simply never matches (fail-closed, never a
+/// panic). All operands are public (host-derivable via PUBLIC_IDENTITY), so the plain compare leaks no
+/// secret-dependent timing. A named helper (not an inline closure) so this custody gate is unit-tested in
+/// isolation (`recipient_allowlist_matches_only_stored_transfer_keys`).
+#[cfg(feature = "agent-sign-faucet-preview")]
+fn is_known_transfer_recipient(keystore: &KeystoreBody, to: &[u8; 20]) -> bool {
+    keystore.entries.iter().any(|e| {
+        e.purpose == KeyPurpose::AgentTransferK1
+            && <[u8; 65]>::try_from(e.public_identity.as_slice())
+                .ok()
+                .and_then(|pk| crate::secp256k1::eth_address_from_uncompressed(&pk).ok())
+                .is_some_and(|addr| &addr == to)
+    })
+}
+
+/// SIGN_FAUCET_DISPENSE(5): treasury→known-transfer-key native dispense (TASK-7.4 §2 / slice 15-3b). It
+/// reuses the SAME machinery as SIGN_TRANSFER — the identical strict 8-field EIP-155 payload, the sealed
+/// chain_id, the `from`-equals-derived-address check, and the canonical internal preimage — but with three
+/// faucet-tier differences: (1) the signer is the singleton `agent_faucet_treasury_k1` key (not a transfer
+/// key); (2) the recipient `to` MUST match a stored `agent_transfer_k1` identity in the keystore (§2
+/// recipient allowlist — blocks one-command faucet→external spend); and (3) the dispense passes the §2
+/// accept-gate (per-field caps + worst-case cumulative budget + optional lifetime breaker) and ATOMICALLY
+/// debits BOTH faucet spend counters.
+///
+/// MUTATING (EpochOnly, rollback-sensitive — the dispatch gate already fail-closed it when anti-rollback
+/// is unconfigured): it returns a CANDIDATE body (debited faucet + the atomic epoch bump) for the frame
+/// layer's seal-before-emit seam to seal → anchor-commit → swap → emit. The signature is computed here but
+/// only EMITTED after the debit is durably committed (§3 unbroadcast-burn — the debit is permanent once a
+/// signature leaves, never credited back). Gated by `agent-sign-faucet-preview`.
+///
+/// Error bands (anti-oracle §10.9), ordered so a less-privileged probe never reaches a higher band:
+/// request-SHAPE (bad CBOR, an ABSENT `key_ref`, chain_id ≠ sealed, non-empty `data`, over-width/non-minimal
+/// u256) → 0x40; everything key/recipient-related for a PRESENT `key_ref` (present-but-not-found, wrong
+/// purpose, `from` ≠ derived, `to` not a known transfer identity, signing failure) → uniform 0x42 (so the
+/// host can't probe keystore contents); any §2 cap/budget/breaker/overflow rejection → 0x44; a candidate
+/// epoch-bump overflow → 0x46. The §2 checks run only AFTER the key+recipient checks pass, so a 0x44 leaks
+/// no more than a valid dispense already would. (An absent `key_ref` is a structurally-incomplete request,
+/// host-observable from its own bytes, so 0x40 leaks nothing — matches SIGN_TRANSFER; see §1 doc.)
+#[cfg(feature = "agent-sign-faucet-preview")]
+fn handle_sign_faucet_dispense(
+    env: &AgentEnvelope,
+    keystore: &KeystoreBody,
+) -> Result<AgentResponse, AgentError> {
+    use crate::agent_cbor::{as_bytes_n, as_u256_minimal_be};
+    use crate::agent_transfer::{sign_transfer, EthTransferFields};
+    let key_ref = env.key_ref.ok_or(AgentError::Malformed)?;
+    // payload (envelope key 7) = the SAME strict 8-field map as SIGN_TRANSFER — a faucet dispense is a
+    // pure native transfer (§2): `{1: chain_id, 2: from(20B), 3: to(20B), 4: amount, 5: nonce,
+    // 6: gas_limit, 7: gas_price, 8: data}`.
+    let payload = env.payload.as_deref().ok_or(AgentError::Malformed)?;
+    if payload.len() != 8 || !check_strict_keys(payload, |n| (1..=8).contains(&n)) {
+        return Err(AgentError::Malformed);
+    }
+    let req_chain_id = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let req_from = map_get(payload, 2).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
+    let to = map_get(payload, 3).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
+    let value_be = map_get(payload, 4).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+    let nonce = map_get(payload, 5).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let gas_limit = map_get(payload, 6).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let gas_price_be = map_get(payload, 7).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+    // data MUST be present and empty (native dispenses only — no calldata/memo, §2).
+    let data = map_get(payload, 8).and_then(as_bytes).ok_or(AgentError::Malformed)?;
+    if !data.is_empty() {
+        return Err(AgentError::Malformed);
+    }
+    // §1 pre-build check: chain_id MUST equal the sealed 2D chain_id (never request-authoritative).
+    if req_chain_id != keystore.config.twod_chain_id {
+        return Err(AgentError::Malformed);
+    }
+    // Lift the canonical minimal-BE wire `amount`/`gas_price` into the right-aligned `[u8; 32]` arithmetic
+    // form HERE — in the request-SHAPE (0x40) region, BEFORE the key/recipient (0x42) checks — so the
+    // anti-oracle band ordering holds structurally: every shape error (incl. a u256-width reject) precedes
+    // the key band, and no post-key path can emit a lower band. (`as_u256_minimal_be` already bounded these
+    // to ≤32 bytes, so `from_minimal_be` cannot widen-reject — the `ok_or(Malformed)` is unreachable
+    // defense-in-depth, and now correctly sits in the 0x40 region even if it ever became reachable.)
+    let amount = crate::u256::from_minimal_be(&value_be).ok_or(AgentError::Malformed)?;
+    let gas_price = crate::u256::from_minimal_be(&gas_price_be).ok_or(AgentError::Malformed)?;
+    // Key-purpose: SIGN_FAUCET_DISPENSE accepts ONLY the singleton agent_faucet_treasury_k1. not-found ≡
+    // wrong-purpose → 0x42 (anti-oracle, §4 / §10.9).
+    let entry = crate::agent_identity::find_entry(keystore, &key_ref)
+        .ok_or(AgentError::KeyPurposeMismatch)?;
+    if entry.purpose != KeyPurpose::AgentFaucetTreasuryK1 {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    let keypair = load_keypair_for(entry)?;
+    // §1 pre-build check: `from` MUST equal the treasury key's derived eth address (per-KEY bucket 0x42).
+    if req_from != keypair.eth_address() {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    // §2 recipient allowlist (AC#5): `to` MUST match a stored agent_transfer_k1 identity (a named,
+    // separately-unit-tested seam — `is_known_transfer_recipient` — so this fund-custody gate is a
+    // reviewable unit, not an inline closure that a refactor could silently widen). Recipient-not-found
+    // collapses into the same per-key 0x42 bucket (anti-oracle): a host WITHOUT valid treasury credentials
+    // cannot distinguish recipient-not-found from a missing/mis-purposed treasury key (both 0x42). (A host
+    // WITH valid treasury credentials can still distinguish 0x44=known-recipient-over-cap from 0x42 by
+    // varying `to`, but every transfer address is already host-derivable via PUBLIC_IDENTITY — see the §2
+    // doc — so this leaks nothing new.)
+    if !is_known_transfer_recipient(keystore, &to) {
+        return Err(AgentError::KeyPurposeMismatch);
+    }
+    // §2 accept-gate + atomic dual-counter debit, using the pre-lifted `amount`/`gas_price`. The faucet
+    // gate caps worst_case = amount + gas_limit*gas_price and debits cumulative_native_spend +
+    // lifetime_spend; ANY cap/overflow collapses to 0x44 (anti-oracle: the host can't tell WHICH cap
+    // tripped). Runs only AFTER the key+recipient checks, so a 0x44 reveals nothing a valid dispense
+    // wouldn't (and is strictly above the 0x40/0x42 bands those checks emit).
+    let new_faucet = keystore
+        .faucet
+        .accept_and_debit(&amount, gas_limit, &gas_price)
+        .map_err(|_| AgentError::CapExceeded)?;
+    // Sign the dispense (pure — the signature bytes do not leave the enclave until the frame layer's
+    // seal-before-emit commit succeeds). Collapse a signing failure (the ~2^-128 x-reduced recovery_id
+    // rejection / recovery==from invariant) to the per-key bucket (0x42) — NOT SealFailed (0x46 is
+    // reserved for the frame layer's seal/anchor-commit failure).
+    let fields = EthTransferFields { chain_id: req_chain_id, nonce, gas_limit, to, value_be, gas_price_be };
+    let signed = sign_transfer(&keypair, &fields).map_err(|_| AgentError::KeyPurposeMismatch)?;
+    // CANDIDATE: clone live → install the debited faucet → advance the EpochOnly commit (freshness_epoch
+    // ONLY; the debit changed the marks surfaces cumulative_native_spend/lifetime_spend, which the
+    // frame-layer commit's `compute_local_marks_digest` picks up). Derive the bump class from the
+    // single-source classifier (EpochOnly — a faucet debit is anchor-reconstructable via AdoptForward)
+    // rather than a hardcoded bool; an epoch overflow fails closed (0x46) with no swap.
+    let mut candidate = keystore.clone();
+    candidate.faucet = new_faucet;
+    let bumps_structural =
+        matches!(AgentOpcode::SignFaucetDispense.commit_bump_class(), CommitBumpClass::Structural);
+    candidate
+        .advance_commit_epoch(bumps_structural)
+        .map_err(|_| AgentError::SealFailed)?;
+    Ok(AgentResponse::SignFaucetDispense {
+        signed,
+        candidate: Box::new(candidate),
+        request_id: env.request_id.clone(),
+    })
 }
 
 /// Canonical CBOR of the GENERATE_KEYS command params `{1: purpose, 2: count}` (RFC 8949 shortest
@@ -1047,6 +1225,15 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 encode_generate_keys_response(&keys, sealed)
             })
         }
+        Ok(AgentResponse::SignFaucetDispense { signed, candidate, request_id }) => {
+            // SIGN_FAUCET_DISPENSE (rollback-sensitive, EpochOnly) goes through the SAME shared
+            // seal-before-emit seam as GENERATE_KEYS — the only op-specific part is the success-body
+            // encoder (the signed dispense tx + the sealed blob), invoked by the seam ONLY after the anchor
+            // commit succeeds, so the signature never leaves before the debit is durably recorded.
+            commit_before_emit(candidate, &request_id, measurement, &mut guard, move |sealed| {
+                encode_sign_faucet_dispense_response(signed, sealed)
+            })
+        }
         Ok(resp) => encode_agent_response(&resp),
         Err(e) => encode_agent_error(e),
     }
@@ -1106,6 +1293,10 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
         // fail closed to an error body rather than fabricate a persist-less success the host can't
         // store. (No panic/`debug_assert` here — this runs under the INSTALLED_KEYSTORE lock.)
         AgentResponse::GenerateKeys { .. } => encode_agent_error(AgentError::SealFailed),
+        // SIGN_FAUCET_DISPENSE is likewise frame-layer-only (`encode_sign_faucet_dispense_response` needs
+        // the sealed blob). Reaching the generic encoder is a mis-routed mutation ⇒ fail closed, same as
+        // GENERATE_KEYS — never emit a signed dispense whose debit was not sealed/committed.
+        AgentResponse::SignFaucetDispense { .. } => encode_agent_error(AgentError::SealFailed),
     }
 }
 
@@ -1131,6 +1322,26 @@ fn encode_generate_keys_response(keys: &[GeneratedKey], sealed_blob: &[u8]) -> V
     encode_body(vec![
         (Value::Integer(1.into()), Value::Array(key_list)),
         (Value::Integer(2.into()), Value::Bytes(sealed_blob.to_vec())),
+    ])
+}
+
+/// Encode the SIGN_FAUCET_DISPENSE response: the signed-tx 7-key map (BYTE-FOR-BYTE the SIGN_TRANSFER
+/// layout — `{1: signed_rlp, 2: r, 3: s, 4: recovery_id, 5: v, 6: signing_hash, 7: from}`) PLUS key 8 =
+/// the new sealed keystore blob the host MUST persist (the debited faucet state; mirrors GENERATE_KEYS
+/// key 2 — the enclave has no durable storage). Key 1 is BYTES so a success body is distinguishable from a
+/// `{1: code(int)}` error body (cf. `decode_agent_error_code`). Called by the frame layer ONLY after the
+/// anchor commit succeeds, so the signature is emitted iff the debit is durably recorded.
+fn encode_sign_faucet_dispense_response(signed: SignedTransfer, sealed_blob: &[u8]) -> Vec<u8> {
+    encode_body(vec![
+        // `signed` is owned (moved out of the frame outcome), so move `signed_rlp` instead of cloning it.
+        (Value::Integer(1.into()), Value::Bytes(signed.signed_rlp)),
+        (Value::Integer(2.into()), Value::Bytes(signed.signature.r.to_vec())),
+        (Value::Integer(3.into()), Value::Bytes(signed.signature.s.to_vec())),
+        (Value::Integer(4.into()), Value::Integer((signed.signature.recovery_id as u64).into())),
+        (Value::Integer(5.into()), Value::Integer(signed.v.into())),
+        (Value::Integer(6.into()), Value::Bytes(signed.signing_hash.to_vec())),
+        (Value::Integer(7.into()), Value::Bytes(signed.from.to_vec())),
+        (Value::Integer(8.into()), Value::Bytes(sealed_blob.to_vec())),
     ])
 }
 
@@ -1172,7 +1383,8 @@ mod tests {
     // `any(..)` gate avoids a duplicate import when both previews are enabled.
     #[cfg(any(
         feature = "agent-keygen-exec-preview",
-        feature = "agent-sign-transfer-preview"
+        feature = "agent-sign-transfer-preview",
+        feature = "agent-sign-faucet-preview"
     ))]
     use crate::agent_keystore::{BackupExportMetadata, KeyAlgorithm, KeyEntry};
     #[cfg(feature = "agent-keygen-exec-preview")]
@@ -1258,13 +1470,13 @@ mod tests {
     /// A scripted process-global commit channel for the 6-4 seal-before-emit tests: decode the 0x45
     /// request and answer per the action — a conformant anchor (signs the proposed state with
     /// `anchor_test_key`), a transport failure, or a forged signer (wrong key → ack fails verify).
-    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
     enum CommitChannelAct {
         Ok,
         Transport,
         WrongKey,
     }
-    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
     struct TestCommitChannel {
         act: CommitChannelAct,
         /// Bumped at the TOP of every `round_trip`, so a test can assert the commit was reached
@@ -1272,17 +1484,20 @@ mod tests {
         /// to a throwaway counter the test ignores via [`TestCommitChannel::new`].
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
-    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
     impl TestCommitChannel {
         fn new(act: CommitChannelAct) -> Self {
             Self { act, calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
         }
-        /// Share a caller-held counter so the test can read how many commits were attempted.
+        /// Share a caller-held counter so the test can read how many commits were attempted. Only the
+        /// keygen-exec frame tests use the counted form (the over-size-candidate never-commit proof); the
+        /// faucet-preview lane reuses `TestCommitChannel` via `new` only, so allow it dead there.
+        #[cfg_attr(not(feature = "agent-keygen-exec-preview"), allow(dead_code))]
         fn counted(act: CommitChannelAct, calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
             Self { act, calls }
         }
     }
-    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
     impl crate::agent_boot_relay::BootRelayChannel for TestCommitChannel {
         fn round_trip(
             &mut self,
@@ -2765,6 +2980,415 @@ mod tests {
                 Some(AgentError::Malformed),
                 "unknown outer envelope key"
             );
+        }
+    }
+
+    /// SIGN_FAUCET_DISPENSE(5) dispatch handler (TASK-15 slice 15-3b) — the §2 recipient allowlist +
+    /// accept-gate + dual-counter debit through the seal-before-emit seam.
+    #[cfg(feature = "agent-sign-faucet-preview")]
+    mod sign_faucet_dispatch {
+        use super::*;
+
+        const KEYS: &str = include_str!("../testvectors/agent-gateway/keys.json");
+
+        fn unhex(s: &str) -> Vec<u8> {
+            hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap()
+        }
+        fn arr20(s: &str) -> [u8; 20] {
+            unhex(s).try_into().unwrap()
+        }
+        /// Minimal big-endian bytes of a u64 (the canonical u256 wire form for values that fit u64).
+        fn min_be(x: u64) -> Vec<u8> {
+            let b = x.to_be_bytes();
+            let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+            b[i..].to_vec()
+        }
+        fn entry(name: &str, key_ref: [u8; 32], purpose: KeyPurpose, batch: u64) -> KeyEntry {
+            let k: serde_json::Value = serde_json::from_str(KEYS).unwrap();
+            KeyEntry {
+                key_ref,
+                purpose,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity: unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+                secret_scalar: zeroize::Zeroizing::new(unhex(k[name]["privkey"].as_str().unwrap())),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: batch },
+                backup_export_metadata: BackupExportMetadata::default(),
+            }
+        }
+        fn addr(name: &str) -> [u8; 20] {
+            let k: serde_json::Value = serde_json::from_str(KEYS).unwrap();
+            arr20(k[name]["eth_address"].as_str().unwrap())
+        }
+
+        const TREASURY_REF: [u8; 32] = [0x55; 32];
+        const TRANSFER_REF: [u8; 32] = [0x66; 32];
+        // The dispense `to` + the test caps yield this worst_case = amount + gas_limit*gas_price.
+        const DISP_AMOUNT: u64 = 1000;
+        const DISP_GAS_LIMIT: u64 = 21000;
+        const DISP_GAS_PRICE: u64 = 100;
+        fn worst_case() -> u64 {
+            DISP_AMOUNT + DISP_GAS_LIMIT * DISP_GAS_PRICE
+        }
+
+        /// A keystore body with the singleton faucet TREASURY key (the dispense signer) AND one TRANSFER
+        /// key (the only allowlisted recipient), faucet caps set, and a `budget` budget ceiling. Returns
+        /// (body, treasury_from, recipient_to).
+        fn faucet_body(budget: u64) -> (KeystoreBody, [u8; 20], [u8; 20]) {
+            let mut body = base_body();
+            body.entries.push(entry("treasury_key", TREASURY_REF, KeyPurpose::AgentFaucetTreasuryK1, 1));
+            body.entries.push(entry("transfer_key", TRANSFER_REF, KeyPurpose::AgentTransferK1, 2));
+            body.faucet.per_dispense_max_amount = crate::u256::from_u64(1_000_000);
+            body.faucet.max_gas_limit = 21_000;
+            body.faucet.max_effective_gas_fee_rate = 1_000_000_000;
+            body.faucet.cumulative_signing_budget = crate::u256::from_u64(budget);
+            (body, addr("treasury_key"), addr("transfer_key"))
+        }
+
+        /// Build a SIGN_FAUCET_DISPENSE request envelope (the SAME strict 8-field map as SIGN_TRANSFER).
+        #[allow(clippy::too_many_arguments)]
+        fn request(
+            key_ref: &[u8; 32],
+            chain_id: u64,
+            from: &[u8; 20],
+            to: &[u8; 20],
+            amount: Value,
+            nonce: u64,
+            gas_limit: u64,
+            gas_price: Value,
+            data: Value,
+        ) -> Vec<u8> {
+            let payload = Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(chain_id.into())),
+                (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                (Value::Integer(4.into()), amount),
+                (Value::Integer(5.into()), Value::Integer(nonce.into())),
+                (Value::Integer(6.into()), Value::Integer(gas_limit.into())),
+                (Value::Integer(7.into()), gas_price),
+                (Value::Integer(8.into()), data),
+            ]);
+            envelope(
+                5,
+                vec![
+                    (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+                    (Value::Integer(7.into()), payload),
+                ],
+            )
+        }
+
+        /// A canonical accepted dispense from the treasury to the allowlisted transfer key.
+        fn good_request(from: &[u8; 20], to: &[u8; 20]) -> Vec<u8> {
+            request(
+                &TREASURY_REF,
+                11565,
+                from,
+                to,
+                Value::Bytes(min_be(DISP_AMOUNT)),
+                0,
+                DISP_GAS_LIMIT,
+                Value::Bytes(min_be(DISP_GAS_PRICE)),
+                Value::Bytes(vec![]),
+            )
+        }
+
+        fn resp_map(body: &[u8]) -> Vec<(Value, Value)> {
+            match ciborium::de::from_reader::<Value, _>(body).unwrap() {
+                Value::Map(m) => m,
+                _ => panic!("response is not a CBOR map"),
+            }
+        }
+
+        #[test]
+        fn dispatch_accepts_and_debits_dual_counters() {
+            let _g = gate_configured(); // rollback-sensitive ⇒ the binding must be installed
+            let (body, from, to) = faucet_body(10_000_000);
+            let resp = dispatch_agent(Profile::AgentGateway, &good_request(&from, &to), &body)
+                .expect("an in-cap dispense to a known transfer key must succeed");
+            match resp {
+                AgentResponse::SignFaucetDispense { signed, candidate, request_id } => {
+                    // Signed FROM the treasury key (recovery==from invariant holds inside sign_transfer).
+                    assert_eq!(signed.from, from, "dispense signed by the treasury key");
+                    assert!(!signed.signed_rlp.is_empty(), "broadcastable signed tx present");
+                    // The envelope's request_id is echoed verbatim — the frame layer keys the anchor
+                    // commit record by it (idempotency).
+                    assert_eq!(request_id, vec![0x11; 16], "request_id echoed from the envelope");
+                    // BOTH spend counters advanced by worst_case; budget/caps untouched; EpochOnly bump.
+                    let wc = crate::u256::from_u64(worst_case());
+                    assert_eq!(candidate.faucet.cumulative_native_spend, wc, "cumulative debited");
+                    assert_eq!(candidate.faucet.lifetime_spend, wc, "lifetime debited");
+                    assert_eq!(candidate.faucet.cumulative_signing_budget, body.faucet.cumulative_signing_budget, "budget unchanged");
+                    assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "EpochOnly: epoch advanced");
+                    assert_eq!(candidate.structural_version, body.structural_version, "EpochOnly: structural untouched");
+                }
+                _ => panic!("expected SignFaucetDispense"),
+            }
+        }
+
+        #[test]
+        fn rejects_recipient_not_a_known_transfer_key() {
+            let _g = gate_configured();
+            let (body, from, _to) = faucet_body(10_000_000);
+            // A `to` that is no transfer key in the keystore → 0x42 (anti-oracle: indistinguishable from a
+            // missing/mis-purposed treasury key; the host cannot probe which addresses are known).
+            let stranger = [0xab; 20];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &good_request(&from, &stranger), &body).err(),
+                Some(AgentError::KeyPurposeMismatch),
+                "recipient not a known transfer identity"
+            );
+            // The treasury's OWN address is also not a transfer-key recipient → still 0x42 (no self-dispense
+            // shortcut past the allowlist).
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &good_request(&from, &from), &body).err(),
+                Some(AgentError::KeyPurposeMismatch),
+                "treasury address is not an allowlisted recipient"
+            );
+        }
+
+        #[test]
+        fn recipient_allowlist_matches_only_stored_transfer_keys() {
+            // Unit-test the custody gate in isolation (the inline-vs-named-helper altitude fix).
+            let (body, treasury_from, transfer_to) = faucet_body(10_000_000);
+            // The stored transfer key's address matches; the treasury's own address does NOT (only
+            // AgentTransferK1 entries are recipients); a stranger does not.
+            assert!(is_known_transfer_recipient(&body, &transfer_to), "stored transfer key is a recipient");
+            assert!(!is_known_transfer_recipient(&body, &treasury_from), "treasury address is not a recipient");
+            assert!(!is_known_transfer_recipient(&body, &[0xab; 20]), "stranger is not a recipient");
+            // A malformed transfer entry (wrong-length public_identity) never matches — fail-closed, no
+            // panic (defense-in-depth on a trusted-but-validated sealed entry).
+            let mut malformed = body.clone();
+            malformed.entries.push(KeyEntry {
+                key_ref: [0x77; 32],
+                purpose: KeyPurpose::AgentTransferK1,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity: vec![0x04; 64], // 64 bytes, not the 65-byte SEC1 form
+                secret_scalar: zeroize::Zeroizing::new(vec![0x01; 32]),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 9 },
+                backup_export_metadata: BackupExportMetadata::default(),
+            });
+            assert!(!is_known_transfer_recipient(&malformed, &[0x00; 20]), "malformed entry never matches");
+            // and the GOOD transfer key still matches alongside the malformed one.
+            assert!(is_known_transfer_recipient(&malformed, &transfer_to), "good entry still matches");
+        }
+
+        #[test]
+        fn rejects_wrong_signer_key_purpose_and_from() {
+            let _g = gate_configured();
+            let (body, from, to) = faucet_body(10_000_000);
+            // The TRANSFER key as the signer (key_ref) → 0x42 (faucet accepts only the treasury purpose;
+            // cross-use collapses with not-found).
+            let transfer_signer = request(
+                &TRANSFER_REF, 11565, &addr("transfer_key"), &to,
+                Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &transfer_signer, &body).err(),
+                Some(AgentError::KeyPurposeMismatch),
+                "transfer key cannot sign a faucet dispense"
+            );
+            // unknown key_ref → 0x42.
+            let unknown = request(
+                &[0x99; 32], 11565, &from, &to,
+                Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &unknown, &body).err(),
+                Some(AgentError::KeyPurposeMismatch),
+                "unknown signer key_ref"
+            );
+            // `from` != the treasury key's derived address → 0x42 (per-key bucket, key established).
+            let mut bad_from = from;
+            bad_from[0] ^= 0xff;
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &good_request(&bad_from, &to), &body).err(),
+                Some(AgentError::KeyPurposeMismatch),
+                "from != treasury derived address"
+            );
+        }
+
+        #[test]
+        fn rejects_shape_errors_as_malformed() {
+            let _g = gate_configured();
+            let (body, from, to) = faucet_body(10_000_000);
+            let err = |req: &[u8]| dispatch_agent(Profile::AgentGateway, req, &body).err();
+            // wrong chain_id (never request-authoritative) → 0x40.
+            assert_eq!(
+                err(&request(&TREASURY_REF, 11566, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]))),
+                Some(AgentError::Malformed),
+                "wrong chain_id"
+            );
+            // non-empty data (no calldata/memo) → 0x40.
+            assert_eq!(
+                err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![0xde, 0xad]))),
+                Some(AgentError::Malformed),
+                "non-empty data"
+            );
+            // over-width amount (33 bytes) → 0x40 (never truncated, §2 AC#8) — a SHAPE error caught at
+            // decode BEFORE the §2 cap gate (which would be 0x44), pinning the band split.
+            assert_eq!(
+                err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(vec![0x01; 33]), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]))),
+                Some(AgentError::Malformed),
+                "over-width amount"
+            );
+            // non-minimal gas_price (leading zero) → 0x40.
+            assert_eq!(
+                err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(vec![0x00, 0x01]), Value::Bytes(vec![]))),
+                Some(AgentError::Malformed),
+                "non-minimal gas_price"
+            );
+        }
+
+        #[test]
+        fn absent_key_ref_is_malformed_not_key_band() {
+            // An ABSENT envelope key_ref (key 6 omitted) is a structurally-incomplete request → 0x40
+            // (shape), NOT the 0x42 key-band — pins the chosen band (matches SIGN_TRANSFER; a present-but-
+            // unknown key_ref is the 0x42 case, covered by rejects_wrong_signer_key_purpose_and_from).
+            let _g = gate_configured();
+            let (body, from, to) = faucet_body(10_000_000);
+            // A valid 8-field payload, but the envelope carries NO key_ref.
+            let payload = Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(11565.into())),
+                (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                (Value::Integer(4.into()), Value::Bytes(min_be(DISP_AMOUNT))),
+                (Value::Integer(5.into()), Value::Integer(0.into())),
+                (Value::Integer(6.into()), Value::Integer(DISP_GAS_LIMIT.into())),
+                (Value::Integer(7.into()), Value::Bytes(min_be(DISP_GAS_PRICE))),
+                (Value::Integer(8.into()), Value::Bytes(vec![])),
+            ]);
+            let no_key_ref = envelope(5, vec![(Value::Integer(7.into()), payload)]);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &no_key_ref, &body).err(),
+                Some(AgentError::Malformed),
+                "absent key_ref → shape error (0x40), not the key band"
+            );
+        }
+
+        #[test]
+        fn rejects_cap_and_budget_as_cap_exceeded() {
+            let _g = gate_configured();
+            // amount over the per-dispense cap → 0x44 (key+recipient valid, so the §2 gate is reached).
+            let (body, from, to) = faucet_body(10_000_000_000);
+            let over_amount = request(
+                &TREASURY_REF, 11565, &from, &to,
+                Value::Bytes(min_be(2_000_000)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &over_amount, &body).err(),
+                Some(AgentError::CapExceeded),
+                "amount over per_dispense_max_amount"
+            );
+            // gas_limit over the cap → 0x44.
+            let over_gas = request(
+                &TREASURY_REF, 11565, &from, &to,
+                Value::Bytes(min_be(DISP_AMOUNT)), 0, 21_001, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &over_gas, &body).err(),
+                Some(AgentError::CapExceeded),
+                "gas_limit over max_gas_limit"
+            );
+            // worst_case over the cumulative budget → 0x44 (budget too small for one dispense).
+            let (tiny, from2, to2) = faucet_body(worst_case() - 1);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &good_request(&from2, &to2), &tiny).err(),
+                Some(AgentError::CapExceeded),
+                "worst_case over cumulative_signing_budget"
+            );
+            // an UNCONFIGURED budget (==0) rejects every dispense, even an in-cap one → 0x44.
+            let (unconf, from3, to3) = faucet_body(0);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &good_request(&from3, &to3), &unconf).err(),
+                Some(AgentError::CapExceeded),
+                "unconfigured budget fails closed"
+            );
+        }
+
+        #[test]
+        fn gated_off_when_anti_rollback_unconfigured() {
+            // The dispatch anti-rollback gate fires BEFORE the handler: with NO binding installed, a
+            // rollback-sensitive dispense is NotConfigured (0x45) regardless of the preview feature.
+            let _g = gate_unconfigured();
+            let (body, from, to) = faucet_body(10_000_000);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &good_request(&from, &to), &body).err(),
+                Some(AgentError::NotConfigured),
+                "anti-rollback unconfigured ⇒ NotConfigured"
+            );
+        }
+
+        /// Full wire path: install keystore + commit channel, dispense through the frame, observe the
+        /// sealed blob (key 8) AND the swap (the debit advanced the LIVE slot, so a second dispense that
+        /// would exceed the budget is now rejected).
+        #[test]
+        fn frame_path_seals_commits_and_swaps_the_debit() {
+            let _g = gate_configured();
+            // Budget covers EXACTLY one worst_case so the swap is observable: the 2nd dispense exceeds it.
+            let (mut body, from, to) = faucet_body(worst_case());
+            body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+            assert!(install_agent_keystore(body, b"meas"));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+
+            let out = handle_agent_gateway_frame(&good_request(&from, &to));
+            assert_eq!(decode_agent_error_code(&out), None, "first dispense is a success body");
+            let m = resp_map(&out);
+            // signed-tx 7-key map + key 8 = the non-empty sealed keystore blob the host persists.
+            assert_eq!(as_bytes(map_get(&m, 7).unwrap()).unwrap().to_vec(), from.to_vec(), "from = treasury");
+            assert!(!as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(), "key 1 = signed_rlp");
+            assert!(!as_bytes(map_get(&m, 8).unwrap()).unwrap().is_empty(), "key 8 = sealed blob");
+
+            // PROOF OF SWAP: the live slot now carries the debit, so the SAME dispense (cumulative would be
+            // 2*worst_case > budget) is rejected 0x44. If the first hadn't swapped, this would succeed.
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
+                Some(0x44),
+                "second dispense exceeds the budget after the first debit swapped into the live slot"
+            );
+            reset_agent_keystore_for_tests();
+        }
+
+        /// Seal-before-emit fail-closed: a commit failure (no channel / transport / forged ACK) fails the
+        /// dispense closed (0x46) with NO debit — the live faucet is untouched, so the SAME dispense still
+        /// succeeds once a conformant channel is installed. The signature is emitted ONLY after the anchor
+        /// durably records the debit (§3 — no signed dispense without a committed spend).
+        #[test]
+        fn frame_path_commit_failure_fails_closed_no_debit() {
+            let _g = gate_configured();
+            let (mut body, from, to) = faucet_body(worst_case());
+            body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+            assert!(install_agent_keystore(body, b"meas"));
+
+            // (a) NO commit channel → 0x46.
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
+                Some(0x46),
+                "no commit channel ⇒ SealFailed"
+            );
+            // (b) transport failure → 0x46.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Transport))));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
+                Some(0x46),
+                "commit transport failure ⇒ SealFailed"
+            );
+            reset_commit_channel_for_tests();
+            // (c) forged ACK (wrong signer) → 0x46.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::WrongKey))));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
+                Some(0x46),
+                "forged commit ack ⇒ SealFailed"
+            );
+            reset_commit_channel_for_tests();
+            // (d) PROOF OF NO DEBIT: the live faucet never advanced across all three failures, so a
+            // conformant channel now accepts the SAME single-worst_case dispense against the full budget.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
+                None,
+                "the failed dispenses never debited ⇒ the budget is intact and the dispense now succeeds"
+            );
+            reset_agent_keystore_for_tests();
         }
     }
 }

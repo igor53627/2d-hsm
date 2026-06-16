@@ -691,7 +691,13 @@ and error contract, with the per-command map carried at envelope key 7:
   transfer, `data` empty; `to` MUST match a known `agent_transfer_k1` identity in the
   keystore. TEE caps over worst-case `amount + gas_limit * effective_max_fee_rate`
   (checked arithmetic, fail-closed on overflow); two sealed counters debited
-  **before** the signature is emitted.
+  **before** the signature is emitted. Request map = the **same 8-field map** as
+  SIGN_TRANSFER; the success response is the SIGN_TRANSFER 7-key signed-tx map PLUS
+  **key 8 = the new sealed keystore blob** the host persists (the debited faucet state —
+  mirrors `GENERATE_KEYS` key 2). Because it debits sealed counters it is **mutating /
+  rollback-sensitive (EpochOnly)** and routes through the seal→anchor-commit→swap→emit
+  seam; production-gated behind the release-banned `agent-sign-faucet-preview` feature
+  (full encoding + error bands in `agent-gateway-transfer-faucet-signing.md` §2).
 - **`AGENT_K1_PUBLIC_IDENTITY`** response — `{1: pubkey (uncompressed 65B SEC1 0x04, AC#14),
   2: eth_address (20B), 3: tron_address (Base58Check of 0x41‖body), 4: key_ref,
   5: key_purpose, 6: backend_version}`. Returning **both** address encodings reflects the

@@ -17,11 +17,15 @@
 //! Generic primitives only — the faucet worst-case cost (`amount + gas_limit*gas_price`) is composed
 //! from these in the faucet dispense handler (slice 15-3), keeping this module domain-agnostic.
 //!
-//! Built only under the `agent-gateway` feature. The consumer is slice 15-3; `#[allow(dead_code)]`
-//! covers the base `agent-gateway` lib build until then (15-3 drops the allow as it wires each caller).
+//! Built only under the `agent-gateway` feature. The live consumer is the `agent-sign-faucet-preview`
+//! SIGN_FAUCET_DISPENSE handler (slice 15-3b) — directly (`from_minimal_be`) and via
+//! `FaucetState::accept_and_debit` (`from_u64`/`checked_add`/`checked_mul_u64`). So the allow is
+//! CONDITIONAL: with the faucet preview ON these have a live non-test caller (`#[cfg_attr(not(...))]`
+//! drops the allow, proving the wiring); with it OFF the base `agent-gateway` build keeps the allow
+//! (only the in-module tests exercise them).
 
 /// Lift a `u64` into a big-endian `u256` (`[u8; 32]`), right-aligned into the 8 low bytes.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "agent-sign-faucet-preview"), allow(dead_code))]
 pub(crate) fn from_u64(x: u64) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[24..].copy_from_slice(&x.to_be_bytes());
@@ -38,7 +42,7 @@ pub(crate) fn from_u64(x: u64) -> [u8; 32] {
 /// so re-checking here would both duplicate that logic and wrongly reject a legitimately-32-byte value
 /// that happens to have a high zero byte. Numerically a leading zero changes nothing — `[0x00, 0x01]`
 /// and `[0x01]` both lift to the value 1.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "agent-sign-faucet-preview"), allow(dead_code))]
 pub(crate) fn from_minimal_be(bytes: &[u8]) -> Option<[u8; 32]> {
     if bytes.len() > 32 {
         return None;
@@ -49,7 +53,7 @@ pub(crate) fn from_minimal_be(bytes: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Checked `u256 + u256`. `None` iff the true sum exceeds 2²⁵⁶−1 (a carry out of the top byte).
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "agent-sign-faucet-preview"), allow(dead_code))]
 pub(crate) fn checked_add(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     let mut carry = 0u16;
@@ -68,7 +72,7 @@ pub(crate) fn checked_add(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
 
 /// Checked `u256 * u64`. `None` iff the true product exceeds 2²⁵⁶−1. This is the faucet worst-case
 /// `gas_limit (u64) * gas_price (u256)` term (commutative — pass `gas_price` as `a`, `gas_limit` as `b`).
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "agent-sign-faucet-preview"), allow(dead_code))]
 pub(crate) fn checked_mul_u64(a: &[u8; 32], b: u64) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     // Schoolbook multiply, one base-256 digit (byte) of `a` at a time, LSB→MSB. The running `carry`

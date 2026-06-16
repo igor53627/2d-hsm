@@ -402,12 +402,13 @@ pub struct FaucetState {
 /// A §2 faucet accept-gate rejection. **Coarse on purpose**: the SIGN_FAUCET_DISPENSE handler collapses
 /// EVERY variant to `CapExceeded` (0x44) on the wire, so the host cannot tell WHICH cap/budget/breaker
 /// tripped (anti-oracle, §10.9) — the variants exist only for in-crate tests. `pub(crate)` + the
-/// `#[allow(dead_code)]` on the method below: the sole non-test caller is the SIGN_FAUCET_DISPENSE
-/// handler landing in slice 15-3b, which will define its OWN release-banned preview feature there
-/// (mirroring `agent-sign-transfer-preview`); this slice adds no such feature (it would gate nothing
-/// without the handler). So the base lib build has no live caller yet.
+/// CONDITIONAL allow below: the sole non-test caller is the SIGN_FAUCET_DISPENSE handler (slice 15-3b),
+/// gated behind `agent-sign-faucet-preview`. With that feature ON the handler makes `accept_and_debit`
+/// (and so this enum's variants) reachable, so the allow is dropped — a now-dead variant would warn,
+/// proving the gate stays wired; with it OFF the base `agent-gateway` build keeps the allow (only the
+/// in-crate `faucet_*` tests exercise it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "agent-sign-faucet-preview"), allow(dead_code))]
 pub(crate) enum FaucetCapError {
     /// `amount > per_dispense_max_amount`.
     PerDispenseAmount,
@@ -437,7 +438,11 @@ impl FaucetState {
     /// `gas_price` exceeding `u64` is correctly REJECTED, never downcast/wrapped under the cap (a
     /// fund-drain guard; see `u256` module docs). `lifetime_spend` ALWAYS advances on accept; only the
     /// breaker THRESHOLD check is conditional (its absence is not a failure, §2).
-    #[allow(dead_code)]
+    ///
+    /// Allow is CONDITIONAL on the faucet preview: the live caller is the `agent-sign-faucet-preview`
+    /// SIGN_FAUCET_DISPENSE handler (slice 15-3b); with the feature OFF only the `faucet_*` tests call it,
+    /// so the base build keeps the allow.
+    #[cfg_attr(not(feature = "agent-sign-faucet-preview"), allow(dead_code))]
     pub(crate) fn accept_and_debit(
         &self,
         amount: &[u8; 32],

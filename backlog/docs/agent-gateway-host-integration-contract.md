@@ -38,7 +38,7 @@ signing.
 | # | Capability (AC#1) | Commands | Issuer / key-5 cap | Counter | Scope |
 |---|-------------------|----------|--------------------|---------|-------|
 | 1 | **runtime signing** | `SIGN_TRANSFER`(4), `agent_transfer_k1` | **none** (no cap) | none — bounded by sealed key-purpose + canonical EIP-155 + sealed chain_id | transfer key |
-| 2 | **faucet-treasury signing** | `SIGN_FAUCET_DISPENSE`(5), `agent_faucet_treasury_k1` | **none** (no cap) | none — bounded by sealed key-purpose + per-dispense/cumulative/lifetime caps + seal-before-emit | `to` ∈ active transfer-key set |
+| 2 | **faucet-treasury signing** | `SIGN_FAUCET_DISPENSE`(5), `agent_faucet_treasury_k1` | **none** (no cap) | none — bounded by sealed key-purpose + per-dispense/cumulative/lifetime caps + seal-before-emit | `to` ∈ stored transfer-key set (every stored `agent_transfer_k1` identity; "active" == "present" — no revocation surface yet, a future revocation slice revisits) |
 | 3 | **provisioning/refill** | `GENERATE_KEYS`(1: transfer count≥1 \| faucet count=1 singleton), `CONFIGURE_TREASURY`(6: set_limits/refill_budget/raise_lifetime_breaker) | `admin_authority_pk` | contiguous per `(authority,env,scope_class,scope_target)`; `command_class`∈{generate_transfer, generate_faucet, configure_treasury} | transfer=**fleet**; treasury+config=**enclave** |
 | 4 | **backup export** | `EXPORT_BACKUP`(7) | `admin_authority_pk` (export role) | contiguous; `command_class=export_backup` | enclave |
 | 5 | **restore/recovery** | `RESTORE_BACKUP`(8), `CONFIGURE_TREASURY` reset_lifetime_breaker | `recovery_authority_pk` (`is_recovery=true`) | **single strict recovery counter** — shared by restore + reset_lifetime_breaker (per vsock §10.6), never rolls back | enclave, fresh-TEE |

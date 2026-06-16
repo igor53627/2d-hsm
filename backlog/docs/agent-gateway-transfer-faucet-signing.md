@@ -73,10 +73,13 @@ this same `u256` wire form. The **success response** map is
 §10.9 error body.
 
 **Error-code mapping (anti-oracle, §10.9).** Request-SHAPE failures that need no keystore — bad CBOR,
-`chain_id` ≠ sealed (a public constant), non-empty `data`, a non-minimal/over-width integer — collapse
-to `AGENT_MALFORMED` (0x40). Everything KEY-related — `key_ref` not found, wrong key purpose, and
-`from` ≠ the key's derived address — collapses uniformly to `AGENT_KEY_PURPOSE_MISMATCH` (0x42), so the
-error code never distinguishes "absent" from "present-but-…". `0x42` is therefore the **key-band /
+`chain_id` ≠ sealed (a public constant), non-empty `data`, a non-minimal/over-width integer, **and an
+ABSENT `key_ref`** (envelope key 6 missing — a structurally-incomplete request for a signing opcode, and
+host-observable from its own request, so it leaks nothing) — collapse to `AGENT_MALFORMED` (0x40).
+Everything KEY-related for a `key_ref` that IS present — `key_ref` **present-but-not-found**, wrong key
+purpose, and `from` ≠ the key's derived address — collapses uniformly to `AGENT_KEY_PURPOSE_MISMATCH`
+(0x42), so the error code never distinguishes "present-but-absent-from-the-store" from "present-but-…".
+(Both SIGN_TRANSFER and SIGN_FAUCET_DISPENSE follow this split identically.) `0x42` is therefore the **key-band /
 internal-signing bucket**, not strictly a "purpose mismatch": a (≈2⁻¹²⁸) signing failure (the x-reduced
 `recovery_id` rejection or the post-sign `recovery==from` invariant) also maps to 0x42 — SIGN_TRANSFER
 never seals, so **not** the seal-reserved 0x46. The `u256` width/minimality rule above is the **same**
@@ -102,11 +105,47 @@ Opcode 5, **faucet-treasury** tier, the singleton `agent_faucet_treasury_k1` key
 preimage / `from` / `chain_id` machinery as §1 (`from` = treasury key's derived address).
 Differs by recipient allowlist + spend caps + sealed counter debit.
 
-- **Recipient allowlist (AC#5):** `to` **must match an active `agent_transfer_k1` public
-  identity in the keystore**. This blocks one-command faucet→external spend, but **not**
-  two-step exfiltration (host dispenses to a transfer key, then signs a transfer out) until
-  TEE-side per-agent transfer destination/amount limits exist — **documented residual**.
-  `data`/memo **must be empty** (native transfers only).
+**Wire encoding + preview gate (TASK-15 / 7.6.4 impl decisions; slice 15-3b).** The request map is the
+**identical strict 8-field map** as SIGN_TRANSFER (§1) — `{1: chain_id, 2: from(20B), 3: to(20B),
+4: amount, 5: nonce, 6: gas_limit, 7: gas_price, 8: data(empty)}`, same canonical minimal-BE `u256` form
+for `amount`/`gas_price`, same `chain_id == sealed twod_chain_id` rule (a faucet dispense IS a pure native
+transfer). The **success response** appends the sealed blob to the transfer response: `{1: signed_rlp,
+2: r, 3: s, 4: recovery_id, 5: v, 6: signing_hash, 7: from, 8: sealed_keystore_blob}` — keys 1–7 are the
+broadcastable signed dispense tx (byte-for-byte the SIGN_TRANSFER layout); **key 8 is the new sealed
+keystore the host MUST persist** (the debited faucet state, mirroring GENERATE_KEYS key 2). Key 1 is BYTES,
+so a success body is distinguishable from a `{1: code(int)}` §10.9 error body. **Error bands** (anti-oracle
+§10.9, in handler order): request-SHAPE — bad CBOR, **an ABSENT signer `key_ref`** (envelope key 6 omitted
+= a structurally-incomplete request, host-observable from its own bytes), chain_id ≠ sealed, non-empty
+`data`, over-width/non-minimal u256 — → 0x40; everything key/recipient-related for a `key_ref` that IS
+present — `key_ref` **present-but-not-found**, wrong purpose, `from` ≠ derived, `to` not a known transfer
+identity, **and a (≈2⁻¹²⁸, non-host-controllable) signing failure** — collapses uniformly to 0x42; any §2
+cap/budget/breaker/overflow → 0x44; a seal / anchor-commit failure **and the (unreachable: needs
+`freshness_epoch == u64::MAX`) candidate epoch-bump overflow** → 0x46. The §2 checks run only AFTER the key+recipient checks pass, so a
+0x44 reveals nothing a valid dispense would not. **Membership-probe scope (precise).** Collapsing
+recipient-not-found into 0x42 hides keystore membership from a host **without** valid treasury credentials
+(it cannot tell recipient-not-found from a missing/mis-purposed treasury key). A host **with** valid
+treasury credentials (a real `key_ref` + the correct `from`, both host-obtainable — `key_ref` is
+host-supplied and the treasury eth address is returned by `AGENT_K1_PUBLIC_IDENTITY`) **can** still
+distinguish `0x44` (= `to` is a known recipient, over-cap) from `0x42` (= `to` unknown) by holding those
+constant and varying `to`. This residual is **accepted**: every `agent_transfer_k1` address is already
+host-derivable via `PUBLIC_IDENTITY`, so reaching §2 reveals nothing the host could not already enumerate —
+the band split is a non-credentialed-host defense, not a claim of absolute membership-unprobeability.
+Production-gated behind
+the release-banned **`agent-sign-faucet-preview`** feature (fund-CUSTODY readiness, ON TOP OF the runtime
+anti-rollback gate — SIGN_FAUCET_DISPENSE is rollback-sensitive); fails closed (`AGENT_NOT_CONFIGURED`)
+without it. It is a **mutating, EpochOnly** op: the debited candidate goes through the slice-6
+`commit_before_emit` seam (seal → anchor-commit → swap → emit), so the signature is emitted ONLY after the
+debit is durably committed (§3).
+
+- **Recipient allowlist (AC#5):** `to` **must match an `agent_transfer_k1` public
+  identity in the keystore**. **"Active" == "present as a stored transfer key"**: there is no
+  key-revocation/deactivation surface yet, so **every** stored `agent_transfer_k1` key is an eligible
+  recipient (the slice-15-3b `is_known_transfer_recipient` predicate enforces exactly "present + purpose
+  == transfer + derived eth address == `to`"); a future key-revocation slice MUST revisit this predicate
+  so a revoked transfer key stops being a valid dispense target. This blocks one-command
+  faucet→external spend, but **not** two-step exfiltration (host dispenses to a transfer key, then signs
+  a transfer out) until TEE-side per-agent transfer destination/amount limits exist — **documented
+  residual**. `data`/memo **must be empty** (native transfers only).
 - **Cap set (sealed in the 7.2 keystore faucet state):** per-dispense `max_amount`,
   `max_gas_limit`, `max_effective_gas_fee_rate`, a **mandatory refillable cumulative
   signing-budget** counter, and an **optional quorum-resettable lifetime circuit breaker**.

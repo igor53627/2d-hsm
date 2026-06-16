@@ -115,6 +115,14 @@ jobs:
       - name: Agent Gateway incl. SIGN_TRANSFER preview (TASK-7.6.4 / slice 15-1)
         run: cargo test --features agent-sign-transfer-preview
 
+      # TASK-15 slice 15-3b: SIGN_FAUCET_DISPENSE handler — the recipient allowlist + §2 accept-gate +
+      # dual-counter debit through the seal-before-emit seam — is gated behind agent-sign-faucet-preview.
+      # This lane also covers the faucet frame-path commit e2e (the TestCommitChannel is widened to this
+      # feature) and drops the conditional dead_code allow on the u256 / accept_and_debit wiring. Cheap
+      # unit tests (no boot/SNP) — mirrors the prove-identity / keygen-exec / sign-transfer preview lanes.
+      - name: Agent Gateway incl. SIGN_FAUCET_DISPENSE preview (TASK-7.6.4 / slice 15-3b)
+        run: cargo test --features agent-sign-faucet-preview
+
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 

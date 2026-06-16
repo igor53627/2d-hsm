@@ -74,6 +74,14 @@ agent-keygen-exec-preview = ["agent-gateway"]
 # SIGN_TRANSFER fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs). Never enable
 # in production.
 agent-sign-transfer-preview = ["agent-gateway"]
+# Enables LIVE AGENT_K1_SIGN_FAUCET_DISPENSE execution (treasury→known-transfer-key native dispense with
+# the §2 spend caps + atomic dual-counter debit through the seal-before-emit seam). **Production-gated
+# OFF**: on top of the AC#5 fund-CUSTODY-readiness gate it is ROLLBACK-SENSITIVE (it debits sealed faucet
+# spend counters), so it ALSO carries the TASK-7.7 anti-rollback obligation — the runtime dispatch gate
+# already fails it closed (AGENT_NOT_CONFIGURED) when the anti-rollback binding is unconfigured. Without
+# this feature SIGN_FAUCET_DISPENSE fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see
+# lib.rs). Never enable in production.
+agent-sign-faucet-preview = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []

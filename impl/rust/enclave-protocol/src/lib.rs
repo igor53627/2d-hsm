@@ -113,6 +113,16 @@ compile_error!(
      release builds until the AC#5 production funding profile is armed and TASK-18 un-gates"
 );
 
+// Live AGENT_K1_SIGN_FAUCET_DISPENSE signing emits fund-moving dispense signatures AND debits sealed
+// faucet spend counters (rollback-sensitive). The ban is the production fund-CUSTODY-readiness gate ON TOP
+// OF the runtime anti-rollback gate: it stays fail-closed until the AC#5 production funding profile is
+// provisioned and TASK-18 un-gates. Hard-ban it from release builds.
+#[cfg(all(release_build, feature = "agent-sign-faucet-preview"))]
+compile_error!(
+    "`agent-sign-faucet-preview` (live AGENT_K1_SIGN_FAUCET_DISPENSE signing) must not be enabled in \
+     release builds until the AC#5 production funding profile is armed and TASK-18 un-gates"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
