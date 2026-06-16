@@ -320,6 +320,16 @@ pub use lab_agent_smoke::{
     feature = "agent-keygen-exec-preview"
 ))]
 pub use lab_agent_smoke::run_agent_keygen_smoke_client;
+// TASK-15 combined faucet write-path smoke client — needs all three preview gates (mint treasury +
+// configure budget + dispense).
+#[cfg(all(
+    feature = "agent-gateway",
+    feature = "lab-agent-smoke",
+    feature = "agent-keygen-exec-preview",
+    feature = "agent-configure-treasury-preview",
+    feature = "agent-sign-faucet-preview"
+))]
+pub use lab_agent_smoke::run_agent_faucet_smoke_client;
 mod wire;
 
 use serde::{Deserialize, Serialize};

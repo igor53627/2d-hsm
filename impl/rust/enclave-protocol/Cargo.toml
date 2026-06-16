@@ -245,6 +245,15 @@ name = "twod-hsm-agent-keygen-smoke-client"
 path = "src/bin/twod_hsm_agent_keygen_smoke_client.rs"
 required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke", "agent-keygen-exec-preview"]
 
+# TASK-15 host-side combined FAUCET write-path smoke client. Drives mint-treasury → set_limits →
+# refill_budget → dispense → stranger-reject over AF_VSOCK (linux-only; non-linux main exits 2). Needs
+# ALL THREE preview gates (listed keygen-first to document the logical dependency: mint, then configure,
+# then dispense) — the guest must execute GENERATE_KEYS + CONFIGURE_TREASURY + SIGN_FAUCET_DISPENSE.
+[[bin]]
+name = "twod-hsm-agent-faucet-smoke-client"
+path = "src/bin/twod_hsm_agent_faucet_smoke_client.rs"
+required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke", "agent-keygen-exec-preview", "agent-configure-treasury-preview", "agent-sign-faucet-preview"]
+
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 
 [[example]]
