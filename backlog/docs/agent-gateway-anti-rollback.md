@@ -409,7 +409,12 @@ now so `marks_digest` is complete (this is `agent_capability`'s "independent str
 `agent-keygen-exec-preview`-gated GENERATE_KEYS path), so v2 is a **hard bump with no v1 reader**: the
 pre-decrypt `UnsupportedVersion` rejection (version is AAD-bound) is the entire migration. The frozen
 golden vector was regenerated. `KeystoreBody` fields are feature-invariant (never `#[cfg]`-gated) so the
-golden is single-valued across feature combos.
+golden is single-valued across feature combos. **TASK-15 15-2b then bumps `KEYSTORE_FORMAT_VERSION 2 →
+3`**, adding `FaucetState.cumulative_signing_budget` (the §2 faucet budget CEILING — a STRUCTURAL config
+cap, deliberately **NOT** a marks surface, so a dropped seal of a budget change fails closed
+StructuralGap→restore rather than being adopt-forwarded). Same hard-bump rules: **neither v1 nor v2 ever
+sealed a deployed blob** (all seal sites are preview-gated until TASK-18), so the bump loses no fielded
+state; the golden + genesis/smoke fixtures were regenerated.
 
 Strict decode (else `Malformed`): keys ⊆ `{1..=9, 13}`, no duplicates, all required present, fixed
 byte-lengths exact, and keys 8/9 **both-or-neither** (a chain attestation binds to a finalized block).
@@ -1243,7 +1248,7 @@ request golden vector is a 5b-2b test-vector item.
   - `unseal_agent_keystore_at_boot() -> Result<(KeystoreBody, Vec<u8> /*measurement*/), ProtocolError>` —
     a PURE source→unseal→return seam. It reads the sealed blob + the enclave measurement, resolves the
     provisioning root, and calls the SHARED `agent_keystore::unseal_body` VERBATIM (length → magic
-    `2DAGTKS\0` → `format_version==2` BEFORE decrypt → measurement-binding → strict whole-buffer CBOR →
+    `2DAGTKS\0` → `format_version==3` BEFORE decrypt → measurement-binding → strict whole-buffer CBOR →
     `validate()` incl. `structural_version!=0`). It does **NOT** install (the 5b-2c bin owns
     `install_agent_keystore` + the move-vs-borrow order: the handshake BORROWS `&body`, install MOVES it +
     retains the measurement for re-seal; `install_agent_keystore` returns `bool` and **false** —
@@ -1274,7 +1279,7 @@ request golden vector is a 5b-2b test-vector item.
   - **GENESIS GOLDEN:** committed `testvectors/agent-gateway/agent_keystore_genesis_v2.{sealed.bin,json}`
     (deterministic-nonce `seal_keystore_with_nonce` over the committed reference root + the agent
     placeholder; `structural_version=1`, `strict_recovery_counter=0`, no entries/counters; both required,
-    no serde default; `format_version=2` hard, no v1 reader; blob 3998 B ≤ `MAX_KEYSTORE_BLOB_SIZE`). An
+    no serde default; `format_version=3` hard, no v1/v2 reader; blob 4059 B ≤ `MAX_KEYSTORE_BLOB_SIZE`). An
     in-source byte-exact freeze + a from-disk integration test (`tests/agent_keystore_boot_loader.rs`) both
     consume the same bytes — any encoder/layout drift flips BOTH; regen via `#[ignore]
     regen_agent_genesis_golden_vector` (re-mint the `.json` in the same commit on a `format_version` bump).

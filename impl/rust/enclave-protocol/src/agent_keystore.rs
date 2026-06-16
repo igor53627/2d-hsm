@@ -33,16 +33,24 @@ use zeroize::{Zeroize as _, Zeroizing};
 /// `b"2DAGTKS\0"` — distinct from the producer `b"2DHSMV1\0"` so the two blob families can never
 /// be cross-parsed (format-level role separation, AC#2).
 pub const KEYSTORE_MAGIC: &[u8; 8] = b"2DAGTKS\0";
-/// Current sealed-keystore format version (`u16`, big-endian on the wire). `2` denotes the
-/// XChaCha20Poly1305 envelope + deterministic-CBOR body defined here **with the TASK-7.7
-/// anti-rollback body fields** `structural_version` + `strict_recovery_counter` (added in v2). `1`
-/// (the same envelope without those fields) **never shipped a real blob** — the only seal site is the
-/// `agent-keygen-exec-preview`-gated GENERATE_KEYS path — so v2 is a hard bump with **no v1 reader**:
-/// the pre-decrypt `UnsupportedVersion` rejection (version is AAD-bound) is the entire migration. Any
-/// further incompatible on-disk layout/encoding change bumps this again. Note: the `KeystoreBody`
-/// fields are feature-invariant (never `#[cfg]`-gated) so the sealed layout/golden is single-valued
-/// across all feature combinations.
-pub const KEYSTORE_FORMAT_VERSION: u16 = 2;
+/// Current sealed-keystore format version (`u16`, big-endian on the wire). `3` denotes the
+/// XChaCha20Poly1305 envelope + deterministic-CBOR body defined here. `2` added the TASK-7.7
+/// anti-rollback body fields `structural_version` + `strict_recovery_counter`; **`3` (TASK-15 slice
+/// 15-2b) adds `FaucetState::cumulative_signing_budget`** — the mandatory refillable signing-budget
+/// CEILING the §2 faucet gate checks `cumulative_native_spend + worst_case ≤ cumulative_signing_budget`
+/// against (a STRUCTURAL config cap set by CONFIGURE_TREASURY `refill_budget`, **not** a marks/spend
+/// surface). **MIGRATION SAFETY: NEITHER `1` NOR `2` ever sealed a deployed/production blob** — the only
+/// seal sites are the release-banned `agent-keygen-exec-preview` GENERATE_KEYS path and the lab test
+/// fixtures (the whole agent-gateway serving + keygen path stays preview-gated until TASK-18), so there
+/// is **no fielded keystore to migrate** and the v2→v3 bump cannot lose keys/counters/audit/spend state.
+/// Each bump is therefore a HARD one with **no reader for the prior version**: the pre-decrypt
+/// `UnsupportedVersion` rejection (version is AAD-bound) is the entire "migration" — a fresh provision,
+/// never an in-place upgrade. (When production keygen un-gates at TASK-18, any future bump MUST first
+/// define a real migration/reprovision path, since v3 will then be a fielded format.) Any further
+/// incompatible on-disk layout/encoding change bumps this again. Note: the `KeystoreBody` fields are
+/// feature-invariant (never `#[cfg]`-gated) so the sealed layout/golden is single-valued across all
+/// feature combinations.
+pub const KEYSTORE_FORMAT_VERSION: u16 = 3;
 
 const MEAS_DIGEST_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-meas";
 const AEAD_KEY_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-key";
@@ -240,7 +248,7 @@ pub fn unseal_keystore(
 // high-water table, faucet state, audit ring.) All structs are `deny_unknown_fields` so an
 // unexpected field fails closed rather than being silently dropped on a forward-migration read.
 //
-// Encoding note (sealed-body format, current format_version 2): this uses **deterministic** CBOR — serde emits struct fields
+// Encoding note (sealed-body format, current format_version 3): this uses **deterministic** CBOR — serde emits struct fields
 // in declaration order and every collection is a `Vec` (no map/HashMap), so a given body always
 // encodes to the same bytes (the golden vector locks this). It is NOT RFC 8949 *canonical* CBOR,
 // and byte fields (`[u8; N]`, `Vec<u8>`) serialize as CBOR integer-arrays, not byte strings.
@@ -377,6 +385,18 @@ pub struct FaucetState {
     pub lifetime_spend: [u8; 32],
     /// Optional lifetime circuit-breaker threshold (TASK-7.4 §2).
     pub circuit_breaker_threshold: Option<[u8; 32]>,
+    /// Mandatory refillable cumulative signing-budget CEILING (TASK-7.4 §2, format_version 3). The §2
+    /// faucet gate accepts a dispense iff `cumulative_native_spend + worst_case ≤ cumulative_signing_budget`
+    /// (big-endian `u256`). A STRUCTURAL config cap (raised by `CONFIGURE_TREASURY refill_budget`), NOT a
+    /// marks/spend surface — so it is deliberately **absent** from `encode_marks_payload`; a dropped seal
+    /// of a budget change fails closed (StructuralGap→restore), never adopt-forwarded. Genesis = `[0; 32]`
+    /// (a fresh keystore cannot dispense until a budget is configured — §2 "fails closed until a cumulative
+    /// budget is sealed"). Appended LAST so the audited marks-surface field order above is untouched.
+    /// **Slice 15-2b ships this field INERT/frozen-ahead** (like v2's `structural_version` did): no code
+    /// reads or writes it yet — the §2 gate that CHECKS it lands in slice 15-3 (SIGN_FAUCET_DISPENSE) and
+    /// the `refill_budget` mutator that RAISES it in slice 15-4 (CONFIGURE_TREASURY). The field is sealed
+    /// now so the format/golden settle before those mutators exist.
+    pub cumulative_signing_budget: [u8; 32],
 }
 
 /// One privileged-op audit record (AC#14).
@@ -860,21 +880,31 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails_closed_before_decrypt() {
-        // An unknown FUTURE version (3) is rejected pre-decrypt (version is AAD-bound).
+        // An unknown FUTURE version (4 — the current version is 3) is rejected pre-decrypt (version is
+        // AAD-bound). NB: must be 0x04, not 0x03 — 3 is now the live KEYSTORE_FORMAT_VERSION.
         let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         blob[8] = 0x00;
-        blob[9] = 0x03;
+        blob[9] = 0x04;
         assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::UnsupportedVersion));
     }
 
     #[test]
-    fn legacy_v1_version_rejected_after_bump() {
-        // The pre-bump format_version 1 (never shipped a real blob) is now rejected: v2 is a hard bump
-        // with no v1 reader, so a v1-stamped blob fails closed before decrypt.
-        let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
-        blob[8] = 0x00;
-        blob[9] = 0x01;
-        assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::UnsupportedVersion));
+    fn legacy_versions_rejected_after_bump() {
+        // Both pre-bump versions are now legacy with no reader: v1 never shipped a real blob, and v2 is
+        // superseded by v3 (which added cumulative_signing_budget). Each is a hard bump — a v1- or
+        // v2-stamped blob fails closed before decrypt (the version is AAD-bound, so this is the entire
+        // migration story). The live version (3) is exercised by the round-trip tests; 4 by
+        // unsupported_version_fails_closed_before_decrypt.
+        for legacy in [0x01u8, 0x02u8] {
+            let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
+            blob[8] = 0x00;
+            blob[9] = legacy;
+            assert_eq!(
+                unseal_keystore(&blob, &ROOT, MEAS_A),
+                Err(KeystoreError::UnsupportedVersion),
+                "legacy version {legacy} must be rejected pre-decrypt"
+            );
+        }
     }
 
     #[test]
@@ -996,6 +1026,7 @@ mod tests {
                 cumulative_native_spend: [0; 32],
                 lifetime_spend: [0; 32],
                 circuit_breaker_threshold: None,
+                cumulative_signing_budget: [0; 32],
             },
             audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch: 1,
@@ -1351,6 +1382,7 @@ mod tests {
                 cumulative_native_spend: [0; 32],
                 lifetime_spend: [0; 32],
                 circuit_breaker_threshold: None,
+                cumulative_signing_budget: [0; 32],
             },
             audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch: 1,
@@ -1370,20 +1402,21 @@ mod tests {
         let mut cbor = Zeroizing::new(Vec::new());
         ciborium::ser::into_writer(&body, &mut *cbor).unwrap();
         let blob = seal_keystore_with_nonce(&cbor, &GOLDEN_ROOT, GOLDEN_MEAS, &GOLDEN_NONCE).unwrap();
-        // Independently pin the on-wire format-version byte to the literal 2 (not just the const), so a
+        // Independently pin the on-wire format-version byte to the literal 3 (not just the const), so a
         // stealth const edit can't pass on the hash alone.
-        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), 2, "sealed format_version must be 2");
+        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), 3, "sealed format_version must be 3");
 
         let digest: [u8; 32] = {
             let mut h = Sha3_256::new();
             h.update(&blob);
             h.finalize().into()
         };
-        // format_version 2 (adds structural_version + strict_recovery_counter); supersedes the v1
-        // vector 4233 / c55edc09… (v1 never shipped a real blob — see KEYSTORE_FORMAT_VERSION).
+        // format_version 3 (adds FaucetState::cumulative_signing_budget on top of v2's structural_version
+        // + strict_recovery_counter); supersedes the v2 vector 4278 / 0e8e0df5… and the never-shipped v1
+        // (4233 / c55edc09…) — see KEYSTORE_FORMAT_VERSION.
         assert_eq!(
             (blob.len(), hex::encode(digest)),
-            (4278usize, "0e8e0df50b19ecb34faf0d09a51d5224e3c044ad3e07ef961814f4dfd1382edc".to_string()),
+            (4339usize, "1f24fdafbecb85c8a0d9a56a27f4a4a2ff6363090315b39f654510a8dcac636d".to_string()),
             "keystore golden blob changed — if intentional, bump format_version + update this vector"
         );
 
@@ -1847,7 +1880,66 @@ mod tests {
             ciborium::ser::into_writer(&ciborium::value::Value::Map(shortened_entries), &mut shortened)
                 .unwrap();
             let res: Result<KeystoreBody, _> = ciborium::de::from_reader(&shortened[..]);
-            assert!(res.is_err(), "v2 body missing {field} must fail closed, not default");
+            assert!(res.is_err(), "body missing {field} must fail closed, not default");
         }
+    }
+
+    #[test]
+    fn v3_body_missing_nested_faucet_budget_fails_closed() {
+        // The format_version-3 `cumulative_signing_budget` lives INSIDE the nested `faucet` map, which
+        // the top-level strip above cannot reach. FaucetState is `deny_unknown_fields` + has no
+        // `serde(default)`, so a v3 body whose faucet map OMITS the budget must FAIL to decode — never
+        // silently zero a (future §2 §-gate) spend ceiling. Guards against a `#[serde(default)]`
+        // regression on the nested field specifically.
+        let body = sample_body();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&body, &mut buf).unwrap();
+        let mut entries = match ciborium::de::from_reader(&buf[..]).unwrap() {
+            ciborium::value::Value::Map(m) => m,
+            _ => panic!("KeystoreBody should serialize as a CBOR map"),
+        };
+        let faucet_idx = entries
+            .iter()
+            .position(|(k, _)| matches!(k, ciborium::value::Value::Text(s) if s == "faucet"))
+            .expect("body has a faucet field");
+        let faucet_entries = match &mut entries[faucet_idx].1 {
+            ciborium::value::Value::Map(m) => m,
+            _ => panic!("FaucetState should serialize as a CBOR map"),
+        };
+        let before = faucet_entries.len();
+        faucet_entries.retain(
+            |(k, _)| !matches!(k, ciborium::value::Value::Text(s) if s == "cumulative_signing_budget"),
+        );
+        assert_eq!(faucet_entries.len(), before - 1, "removed faucet.cumulative_signing_budget");
+        let mut shortened = Vec::new();
+        ciborium::ser::into_writer(&ciborium::value::Value::Map(entries), &mut shortened).unwrap();
+        assert!(
+            ciborium::de::from_reader::<KeystoreBody, _>(&shortened[..]).is_err(),
+            "v3 body missing faucet.cumulative_signing_budget must fail closed, not default"
+        );
+    }
+
+    #[test]
+    fn cumulative_signing_budget_is_not_a_marks_surface() {
+        // Load-bearing anti-rollback invariant (design §3): the budget is STRUCTURAL config (raised by a
+        // CONFIGURE_TREASURY refill_budget — a Structural op), deliberately EXCLUDED from the marks
+        // payload. If it were a marks surface, a host that dropped the seal of a budget RAISE could have
+        // it adopt-forwarded instead of StructuralGap→restored. Pin it DIRECTLY (not just via the frozen
+        // marks goldens): mutating ONLY cumulative_signing_budget must leave the marks payload + digest
+        // byte-identical.
+        let base = sample_body();
+        let mut bumped = base.clone();
+        bumped.faucet.cumulative_signing_budget = [0xff; 32];
+        assert_ne!(base.faucet, bumped.faucet, "precondition: the budget field actually differs");
+        assert_eq!(
+            base.encode_marks_payload(),
+            bumped.encode_marks_payload(),
+            "cumulative_signing_budget must NOT appear in the marks payload (structural cap, not a marks surface)"
+        );
+        assert_eq!(
+            base.compute_local_marks_digest(),
+            bumped.compute_local_marks_digest(),
+            "cumulative_signing_budget must NOT affect marks_digest"
+        );
     }
 }

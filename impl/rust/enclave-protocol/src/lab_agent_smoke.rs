@@ -122,6 +122,7 @@ pub(crate) fn smoke_body() -> KeystoreBody {
             cumulative_native_spend: [0; 32],
             lifetime_spend: [0; 32],
             circuit_breaker_threshold: None,
+            cumulative_signing_budget: [0; 32],
         },
         audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
         freshness_epoch: 1,
@@ -1080,7 +1081,7 @@ mod tests {
         let body = smoke_body();
         body.validate().expect("smoke body passes structural validation");
         let blob = smoke_sealed_blob();
-        assert_eq!(&blob[8..10], &[0x00, 0x02], "format_version 2 in the header");
+        assert_eq!(&blob[8..10], &[0x00, 0x03], "format_version 3 in the header");
         assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE, "smoke blob is re-installable");
         let unsealed =
             unseal_body(&blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
@@ -1838,7 +1839,7 @@ mod tests {
             "blob_sha256": hex(&Sha256::digest(&blob)),
             "envelope": {
                 "keystore_magic_ascii": "2DAGTKS<NUL>",
-                "keystore_format_version": 2,
+                "keystore_format_version": 3,
                 "aead": "XChaCha20Poly1305",
                 "nonce_hex": hex(&SMOKE_SEAL_NONCE),
             },
