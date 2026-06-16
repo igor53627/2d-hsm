@@ -197,9 +197,12 @@ pub(crate) enum CommitBumpClass {
 /// `Structural`** — same as the opcode-level [`AgentOpcode::commit_bump_class`]. This fn is kept as the
 /// per-sub-op extension point (and to single-source the handler's `bumps_structural`), but each sub-op is
 /// re-confirmed Structural here:
-/// - `{0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker}` mutate anchor-UNRECONSTRUCTABLE faucet
-///   CONFIG (the limit triple / the refillable budget ceiling / the breaker threshold — none a marks
-///   surface), so a dropped seal must `StructuralGap`→restore.
+/// - `{0 set_limits, 2 raise_lifetime_breaker}` mutate anchor-UNRECONSTRUCTABLE faucet CONFIG (the limit
+///   triple / the breaker threshold — not marks surfaces), so a dropped seal must `StructuralGap`→restore.
+/// - `1 refill_budget` mutates the budget ceiling (not a marks surface) AND resets the refillable
+///   `cumulative_native_spend` → 0 — that IS a marks surface, and a DECREASE. That marks decrease is
+///   exactly why it too must be Structural: `AdoptForward`'s monotone-up belt could not adopt a lowered
+///   `cumulative_native_spend`, so a dropped seal must `StructuralGap`→restore (which fences it).
 /// - `3 reset_lifetime_breaker` was INITIALLY thought EpochOnly ("its effect is in the marks"), but that
 ///   is **wrong** (TASK-15 15-4 review, all reviewers): it (a) LOWERS `lifetime_spend`, a marks surface —
 ///   and `AdoptForward`'s `marks_dominate_local` belt REQUIRES adopted marks ≥ local, so a lowered
