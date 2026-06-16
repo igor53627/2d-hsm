@@ -151,6 +151,16 @@ debit is durably committed (§3).
   signing-budget** counter, and an **optional quorum-resettable lifetime circuit breaker**.
   Faucet signing **fails closed** until mandatory per-dispense caps + a cumulative budget are
   sealed.
+- **Cap mutation — `CONFIGURE_TREASURY` (slice 15-4):** the cap set above is mutated ONLY by the four
+  `CONFIGURE_TREASURY` sub-ops (§10.7), each touching only its own field(s) so the rotation carry-over
+  (counters keyed independently of `key_ref`, AC#15/#17) is preserved: `set_limits` sets the per-dispense
+  limit triple (no spend touch); `refill_budget` sets the `cumulative_signing_budget` ceiling AND resets
+  `cumulative_native_spend → 0` (a fresh refill window — `lifetime_spend` is NOT reset), rejecting a zero
+  budget (0x44, would re-disable the faucet); `raise_lifetime_breaker` sets the breaker threshold
+  (rejecting `< lifetime_spend`, 0x44); `reset_lifetime_breaker` (recovery-tier) clears the breaker and
+  LOWERS `lifetime_spend` to a target `≤` current (0x44 otherwise) while advancing `strict_recovery_counter`.
+  Every sub-op bumps the monotonic `config_version`; all but `reset_lifetime_breaker` are anti-rollback
+  **Structural** (see `agent-gateway-anti-rollback.md`).
 - **Checked worst-case arithmetic + integer domain (AC#8):** EVM-value fields (`amount`,
   `value`, `gas_price`/`effective_max_fee_rate`) and the cumulative-spend / budget / breaker
   counters are **`u256`**; `nonce` and `gas_limit` are **`u64`** (the EVM / 2D domain — 2D

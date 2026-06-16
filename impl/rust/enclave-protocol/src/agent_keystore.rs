@@ -735,6 +735,33 @@ impl KeystoreBody {
         }
         Ok(())
     }
+
+    /// Slice 15-4: advance the monotonic treasury **config version** for a committed
+    /// `CONFIGURE_TREASURY` sub-op. EVERY one of the 4 sub-ops bumps it (the per-op monotonic/audit
+    /// trail — `AuditRecord::config_version` snapshots it). This is a SEPARATE checked bump from
+    /// [`Self::advance_commit_epoch`]: that fn moves `freshness_epoch` (+ `structural_version` for a
+    /// STRUCTURAL op) but deliberately does NOT touch `monotonic_treasury_config_version`.
+    ///
+    /// `config_version` is NOT a marks surface (absent from [`Self::encode_marks_payload`]) and MUST NOT
+    /// be aliased onto `structural_version` — their independence is part of the anti-rollback contract.
+    /// For the `{set_limits, refill_budget, raise_lifetime_breaker}` (Structural) sub-ops `config_version`
+    /// rides ALONGSIDE the `structural_version` bump, so a rolled-back config is caught as the
+    /// `StructuralGap` that bump produces; `reset_lifetime_breaker` is EpochOnly (its full effect is in
+    /// the marks `lifetime_spend`/`strict_recovery_counter`), so there `config_version` advances WITHOUT a
+    /// `structural_version` bump.
+    ///
+    /// **Checked, never wraps:** a wrapped config_version would let a superseded/loosened config be
+    /// re-applied via rollback undetected, so overflow fails closed (`MonotonicOverflow`) — the handler
+    /// maps it to `SealFailed`/0x46. `u64` overflow is unreachable in practice (one bump per config op).
+    #[cfg_attr(not(feature = "agent-configure-treasury-preview"), allow(dead_code))]
+    pub(crate) fn advance_treasury_config_version(&mut self) -> Result<(), KeystoreError> {
+        self.config.monotonic_treasury_config_version = self
+            .config
+            .monotonic_treasury_config_version
+            .checked_add(1)
+            .ok_or(KeystoreError::MonotonicOverflow)?;
+        Ok(())
+    }
 }
 
 /// `environment_identifier` rules (TASK-7.1 §10.6): UTF-8, length `1..=64`, `[a-z0-9-]`, no
@@ -1932,6 +1959,34 @@ mod tests {
         assert_eq!(b.advance_commit_epoch(false), Err(KeystoreError::MonotonicOverflow));
         assert_eq!(b.freshness_epoch, u64::MAX, "epoch-only overflow leaves epoch unchanged");
         assert_eq!(b.structural_version, s, "epoch-only never touches structural");
+    }
+
+    /// Slice 15-4: `advance_treasury_config_version` bumps ONLY `config_version` (NOT freshness_epoch /
+    /// structural_version — those are owned by `advance_commit_epoch`), is checked, and never wraps.
+    #[test]
+    fn advance_treasury_config_version_bumps_only_config_and_overflow_fails_closed() {
+        let mut b = sample_body();
+        let (v, e, s) = (
+            b.config.monotonic_treasury_config_version,
+            b.freshness_epoch,
+            b.structural_version,
+        );
+        b.advance_treasury_config_version().unwrap();
+        assert_eq!(b.config.monotonic_treasury_config_version, v + 1, "config_version += 1");
+        assert_eq!(b.freshness_epoch, e, "config bump must NOT touch freshness_epoch");
+        assert_eq!(b.structural_version, s, "config bump must NOT touch structural_version (no aliasing)");
+        // config_version is not a marks surface — the bump leaves the marks digest unchanged.
+        let before = b.compute_local_marks_digest();
+        b.advance_treasury_config_version().unwrap();
+        assert_eq!(b.compute_local_marks_digest(), before, "config_version is not a marks surface");
+        // Overflow fails closed (never wraps — a wrapped version would let a loosened config re-apply).
+        b.config.monotonic_treasury_config_version = u64::MAX;
+        assert_eq!(
+            b.advance_treasury_config_version(),
+            Err(KeystoreError::MonotonicOverflow),
+            "config_version at u64::MAX ⇒ MonotonicOverflow"
+        );
+        assert_eq!(b.config.monotonic_treasury_config_version, u64::MAX, "no wrap on overflow");
     }
 
     #[test]

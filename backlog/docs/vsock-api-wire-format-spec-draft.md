@@ -698,6 +698,30 @@ and error contract, with the per-command map carried at envelope key 7:
   rollback-sensitive (EpochOnly)** and routes through the seal→anchor-commit→swap→emit
   seam; production-gated behind the release-banned `agent-sign-faucet-preview` feature
   (full encoding + error bands in `agent-gateway-transfer-faucet-signing.md` §2).
+- **`AGENT_K1_CONFIGURE_TREASURY`** (slice 15-4; treasury config — signs nothing) — request payload
+  (envelope key 7) = `{1: sub_op, …per-sub-op fields}`, strict per-sub-op key count (extra/dup/unknown
+  key ⇒ 0x40):
+  - `0 set_limits` (admin): `{1:0, 2: per_dispense_max_amount (u256 minimal-BE), 3: max_gas_limit (u64),
+    4: max_effective_gas_fee_rate (u64)}` — sets the limit triple atomically; spend/budget untouched.
+  - `1 refill_budget` (admin): `{1:1, 2: new_cumulative_signing_budget (u256)}` — sets the budget ceiling
+    AND resets `cumulative_native_spend → 0` (a fresh refill window); `lifetime_spend` untouched.
+    `new_budget == 0` ⇒ 0x44 (would re-disable the faucet).
+  - `2 raise_lifetime_breaker` (admin): `{1:2, 2: new_circuit_breaker_threshold (u256)}` — sets the
+    lifetime breaker; `new_threshold < current lifetime_spend` ⇒ 0x44 (anti-inversion — would trip at once).
+  - `3 reset_lifetime_breaker` (recovery): `{1:3, 2: target_lifetime_spend (u256)}` — clears the breaker,
+    LOWERS `lifetime_spend` to `target` (`target > current` ⇒ 0x44), and advances `strict_recovery_counter`.
+  `u256` fields reuse `as_u256_minimal_be` (over-width / non-minimal ⇒ 0x40). The cap's `payload_binding`
+  canonical params are the canonical CBOR of this exact map (sub_op at key 1), and the handler ALSO
+  asserts `request.sub_op == cap.treasury_sub_op` directly (§10.5 — load-bearing for tier separation, so an
+  admin cap cannot drive the recovery-tier reset via a baked `payload_binding`). Success response =
+  `{1: sealed_keystore_blob}`. EVERY sub-op bumps the monotonic `config_version`; `{0,1,2}` are
+  **Structural** (also bump `structural_version`), `3` is **EpochOnly** (its full effect is the marks
+  `lifetime_spend`/`strict_recovery_counter`). Mutating / rollback-sensitive ⇒ routes through the
+  seal→anchor-commit→swap→emit seam; production-gated behind the release-banned
+  `agent-configure-treasury-preview` feature. Error bands (anti-oracle, §10.9): request shape → 0x40;
+  sub-op binding / `payload_binding` / non-enclave scope → 0x43; quantitative (zero budget / breaker
+  inversion / reset overshoot / counter table) → 0x44; seal/commit or `config_version`/epoch overflow →
+  0x46. There is **no 0x42 band** (no `key_ref` — treasury config is the singleton `FaucetState`).
 - **`AGENT_K1_PUBLIC_IDENTITY`** response — `{1: pubkey (uncompressed 65B SEC1 0x04, AC#14),
   2: eth_address (20B), 3: tron_address (Base58Check of 0x41‖body), 4: key_ref,
   5: key_purpose, 6: backend_version}`. Returning **both** address encodings reflects the

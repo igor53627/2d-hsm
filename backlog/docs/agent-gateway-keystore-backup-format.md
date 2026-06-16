@@ -75,7 +75,10 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    (Ed25519 32 B); `recovery_authority_pk` / threshold root (Ed25519 32 B / quorum
    descriptor); `backup_recovery_wrapping_pubkey` (the operator recovery **public** key for
    DR — ML-KEM-1024 encapsulation key, 1568 B; public, sealed here so the enclave can wrap to
-   it; private side never in TEE); `monotonic_treasury_config_version` (u64); `authority_epoch`
+   it; private side never in TEE); `monotonic_treasury_config_version` (u64 — bumped by EVERY committed
+   `CONFIGURE_TREASURY` sub-op (slice 15-4) via a checked add SEPARATE from the anti-rollback
+   epoch/structural bump; **not** a marks surface and **never** aliased onto `structural_version`; overflow
+   fails closed); `authority_epoch`
    (u64, reserved for future rotation); `anchor_root` (Ed25519 32 B — the pinned TASK-7.7
    anti-rollback anchor identity the enclave verifies freshness responses against; 7.2 stores it,
    7.7 owns the mechanism).

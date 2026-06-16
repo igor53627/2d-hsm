@@ -123,6 +123,19 @@ compile_error!(
      release builds until the AC#5 production funding profile is armed and TASK-18 un-gates"
 );
 
+// Live AGENT_K1_CONFIGURE_TREASURY execution mutates sealed faucet config (limits / refillable budget /
+// lifetime circuit-breaker / lifetime-spend recovery) + advances the monotonic config_version
+// (rollback-sensitive). The ban is the production fund-CUSTODY-readiness gate ON TOP OF the runtime
+// anti-rollback gate: it stays fail-closed until the AC#5 production funding profile is armed, the
+// independent recovery-counter rule + the AC#14 audit record land, and TASK-18 un-gates. Hard-ban it
+// from release builds.
+#[cfg(all(release_build, feature = "agent-configure-treasury-preview"))]
+compile_error!(
+    "`agent-configure-treasury-preview` (live AGENT_K1_CONFIGURE_TREASURY config mutation) must not be \
+     enabled in release builds until the AC#5 production funding profile is armed, the independent \
+     recovery-counter rule + the AC#14 audit record land, and TASK-18 un-gates"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;

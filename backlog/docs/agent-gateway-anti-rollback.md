@@ -147,6 +147,19 @@ epoch + counter/spend marks, so a dropped `GENERATE_KEYS`/`CONFIGURE_TREASURY` s
 reconstructable) — fails closed for operator intervention (restore from backup). This preserves
 no-over-dispense without a permanent self-wedge on a single dropped ack.
 
+**`CONFIGURE_TREASURY` sub-op commit classifier (slice 15-4).** The opcode-level commit class is
+`Structural`, but the handler classifies PER SUB-OP (fail-closed-safe over-classification is corrected
+only in the direction that is safe): `set_limits` / `refill_budget` / `raise_lifetime_breaker` mutate
+anchor-UNRECONSTRUCTABLE faucet **config** (limits / budget ceiling / breaker threshold — none a marks
+surface) ⇒ **Structural** (a dropped seal ⇒ `StructuralGap`→restore, never silently lost);
+`reset_lifetime_breaker` mutates ONLY marks surfaces (`lifetime_spend` + `strict_recovery_counter`) ⇒
+**EpochOnly** (a dropped seal `AdoptForward`s from the anchor's authenticated marks). UNDER-classifying a
+config sub-op as EpochOnly would be the dangerous direction (a dropped seal would adopt-forward and lose
+the config change), so the classifier is explicit per sub-op. EVERY sub-op also bumps the monotonic
+`config_version` (a checked add, NOT a marks surface, never aliased onto `structural_version`); for the
+Structural sub-ops it rides alongside the `structural_version` bump, for `reset_lifetime_breaker` it
+advances without one.
+
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
 1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.
 2. **An idempotent retry RE-SIGNS for the CURRENT (fresh per-op) nonce.** A duplicate commit under an already-recorded `request_id` with **matching** `{epoch, structural, marks}` MUST return an ack **re-signed for the attempt's fresh nonce** (NOT a replay of the original ack) — the enclave's `verify_commit_ack_bytes` echoes the *current* op's nonce, so a replayed original ack fails `NonceMismatch` and wedges the retry. The durable record is NOT advanced again.

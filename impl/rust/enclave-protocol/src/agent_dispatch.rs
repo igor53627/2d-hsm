@@ -192,6 +192,28 @@ pub(crate) enum CommitBumpClass {
     NotCommitted,
 }
 
+/// Slice 15-4: the SUB-OP-level commit-bump classifier for CONFIGURE_TREASURY. The opcode-level
+/// [`AgentOpcode::commit_bump_class`] returns `Structural` for the whole opcode (fail-closed-safe), but
+/// that OVER-classifies `reset_lifetime_breaker(3)`, whose full effect IS in the anchor's authenticated
+/// marks (`lifetime_spend` + `strict_recovery_counter`) ⇒ EpochOnly. The config sub-ops
+/// `{0 set_limits, 1 refill_budget, 2 raise_lifetime_breaker}` mutate anchor-UNRECONSTRUCTABLE faucet
+/// config (limits / refillable budget ceiling / breaker threshold — none a marks surface), so a dropped
+/// seal must `StructuralGap`→restore ⇒ Structural. UNDER-classifying any of {0,1,2} as EpochOnly is the
+/// DANGEROUS direction (a dropped seal would adopt-forward and silently LOSE the config change); the
+/// match is therefore explicit per sub-op, and the wildcard defaults to the fail-closed-safe `Structural`
+/// (unreachable — the handler validates `sub_op ∈ 0..=3` before calling).
+#[cfg_attr(not(feature = "agent-configure-treasury-preview"), allow(dead_code))]
+fn configure_treasury_sub_op_bump_class(sub_op: u8) -> CommitBumpClass {
+    match sub_op {
+        // set_limits / refill_budget / raise_lifetime_breaker — anchor-unreconstructable faucet config.
+        0..=2 => CommitBumpClass::Structural,
+        // reset_lifetime_breaker — marks-only (lifetime_spend + strict_recovery_counter).
+        3 => CommitBumpClass::EpochOnly,
+        // Unreachable (sub_op validated to 0..=3 by the handler); default to fail-closed-safe Structural.
+        _ => CommitBumpClass::Structural,
+    }
+}
+
 /// Which role this signer instance runs as (production role isolation, §10.2). A `Producer` signer
 /// rejects every agent opcode; an `AgentGateway` signer rejects producer/AuthorizationTicket frames
 /// (the latter is enforced at the frame layer, not here).
@@ -233,6 +255,18 @@ pub enum AgentResponse {
     /// `request_id` is carried so the frame-layer commit can key the anchor record by it (idempotency).
     SignFaucetDispense {
         signed: SignedTransfer,
+        candidate: Box<KeystoreBody>,
+        request_id: Vec<u8>,
+    },
+    /// CONFIGURE_TREASURY result (slice 15-4): the mutated `candidate` keystore after one faucet-config
+    /// sub-op — `{set_limits, refill_budget, raise_lifetime_breaker, reset_lifetime_breaker}` — plus the
+    /// monotonic `config_version` bump and the sub-op's commit-epoch bump (Structural for the first three,
+    /// EpochOnly for `reset_lifetime_breaker`). Like GENERATE_KEYS it is MUTATING but emits NO
+    /// secret/signature — a config op signs nothing. The frame layer SEALS the candidate, COMMITS the
+    /// post-config state to the anchor (seal-before-emit), SWAPS it into the live slot and returns ONLY the
+    /// sealed blob (the sole durable artifact). `request_id` is carried so the frame-layer commit can key
+    /// the anchor record by it (idempotency).
+    ConfigureTreasury {
         candidate: Box<KeystoreBody>,
         request_id: Vec<u8>,
     },
@@ -400,8 +434,14 @@ pub(crate) fn dispatch_agent(
             // closed (no mutation).
             #[cfg(feature = "agent-keygen-exec-preview")]
             AgentOpcode::GenerateKeys => handle_generate_keys(&env, keystore, &verified),
-            // CONFIGURE_TREASURY / EXPORT_BACKUP / RESTORE_BACKUP (and GENERATE_KEYS without the
-            // preview feature) verify here but their execution lands in later slices ⇒ fail closed.
+            // CONFIGURE_TREASURY executes ONLY under the off-by-default `agent-configure-treasury-preview`
+            // feature (release-banned): live faucet-config mutation must wait for the AC#5 funding profile,
+            // the independent recovery-counter rule + AC#14 audit record, and TASK-18. Without the feature
+            // it falls through to the privileged default arm below (verify cap, then fail closed).
+            #[cfg(feature = "agent-configure-treasury-preview")]
+            AgentOpcode::ConfigureTreasury => handle_configure_treasury(&env, keystore, &verified),
+            // CONFIGURE_TREASURY (without its preview) / EXPORT_BACKUP / RESTORE_BACKUP (and GENERATE_KEYS
+            // without its preview) verify here but their execution lands in later slices ⇒ fail closed.
             _ => {
                 let _ = &verified;
                 Err(AgentError::NotConfigured)
@@ -760,6 +800,44 @@ pub(crate) fn generate_keys_canonical_params(purpose_code: u64, count: u64) -> V
     out
 }
 
+/// Canonical CBOR of the CONFIGURE_TREASURY command params (slice 15-4) — the exact bytes hashed into
+/// `payload_binding` (mirrors [`generate_keys_canonical_params`]). The map mirrors the request payload
+/// (envelope key 7) 1:1: `{1: sub_op, 2: <field2 u256 minimal-BE>, [3: max_gas_limit, 4: max_fee_rate]}`,
+/// keys 3,4 present iff `sub_op == 0 set_limits`. `field2_minimal_be` is the ON-THE-WIRE minimal
+/// big-endian byte string (as validated by `agent_cbor::as_u256_minimal_be`), NOT the lifted `[u8; 32]`,
+/// so a conformant cap issuer and this verifier produce byte-identical preimages. `pub(crate)` so the
+/// handler + tests single-source the wire layout (no drift). `sub_op` is bound BOTH here (map key 1) and
+/// as the `payload_binding` preimage's 2nd byte — intentional belt-and-suspenders; the caller passes the
+/// same `sub_op` to both.
+#[cfg_attr(not(feature = "agent-configure-treasury-preview"), allow(dead_code))]
+pub(crate) fn configure_treasury_canonical_params(
+    sub_op: u8,
+    field2_minimal_be: &[u8],
+    set_limits_gas_fields: Option<(u64, u64)>,
+) -> Vec<u8> {
+    use crate::agent_capability::{put_bytes, put_uint};
+    // set_limits(0) carries 4 keys {1,2,3,4}; every other sub-op carries 2 keys {1,2}.
+    debug_assert_eq!(
+        sub_op == 0,
+        set_limits_gas_fields.is_some(),
+        "set_limits(0) ⇔ gas fields present",
+    );
+    let n_keys: u64 = if set_limits_gas_fields.is_some() { 4 } else { 2 };
+    let mut out = Vec::new();
+    put_uint(&mut out, 5, n_keys); // definite-length map header (RFC 8949 shortest form)
+    put_uint(&mut out, 0, 1);
+    put_uint(&mut out, 0, u64::from(sub_op));
+    put_uint(&mut out, 0, 2);
+    put_bytes(&mut out, field2_minimal_be);
+    if let Some((max_gas_limit, max_fee_rate)) = set_limits_gas_fields {
+        put_uint(&mut out, 0, 3);
+        put_uint(&mut out, 0, max_gas_limit);
+        put_uint(&mut out, 0, 4);
+        put_uint(&mut out, 0, max_fee_rate);
+    }
+    out
+}
+
 /// GENERATE_KEYS(1): after a verified admin capability, bind the request params to the cap, generate
 /// `count` keys of `purpose` on a CANDIDATE clone, and advance the capability counter. Returns the
 /// candidate for the frame layer to seal → anchor-commit → swap → emit (no live mutation here).
@@ -854,6 +932,214 @@ fn handle_generate_keys(
         .map_err(|_| AgentError::SealFailed)?;
     Ok(AgentResponse::GenerateKeys {
         keys,
+        candidate: Box::new(candidate),
+        request_id: env.request_id.clone(),
+    })
+}
+
+/// CONFIGURE_TREASURY(6) (slice 15-4): after a verified admin/recovery capability, apply ONE faucet-config
+/// sub-op to a CANDIDATE clone, bump the monotonic `config_version`, and advance the sub-op's commit
+/// epoch. Returns the candidate for the frame layer to seal → anchor-commit → swap → emit (no live
+/// mutation here; a config op signs nothing — the only emitted artifact is the sealed blob).
+///
+/// Compiled always (so its imports/helpers stay "used") but only CALLED under
+/// `agent-configure-treasury-preview` — without it, dispatch routes CONFIGURE_TREASURY to NotConfigured.
+///
+/// Anti-oracle §10.9 band order: request shape/decode (0x40) → sub-op binding + payload_binding +
+/// financial scope (0x43) → quantitative limits + counter table (0x44) → config_version / epoch / (frame
+/// seam) seal+commit (0x46). There is NO 0x42 band — treasury config is the singleton `FaucetState`, with
+/// no `key_ref` / key lookup.
+#[cfg_attr(not(feature = "agent-configure-treasury-preview"), allow(dead_code))]
+fn handle_configure_treasury(
+    env: &AgentEnvelope,
+    keystore: &KeystoreBody,
+    verified: &VerifiedCapability,
+) -> Result<AgentResponse, AgentError> {
+    use crate::agent_cbor::as_u256_minimal_be;
+
+    // ---- ORDER 3: request shape / payload decode (0x40 Malformed) ----
+    // payload (envelope key 7) = strict `{1: sub_op, ...per-sub-op fields}`. Decode the selector first.
+    let payload = env.payload.as_deref().ok_or(AgentError::Malformed)?;
+    let sub_op_u64 = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let sub_op = u8::try_from(sub_op_u64).map_err(|_| AgentError::Malformed)?;
+
+    // Decoded + lifted per-sub-op fields, carried from the shape phase to the mutation phase so the
+    // anti-oracle band order (decode 0x40 → bind 0x43 → limits 0x44) is preserved.
+    enum Params {
+        SetLimits { per_dispense_max: [u8; 32], max_gas_limit: u64, max_fee_rate: u64 },
+        RefillBudget { new_budget: [u8; 32] },
+        RaiseBreaker { new_threshold: [u8; 32] },
+        ResetBreaker { target_lifetime_spend: [u8; 32] },
+    }
+    // Read a u256 field: BOTH the on-wire minimal-BE bytes (for the canonical_params preimage) and the
+    // lifted `[u8; 32]` (for mutation/comparison). `as_u256_minimal_be` already bounds len ≤ 32, so
+    // `from_minimal_be` cannot widen-reject — the `ok_or` is defense-in-depth (matches the faucet handler).
+    let read_u256 = |key: u64| -> Result<(Vec<u8>, [u8; 32]), AgentError> {
+        let minimal =
+            map_get(payload, key).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+        let lifted = crate::u256::from_minimal_be(&minimal).ok_or(AgentError::Malformed)?;
+        Ok((minimal, lifted))
+    };
+
+    // A strict per-sub-op key count rejects extra/duplicate/unknown keys (anti-oracle 0x40). An unknown
+    // sub-op (> 3) is a structural field error ⇒ 0x40.
+    let (params, canonical_params) = match sub_op {
+        0 => {
+            // set_limits: {1: sub_op, 2: per_dispense_max(u256), 3: max_gas_limit(u64), 4: max_fee_rate(u64)}
+            if payload.len() != 4 {
+                return Err(AgentError::Malformed);
+            }
+            let (f2_min, per_dispense_max) = read_u256(2)?;
+            let max_gas_limit = map_get(payload, 3).and_then(as_u64).ok_or(AgentError::Malformed)?;
+            let max_fee_rate = map_get(payload, 4).and_then(as_u64).ok_or(AgentError::Malformed)?;
+            let cp = configure_treasury_canonical_params(
+                sub_op,
+                &f2_min,
+                Some((max_gas_limit, max_fee_rate)),
+            );
+            (Params::SetLimits { per_dispense_max, max_gas_limit, max_fee_rate }, cp)
+        }
+        1 => {
+            // refill_budget: {1: sub_op, 2: new_cumulative_signing_budget(u256)}
+            if payload.len() != 2 {
+                return Err(AgentError::Malformed);
+            }
+            let (f2_min, new_budget) = read_u256(2)?;
+            (
+                Params::RefillBudget { new_budget },
+                configure_treasury_canonical_params(sub_op, &f2_min, None),
+            )
+        }
+        2 => {
+            // raise_lifetime_breaker: {1: sub_op, 2: new_circuit_breaker_threshold(u256)}
+            if payload.len() != 2 {
+                return Err(AgentError::Malformed);
+            }
+            let (f2_min, new_threshold) = read_u256(2)?;
+            (
+                Params::RaiseBreaker { new_threshold },
+                configure_treasury_canonical_params(sub_op, &f2_min, None),
+            )
+        }
+        3 => {
+            // reset_lifetime_breaker: {1: sub_op, 2: target_lifetime_spend(u256)}
+            if payload.len() != 2 {
+                return Err(AgentError::Malformed);
+            }
+            let (f2_min, target_lifetime_spend) = read_u256(2)?;
+            (
+                Params::ResetBreaker { target_lifetime_spend },
+                configure_treasury_canonical_params(sub_op, &f2_min, None),
+            )
+        }
+        _ => return Err(AgentError::Malformed), // unknown sub-op (§10.9 0x40)
+    };
+
+    // ---- ORDER 4: capability binding (0x43 CapabilityRejected) ----
+    // (4a) Bind the request's sub-op to the cap's signed `treasury_sub_op` (§10.7). LOAD-BEARING for tier
+    // separation: the verify-layer tier check (admin vs recovery) keys off the cap's sub-op, so without
+    // this an admin cap (sub_op ∈ {0..2}) carrying a `payload_binding` baked for sub_op 3 could authorize
+    // the recovery-tier reset. (`payload_binding` alone does not close it — see VerifiedCapability docs.)
+    if verified.treasury_sub_op != Some(sub_op) {
+        return Err(AgentError::CapabilityRejected);
+    }
+    // (4b) payload_binding: recompute keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical_params) and
+    // compare to the cap's signed value, so the host cannot have altered the sub-op fields under a valid
+    // cap. → 0x43.
+    let computed = crate::agent_capability::payload_binding(
+        env.opcode,
+        Some(sub_op),
+        &env.request_id,
+        &canonical_params,
+    );
+    if computed != verified.payload_binding {
+        return Err(AgentError::CapabilityRejected);
+    }
+    // (4c) Financial scope policy (§10.5/§10.6 AC#12): treasury config MUST be enclave-scoped
+    // (scope_class == 0) so a fleet-scoped cap can't reconfigure a treasury across clones. → 0x43.
+    if verified.scope_class != 0 {
+        return Err(AgentError::CapabilityRejected);
+    }
+
+    // ---- ORDER 5 + 6: quantitative checks (0x44) + mutation on the CANDIDATE clone ----
+    // The CANDIDATE is mutated locally; nothing is live until the frame layer's seal-before-emit commit.
+    // Each sub-op touches ONLY its own field(s) (`..` keeps the rest), so the spend/breaker carry-over over
+    // treasury-key rotation (AC#17 — `FaucetState` is keyed independently of any `key_ref`) is preserved.
+    let mut candidate = keystore.clone();
+    match params {
+        Params::SetLimits { per_dispense_max, max_gas_limit, max_fee_rate } => {
+            // Forward config — no ordering constraint vs current spend; touches ONLY the limit triple.
+            candidate.faucet.per_dispense_max_amount = per_dispense_max;
+            candidate.faucet.max_gas_limit = max_gas_limit;
+            candidate.faucet.max_effective_gas_fee_rate = max_fee_rate;
+        }
+        Params::RefillBudget { new_budget } => {
+            // A zero budget marks an UNCONFIGURED faucet (rejects every dispense); refilling to zero would
+            // re-disable it — a regression, not a config ⇒ 0x44 (anti-oracle, collapses with the other
+            // quantitative rejections). Refill RAISES/sets the ceiling AND resets the refillable spend
+            // window; the genesis-from-zero `lifetime_spend` is left untouched (only reset_lifetime_breaker
+            // lowers it).
+            if new_budget == [0u8; 32] {
+                return Err(AgentError::CapExceeded);
+            }
+            candidate.faucet.cumulative_signing_budget = new_budget;
+            candidate.faucet.cumulative_native_spend = [0u8; 32];
+        }
+        Params::RaiseBreaker { new_threshold } => {
+            // Anti-inversion: a breaker BELOW already-accumulated `lifetime_spend` would trip immediately
+            // and is almost certainly an operator error — reject (⇒ 0x44) rather than instantly disable the
+            // faucet. (`[u8; 32]` Ord is big-endian numeric.)
+            if new_threshold < candidate.faucet.lifetime_spend {
+                return Err(AgentError::CapExceeded);
+            }
+            candidate.faucet.circuit_breaker_threshold = Some(new_threshold);
+        }
+        Params::ResetBreaker { target_lifetime_spend } => {
+            // Recovery-tier: clears the breaker and LOWERS `lifetime_spend` to a recovery target. `target`
+            // can only LOWER (≤ current) — raising `lifetime_spend` is not a reset (and would be a covert
+            // spend deflation/inflation of the lifetime total) ⇒ 0x44 on target > current. Advances the
+            // forward-only `strict_recovery_counter` (a marks surface) so the recovery is
+            // anchor-authenticated (EpochOnly: its full effect is in the marks).
+            if target_lifetime_spend > candidate.faucet.lifetime_spend {
+                return Err(AgentError::CapExceeded);
+            }
+            candidate.faucet.lifetime_spend = target_lifetime_spend;
+            candidate.faucet.circuit_breaker_threshold = None;
+            candidate.strict_recovery_counter = candidate
+                .strict_recovery_counter
+                .checked_add(1)
+                .ok_or(AgentError::SealFailed)?;
+        }
+    }
+
+    // Advance the capability counter on the candidate (table full ⇒ 0x44; any regression / invariant
+    // break ⇒ 0x46, no swap) — mirrors handle_generate_keys.
+    candidate
+        .advance_counter(
+            &verified.authority,
+            verified.scope_class,
+            &verified.scope_target,
+            verified.counter,
+        )
+        .map_err(|e| match e {
+            crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
+            _ => AgentError::SealFailed,
+        })?;
+
+    // Monotonic config_version bump (EVERY sub-op): a SEPARATE checked bump from advance_commit_epoch.
+    // Overflow ⇒ 0x46 (never wrap — a wrapped version would let a loosened config be re-applied via
+    // rollback).
+    candidate.advance_treasury_config_version().map_err(|_| AgentError::SealFailed)?;
+
+    // Anti-rollback commit-epoch bump from the SUB-OP-level classifier (NOT the opcode-level one):
+    // {set_limits, refill_budget, raise_lifetime_breaker} are Structural (freshness_epoch +
+    // structural_version); reset_lifetime_breaker is EpochOnly (freshness_epoch only — its effect is in
+    // the marks). Overflow ⇒ 0x46, no swap.
+    let bumps_structural =
+        matches!(configure_treasury_sub_op_bump_class(sub_op), CommitBumpClass::Structural);
+    candidate.advance_commit_epoch(bumps_structural).map_err(|_| AgentError::SealFailed)?;
+
+    Ok(AgentResponse::ConfigureTreasury {
         candidate: Box::new(candidate),
         request_id: env.request_id.clone(),
     })
@@ -1234,6 +1520,16 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 encode_sign_faucet_dispense_response(signed, sealed)
             })
         }
+        Ok(AgentResponse::ConfigureTreasury { candidate, request_id }) => {
+            // CONFIGURE_TREASURY (rollback-sensitive; Structural for {set_limits, refill_budget,
+            // raise_lifetime_breaker}, EpochOnly for reset_lifetime_breaker) goes through the SAME shared
+            // seal-before-emit seam. A config op signs nothing — the only op-specific part is the
+            // success-body encoder (just the sealed blob), invoked by the seam ONLY after the anchor commit
+            // succeeds, so the new config is durably recorded before the host sees success.
+            commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
+                encode_configure_treasury_response(sealed)
+            })
+        }
         Ok(resp) => encode_agent_response(&resp),
         Err(e) => encode_agent_error(e),
     }
@@ -1297,6 +1593,10 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
         // the sealed blob). Reaching the generic encoder is a mis-routed mutation ⇒ fail closed, same as
         // GENERATE_KEYS — never emit a signed dispense whose debit was not sealed/committed.
         AgentResponse::SignFaucetDispense { .. } => encode_agent_error(AgentError::SealFailed),
+        // CONFIGURE_TREASURY is likewise frame-layer-only (`encode_configure_treasury_response` needs the
+        // sealed blob). Reaching the generic encoder is a mis-routed mutation ⇒ fail closed — never report
+        // a config success the host can't persist (and whose anchor commit never ran).
+        AgentResponse::ConfigureTreasury { .. } => encode_agent_error(AgentError::SealFailed),
     }
 }
 
@@ -1343,6 +1643,15 @@ fn encode_sign_faucet_dispense_response(signed: SignedTransfer, sealed_blob: &[u
         (Value::Integer(7.into()), Value::Bytes(signed.from.to_vec())),
         (Value::Integer(8.into()), Value::Bytes(sealed_blob.to_vec())),
     ])
+}
+
+/// Encode the CONFIGURE_TREASURY response (slice 15-4): `{1: sealed_keystore_blob}` — the new sealed
+/// keystore the host MUST persist (the mutated faucet config + bumped `config_version`; the enclave has no
+/// durable storage). A config op signs nothing, so there is no echoed result data. Key 1 is BYTES so a
+/// success body is distinguishable from a `{1: code(int)}` error body (cf. `decode_agent_error_code`).
+/// Called by the frame layer ONLY after the anchor commit succeeds.
+fn encode_configure_treasury_response(sealed_blob: &[u8]) -> Vec<u8> {
+    encode_body(vec![(Value::Integer(1.into()), Value::Bytes(sealed_blob.to_vec()))])
 }
 
 /// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
@@ -1470,13 +1779,21 @@ mod tests {
     /// A scripted process-global commit channel for the 6-4 seal-before-emit tests: decode the 0x45
     /// request and answer per the action — a conformant anchor (signs the proposed state with
     /// `anchor_test_key`), a transport failure, or a forged signer (wrong key → ack fails verify).
-    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
+    #[cfg(any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-sign-faucet-preview",
+        feature = "agent-configure-treasury-preview"
+    ))]
     enum CommitChannelAct {
         Ok,
         Transport,
         WrongKey,
     }
-    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
+    #[cfg(any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-sign-faucet-preview",
+        feature = "agent-configure-treasury-preview"
+    ))]
     struct TestCommitChannel {
         act: CommitChannelAct,
         /// Bumped at the TOP of every `round_trip`, so a test can assert the commit was reached
@@ -1484,7 +1801,11 @@ mod tests {
         /// to a throwaway counter the test ignores via [`TestCommitChannel::new`].
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
-    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
+    #[cfg(any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-sign-faucet-preview",
+        feature = "agent-configure-treasury-preview"
+    ))]
     impl TestCommitChannel {
         fn new(act: CommitChannelAct) -> Self {
             Self { act, calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
@@ -1497,7 +1818,11 @@ mod tests {
             Self { act, calls }
         }
     }
-    #[cfg(any(feature = "agent-keygen-exec-preview", feature = "agent-sign-faucet-preview"))]
+    #[cfg(any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-sign-faucet-preview",
+        feature = "agent-configure-treasury-preview"
+    ))]
     impl crate::agent_boot_relay::BootRelayChannel for TestCommitChannel {
         fn round_trip(
             &mut self,
@@ -3389,6 +3714,443 @@ mod tests {
                 "the failed dispenses never debited ⇒ the budget is intact and the dispense now succeeds"
             );
             reset_agent_keystore_for_tests();
+        }
+    }
+
+    // ===================== slice 15-4: CONFIGURE_TREASURY =====================
+
+    /// Pure classifier test (no feature needed): the SUB-OP commit-bump divergence. set_limits/refill/raise
+    /// = Structural; reset_lifetime_breaker = EpochOnly. The opcode-level class OVER-classifies reset as
+    /// Structural (fail-closed-safe) — the handler uses the sub-op classifier to avoid the spurious
+    /// StructuralGap on a dropped reset seal.
+    #[test]
+    fn configure_treasury_sub_op_bump_class_exhaustive_and_caveat_consistent() {
+        assert_eq!(configure_treasury_sub_op_bump_class(0), CommitBumpClass::Structural);
+        assert_eq!(configure_treasury_sub_op_bump_class(1), CommitBumpClass::Structural);
+        assert_eq!(configure_treasury_sub_op_bump_class(2), CommitBumpClass::Structural);
+        assert_eq!(configure_treasury_sub_op_bump_class(3), CommitBumpClass::EpochOnly);
+        // The opcode-level granularity OVER-classifies reset(3); the sub-op classifier is authoritative.
+        assert_eq!(AgentOpcode::ConfigureTreasury.commit_bump_class(), CommitBumpClass::Structural);
+    }
+
+    #[cfg(feature = "agent-configure-treasury-preview")]
+    mod configure_treasury {
+        use super::*;
+        use ed25519_dalek::SigningKey;
+
+        const SCOPE: &[u8] = b"configure_treasury";
+
+        fn min_be(x: u64) -> Vec<u8> {
+            let b = x.to_be_bytes();
+            let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+            b[i..].to_vec()
+        }
+
+        fn resp_map(body: &[u8]) -> Vec<(Value, Value)> {
+            match ciborium::de::from_reader::<Value, _>(body).unwrap() {
+                Value::Map(m) => m,
+                _ => panic!("response is not a CBOR map"),
+            }
+        }
+
+        /// Build a CONFIGURE_TREASURY cap (covering sub_op + canonical params) + the matching
+        /// envelope-key-7 payload. `authority`/`is_recovery` must match the sub-op's tier (admin for 0..=2,
+        /// recovery for 3); pass them mismatched to exercise the verify-layer tier rejection.
+        #[allow(clippy::type_complexity)]
+        fn cap_and_payload(
+            authority: &SigningKey,
+            is_recovery: bool,
+            sub_op: u8,
+            request_id: &[u8],
+            counter: u64,
+            field2_min: &[u8],
+            set_limits_gas: Option<(u64, u64)>,
+        ) -> (Vec<(Value, Value)>, Vec<(Value, Value)>) {
+            let cp = configure_treasury_canonical_params(sub_op, field2_min, set_limits_gas);
+            let pb = crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &cp);
+            let cap = crate::agent_capability::test_signed_capability_with_sub_op(
+                authority, 6, Some(sub_op), request_id, counter, is_recovery, 11565, "testnet", 0, SCOPE,
+                2, pb,
+            );
+            let mut payload = vec![
+                (Value::Integer(1.into()), Value::Integer(u64::from(sub_op).into())),
+                (Value::Integer(2.into()), Value::Bytes(field2_min.to_vec())),
+            ];
+            if let Some((gl, fr)) = set_limits_gas {
+                payload.push((Value::Integer(3.into()), Value::Integer(gl.into())));
+                payload.push((Value::Integer(4.into()), Value::Integer(fr.into())));
+            }
+            (cap, payload)
+        }
+
+        fn env_for(cap: Vec<(Value, Value)>, payload: Vec<(Value, Value)>) -> Vec<u8> {
+            envelope(
+                6,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(payload)),
+                ],
+            )
+        }
+
+        fn body_with_authorities(admin: &SigningKey, recovery: &SigningKey) -> KeystoreBody {
+            let mut body = base_body();
+            body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+            body.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            body
+        }
+
+        fn admin_key() -> SigningKey {
+            SigningKey::from_bytes(&[7u8; 32])
+        }
+        fn recovery_key() -> SigningKey {
+            SigningKey::from_bytes(&[8u8; 32])
+        }
+
+        #[test]
+        fn set_limits_bumps_config_and_structural() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, request_id } => {
+                    assert_eq!(request_id, vec![0x11; 16], "request_id echoed");
+                    assert_eq!(candidate.faucet.per_dispense_max_amount, crate::u256::from_u64(1_000_000));
+                    assert_eq!(candidate.faucet.max_gas_limit, 30_000);
+                    assert_eq!(candidate.faucet.max_effective_gas_fee_rate, 250);
+                    // spend/budget untouched.
+                    assert_eq!(candidate.faucet.cumulative_native_spend, body.faucet.cumulative_native_spend);
+                    assert_eq!(candidate.faucet.lifetime_spend, body.faucet.lifetime_spend);
+                    assert_eq!(candidate.faucet.cumulative_signing_budget, body.faucet.cumulative_signing_budget);
+                    // Structural: config_version + structural + epoch all advance.
+                    assert_eq!(
+                        candidate.config.monotonic_treasury_config_version,
+                        body.config.monotonic_treasury_config_version + 1
+                    );
+                    assert_eq!(candidate.structural_version, body.structural_version + 1);
+                    assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1);
+                }
+                _ => panic!("expected ConfigureTreasury"),
+            }
+        }
+
+        #[test]
+        fn refill_budget_raises_and_resets_native_spend() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.faucet.cumulative_native_spend = crate::u256::from_u64(123);
+            body.faucet.lifetime_spend = crate::u256::from_u64(456);
+            let (cap, pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
+            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, .. } => {
+                    assert_eq!(candidate.faucet.cumulative_signing_budget, crate::u256::from_u64(9_000_000));
+                    assert_eq!(candidate.faucet.cumulative_native_spend, [0u8; 32], "refill resets native spend");
+                    assert_eq!(candidate.faucet.lifetime_spend, crate::u256::from_u64(456), "lifetime untouched");
+                    assert_eq!(candidate.structural_version, body.structural_version + 1, "Structural");
+                    assert_eq!(
+                        candidate.config.monotonic_treasury_config_version,
+                        body.config.monotonic_treasury_config_version + 1
+                    );
+                }
+                _ => panic!("expected ConfigureTreasury"),
+            }
+        }
+
+        #[test]
+        fn refill_zero_budget_rejected_0x44() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            let (cap, pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(0), None);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                Some(AgentError::CapExceeded),
+                "refill to zero re-disables the faucet ⇒ 0x44"
+            );
+        }
+
+        #[test]
+        fn raise_breaker_sets_threshold_and_rejects_below_spend() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.faucet.lifetime_spend = crate::u256::from_u64(1_000);
+            // threshold >= lifetime_spend: accepted.
+            let (cap, pay) = cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(5_000), None);
+            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, .. } => {
+                    assert_eq!(candidate.faucet.circuit_breaker_threshold, Some(crate::u256::from_u64(5_000)));
+                    assert_eq!(candidate.structural_version, body.structural_version + 1, "Structural");
+                }
+                _ => panic!("expected ConfigureTreasury"),
+            }
+            // threshold < lifetime_spend: 0x44 (anti-inversion — would trip immediately).
+            let (cap2, pay2) = cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(999), None);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
+                Some(AgentError::CapExceeded),
+                "breaker below accumulated lifetime_spend ⇒ 0x44"
+            );
+        }
+
+        #[test]
+        fn reset_breaker_is_epoch_only_recovery_tier() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.faucet.lifetime_spend = crate::u256::from_u64(10_000);
+            body.faucet.circuit_breaker_threshold = Some(crate::u256::from_u64(12_000));
+            // reset to a lower target with a RECOVERY cap.
+            let (cap, pay) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
+            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, .. } => {
+                    assert_eq!(candidate.faucet.lifetime_spend, crate::u256::from_u64(2_000), "lifetime lowered");
+                    assert_eq!(candidate.faucet.circuit_breaker_threshold, None, "breaker cleared");
+                    assert_eq!(
+                        candidate.strict_recovery_counter,
+                        body.strict_recovery_counter + 1,
+                        "recovery counter advanced"
+                    );
+                    assert_eq!(
+                        candidate.config.monotonic_treasury_config_version,
+                        body.config.monotonic_treasury_config_version + 1,
+                        "config_version still bumps"
+                    );
+                    assert_eq!(
+                        candidate.structural_version, body.structural_version,
+                        "EpochOnly: structural_version UNCHANGED"
+                    );
+                    assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "epoch advanced");
+                }
+                _ => panic!("expected ConfigureTreasury"),
+            }
+            // target ABOVE current lifetime_spend → 0x44 (reset can only lower).
+            let (cap2, pay2) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(20_000), None);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
+                Some(AgentError::CapExceeded),
+                "reset target above current lifetime_spend ⇒ 0x44"
+            );
+        }
+
+        #[test]
+        fn tier_mismatch_rejected_0x43() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            // reset(3) with an ADMIN cap (is_recovery=false) → 0x43 (verify-layer tier).
+            let (cap, pay) = cap_and_payload(&admin, false, 3, &[0x11; 16], 1, &min_be(0), None);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                Some(AgentError::CapabilityRejected),
+                "reset with admin tier ⇒ 0x43"
+            );
+            // set_limits(0) with a RECOVERY cap → 0x43.
+            let (cap2, pay2) = cap_and_payload(&recovery, true, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
+                Some(AgentError::CapabilityRejected),
+                "set_limits with recovery tier ⇒ 0x43"
+            );
+        }
+
+        #[test]
+        fn sub_op_substitution_blocked_by_direct_binding() {
+            // ADMIN cap legitimately for set_limits(0), but the REQUEST claims reset(3): the direct
+            // `request.sub_op == cap.treasury_sub_op` check rejects it (0x43). This is the tier-separation
+            // guard — without it an admin could authorize the recovery-tier reset.
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            let (cap, _pay0) = cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
+            let pay3 = vec![
+                (Value::Integer(1.into()), Value::Integer(3u64.into())),
+                (Value::Integer(2.into()), Value::Bytes(min_be(0))),
+            ];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay3), &body).err(),
+                Some(AgentError::CapabilityRejected),
+                "request sub_op != cap sub_op ⇒ 0x43"
+            );
+        }
+
+        #[test]
+        fn payload_binding_mismatch_0x43() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            // valid cap for set_limits, but the request alters max_gas_limit under it.
+            let (cap, _pay) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            let altered = vec![
+                (Value::Integer(1.into()), Value::Integer(0u64.into())),
+                (Value::Integer(2.into()), Value::Bytes(min_be(1_000_000))),
+                (Value::Integer(3.into()), Value::Integer(99_999u64.into())), // altered
+                (Value::Integer(4.into()), Value::Integer(250u64.into())),
+            ];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, altered), &body).err(),
+                Some(AgentError::CapabilityRejected),
+                "altered params under a valid cap ⇒ payload_binding mismatch 0x43"
+            );
+        }
+
+        #[test]
+        fn fleet_scope_rejected_0x43() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            // scope_class=1 (fleet) cap — handler re-asserts enclave-only (AC#12).
+            let cp = configure_treasury_canonical_params(0, &min_be(1), Some((1, 1)));
+            let pb = crate::agent_capability::payload_binding(6, Some(0), &[0x11; 16], &cp);
+            let cap = crate::agent_capability::test_signed_capability_with_sub_op(
+                &admin, 6, Some(0), &[0x11; 16], 1, false, 11565, "testnet", 1, SCOPE, 2, pb,
+            );
+            let pay = vec![
+                (Value::Integer(1.into()), Value::Integer(0u64.into())),
+                (Value::Integer(2.into()), Value::Bytes(min_be(1))),
+                (Value::Integer(3.into()), Value::Integer(1u64.into())),
+                (Value::Integer(4.into()), Value::Integer(1u64.into())),
+            ];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                Some(AgentError::CapabilityRejected),
+                "fleet-scoped treasury cap ⇒ 0x43 (financial must be enclave, AC#12)"
+            );
+        }
+
+        #[test]
+        fn unknown_sub_op_in_request_0x40() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            // cap for valid sub_op 1; request payload sub_op = 4 → handler decode rejects ⇒ 0x40.
+            let (cap, _pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(1), None);
+            let pay4 = vec![
+                (Value::Integer(1.into()), Value::Integer(4u64.into())),
+                (Value::Integer(2.into()), Value::Bytes(min_be(1))),
+            ];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay4), &body).err(),
+                Some(AgentError::Malformed),
+                "unknown sub_op in the request ⇒ 0x40"
+            );
+        }
+
+        #[test]
+        fn overwidth_u256_0x40() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            let (cap, _pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(1), None);
+            let pay = vec![
+                (Value::Integer(1.into()), Value::Integer(1u64.into())),
+                (Value::Integer(2.into()), Value::Bytes(vec![0x01; 33])), // 33 bytes → over-width
+            ];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                Some(AgentError::Malformed),
+                "over-width u256 ⇒ 0x40"
+            );
+        }
+
+        #[test]
+        fn wrong_key_count_0x40() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            // refill(1) expects exactly 2 keys; send an extra key 3 → 0x40.
+            let (cap, _pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
+            let pay = vec![
+                (Value::Integer(1.into()), Value::Integer(1u64.into())),
+                (Value::Integer(2.into()), Value::Bytes(min_be(9_000_000))),
+                (Value::Integer(3.into()), Value::Integer(7u64.into())), // unexpected extra key
+            ];
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                Some(AgentError::Malformed),
+                "extra key for refill ⇒ 0x40"
+            );
+        }
+
+        #[test]
+        fn gated_off_when_anti_rollback_unconfigured() {
+            let _g = gate_unconfigured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            let (cap, pay) = cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                Some(AgentError::NotConfigured),
+                "rollback-sensitive ⇒ NotConfigured when the binding is absent"
+            );
+        }
+
+        #[test]
+        fn frame_path_seals_commits_and_swaps_config_version() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+            assert!(install_agent_keystore(body, b"meas"));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            let out = handle_agent_gateway_frame(&env_for(cap, pay));
+            assert_eq!(decode_agent_error_code(&out), None, "first config is a success body");
+            let m = resp_map(&out);
+            assert!(!as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(), "key 1 = sealed blob");
+
+            // PROOF OF SWAP: the live slot's counter advanced to 1, so a second request reusing counter 1 is
+            // now non-contiguous ⇒ 0x43. (If the first hadn't swapped, counter 1 would still be expected.)
+            let (cap2, pay2) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(2_000_000), Some((30_000, 250)));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&env_for(cap2, pay2))),
+                Some(0x43),
+                "reused counter after the swap ⇒ 0x43 (proves the candidate swapped into the live slot)"
+            );
+            reset_agent_keystore_for_tests();
+            reset_commit_channel_for_tests();
+        }
+
+        #[test]
+        fn frame_path_commit_failure_fails_closed_no_config_bump() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+            assert!(install_agent_keystore(body, b"meas"));
+
+            let mk = || {
+                let (cap, pay) =
+                    cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+                env_for(cap, pay)
+            };
+            // (a) no channel → 0x46.
+            assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&mk())), Some(0x46), "no channel ⇒ 0x46");
+            // (b) transport failure → 0x46.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Transport))));
+            assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&mk())), Some(0x46), "transport ⇒ 0x46");
+            reset_commit_channel_for_tests();
+            // (c) forged ACK → 0x46.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::WrongKey))));
+            assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&mk())), Some(0x46), "forged ack ⇒ 0x46");
+            reset_commit_channel_for_tests();
+            // (d) PROOF OF NO MUTATION: the live config never advanced across the 3 failures, so the SAME
+            // request (counter 1) now SUCCEEDS once a conformant channel is installed.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&mk())),
+                None,
+                "no prior bump ⇒ counter 1 still valid ⇒ succeeds"
+            );
+            reset_agent_keystore_for_tests();
+            reset_commit_channel_for_tests();
         }
     }
 }
