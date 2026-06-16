@@ -1065,6 +1065,11 @@ fn handle_configure_treasury(
     }
     // (4c) Financial scope policy (§10.5/§10.6 AC#12): treasury config MUST be enclave-scoped
     // (scope_class == 0) so a fleet-scoped cap can't reconfigure a treasury across clones. → 0x43.
+    // DEFERRED (TASK-18 un-gate prereq, IDENTICAL to handle_generate_keys): this checks scope_class only;
+    // it does NOT yet bind `verified.scope_target` to a sealed enclave id, so an enclave-scoped cap is not
+    // yet pinned to ONE enclave (a clone with the same authority/chain/env/counter could accept it). The
+    // `scope_target`↔sealed-enclave-id binding is a release-ban un-gate precondition (see lib.rs) shared by
+    // ALL preview-gated privileged ops; CONFIGURE_TREASURY is preview-banned (non-production) until it lands.
     if verified.scope_class != 0 {
         return Err(AgentError::CapabilityRejected);
     }

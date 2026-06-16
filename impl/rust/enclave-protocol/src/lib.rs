@@ -127,13 +127,16 @@ compile_error!(
 // lifetime circuit-breaker / lifetime-spend recovery) + advances the monotonic config_version
 // (rollback-sensitive). The ban is the production fund-CUSTODY-readiness gate ON TOP OF the runtime
 // anti-rollback gate: it stays fail-closed until the AC#5 production funding profile is armed, the
-// independent recovery-counter rule + the AC#14 audit record land, and TASK-18 un-gates. Hard-ban it
-// from release builds.
+// `scope_target`↔sealed-enclave-id binding lands (same clone-replay un-gate prereq as GENERATE_KEYS —
+// today the handler enforces scope_class==0 but does NOT bind scope_target to a sealed enclave id, so a
+// cap is not yet pinned to one enclave; preview-banned so non-reachable in production), the independent
+// recovery-counter rule + the AC#14 audit record land, and TASK-18 un-gates. Hard-ban it from release.
 #[cfg(all(release_build, feature = "agent-configure-treasury-preview"))]
 compile_error!(
     "`agent-configure-treasury-preview` (live AGENT_K1_CONFIGURE_TREASURY config mutation) must not be \
-     enabled in release builds until the AC#5 production funding profile is armed, the independent \
-     recovery-counter rule + the AC#14 audit record land, and TASK-18 un-gates"
+     enabled in release builds until the AC#5 production funding profile is armed, the \
+     scope_target-binding + the independent recovery-counter rule + the AC#14 audit record land, and \
+     TASK-18 un-gates"
 );
 
 mod boot_input;

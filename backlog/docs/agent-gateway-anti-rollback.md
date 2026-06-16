@@ -151,8 +151,11 @@ no-over-dispense without a permanent self-wedge on a single dropped ack.
 `Structural`, but the handler classifies PER SUB-OP (fail-closed-safe over-classification is corrected
 only in the direction that is safe): **ALL FOUR sub-ops are `Structural`** (a dropped seal ⇒
 `StructuralGap`→restore, never silently lost / never a belt wedge). `set_limits` / `refill_budget` /
-`raise_lifetime_breaker` mutate anchor-UNRECONSTRUCTABLE faucet **config** (limits / budget ceiling /
-breaker threshold — none a marks surface), so they are Structural. `reset_lifetime_breaker` is ALSO
+`raise_lifetime_breaker` mutate anchor-UNRECONSTRUCTABLE faucet **config** (the limit triple / budget
+ceiling / breaker threshold — not marks surfaces), so they are Structural. `refill_budget` ADDITIONALLY
+resets the refillable `cumulative_native_spend` → 0 — that IS a marks surface, and a DECREASE — but that
+is exactly why Structural is right (a dropped seal ⇒ `StructuralGap`→restore fences the marks decrease,
+which `AdoptForward`'s monotone-up belt could not adopt). `reset_lifetime_breaker` is ALSO
 Structural — it was INITIALLY thought EpochOnly ("its effect is in the marks"), but that is **wrong**
 (TASK-15 15-4 review): it (a) **LOWERS** `lifetime_spend`, a marks surface — and `AdoptForward`'s
 `marks_dominate_local` belt REQUIRES adopted marks ≥ local, so a *decreasing* marks value fails the belt
