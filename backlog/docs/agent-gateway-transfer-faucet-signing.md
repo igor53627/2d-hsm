@@ -73,10 +73,13 @@ this same `u256` wire form. The **success response** map is
 §10.9 error body.
 
 **Error-code mapping (anti-oracle, §10.9).** Request-SHAPE failures that need no keystore — bad CBOR,
-`chain_id` ≠ sealed (a public constant), non-empty `data`, a non-minimal/over-width integer — collapse
-to `AGENT_MALFORMED` (0x40). Everything KEY-related — `key_ref` not found, wrong key purpose, and
-`from` ≠ the key's derived address — collapses uniformly to `AGENT_KEY_PURPOSE_MISMATCH` (0x42), so the
-error code never distinguishes "absent" from "present-but-…". `0x42` is therefore the **key-band /
+`chain_id` ≠ sealed (a public constant), non-empty `data`, a non-minimal/over-width integer, **and an
+ABSENT `key_ref`** (envelope key 6 missing — a structurally-incomplete request for a signing opcode, and
+host-observable from its own request, so it leaks nothing) — collapse to `AGENT_MALFORMED` (0x40).
+Everything KEY-related for a `key_ref` that IS present — `key_ref` **present-but-not-found**, wrong key
+purpose, and `from` ≠ the key's derived address — collapses uniformly to `AGENT_KEY_PURPOSE_MISMATCH`
+(0x42), so the error code never distinguishes "present-but-absent-from-the-store" from "present-but-…".
+(Both SIGN_TRANSFER and SIGN_FAUCET_DISPENSE follow this split identically.) `0x42` is therefore the **key-band /
 internal-signing bucket**, not strictly a "purpose mismatch": a (≈2⁻¹²⁸) signing failure (the x-reduced
 `recovery_id` rejection or the post-sign `recovery==from` invariant) also maps to 0x42 — SIGN_TRANSFER
 never seals, so **not** the seal-reserved 0x46. The `u256` width/minimality rule above is the **same**

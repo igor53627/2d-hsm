@@ -349,7 +349,16 @@ fn verify_capability(
 ///
 /// Read opcodes are served here; privileged opcodes route through the fail-closed capability seam;
 /// runtime-signing opcodes are deferred (TASK-7.6.4). Errors carry the §10.9 collapsed code.
-pub fn dispatch_agent(
+///
+/// **`pub(crate)`, NOT `pub`** (TASK-15 15-3b hardening): the mutating outcomes carry the to-be-emitted
+/// artifact BEFORE the seal-before-emit commit — `SignFaucetDispense` carries the broadcastable `signed`
+/// dispense tx and `GenerateKeys` carries the new key material — which is durable/emittable ONLY after
+/// [`handle_agent_gateway_frame`] runs `commit_before_emit` (seal → anchor-commit → swap). Exposing this
+/// as `pub` would let an out-of-crate caller extract a fund-moving signature (or minted keys) WITHOUT the
+/// debit/counter being sealed and committed — a seal-before-emit bypass. The public frame entry point is
+/// [`handle_agent_gateway_frame`]; `dispatch_agent` is an internal step reachable only in-crate (the frame
+/// handler + tests).
+pub(crate) fn dispatch_agent(
     profile: Profile,
     payload: &[u8],
     keystore: &KeystoreBody,
@@ -670,6 +679,14 @@ fn handle_sign_faucet_dispense(
     if req_chain_id != keystore.config.twod_chain_id {
         return Err(AgentError::Malformed);
     }
+    // Lift the canonical minimal-BE wire `amount`/`gas_price` into the right-aligned `[u8; 32]` arithmetic
+    // form HERE — in the request-SHAPE (0x40) region, BEFORE the key/recipient (0x42) checks — so the
+    // anti-oracle band ordering holds structurally: every shape error (incl. a u256-width reject) precedes
+    // the key band, and no post-key path can emit a lower band. (`as_u256_minimal_be` already bounded these
+    // to ≤32 bytes, so `from_minimal_be` cannot widen-reject — the `ok_or(Malformed)` is unreachable
+    // defense-in-depth, and now correctly sits in the 0x40 region even if it ever became reachable.)
+    let amount = crate::u256::from_minimal_be(&value_be).ok_or(AgentError::Malformed)?;
+    let gas_price = crate::u256::from_minimal_be(&gas_price_be).ok_or(AgentError::Malformed)?;
     // Key-purpose: SIGN_FAUCET_DISPENSE accepts ONLY the singleton agent_faucet_treasury_k1. not-found ≡
     // wrong-purpose → 0x42 (anti-oracle, §4 / §10.9).
     let entry = crate::agent_identity::find_entry(keystore, &key_ref)
@@ -693,15 +710,11 @@ fn handle_sign_faucet_dispense(
     if !is_known_transfer_recipient(keystore, &to) {
         return Err(AgentError::KeyPurposeMismatch);
     }
-    // §2 accept-gate + atomic dual-counter debit. Lift the canonical minimal-BE wire `amount`/`gas_price`
-    // into the right-aligned `[u8; 32]` arithmetic form (`as_u256_minimal_be` already bounded them to ≤32
-    // bytes, so `from_minimal_be` cannot widen-reject — the guard stays as defense-in-depth). The faucet
+    // §2 accept-gate + atomic dual-counter debit, using the pre-lifted `amount`/`gas_price`. The faucet
     // gate caps worst_case = amount + gas_limit*gas_price and debits cumulative_native_spend +
     // lifetime_spend; ANY cap/overflow collapses to 0x44 (anti-oracle: the host can't tell WHICH cap
     // tripped). Runs only AFTER the key+recipient checks, so a 0x44 reveals nothing a valid dispense
-    // wouldn't.
-    let amount = crate::u256::from_minimal_be(&value_be).ok_or(AgentError::Malformed)?;
-    let gas_price = crate::u256::from_minimal_be(&gas_price_be).ok_or(AgentError::Malformed)?;
+    // wouldn't (and is strictly above the 0x40/0x42 bands those checks emit).
     let new_faucet = keystore
         .faucet
         .accept_and_debit(&amount, gas_limit, &gas_price)
@@ -1215,8 +1228,8 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             // seal-before-emit seam as GENERATE_KEYS — the only op-specific part is the success-body
             // encoder (the signed dispense tx + the sealed blob), invoked by the seam ONLY after the anchor
             // commit succeeds, so the signature never leaves before the debit is durably recorded.
-            commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
-                encode_sign_faucet_dispense_response(&signed, sealed)
+            commit_before_emit(candidate, &request_id, measurement, &mut guard, move |sealed| {
+                encode_sign_faucet_dispense_response(signed, sealed)
             })
         }
         Ok(resp) => encode_agent_response(&resp),
@@ -1316,9 +1329,10 @@ fn encode_generate_keys_response(keys: &[GeneratedKey], sealed_blob: &[u8]) -> V
 /// key 2 — the enclave has no durable storage). Key 1 is BYTES so a success body is distinguishable from a
 /// `{1: code(int)}` error body (cf. `decode_agent_error_code`). Called by the frame layer ONLY after the
 /// anchor commit succeeds, so the signature is emitted iff the debit is durably recorded.
-fn encode_sign_faucet_dispense_response(signed: &SignedTransfer, sealed_blob: &[u8]) -> Vec<u8> {
+fn encode_sign_faucet_dispense_response(signed: SignedTransfer, sealed_blob: &[u8]) -> Vec<u8> {
     encode_body(vec![
-        (Value::Integer(1.into()), Value::Bytes(signed.signed_rlp.clone())),
+        // `signed` is owned (moved out of the frame outcome), so move `signed_rlp` instead of cloning it.
+        (Value::Integer(1.into()), Value::Bytes(signed.signed_rlp)),
         (Value::Integer(2.into()), Value::Bytes(signed.signature.r.to_vec())),
         (Value::Integer(3.into()), Value::Bytes(signed.signature.s.to_vec())),
         (Value::Integer(4.into()), Value::Integer((signed.signature.recovery_id as u64).into())),
