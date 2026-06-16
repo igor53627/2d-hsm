@@ -112,21 +112,35 @@ broadcastable signed dispense tx (byte-for-byte the SIGN_TRANSFER layout); **key
 keystore the host MUST persist** (the debited faucet state, mirroring GENERATE_KEYS key 2). Key 1 is BYTES,
 so a success body is distinguishable from a `{1: code(int)}` §10.9 error body. **Error bands** (anti-oracle
 §10.9, in handler order): request-SHAPE → 0x40; everything key/recipient-related — signer `key_ref`
-absent, wrong purpose, `from` ≠ derived, AND **`to` not a known transfer identity** — collapses uniformly
-to 0x42 (the recipient allowlist runs in the same band, so the host cannot probe keystore membership); any
-§2 cap/budget/breaker/overflow → 0x44; a seal/anchor-commit failure → 0x46. The §2 checks run only AFTER
-the key+recipient checks pass, so a 0x44 reveals nothing a valid dispense would not. Production-gated behind
+absent, wrong purpose, `from` ≠ derived, `to` not a known transfer identity, **and a (≈2⁻¹²⁸,
+non-host-controllable) signing failure** — collapses uniformly to 0x42; any §2 cap/budget/breaker/overflow
+→ 0x44; a seal / anchor-commit failure **and the (unreachable: needs `freshness_epoch == u64::MAX`)
+candidate epoch-bump overflow** → 0x46. The §2 checks run only AFTER the key+recipient checks pass, so a
+0x44 reveals nothing a valid dispense would not. **Membership-probe scope (precise).** Collapsing
+recipient-not-found into 0x42 hides keystore membership from a host **without** valid treasury credentials
+(it cannot tell recipient-not-found from a missing/mis-purposed treasury key). A host **with** valid
+treasury credentials (a real `key_ref` + the correct `from`, both host-obtainable — `key_ref` is
+host-supplied and the treasury eth address is returned by `AGENT_K1_PUBLIC_IDENTITY`) **can** still
+distinguish `0x44` (= `to` is a known recipient, over-cap) from `0x42` (= `to` unknown) by holding those
+constant and varying `to`. This residual is **accepted**: every `agent_transfer_k1` address is already
+host-derivable via `PUBLIC_IDENTITY`, so reaching §2 reveals nothing the host could not already enumerate —
+the band split is a non-credentialed-host defense, not a claim of absolute membership-unprobeability.
+Production-gated behind
 the release-banned **`agent-sign-faucet-preview`** feature (fund-CUSTODY readiness, ON TOP OF the runtime
 anti-rollback gate — SIGN_FAUCET_DISPENSE is rollback-sensitive); fails closed (`AGENT_NOT_CONFIGURED`)
 without it. It is a **mutating, EpochOnly** op: the debited candidate goes through the slice-6
 `commit_before_emit` seam (seal → anchor-commit → swap → emit), so the signature is emitted ONLY after the
 debit is durably committed (§3).
 
-- **Recipient allowlist (AC#5):** `to` **must match an active `agent_transfer_k1` public
-  identity in the keystore**. This blocks one-command faucet→external spend, but **not**
-  two-step exfiltration (host dispenses to a transfer key, then signs a transfer out) until
-  TEE-side per-agent transfer destination/amount limits exist — **documented residual**.
-  `data`/memo **must be empty** (native transfers only).
+- **Recipient allowlist (AC#5):** `to` **must match an `agent_transfer_k1` public
+  identity in the keystore**. **"Active" == "present as a stored transfer key"**: there is no
+  key-revocation/deactivation surface yet, so **every** stored `agent_transfer_k1` key is an eligible
+  recipient (the slice-15-3b `is_known_transfer_recipient` predicate enforces exactly "present + purpose
+  == transfer + derived eth address == `to`"); a future key-revocation slice MUST revisit this predicate
+  so a revoked transfer key stops being a valid dispense target. This blocks one-command
+  faucet→external spend, but **not** two-step exfiltration (host dispenses to a transfer key, then signs
+  a transfer out) until TEE-side per-agent transfer destination/amount limits exist — **documented
+  residual**. `data`/memo **must be empty** (native transfers only).
 - **Cap set (sealed in the 7.2 keystore faucet state):** per-dispense `max_amount`,
   `max_gas_limit`, `max_effective_gas_fee_rate`, a **mandatory refillable cumulative
   signing-budget** counter, and an **optional quorum-resettable lifetime circuit breaker**.

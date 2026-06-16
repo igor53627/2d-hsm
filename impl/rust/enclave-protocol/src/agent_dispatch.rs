@@ -617,6 +617,28 @@ fn handle_sign_transfer(
 /// transfer identity, signing failure) → uniform 0x42 (so the host can't probe keystore contents); any §2
 /// cap/budget/breaker/overflow rejection → 0x44; a candidate epoch-bump overflow → 0x46. The §2 checks run
 /// only AFTER the key+recipient checks pass, so a 0x44 leaks no more than a valid dispense already would.
+/// §2 faucet recipient allowlist (AC#5): is `to` the derived eth address of SOME stored
+/// `agent_transfer_k1` key? **"Allowlisted" == "present in the keystore as a transfer key"** — there is no
+/// key-revocation/deactivation surface yet, so every stored transfer key is an eligible recipient (a
+/// future revocation slice MUST revisit this predicate). Each candidate address is derived straight from
+/// the entry's stored uncompressed public key — **no secret load** — and the tron form is deliberately not
+/// computed (only the eth address is compared) to avoid wasted base58 work per scanned entry. The on-curve
+/// re-validation inside `eth_address_from_uncompressed` is defense-in-depth (consistent with
+/// `public_identity_from_entry`); a malformed stored entry simply never matches (fail-closed, never a
+/// panic). All operands are public (host-derivable via PUBLIC_IDENTITY), so the plain compare leaks no
+/// secret-dependent timing. A named helper (not an inline closure) so this custody gate is unit-tested in
+/// isolation (`recipient_allowlist_matches_only_stored_transfer_keys`).
+#[cfg(feature = "agent-sign-faucet-preview")]
+fn is_known_transfer_recipient(keystore: &KeystoreBody, to: &[u8; 20]) -> bool {
+    keystore.entries.iter().any(|e| {
+        e.purpose == KeyPurpose::AgentTransferK1
+            && <[u8; 65]>::try_from(e.public_identity.as_slice())
+                .ok()
+                .and_then(|pk| crate::secp256k1::eth_address_from_uncompressed(&pk).ok())
+                .is_some_and(|addr| &addr == to)
+    })
+}
+
 #[cfg(feature = "agent-sign-faucet-preview")]
 fn handle_sign_faucet_dispense(
     env: &AgentEnvelope,
@@ -660,21 +682,15 @@ fn handle_sign_faucet_dispense(
     if req_from != keypair.eth_address() {
         return Err(AgentError::KeyPurposeMismatch);
     }
-    // §2 recipient allowlist (AC#5): `to` MUST match an ACTIVE agent_transfer_k1 identity in the keystore.
-    // Recipient-not-found collapses into the same per-key 0x42 bucket (anti-oracle: the host cannot probe
-    // which addresses are known transfer keys, and cannot tell it from a missing/mis-purposed treasury
-    // key). Each candidate address is derived straight from the entry's stored uncompressed public key —
-    // NO secret load, and the tron form is deliberately not computed (only the eth address is compared) to
-    // avoid wasted base58 work per scanned entry. All operands are public (host-known), so a plain compare
-    // is safe (no secret-dependent timing).
-    let recipient_known = keystore.entries.iter().any(|e| {
-        e.purpose == KeyPurpose::AgentTransferK1
-            && <[u8; 65]>::try_from(e.public_identity.as_slice())
-                .ok()
-                .and_then(|pk| crate::secp256k1::eth_address_from_uncompressed(&pk).ok())
-                .is_some_and(|addr| addr == to)
-    });
-    if !recipient_known {
+    // §2 recipient allowlist (AC#5): `to` MUST match a stored agent_transfer_k1 identity (a named,
+    // separately-unit-tested seam — `is_known_transfer_recipient` — so this fund-custody gate is a
+    // reviewable unit, not an inline closure that a refactor could silently widen). Recipient-not-found
+    // collapses into the same per-key 0x42 bucket (anti-oracle): a host WITHOUT valid treasury credentials
+    // cannot distinguish recipient-not-found from a missing/mis-purposed treasury key (both 0x42). (A host
+    // WITH valid treasury credentials can still distinguish 0x44=known-recipient-over-cap from 0x42 by
+    // varying `to`, but every transfer address is already host-derivable via PUBLIC_IDENTITY — see the §2
+    // doc — so this leaks nothing new.)
+    if !is_known_transfer_recipient(keystore, &to) {
         return Err(AgentError::KeyPurposeMismatch);
     }
     // §2 accept-gate + atomic dual-counter debit. Lift the canonical minimal-BE wire `amount`/`gas_price`
@@ -3111,6 +3127,32 @@ mod tests {
                 Some(AgentError::KeyPurposeMismatch),
                 "treasury address is not an allowlisted recipient"
             );
+        }
+
+        #[test]
+        fn recipient_allowlist_matches_only_stored_transfer_keys() {
+            // Unit-test the custody gate in isolation (the inline-vs-named-helper altitude fix).
+            let (body, treasury_from, transfer_to) = faucet_body(10_000_000);
+            // The stored transfer key's address matches; the treasury's own address does NOT (only
+            // AgentTransferK1 entries are recipients); a stranger does not.
+            assert!(is_known_transfer_recipient(&body, &transfer_to), "stored transfer key is a recipient");
+            assert!(!is_known_transfer_recipient(&body, &treasury_from), "treasury address is not a recipient");
+            assert!(!is_known_transfer_recipient(&body, &[0xab; 20]), "stranger is not a recipient");
+            // A malformed transfer entry (wrong-length public_identity) never matches — fail-closed, no
+            // panic (defense-in-depth on a trusted-but-validated sealed entry).
+            let mut malformed = body.clone();
+            malformed.entries.push(KeyEntry {
+                key_ref: [0x77; 32],
+                purpose: KeyPurpose::AgentTransferK1,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity: vec![0x04; 64], // 64 bytes, not the 65-byte SEC1 form
+                secret_scalar: zeroize::Zeroizing::new(vec![0x01; 32]),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 9 },
+                backup_export_metadata: BackupExportMetadata::default(),
+            });
+            assert!(!is_known_transfer_recipient(&malformed, &[0x00; 20]), "malformed entry never matches");
+            // and the GOOD transfer key still matches alongside the malformed one.
+            assert!(is_known_transfer_recipient(&malformed, &transfer_to), "good entry still matches");
         }
 
         #[test]
