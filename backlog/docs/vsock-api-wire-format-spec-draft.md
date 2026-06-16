@@ -793,11 +793,17 @@ host-controlled).
 - **`environment_identifier` (AC#10):** UTF-8, `1..=64` bytes, `[a-z0-9-]`, no
   leading/trailing/double hyphen; byte-exact case-sensitive compare against the sealed value;
   malformed → fail closed at decode.
-- **Recovery resync (AC#11):** a recovery-authority capability resyncs a wedged scope
-  **forward-only**: it sets the target tuple's counter strictly `>` its current highest
-  **and** is itself sequenced by an independent strict recovery counter (one normative
-  mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
-  strict recovery counter. Audited; never rolls backward.
+- **Recovery resync (AC#11) — NORMATIVE target, partially DEFERRED in code:** a recovery-authority
+  capability resyncs a wedged scope **forward-only**: it sets the target tuple's counter strictly `>`
+  its current highest **and** is itself sequenced by an independent strict recovery counter (one
+  normative mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
+  strict recovery counter. Audited; never rolls backward. **Implementation status (TASK-15 15-4):** the
+  live `reset_lifetime_breaker` handler ADVANCES `strict_recovery_counter` (the audited marks surface)
+  but does NOT yet GATE on it — it is currently sequenced by the uniform admin contiguous counter
+  (`counter == highest+1`), not the forward-only `>` rule above. Wiring the forward-only
+  strict-recovery-counter gate is a **TASK-18 un-gate precondition** (with `RESTORE_BACKUP`, which owns
+  the same counter); CONFIGURE_TREASURY is preview-banned (`agent-configure-treasury-preview`) until it
+  lands, so the deferral is non-production. See §10.7.
 - **Authority rotation (AC#17):** `authority` is part of the tuple, so a new authority
   starts a fresh stream and retired-authority capabilities cannot replay. Fallback for
   authority compromise = full re-provisioning (residual risk documented).
