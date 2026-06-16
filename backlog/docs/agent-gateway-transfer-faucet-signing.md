@@ -159,8 +159,10 @@ debit is durably committed (§3).
   budget (0x44, would re-disable the faucet); `raise_lifetime_breaker` sets the breaker threshold
   (rejecting `< lifetime_spend`, 0x44); `reset_lifetime_breaker` (recovery-tier) clears the breaker and
   LOWERS `lifetime_spend` to a target `≤` current (0x44 otherwise) while advancing `strict_recovery_counter`.
-  Every sub-op bumps the monotonic `config_version`; all but `reset_lifetime_breaker` are anti-rollback
-  **Structural** (see `agent-gateway-anti-rollback.md`).
+  Every sub-op bumps the monotonic `config_version`; ALL FOUR sub-ops (including `reset_lifetime_breaker`)
+  are anti-rollback **Structural** — reset lowers `lifetime_spend` (a marks surface the `AdoptForward`
+  belt cannot adopt) + mutates non-marks state, so it too must `StructuralGap`→restore on a dropped seal
+  (see `agent-gateway-anti-rollback.md`).
 - **Checked worst-case arithmetic + integer domain (AC#8):** EVM-value fields (`amount`,
   `value`, `gas_price`/`effective_max_fee_rate`) and the cumulative-spend / budget / breaker
   counters are **`u256`**; `nonce` and `gas_limit` are **`u64`** (the EVM / 2D domain — 2D
