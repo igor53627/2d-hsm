@@ -605,27 +605,6 @@ fn handle_sign_transfer(
     Ok(AgentResponse::SignTransfer(signed))
 }
 
-/// SIGN_FAUCET_DISPENSE(5): treasury→known-transfer-key native dispense (TASK-7.4 §2 / slice 15-3b). It
-/// reuses the SAME machinery as SIGN_TRANSFER — the identical strict 8-field EIP-155 payload, the sealed
-/// chain_id, the `from`-equals-derived-address check, and the canonical internal preimage — but with three
-/// faucet-tier differences: (1) the signer is the singleton `agent_faucet_treasury_k1` key (not a transfer
-/// key); (2) the recipient `to` MUST match an active `agent_transfer_k1` identity in the keystore (§2
-/// recipient allowlist — blocks one-command faucet→external spend); and (3) the dispense passes the §2
-/// accept-gate (per-field caps + worst-case cumulative budget + optional lifetime breaker) and ATOMICALLY
-/// debits BOTH faucet spend counters.
-///
-/// MUTATING (EpochOnly, rollback-sensitive — the dispatch gate already fail-closed it when anti-rollback
-/// is unconfigured): it returns a CANDIDATE body (debited faucet + the atomic epoch bump) for the frame
-/// layer's seal-before-emit seam to seal → anchor-commit → swap → emit. The signature is computed here but
-/// only EMITTED after the debit is durably committed (§3 unbroadcast-burn — the debit is permanent once a
-/// signature leaves, never credited back). Gated by `agent-sign-faucet-preview`.
-///
-/// Error bands (anti-oracle §10.9), ordered so a less-privileged probe never reaches a higher band:
-/// request-SHAPE (bad CBOR, chain_id ≠ sealed, non-empty `data`, over-width/non-minimal u256) → 0x40;
-/// everything key/recipient-related (key absent, wrong purpose, `from` ≠ derived, `to` not a known
-/// transfer identity, signing failure) → uniform 0x42 (so the host can't probe keystore contents); any §2
-/// cap/budget/breaker/overflow rejection → 0x44; a candidate epoch-bump overflow → 0x46. The §2 checks run
-/// only AFTER the key+recipient checks pass, so a 0x44 leaks no more than a valid dispense already would.
 /// §2 faucet recipient allowlist (AC#5): is `to` the derived eth address of SOME stored
 /// `agent_transfer_k1` key? **"Allowlisted" == "present in the keystore as a transfer key"** — there is no
 /// key-revocation/deactivation surface yet, so every stored transfer key is an eligible recipient (a
@@ -648,6 +627,29 @@ fn is_known_transfer_recipient(keystore: &KeystoreBody, to: &[u8; 20]) -> bool {
     })
 }
 
+/// SIGN_FAUCET_DISPENSE(5): treasury→known-transfer-key native dispense (TASK-7.4 §2 / slice 15-3b). It
+/// reuses the SAME machinery as SIGN_TRANSFER — the identical strict 8-field EIP-155 payload, the sealed
+/// chain_id, the `from`-equals-derived-address check, and the canonical internal preimage — but with three
+/// faucet-tier differences: (1) the signer is the singleton `agent_faucet_treasury_k1` key (not a transfer
+/// key); (2) the recipient `to` MUST match a stored `agent_transfer_k1` identity in the keystore (§2
+/// recipient allowlist — blocks one-command faucet→external spend); and (3) the dispense passes the §2
+/// accept-gate (per-field caps + worst-case cumulative budget + optional lifetime breaker) and ATOMICALLY
+/// debits BOTH faucet spend counters.
+///
+/// MUTATING (EpochOnly, rollback-sensitive — the dispatch gate already fail-closed it when anti-rollback
+/// is unconfigured): it returns a CANDIDATE body (debited faucet + the atomic epoch bump) for the frame
+/// layer's seal-before-emit seam to seal → anchor-commit → swap → emit. The signature is computed here but
+/// only EMITTED after the debit is durably committed (§3 unbroadcast-burn — the debit is permanent once a
+/// signature leaves, never credited back). Gated by `agent-sign-faucet-preview`.
+///
+/// Error bands (anti-oracle §10.9), ordered so a less-privileged probe never reaches a higher band:
+/// request-SHAPE (bad CBOR, an ABSENT `key_ref`, chain_id ≠ sealed, non-empty `data`, over-width/non-minimal
+/// u256) → 0x40; everything key/recipient-related for a PRESENT `key_ref` (present-but-not-found, wrong
+/// purpose, `from` ≠ derived, `to` not a known transfer identity, signing failure) → uniform 0x42 (so the
+/// host can't probe keystore contents); any §2 cap/budget/breaker/overflow rejection → 0x44; a candidate
+/// epoch-bump overflow → 0x46. The §2 checks run only AFTER the key+recipient checks pass, so a 0x44 leaks
+/// no more than a valid dispense already would. (An absent `key_ref` is a structurally-incomplete request,
+/// host-observable from its own bytes, so 0x40 leaks nothing — matches SIGN_TRANSFER; see §1 doc.)
 #[cfg(feature = "agent-sign-faucet-preview")]
 fn handle_sign_faucet_dispense(
     env: &AgentEnvelope,
@@ -3233,6 +3235,32 @@ mod tests {
                 err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(vec![0x00, 0x01]), Value::Bytes(vec![]))),
                 Some(AgentError::Malformed),
                 "non-minimal gas_price"
+            );
+        }
+
+        #[test]
+        fn absent_key_ref_is_malformed_not_key_band() {
+            // An ABSENT envelope key_ref (key 6 omitted) is a structurally-incomplete request → 0x40
+            // (shape), NOT the 0x42 key-band — pins the chosen band (matches SIGN_TRANSFER; a present-but-
+            // unknown key_ref is the 0x42 case, covered by rejects_wrong_signer_key_purpose_and_from).
+            let _g = gate_configured();
+            let (body, from, to) = faucet_body(10_000_000);
+            // A valid 8-field payload, but the envelope carries NO key_ref.
+            let payload = Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(11565.into())),
+                (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                (Value::Integer(4.into()), Value::Bytes(min_be(DISP_AMOUNT))),
+                (Value::Integer(5.into()), Value::Integer(0.into())),
+                (Value::Integer(6.into()), Value::Integer(DISP_GAS_LIMIT.into())),
+                (Value::Integer(7.into()), Value::Bytes(min_be(DISP_GAS_PRICE))),
+                (Value::Integer(8.into()), Value::Bytes(vec![])),
+            ]);
+            let no_key_ref = envelope(5, vec![(Value::Integer(7.into()), payload)]);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &no_key_ref, &body).err(),
+                Some(AgentError::Malformed),
+                "absent key_ref → shape error (0x40), not the key band"
             );
         }
 
