@@ -105,6 +105,14 @@ pub(crate) struct VerifiedCapability {
     /// from the actual request payload and compares (the last gate before mutation).
     pub payload_binding: [u8; 32],
     pub key_purpose: u8,
+    /// The cap's signed `treasury_sub_op` (cap key 3), `Some` iff `command_opcode == 6`. The
+    /// CONFIGURE_TREASURY handler MUST assert `request.sub_op == Some(this)` (§10.7) — the tier check
+    /// above (admin vs recovery) keys off THIS field, so without the direct equality an admin cap
+    /// (`treasury_sub_op` ∈ {0..2}) carrying a `payload_binding` baked for sub_op 3 would let an admin
+    /// authorize the recovery-tier `reset_lifetime_breaker` (a tier-separation bypass). `payload_binding`
+    /// alone does not close this — the issuer signs `payload_binding` as an opaque value, so it must be
+    /// cross-checked against the independently-signed sub-op.
+    pub treasury_sub_op: Option<u8>,
 }
 
 use crate::agent_cbor::{as_bytes, as_bytes32, as_bytes_n, as_u64, check_strict_keys, map_get};
@@ -401,6 +409,7 @@ fn verify_capability_extract_inner(
         counter: cap.counter,
         payload_binding: cap.payload_binding,
         key_purpose: cap.key_purpose,
+        treasury_sub_op: cap.treasury_sub_op,
     })
 }
 
@@ -477,8 +486,47 @@ pub(crate) fn test_signed_capability(
     key_purpose: u8,
     payload_binding: [u8; 32],
 ) -> Vec<(Value, Value)> {
-    use ed25519_dalek::Signer;
+    // Default treasury sub-op for opcode 6 = `refill_budget`(1) (admin-tier) — back-compat for the
+    // existing callers (none of which exercise sub-ops 0/2/3). Treasury tests that need a specific
+    // sub-op call [`test_signed_capability_with_sub_op`] directly.
     let treasury_sub_op = if opcode == OPCODE_CONFIGURE_TREASURY { Some(1u8) } else { None };
+    test_signed_capability_with_sub_op(
+        signing_key,
+        opcode,
+        treasury_sub_op,
+        request_id,
+        counter,
+        is_recovery,
+        chain_id,
+        environment_identifier,
+        scope_class,
+        scope_target,
+        key_purpose,
+        payload_binding,
+    )
+}
+
+/// As [`test_signed_capability`] but with an explicit `treasury_sub_op` (slice 15-4): treasury tests
+/// build caps for sub-ops `0 set_limits` / `2 raise_lifetime_breaker` (admin) and `3 reset_lifetime_breaker`
+/// (recovery) — the caller is responsible for pairing `treasury_sub_op` with the right `is_recovery` tier
+/// (reset ⇒ recovery; 0..=2 ⇒ admin), exactly as `verify_capability` enforces.
+#[cfg(any(test, all(feature = "lab-agent-smoke", feature = "agent-keygen-exec-preview")))]
+#[allow(clippy::too_many_arguments)] // a test fixture mirroring the §10.5 capability fields
+pub(crate) fn test_signed_capability_with_sub_op(
+    signing_key: &ed25519_dalek::SigningKey,
+    opcode: u8,
+    treasury_sub_op: Option<u8>,
+    request_id: &[u8],
+    counter: u64,
+    is_recovery: bool,
+    chain_id: u64,
+    environment_identifier: &str,
+    scope_class: u8,
+    scope_target: &[u8],
+    key_purpose: u8,
+    payload_binding: [u8; 32],
+) -> Vec<(Value, Value)> {
+    use ed25519_dalek::Signer;
     let mut cap = Capability {
         cap_format_version: 1,
         command_opcode: opcode,

@@ -82,6 +82,16 @@ agent-sign-transfer-preview = ["agent-gateway"]
 # this feature SIGN_FAUCET_DISPENSE fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see
 # lib.rs). Never enable in production.
 agent-sign-faucet-preview = ["agent-gateway"]
+# Enables LIVE AGENT_K1_CONFIGURE_TREASURY execution (the faucet treasury config mutators —
+# `set_limits` / `refill_budget` / `raise_lifetime_breaker` (admin) + `reset_lifetime_breaker`
+# (recovery) — committed through the seal-before-emit seam, slice 15-4). **Production-gated OFF**: it is
+# ROLLBACK-SENSITIVE (mutates sealed faucet config / spend / breaker + the monotonic
+# `config_version`), so the runtime dispatch gate ALSO fails it closed (AGENT_NOT_CONFIGURED) when the
+# anti-rollback binding is unconfigured. Without this feature CONFIGURE_TREASURY verifies the capability
+# then fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs): stays fail-closed
+# until the AC#5 production funding profile is armed, the independent recovery-counter rule + the AC#14
+# audit record land, and TASK-18 un-gates. Never enable in production.
+agent-configure-treasury-preview = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []

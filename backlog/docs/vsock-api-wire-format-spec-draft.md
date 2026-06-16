@@ -698,6 +698,33 @@ and error contract, with the per-command map carried at envelope key 7:
   rollback-sensitive (EpochOnly)** and routes through the seal→anchor-commit→swap→emit
   seam; production-gated behind the release-banned `agent-sign-faucet-preview` feature
   (full encoding + error bands in `agent-gateway-transfer-faucet-signing.md` §2).
+- **`AGENT_K1_CONFIGURE_TREASURY`** (slice 15-4; treasury config — signs nothing) — request payload
+  (envelope key 7) = `{1: sub_op, …per-sub-op fields}`, strict per-sub-op key count (extra/dup/unknown
+  key ⇒ 0x40):
+  - `0 set_limits` (admin): `{1:0, 2: per_dispense_max_amount (u256 minimal-BE), 3: max_gas_limit (u64),
+    4: max_effective_gas_fee_rate (u64)}` — sets the limit triple atomically; spend/budget untouched.
+  - `1 refill_budget` (admin): `{1:1, 2: new_cumulative_signing_budget (u256)}` — sets the budget ceiling
+    AND resets `cumulative_native_spend → 0` (a fresh refill window); `lifetime_spend` untouched.
+    `new_budget == 0` ⇒ 0x44 (would re-disable the faucet).
+  - `2 raise_lifetime_breaker` (admin): `{1:2, 2: new_circuit_breaker_threshold (u256)}` — sets the
+    lifetime breaker; `new_threshold < current lifetime_spend` ⇒ 0x44 (anti-inversion — would trip at once).
+  - `3 reset_lifetime_breaker` (recovery): `{1:3, 2: target_lifetime_spend (u256)}` — clears the breaker,
+    LOWERS `lifetime_spend` to `target` (`target > current` ⇒ 0x44), and advances `strict_recovery_counter`.
+  `u256` fields reuse `as_u256_minimal_be` (over-width / non-minimal ⇒ 0x40). The cap's `payload_binding`
+  canonical params are the canonical CBOR of this exact map (sub_op at key 1), and the handler ALSO
+  asserts `request.sub_op == cap.treasury_sub_op` directly (§10.5 — load-bearing for tier separation, so an
+  admin cap cannot drive the recovery-tier reset via a baked `payload_binding`). Success response =
+  `{1: sealed_keystore_blob}`. EVERY sub-op bumps the monotonic `config_version` AND is **Structural** (also
+  bumps `structural_version`) — including `3 reset_lifetime_breaker`: it LOWERS `lifetime_spend` (a marks
+  surface the `AdoptForward` `marks_dominate_local` belt would reject) and clears the breaker + bumps
+  `config_version` (non-marks), so its effect is NOT AdoptForward-reconstructable and a dropped seal must
+  `StructuralGap`→restore (TASK-15 15-4 review — it was briefly mis-classified EpochOnly). Mutating /
+  rollback-sensitive ⇒ routes through the
+  seal→anchor-commit→swap→emit seam; production-gated behind the release-banned
+  `agent-configure-treasury-preview` feature. Error bands (anti-oracle, §10.9): request shape → 0x40;
+  sub-op binding / `payload_binding` / non-enclave scope → 0x43; quantitative (zero budget / breaker
+  inversion / reset overshoot / counter table) → 0x44; seal/commit or `config_version`/epoch overflow →
+  0x46. There is **no 0x42 band** (no `key_ref` — treasury config is the singleton `FaucetState`).
 - **`AGENT_K1_PUBLIC_IDENTITY`** response — `{1: pubkey (uncompressed 65B SEC1 0x04, AC#14),
   2: eth_address (20B), 3: tron_address (Base58Check of 0x41‖body), 4: key_ref,
   5: key_purpose, 6: backend_version}`. Returning **both** address encodings reflects the
@@ -766,11 +793,17 @@ host-controlled).
 - **`environment_identifier` (AC#10):** UTF-8, `1..=64` bytes, `[a-z0-9-]`, no
   leading/trailing/double hyphen; byte-exact case-sensitive compare against the sealed value;
   malformed → fail closed at decode.
-- **Recovery resync (AC#11):** a recovery-authority capability resyncs a wedged scope
-  **forward-only**: it sets the target tuple's counter strictly `>` its current highest
-  **and** is itself sequenced by an independent strict recovery counter (one normative
-  mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
-  strict recovery counter. Audited; never rolls backward.
+- **Recovery resync (AC#11) — NORMATIVE target, partially DEFERRED in code:** a recovery-authority
+  capability resyncs a wedged scope **forward-only**: it sets the target tuple's counter strictly `>`
+  its current highest **and** is itself sequenced by an independent strict recovery counter (one
+  normative mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
+  strict recovery counter. Audited; never rolls backward. **Implementation status (TASK-15 15-4):** the
+  live `reset_lifetime_breaker` handler ADVANCES `strict_recovery_counter` (the audited marks surface)
+  but does NOT yet GATE on it — it is currently sequenced by the uniform admin contiguous counter
+  (`counter == highest+1`), not the forward-only `>` rule above. Wiring the forward-only
+  strict-recovery-counter gate is a **TASK-18 un-gate precondition** (with `RESTORE_BACKUP`, which owns
+  the same counter); CONFIGURE_TREASURY is preview-banned (`agent-configure-treasury-preview`) until it
+  lands, so the deferral is non-production. See §10.7.
 - **Authority rotation (AC#17):** `authority` is part of the tuple, so a new authority
   starts a fresh stream and retired-authority capabilities cannot replay. Fallback for
   authority compromise = full re-provisioning (residual risk documented).
@@ -779,10 +812,16 @@ host-controlled).
 
 `AGENT_K1_CONFIGURE_TREASURY` sub-ops map to tiers: `set_limits`/`refill_budget`/
 `raise_lifetime_breaker` = treasury-admin; `reset_lifetime_breaker` = recovery/quorum
-(bound to a strict recovery counter and target value). Config version is monotonic and
-sealed; a normal config bump does **not** reset cumulative spend. Two sealed faucet
-counters (refillable cumulative budget + optional lifetime breaker). Enclave-scoped unless
-a global remote monotonic ledger is specified (AC#12). All writes sealed before success.
+(bound to a strict recovery counter and target value — see §10.6 for the recovery-counter
+rule, deferred to TASK-18 un-gate; the live handler currently sequences it on the admin
+contiguous counter). Config version is monotonic and sealed (an audit/version stamp, not a
+rollback control). `set_limits`/`raise_lifetime_breaker` do **not** touch the spend
+counters; `refill_budget` deliberately **resets the refillable `cumulative_native_spend` →
+0** (a fresh budget window — the field is the refillable counter) while leaving the
+genesis-from-zero `lifetime_spend` untouched; only the recovery `reset_lifetime_breaker`
+lowers `lifetime_spend`. Two sealed faucet counters (refillable cumulative budget +
+optional lifetime breaker). Enclave-scoped unless a global remote monotonic ledger is
+specified (AC#12). All writes sealed before success.
 
 ### 10.8 Identity proof + read policy (AC#15, AC#16)
 

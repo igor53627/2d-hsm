@@ -151,6 +151,18 @@ debit is durably committed (§3).
   signing-budget** counter, and an **optional quorum-resettable lifetime circuit breaker**.
   Faucet signing **fails closed** until mandatory per-dispense caps + a cumulative budget are
   sealed.
+- **Cap mutation — `CONFIGURE_TREASURY` (slice 15-4):** the cap set above is mutated ONLY by the four
+  `CONFIGURE_TREASURY` sub-ops (§10.7), each touching only its own field(s) so the rotation carry-over
+  (counters keyed independently of `key_ref`, AC#15/#17) is preserved: `set_limits` sets the per-dispense
+  limit triple (no spend touch); `refill_budget` sets the `cumulative_signing_budget` ceiling AND resets
+  `cumulative_native_spend → 0` (a fresh refill window — `lifetime_spend` is NOT reset), rejecting a zero
+  budget (0x44, would re-disable the faucet); `raise_lifetime_breaker` sets the breaker threshold
+  (rejecting `< lifetime_spend`, 0x44); `reset_lifetime_breaker` (recovery-tier) clears the breaker and
+  LOWERS `lifetime_spend` to a target `≤` current (0x44 otherwise) while advancing `strict_recovery_counter`.
+  Every sub-op bumps the monotonic `config_version`; ALL FOUR sub-ops (including `reset_lifetime_breaker`)
+  are anti-rollback **Structural** — reset lowers `lifetime_spend` (a marks surface the `AdoptForward`
+  belt cannot adopt) + mutates non-marks state, so it too must `StructuralGap`→restore on a dropped seal
+  (see `agent-gateway-anti-rollback.md`).
 - **Checked worst-case arithmetic + integer domain (AC#8):** EVM-value fields (`amount`,
   `value`, `gas_price`/`effective_max_fee_rate`) and the cumulative-spend / budget / breaker
   counters are **`u256`**; `nonce` and `gas_limit` are **`u64`** (the EVM / 2D domain — 2D
@@ -183,8 +195,11 @@ debit is durably committed (§3).
   (cap/overflow/validation/seal failure) consumes **no** budget; once a signature is emitted
   it permanently consumes budget even if it later fails on-chain, is a duplicate-nonce /
   replacement, or is never broadcast — unless a later reviewed reconciliation protocol exists. Nonce sequencing is a host-side 2D responsibility, not a TEE invariant.
-  Normal config bumps do not reset spend; increases require the explicit treasury-refill
-  capability (`CONFIGURE_TREASURY refill_budget`).
+  `set_limits` / `raise_lifetime_breaker` do not touch the spend counters; more *refillable*
+  budget room requires the explicit treasury-refill capability (`CONFIGURE_TREASURY
+  refill_budget`), which opens a fresh window (it resets the refillable `cumulative_native_spend`
+  → 0, see §2.1). `lifetime_spend` is never reset except by the recovery-tier
+  `reset_lifetime_breaker`.
 
 ## §2.1 Cap mutation — refill / breaker raise / reset (AC#10)
 
@@ -192,14 +207,24 @@ Budget and breaker changes are **not** part of a dispense; they go through
 `AGENT_K1_CONFIGURE_TREASURY` (vsock §10.7) with a TEE-verified, **replay-protected** admin
 (or recovery/quorum) capability bound to the `(authority, environment_identifier, scope_class,
 scope_target)` contiguous monotonic counter (§10.6) — a captured `refill_budget` / breaker
-command cannot be replayed. **Host-controlled time never resets any limit.** `refill_budget`
-raises the cumulative budget; `raise_lifetime_breaker` raises the breaker threshold and does
-**not** lower recorded spend; because `lifetime_spend` is maintained from genesis (§2),
-installing the **first** breaker simply applies a threshold to the already-accumulated total —
-there is **no** first-install seeding choice (it is never re-seeded to 0 or from `cumulative_spend`). Any **spend-value reset** (`reset_lifetime_breaker`) is a
-**recovery-tier** operation bound to a **strict recovery counter + explicit target value**
-(§10.6), audited, and never replayable to roll a counter backward. Normal config bumps do not
-reset cumulative spend.
+command cannot be replayed. (The recovery-tier `reset_lifetime_breaker` is bound to the
+independent **strict recovery counter**; the forward-only recovery-counter rule of §10.6 is
+DEFERRED — the current live handler sequences reset on the same admin contiguous counter, and
+production is preview-banned until that rule lands at TASK-18 un-gate.) **Host-controlled time
+never resets any limit.** `refill_budget` **sets** the cumulative signing-budget ceiling to the
+requested value (any non-zero value — monotone-up is NOT required; a zero value ⇒ 0x44 since it
+would re-disable the faucet) AND **resets the refillable `cumulative_native_spend` → 0** (a fresh
+budget window — `cumulative_native_spend` is by design the refillable counter); it does NOT touch
+`lifetime_spend`. `raise_lifetime_breaker` sets the breaker threshold (below current
+`lifetime_spend` ⇒ 0x44 anti-inversion) and does **not** lower recorded spend; because
+`lifetime_spend` is maintained from genesis (§2), installing the **first** breaker simply applies
+a threshold to the already-accumulated total — there is **no** first-install seeding choice (it is
+never re-seeded to 0 or from `cumulative_native_spend`). The only operation that lowers
+`lifetime_spend` is **`reset_lifetime_breaker`** — a **recovery-tier** operation bound to a
+**strict recovery counter + explicit target value** (`target ≤ current` ⇒ it can only lower),
+audited, and never replayable to roll a counter backward. It is classified **Structural** (a
+dropped seal → `StructuralGap`→restore), NOT EpochOnly, because it lowers a marks surface that the
+`AdoptForward` belt cannot adopt (TASK-15 15-4 review).
 
 ## §3 Seal-before-emit, serialized commit, throughput & 7.4↔7.7 boundary (AC#9, AC#14, AC#7)
 
