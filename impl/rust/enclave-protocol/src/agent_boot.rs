@@ -384,6 +384,7 @@ mod tests {
                 cumulative_native_spend: [0; 32],
                 lifetime_spend: [0; 32],
                 circuit_breaker_threshold: None,
+                cumulative_signing_budget: [0; 32],
             },
             audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
             freshness_epoch,
