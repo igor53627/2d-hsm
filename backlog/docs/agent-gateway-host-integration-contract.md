@@ -18,7 +18,7 @@ scheme, error band), `agent-gateway-keystore-backup-format.md` (sealed authoriti
 |-------|----------|
 | Doc landing | A focused companion doc (this file), parallel to the other `agent-gateway-*.md`; design doc stays enclave-centric. |
 | Capability carrier | Operator ceremony **pre-signs** Ed25519 capabilities (admin/recovery authority, offline) → stored in tiered Vault paths **indexed by `request_id`** → host fetches and forwards at envelope key 5. Host sees cap fields but cannot forge/mutate them (TEE re-verifies the signature). |
-| `command_class` folding (AC#18) | **Coarse** default — **five** folded classes `generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`, `restore_backup` (vsock §10.6), each its own `scope_target` lane so a stalled cap in one can't wedge another. Recovery has **two distinct** properties: `restore_backup` is its own folded `command_class` lane, **and** recovery ops (`RESTORE_BACKUP` + `reset_lifetime_breaker`) are sequenced by the **independent strict recovery counter** (never rolls back). Finer per-sub-op lanes are an operator-tunable if `configure_treasury` self-wedges. |
+| `command_class` folding (AC#18) | **Coarse** default — **five** folded classes `generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`, `restore_backup` (vsock §10.6), each its own `scope_target` lane so a stalled cap in one can't wedge another. Recovery has **two distinct** properties: `restore_backup` is its own folded `command_class` lane, **and** recovery ops (`RESTORE_BACKUP` + `reset_lifetime_breaker`) are — per the NORMATIVE design — sequenced by the **independent strict recovery counter** (never rolls back; the forward-only gate is a TASK-18 un-gate precondition, deferred in the current preview-banned handler — see vsock §10.6). Finer per-sub-op lanes are an operator-tunable if `configure_treasury` self-wedges. |
 | Expiry / revocation | **Host-side only** (Vault short-TTL tokens / drop the pre-signed cap). **Counter-burn** hard-revokes only command-class lanes that have a safe no-op (`configure_treasury`); keygen/export/recovery lanes have no harmless burn and stay **host-side-drop only** until a TEE revoke/counter-advance op (see §5). The **TEE does not enforce expiry** (no clock). |
 | Transfer dest/amount limits | **Host/OPA only** (`data.config` allowlist) — there is **no** TEE per-agent transfer destination/amount cap yet. Residual, see §5. |
 
@@ -162,7 +162,10 @@ faucet caps, domain separation), per-command below.
   in-enclave `key_ref`; atomic seal.
 - **CONFIGURE_TREASURY (6, provisioning [set_limits/refill/raise] or recovery [reset_lifetime_breaker]):**
   host = admin (recovery for reset_lifetime_breaker) cap + OPA. TEE = sub_op ∈ {0..3}; reset_lifetime_breaker needs
-  recovery authority + the shared strict recovery counter; config-version bump.
+  recovery authority; config-version bump. **Recovery-counter status (TASK-15 15-4):** the live handler
+  ADVANCES the shared strict recovery counter (audited) but is currently sequenced/replay-gated by the
+  uniform admin contiguous counter — the forward-only strict-recovery-counter GATE (vsock §10.6) is a
+  TASK-18 un-gate precondition (preview-banned until then). All four sub-ops are anti-rollback Structural.
 - **EXPORT_BACKUP (7, backup export):** host = export Vault cap + OPA. TEE = admin authority;
   export counter; opaque `pq-agent-backup-v1` only (cannot decrypt).
 - **RESTORE_BACKUP (8, restore/recovery):** host = recovery Vault cap + OPA. TEE = recovery
