@@ -399,6 +399,102 @@ pub struct FaucetState {
     pub cumulative_signing_budget: [u8; 32],
 }
 
+/// A §2 faucet accept-gate rejection. **Coarse on purpose**: the SIGN_FAUCET_DISPENSE handler collapses
+/// EVERY variant to `CapExceeded` (0x44) on the wire, so the host cannot tell WHICH cap/budget/breaker
+/// tripped (anti-oracle, §10.9) — the variants exist only for in-crate tests. `pub(crate)` + the
+/// `#[allow(dead_code)]` on the method below: the sole non-test caller is the SIGN_FAUCET_DISPENSE
+/// handler landing in slice 15-3b, which will define its OWN release-banned preview feature there
+/// (mirroring `agent-sign-transfer-preview`); this slice adds no such feature (it would gate nothing
+/// without the handler). So the base lib build has no live caller yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum FaucetCapError {
+    /// `amount > per_dispense_max_amount`.
+    PerDispenseAmount,
+    /// `gas_limit > max_gas_limit`.
+    GasLimit,
+    /// `gas_price (effective_max_fee_rate) > max_effective_gas_fee_rate`.
+    GasFeeRate,
+    /// `amount + gas_limit*gas_price`, or a counter += that, exceeded `u256` (checked, fail-closed).
+    WorstCaseOverflow,
+    /// `cumulative_native_spend + worst_case > cumulative_signing_budget`.
+    CumulativeBudget,
+    /// a breaker is configured and `lifetime_spend + worst_case > circuit_breaker_threshold`.
+    LifetimeBreaker,
+}
+
+impl FaucetState {
+    /// §2 faucet accept-gate + atomic DUAL-COUNTER debit (TASK-7.4 §2). Validates all six accept
+    /// conditions over the (already-canonical) operands, and on accept returns a **new** `FaucetState`
+    /// with BOTH `cumulative_native_spend` AND `lifetime_spend` advanced by the worst-case native cost
+    /// `amount + gas_limit * gas_price` (caps/breaker/budget unchanged). `self` is **never mutated**, and
+    /// the returned state is fully-formed or `Err` — the no-partial-mutation property (no counter can
+    /// advance while the other fails). Per-field caps are checked INDIVIDUALLY before the aggregate; ANY
+    /// cap/overflow ⇒ `Err` (the handler maps every variant to `CapExceeded`/0x44).
+    ///
+    /// Domains: `amount`/`gas_price` are big-endian `u256` (`[u8; 32]`); `gas_limit` is `u64`. The `u64`
+    /// caps (`max_gas_limit`, `max_effective_gas_fee_rate`) are LIFTED to `u256` for comparison — a
+    /// `gas_price` exceeding `u64` is correctly REJECTED, never downcast/wrapped under the cap (a
+    /// fund-drain guard; see `u256` module docs). `lifetime_spend` ALWAYS advances on accept; only the
+    /// breaker THRESHOLD check is conditional (its absence is not a failure, §2).
+    #[allow(dead_code)]
+    pub(crate) fn accept_and_debit(
+        &self,
+        amount: &[u8; 32],
+        gas_limit: u64,
+        gas_price: &[u8; 32],
+    ) -> Result<FaucetState, FaucetCapError> {
+        use crate::u256;
+        // §2 fail-closed-until-configured: a zero cumulative budget marks an UNCONFIGURED faucet, which
+        // must reject EVERY dispense — including a degenerate zero-cost one (`amount=0, gas=0`), which
+        // would otherwise slip through as `0 ≤ 0` below. Checked first so an unconfigured faucet is
+        // uniformly unusable (no per-field-cap probing oracle). Collapsed to `CumulativeBudget` so the
+        // wire can't distinguish "not configured" from "over budget" (anti-oracle).
+        if self.cumulative_signing_budget == [0u8; 32] {
+            return Err(FaucetCapError::CumulativeBudget);
+        }
+        // Per-field caps, each individually (§2). `[u8; 32]` Ord is big-endian numeric.
+        if *amount > self.per_dispense_max_amount {
+            return Err(FaucetCapError::PerDispenseAmount);
+        }
+        if gas_limit > self.max_gas_limit {
+            return Err(FaucetCapError::GasLimit);
+        }
+        if *gas_price > u256::from_u64(self.max_effective_gas_fee_rate) {
+            return Err(FaucetCapError::GasFeeRate);
+        }
+        // Worst-case native cost = amount + gas_limit * gas_price (checked u256; gas_limit is the u64
+        // multiplier, gas_price the u256 multiplicand). The mul itself CANNOT overflow 2^256 here — the
+        // gas_price cap above guarantees gas_price ≤ u64::MAX and gas_limit is u64, so the product is
+        // < 2^128 — but the `?` is kept as defense-in-depth (the add below genuinely CAN overflow, since
+        // `amount` is capped only by the u256 per_dispense_max_amount, which may be large).
+        let gas_cost =
+            u256::checked_mul_u64(gas_price, gas_limit).ok_or(FaucetCapError::WorstCaseOverflow)?;
+        let worst_case = u256::checked_add(amount, &gas_cost).ok_or(FaucetCapError::WorstCaseOverflow)?;
+        // Cumulative refillable budget ceiling.
+        let new_cumulative = u256::checked_add(&self.cumulative_native_spend, &worst_case)
+            .ok_or(FaucetCapError::WorstCaseOverflow)?;
+        if new_cumulative > self.cumulative_signing_budget {
+            return Err(FaucetCapError::CumulativeBudget);
+        }
+        // lifetime_spend ALWAYS advances; the threshold check is conditional on a configured breaker.
+        let new_lifetime = u256::checked_add(&self.lifetime_spend, &worst_case)
+            .ok_or(FaucetCapError::WorstCaseOverflow)?;
+        if let Some(breaker) = self.circuit_breaker_threshold {
+            if new_lifetime > breaker {
+                return Err(FaucetCapError::LifetimeBreaker);
+            }
+        }
+        // Accept: both new counters were computed (and overflow-checked) BEFORE either is assigned, so a
+        // single overflow can never leave one advanced — no-partial-mutation.
+        Ok(FaucetState {
+            cumulative_native_spend: new_cumulative,
+            lifetime_spend: new_lifetime,
+            ..self.clone()
+        })
+    }
+}
+
 /// One privileged-op audit record (AC#14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1941,5 +2037,220 @@ mod tests {
             bumped.compute_local_marks_digest(),
             "cumulative_signing_budget must NOT affect marks_digest"
         );
+    }
+
+    // --- §2 faucet accept-gate + dual-counter debit (slice 15-3a) ---
+
+    /// A big-endian `u256` from a `u128` (low 16 bytes) — test oracle.
+    fn be(x: u128) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[16..].copy_from_slice(&x.to_be_bytes());
+        o
+    }
+    /// A faucet with generous per-field caps; tune the cumulative budget + optional breaker per test.
+    fn faucet_with(budget: u128, breaker: Option<u128>) -> FaucetState {
+        FaucetState {
+            per_dispense_max_amount: be(1_000_000),
+            max_gas_limit: 21_000,
+            max_effective_gas_fee_rate: 1_000_000_000,
+            cumulative_native_spend: be(0),
+            lifetime_spend: be(0),
+            circuit_breaker_threshold: breaker.map(be),
+            cumulative_signing_budget: be(budget),
+        }
+    }
+
+    #[test]
+    fn faucet_accept_advances_both_counters_by_worst_case() {
+        let f = faucet_with(100_000_000_000_000, None); // 1e14 budget, no breaker
+        let worst = 500_000u128 + 21_000u128 * 1_000_000_000u128; // amount + gas_limit*gas_price ≈ 2.1e13
+        let out = f
+            .accept_and_debit(&be(500_000), 21_000, &be(1_000_000_000))
+            .expect("within all caps");
+        assert_eq!(out.cumulative_native_spend, be(worst), "cumulative += worst_case");
+        assert_eq!(out.lifetime_spend, be(worst), "lifetime += worst_case (even with no breaker)");
+        // EVERY non-counter field carries through unchanged (only the two spend counters move).
+        assert_eq!(out.cumulative_signing_budget, f.cumulative_signing_budget, "budget unchanged");
+        assert_eq!(out.per_dispense_max_amount, f.per_dispense_max_amount, "per-dispense cap unchanged");
+        assert_eq!(out.max_gas_limit, f.max_gas_limit, "max_gas_limit unchanged");
+        assert_eq!(out.max_effective_gas_fee_rate, f.max_effective_gas_fee_rate, "max fee rate unchanged");
+        assert_eq!(out.circuit_breaker_threshold, f.circuit_breaker_threshold, "breaker unchanged");
+        assert_eq!(f.cumulative_native_spend, be(0), "self is never mutated");
+        assert_eq!(f.lifetime_spend, be(0), "self lifetime never mutated");
+        // amount EXACTLY at the per-dispense cap is accepted (≤, not <).
+        assert!(f.accept_and_debit(&be(1_000_000), 0, &be(0)).is_ok(), "amount == max_amount accepted");
+        // a second dispense accumulates onto the first
+        let out2 = out.accept_and_debit(&be(0), 0, &be(0)).expect("zero dispense ok");
+        assert_eq!(out2.cumulative_native_spend, be(worst), "zero-cost dispense leaves the counter");
+    }
+
+    #[test]
+    fn faucet_accept_high_half_above_u128() {
+        // The accept path must debit correctly into the HIGH 16 bytes (the > 2^128 range that
+        // distinguishes u256 from u128 — the be()-based tests only touch the low half). Build a 2^128
+        // amount (byte 15 = 1) with a generous cap + budget and assert both counters land at exactly 2^128.
+        let mut two_128 = [0u8; 32];
+        two_128[15] = 0x01; // 2^128
+        let f = FaucetState {
+            per_dispense_max_amount: [0xff; 32],
+            max_gas_limit: 0,
+            max_effective_gas_fee_rate: 0,
+            cumulative_native_spend: [0; 32],
+            lifetime_spend: [0; 32],
+            circuit_breaker_threshold: None,
+            cumulative_signing_budget: [0xff; 32],
+        };
+        let out = f.accept_and_debit(&two_128, 0, &[0; 32]).expect("2^128 dispense within caps");
+        assert_eq!(out.cumulative_native_spend, two_128, "cumulative debited into the high half");
+        assert_eq!(out.lifetime_spend, two_128, "lifetime debited into the high half");
+        // a second 2^128 dispense ⇒ 2^129 = 2·2^128 = 0x02 at byte 15 (high-half add).
+        let mut two_129 = [0u8; 32];
+        two_129[15] = 0x02; // 2^129
+        let out2 = out.accept_and_debit(&two_128, 0, &[0; 32]).expect("second 2^128 dispense");
+        assert_eq!(out2.cumulative_native_spend, two_129, "high-half add: 2^128 + 2^128 = 2^129");
+    }
+
+    #[test]
+    fn faucet_breaker_accept_branch() {
+        // The breaker-CONFIGURED accept side (new_lifetime <= breaker) — the reject side is covered by
+        // faucet_cumulative_budget_and_breaker_reject; this pins that an in-threshold dispense SUCCEEDS
+        // (guards an inverted breaker comparison that would DoS legitimate dispenses).
+        let worst = 1u128 + 21_000u128 * 1u128; // 21_001
+        // breaker EXACTLY at worst_case ⇒ new_lifetime == breaker ⇒ accept (≤).
+        let f = faucet_with(u128::MAX, Some(worst));
+        let out = f.accept_and_debit(&be(1), 21_000, &be(1)).expect("new_lifetime == breaker is accepted");
+        assert_eq!(out.lifetime_spend, be(worst), "lifetime advanced to exactly the breaker");
+    }
+
+    #[test]
+    fn faucet_exact_per_field_cap_boundaries_and_accumulation() {
+        let f = faucet_with(u128::MAX, None);
+        // each per-field cap EXACTLY at the limit is accepted (≤, not <).
+        assert!(f.accept_and_debit(&be(1_000_000), 0, &be(0)).is_ok(), "amount == per_dispense_max_amount");
+        assert!(f.accept_and_debit(&be(0), 21_000, &be(0)).is_ok(), "gas_limit == max_gas_limit");
+        assert!(f.accept_and_debit(&be(0), 0, &be(1_000_000_000)).is_ok(), "gas_price == max_effective_gas_fee_rate");
+        // accumulation from NON-ZERO bases: each counter advances from its own independent starting value.
+        let mut g = faucet_with(u128::MAX, None);
+        g.cumulative_native_spend = be(100);
+        g.lifetime_spend = be(7); // distinct from cumulative, so a swapped-counter bug would show
+        let worst = 5u128 + 21_000u128 * 1u128; // amount 5 + gas_limit 21000 * gas_price 1
+        let out = g.accept_and_debit(&be(5), 21_000, &be(1)).expect("within caps");
+        assert_eq!(out.cumulative_native_spend, be(100 + worst), "cumulative accumulates from its base");
+        assert_eq!(out.lifetime_spend, be(7 + worst), "lifetime accumulates from its (independent) base");
+    }
+
+    #[test]
+    fn faucet_per_field_caps_reject_individually() {
+        let f = faucet_with(u128::MAX, None);
+        assert_eq!(
+            f.accept_and_debit(&be(1_000_001), 21_000, &be(1)).unwrap_err(),
+            FaucetCapError::PerDispenseAmount,
+            "amount over per_dispense_max_amount"
+        );
+        assert_eq!(
+            f.accept_and_debit(&be(1), 21_001, &be(1)).unwrap_err(),
+            FaucetCapError::GasLimit,
+            "gas_limit over max_gas_limit"
+        );
+        assert_eq!(
+            f.accept_and_debit(&be(1), 1, &be(1_000_000_001)).unwrap_err(),
+            FaucetCapError::GasFeeRate,
+            "gas_price over max_effective_gas_fee_rate"
+        );
+    }
+
+    #[test]
+    fn faucet_gas_price_u256_cap_is_not_downcast() {
+        // A gas_price > u64::MAX must be REJECTED against the u64 cap (lifted to u256), NOT downcast to
+        // u64 (which would wrap a 2^64 gas_price to 0 and slip under the cap — a fund drain).
+        let f = faucet_with(u128::MAX, None);
+        let gas_price_over_u64 = be(1u128 << 64); // 2^64, just past u64::MAX
+        assert_eq!(
+            f.accept_and_debit(&be(1), 1, &gas_price_over_u64).unwrap_err(),
+            FaucetCapError::GasFeeRate,
+            "a >u64 gas_price is rejected by the lifted-to-u256 comparison, never downcast/wrapped"
+        );
+    }
+
+    #[test]
+    fn faucet_cumulative_budget_and_breaker_reject() {
+        // budget just below the worst_case ⇒ CumulativeBudget
+        let worst = 1u128 + 21_000u128 * 1u128; // amount 1 + gas 21000*1 = 21_001
+        let tight = faucet_with(worst - 1, None);
+        assert_eq!(
+            tight.accept_and_debit(&be(1), 21_000, &be(1)).unwrap_err(),
+            FaucetCapError::CumulativeBudget
+        );
+        // exactly at the budget ⇒ accept (≤, not <)
+        let exact = faucet_with(worst, None);
+        assert!(exact.accept_and_debit(&be(1), 21_000, &be(1)).is_ok(), "spend == budget is allowed");
+        // breaker just below worst_case ⇒ LifetimeBreaker (budget generous)
+        let breaker = faucet_with(u128::MAX, Some(worst - 1));
+        assert_eq!(
+            breaker.accept_and_debit(&be(1), 21_000, &be(1)).unwrap_err(),
+            FaucetCapError::LifetimeBreaker
+        );
+    }
+
+    #[test]
+    fn faucet_genesis_budget_zero_fails_closed() {
+        // A fresh keystore (cumulative_signing_budget = 0) cannot dispense anything positive (§2 "fails
+        // closed until a budget is sealed") — a non-zero worst_case exceeds the 0 budget.
+        let genesis = faucet_with(0, None);
+        assert_eq!(
+            genesis.accept_and_debit(&be(1), 0, &be(0)).unwrap_err(),
+            FaucetCapError::CumulativeBudget,
+            "any positive spend exceeds a zero budget"
+        );
+        // An unconfigured faucet (budget == 0) rejects EVEN a degenerate zero-cost dispense — fully
+        // fail-closed until a budget is sealed (§2), not just for positive amounts.
+        assert_eq!(
+            genesis.accept_and_debit(&be(0), 0, &be(0)).unwrap_err(),
+            FaucetCapError::CumulativeBudget,
+            "a zero-budget (unconfigured) faucet rejects all dispenses, incl. zero-cost"
+        );
+        // The boundary the moment a budget IS sealed: a 1-wei budget accepts a 1-wei dispense.
+        let configured = faucet_with(1, None);
+        assert!(configured.accept_and_debit(&be(1), 0, &be(0)).is_ok(), "a sealed budget enables dispensing");
+    }
+
+    #[test]
+    fn faucet_checked_overflow_fails_closed() {
+        // Each of the THREE reachable overflow sources must fail closed (WorstCaseOverflow), never wrap
+        // a counter under the budget. (The gas_price*gas_limit MUL cannot overflow — gas_price ≤ u64 cap
+        // × u64 gas_limit < 2^128 — so it has no reachable test; see the method comment.)
+        let maxed = || {
+            let mut f = faucet_with(u128::MAX, None);
+            f.per_dispense_max_amount = [0xff; 32];
+            f.cumulative_signing_budget = [0xff; 32];
+            f
+        };
+        // (1) worst_case ADD overflow: amount(2^256-1) + a positive gas_cost.
+        assert_eq!(
+            maxed().accept_and_debit(&[0xff; 32], 21_000, &be(1_000_000_000)).unwrap_err(),
+            FaucetCapError::WorstCaseOverflow,
+            "amount(2^256-1) + gas_cost overflows"
+        );
+        // (2) cumulative-ADD overflow (BEFORE the budget compare): cumulative_native_spend(2^256-1) + 1.
+        let mut c = maxed();
+        c.cumulative_native_spend = [0xff; 32];
+        assert_eq!(
+            c.accept_and_debit(&be(1), 0, &be(0)).unwrap_err(),
+            FaucetCapError::WorstCaseOverflow,
+            "cumulative_native_spend(2^256-1) + worst_case overflows ⇒ fail closed (never wraps under budget)"
+        );
+        // (3) lifetime-ADD overflow (AFTER cumulative passes): lifetime_spend(2^256-1) + 1.
+        let mut g = maxed();
+        g.cumulative_native_spend = be(0);
+        g.lifetime_spend = [0xff; 32];
+        assert_eq!(
+            g.accept_and_debit(&be(1), 0, &be(0)).unwrap_err(),
+            FaucetCapError::WorstCaseOverflow,
+            "lifetime_spend(2^256-1) + 1 overflows"
+        );
+        // No-partial-mutation is STRUCTURAL: accept_and_debit takes &self and returns either Err or ONE
+        // fully-built FaucetState (both counters set in a single expression), so no caller can ever
+        // observe a state with one counter advanced and the other not — there is no half-mutated path to
+        // assert against (the Err returns above ARE the guarantee; `self` is immutable by &-borrow).
     }
 }
