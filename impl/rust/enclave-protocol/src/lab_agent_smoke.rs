@@ -1311,6 +1311,42 @@ mod faucet {
     pub(super) fn u256_of(x: u64) -> [u8; 32] {
         u256_be(x)
     }
+
+    /// Assert the post-CONFIGURE rollback-artifact METADATA (not just the faucet business fields), so a
+    /// regression that applied the config but dropped a monotonic bump / clobbered unrelated state is
+    /// caught: the monotonic `config_version`, the atomic `structural_version` + `freshness_epoch`
+    /// advancement (every CONFIGURE sub-op is Structural), AND preservation of unrelated state (the seeded
+    /// transfer key + the F1-minted treasury key both survive the swap = 2 entries). The absolutes are
+    /// deterministic from the fixed phase order: smoke_body base `epoch=1 / structural=1 / config_version=0`;
+    /// F1 GENERATE_KEYS is Structural but does NOT bump config_version (`epoch=2 / structural=2 / cv=0`);
+    /// then each CONFIGURE advances all three by +1.
+    pub(super) fn assert_configure_metadata(
+        b: &crate::agent_keystore::KeystoreBody,
+        config_version: u64,
+        structural_version: u64,
+        freshness_epoch: u64,
+    ) -> Result<(), String> {
+        if b.config.monotonic_treasury_config_version != config_version {
+            return Err(format!(
+                "config_version {} != expected {config_version}",
+                b.config.monotonic_treasury_config_version
+            ));
+        }
+        if b.structural_version != structural_version {
+            return Err(format!("structural_version {} != expected {structural_version}", b.structural_version));
+        }
+        if b.freshness_epoch != freshness_epoch {
+            return Err(format!("freshness_epoch {} != expected {freshness_epoch}", b.freshness_epoch));
+        }
+        if b.entries.len() != 2 || !b.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF) {
+            return Err(format!(
+                "config swap did not preserve unrelated entries (len={}, seeded transfer key present={})",
+                b.entries.len(),
+                b.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF)
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The combined FAUCET write-path smoke client (mirrors [`run_agent_keygen_smoke_client`]). Drives the
@@ -1385,7 +1421,10 @@ where
                 b.faucet.max_gas_limit, b.faucet.max_effective_gas_fee_rate
             ));
         }
-        Ok("caps applied (resealed blob unseals to the limit triple)".to_string())
+        // Rollback-artifact METADATA: this is the FIRST CONFIGURE, so config_version=1 and the atomic
+        // Structural bump lands epoch=3 / structural=3 (base 1 → F1 GENERATE_KEYS +1 → this CONFIGURE +1).
+        assert_configure_metadata(&b, 1, 3, 3)?;
+        Ok("caps applied (resealed blob unseals to the limit triple; cv=1, epoch=3, structural=3)".to_string())
     });
 
     // F3: refill the cumulative signing budget (resets the refillable spend window to 0).
@@ -1401,7 +1440,9 @@ where
         if b.faucet.cumulative_native_spend != [0u8; 32] {
             return Err("refill_budget: cumulative_native_spend not reset to 0 (the fresh refill window)".to_string());
         }
-        Ok(format!("budget applied (resealed blob unseals to budget={BUDGET}, spend window reset)"))
+        // Rollback-artifact METADATA: SECOND CONFIGURE ⇒ config_version=2, epoch=4 / structural=4.
+        assert_configure_metadata(&b, 2, 4, 4)?;
+        Ok(format!("budget applied (resealed blob unseals to budget={BUDGET}, spend window reset; cv=2, epoch=4, structural=4)"))
     });
 
     // F4: the dispense — treasury → the seeded transfer key, within caps. Asserts the dual-counter debit.
