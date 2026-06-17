@@ -79,10 +79,49 @@ a preview-gated op). (NB `key_ref` here is the lab-smoke fixture's `[0x11;32]`, 
 "no such key" — what a given enclave returns depends on the installed keystore.) End-to-end response-body
 vectors land in the later TASK-22 response slices.
 
-The cap-bearing envelopes (GENERATE_KEYS(1) / CONFIGURE_TREASURY(6)) + the §10.5 capability
-preimage/map, the response bodies, and the negative (rejection) vectors land in subsequent TASK-22
-slices. Regen: `cargo test --features agent-gateway golden_request_envelopes::regen_golden_request_envelopes -- --ignored --nocapture`,
-then commit the `.bin`s + the re-minted `request_envelopes_v1.json` in the same commit.
+The **cap-bearing** envelopes (`req_generate_keys_v1.bin`, `req_configure_set_limits_v1.bin` +
+`cap_envelopes_v1.json`) carry a §10.5 capability at key 5 and NO key_ref. Each is byte-exact +
+accepted by `decode_envelope`, and its embedded cap (key 5), re-encoded, **equals** the
+corresponding `cap_full_*_v1.bin` (AC#2) — which is itself accepted by the live `verify_capability`,
+so the envelope provably carries a valid capability. **TEST KEYS ONLY** (admin Ed25519 `[7;32]`;
+env `env-prod-0`, chain 11565).
+
+Regen (per group): `cargo test --features agent-gateway <mod>::regen_<...> -- --ignored --nocapture`
+where `<mod>` is `golden_request_envelopes` / `golden_cap_envelopes` / `golden_response_bodies` /
+`golden_negative_vectors` (in `agent_dispatch`) and `golden_capability_vectors` (in `agent_capability`);
+commit the `.bin`s + the re-minted `*_v1.json` in the same commit.
+
+### AC#2 — §10.5 capability (`cap_*_v1.bin` + `payload_binding_*_v1.bin` + `capability_vectors_v1.json`)
+
+The Ed25519-signed **preimage** (`CAP_DOMAIN ‖ canonical-CBOR(keys 1..12)`) and the **full capability
+map** (keys 1..13, incl. the signature), for GENERATE_KEYS (11-entry preimage, header `0xAB`) and
+CONFIGURE_TREASURY `set_limits`(sub_op 0)/`reset`(sub_op 3) (12-entry, header `0xAC`) — pinning the
+11-vs-12 header asymmetry. Plus the **`payload_binding`** derivation
+(`keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical-CBOR(params))`) for op 1 (no sub_op byte) and
+op 6 sub_op 0 (sub_op byte) — pinning the sub_op-in-binding. **Each full map is ACCEPTED by the live
+`verify_capability`** (admin `[7;32]` / recovery `[9;32]`), so a signer/encoder/authority-tier drift
+breaks CI. The per-sub-op **authority tier** matters: sub-ops 0..=2 are admin-signed; sub-op 3
+(`reset_lifetime_breaker`) is recovery-signed on the recovery authority's lane (see §10.7).
+
+### AC#3 — response bodies (`resp_*_v1.bin` + `response_bodies_v1.json`)
+
+PUBLIC_IDENTITY (6-key), SIGN_TRANSFER (7-key), SIGN_FAUCET_DISPENSE (8-key incl. sealed blob at key 8),
+GENERATE_KEYS (`{1:[key maps], 2:blob}`), CONFIGURE_TREASURY (`{1:blob}`), and the §10.9 **AgentError**
+body `{1:code, 2:reason}` for all 7 codes. Minted from the real encoders over fixed inputs (signed-tx
+fields from `ordinary_tx_v1`, identity from `keys.json` via the real derivation); the sealed blob is the
+already-frozen `agent_keystore_genesis_v2.sealed.bin` (opaque AEAD — a representative blob pins the
+response SHAPE). Each success body's key 1 is NOT a bare int code, so it is distinguishable from an
+error body.
+
+### AC#4 — negatives (`neg_*_v1.bin` + `negative_vectors_v1.json`)
+
+`{request bytes → expected §10.9 code}` pairs, each asserted via the real `dispatch_agent`: `0x40`
+(unknown envelope key; runtime opcode carrying a capability), `0x41` (agent opcode on the producer
+profile), `0x42` (key_ref not found), `0x43` (capability bad signature; non-contiguous counter), `0x45`
+(GENERATE_KEYS with the anti-rollback binding absent). `0x44` (CapExceeded) / `0x46` (SealFailed) are
+handler/preview-level and deferred. NB CONFIGURE_TREASURY currently **accepts + ignores** a stray
+envelope key 6 (`key_ref`) — §10.7 specifies no key_ref, but the capability binding carries integrity
+(TASK-20 residual; document-the-ignore until a strict-shape tightening makes it a `0x40` negative).
 
 ## 3-way domain separation (AC#15)
 
