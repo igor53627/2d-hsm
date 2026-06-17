@@ -151,6 +151,17 @@ compile_error!(
      attestation, and has no anti-rollback durability"
 );
 
+// TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path (the pq-agent-backup-v1 ML-KEM-1024
+// KEM-DEM envelope). EXPORT advances the sealed audit `last_exported_seq` high-water — until that field is
+// anti-rollback-covered (the EpochOnly→Structural reclassification) and the audit-ring write path lands, a
+// live EXPORT is rollback-sensitive. Hard-ban it from release builds until those land and TASK-18 un-gates.
+#[cfg(all(release_build, feature = "agent-backup-export-preview"))]
+compile_error!(
+    "`agent-backup-export-preview` (live EXPORT_BACKUP/RESTORE_BACKUP DR-backup KEM-DEM) must not be \
+     enabled in release builds until the anti-rollback last_exported_seq coverage + the audit-ring write \
+     path land and TASK-18 un-gates"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
@@ -249,6 +260,12 @@ pub mod secp256k1;
 // mirroring the producer `pq-seal-v1` primitives with distinct magic + KDF/measurement domains.
 #[cfg(feature = "agent-gateway")]
 pub mod agent_keystore;
+// TASK-13b: the pq-agent-backup-v1 DR-backup KEM-DEM primitive (ML-KEM-1024 Encaps → SHA3-256 KDF →
+// ChaCha20Poly1305) wrapping an opaque payload to the operator's offline recovery public key. Pure crypto,
+// no dispatch coupling; compiled only under the release-banned `agent-backup-export-preview` (which pulls
+// the `ml-kem` crate). The EXPORT_BACKUP handler + audit drain + golden vector land in later 13b slices.
+#[cfg(feature = "agent-backup-export-preview")]
+pub(crate) mod agent_backup;
 // Agent Gateway sealed-keystore unseal-at-boot loader (TASK-7.7 5b-2d): the agent twin of
 // `boot_lab_pq_seal` — sources the sealed agent keystore + the agent provisioning root (lab file source)
 // and unseals it via `agent_keystore::unseal_body`, fail-closed. A PURE source→unseal→return seam: it does

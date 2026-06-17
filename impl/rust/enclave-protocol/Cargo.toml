@@ -22,6 +22,15 @@ zeroize = { version = "1.8", features = ["serde"], optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
 hex = { version = "0.4", optional = true }
+# ML-KEM-1024 (FIPS 203) for the pq-agent-backup-v1 DR-backup KEM-DEM envelope (TASK-13b). Pure-Rust
+# RustCrypto, forbid(unsafe_code)-clean, with deterministic encapsulation for byte-exact golden vectors.
+# INDEPENDENT crate — NOT pqcrypto-mldsa and NOT gated by ml-dsa-65, so it stays on the agent side of the
+# `ml-dsa-65 ⊥ agent-gateway` role-isolation XOR (lib.rs). Optional; only the backup-export preview pulls it.
+# `hazmat` exposes `encapsulate_deterministic` (we draw the 32-byte message `m` via the TEE CSPRNG
+# (getrandom) and pass it explicitly — identical to the crate's own `encapsulate_with_rng`, but it lets us
+# pin a fixed `m` for byte-exact golden vectors; the enclave draws randomness via getrandom, not rand_core).
+# `zeroize` scrubs the crate's internal ML-KEM key material.
+ml-kem = { version = "0.3", optional = true, features = ["hazmat", "zeroize"] }
 # Agent Gateway secp256k1 signer (TASK-7.6). Pure-Rust RustCrypto stack, no_std-capable,
 # forbid(unsafe_code)-friendly. RFC6979 deterministic + low-S + recoverable ECDSA.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"], optional = true }
@@ -92,6 +101,13 @@ agent-sign-faucet-preview = ["agent-gateway"]
 # until the AC#5 production funding profile is armed, the independent recovery-counter rule + the AC#14
 # audit record land, and TASK-18 un-gates. Never enable in production.
 agent-configure-treasury-preview = ["agent-gateway"]
+# TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path — the pq-agent-backup-v1 ML-KEM-1024
+# KEM-DEM envelope wrapped to the operator's offline recovery public key. Pulls the pure-Rust `ml-kem`
+# crate (NOT pqcrypto/ml-dsa-65 — independent, so role isolation holds). Without this feature
+# EXPORT/RESTORE verify the capability then fail closed (AGENT_NOT_CONFIGURED). Banned in release builds
+# (see lib.rs): stays fail-closed until the anti-rollback last_exported_seq coverage + audit-ring write
+# path land and TASK-18 un-gates. Never enable in production.
+agent-backup-export-preview = ["agent-gateway", "dep:ml-kem"]
 # TASK-23: deviceless UDS 0x40 contract-test server (twod-hsm-agent-contract-server) — installs a
 # reference keystore (PUBLIC test keys) + serves the agent protocol over AF_UNIX WITHOUT SNP/anti-rollback,
 # so downstream 2d (Elixir/macOS) can live-contract-test. Test/dev-only; release-banned (see lib.rs).
