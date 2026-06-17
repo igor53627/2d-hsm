@@ -1273,8 +1273,10 @@ mod tests {
                 assert_eq!(e["preimage_header_byte"].as_u64(), Some(header as u64), "{name} header");
                 assert_eq!(e["preimage_sha256"].as_str(), Some(hx(&Sha256::digest(&preimage)).as_str()), "{name} pre sha");
                 assert_eq!(e["preimage_len_bytes"].as_u64(), Some(preimage.len() as u64), "{name} pre len");
+                assert_eq!(e["preimage_hex"].as_str(), Some(hx(&preimage).as_str()), "{name} pre hex");
                 assert_eq!(e["full_map_sha256"].as_str(), Some(hx(&Sha256::digest(&fullmap)).as_str()), "{name} full sha");
                 assert_eq!(e["full_map_len_bytes"].as_u64(), Some(fullmap.len() as u64), "{name} full len");
+                assert_eq!(e["full_map_hex"].as_str(), Some(hx(&fullmap).as_str()), "{name} full hex");
             }
         }
 

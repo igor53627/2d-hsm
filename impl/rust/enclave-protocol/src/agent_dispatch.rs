@@ -4642,6 +4642,44 @@ mod tests {
         }
 
         #[test]
+        fn golden_cap_envelope_binding_covers_its_payload() {
+            // The cap's payload_binding (key 11) must equal the binding RECOMPUTED from THIS envelope's own
+            // payload (key 7) — proving the cap binds the payload it travels with (the exact recompute-and-
+            // compare the live handler does before mutating). Parses params back from the decoded payload, so
+            // a future edit that changed the payload without updating the cap's binding source would fail.
+            for (name, bytes, opcode, request_id, _cap_file) in vectors() {
+                let env = decode_envelope(&bytes).unwrap_or_else(|_| panic!("{name} decode"));
+                let cap = env.capability.unwrap_or_else(|| panic!("{name} cap"));
+                let cap_pb = match map_get(&cap, 11) {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    other => panic!("{name}: cap key 11 (payload_binding) not bytes: {other:?}"),
+                };
+                let payload = env.payload.unwrap_or_else(|| panic!("{name} payload"));
+                let recomputed = match opcode {
+                    1 => {
+                        let purpose = map_get(&payload, 1).and_then(as_u64).unwrap();
+                        let count = map_get(&payload, 2).and_then(as_u64).unwrap();
+                        crate::agent_capability::payload_binding(1, None, request_id, &generate_keys_canonical_params(purpose, count))
+                    }
+                    6 => {
+                        let sub_op = map_get(&payload, 1).and_then(as_u64).unwrap() as u8;
+                        let field2 = match map_get(&payload, 2) {
+                            Some(Value::Bytes(b)) => b.clone(),
+                            _ => panic!("{name}: payload key 2 (field2) not bytes"),
+                        };
+                        let set_limits = match (map_get(&payload, 3).and_then(as_u64), map_get(&payload, 4).and_then(as_u64)) {
+                            (Some(g), Some(f)) => Some((g, f)),
+                            _ => None,
+                        };
+                        crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &configure_treasury_canonical_params(sub_op, &field2, set_limits))
+                    }
+                    other => panic!("{name}: unexpected opcode {other}"),
+                };
+                assert_eq!(cap_pb.as_slice(), recomputed.as_slice(), "{name}: cap payload_binding must cover its own payload");
+            }
+        }
+
+        #[test]
         fn golden_cap_envelope_canonical_headers() {
             // Both are 6-pair maps {1,2,3,4,5,7} → 0xA6; key 5 (capability) is a map, key 6 absent.
             for (name, bytes, ..) in vectors() {
@@ -4874,10 +4912,16 @@ mod tests {
                 assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
                 assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
             }
-            // The 7 error bodies, keyed by code hex.
+            // The 7 error bodies, keyed by code hex — exactly 7, no stale/extra entry.
+            assert_eq!(
+                v["agent_errors"].as_object().map(|o| o.len()),
+                Some(agent_errors().len()),
+                "index has a stale/extra agent_error entry"
+            );
             for (code, body) in agent_errors() {
                 let e = &v["agent_errors"][format!("{code:#04x}")];
                 assert_eq!(e["body_hex"].as_str(), Some(hx(&body).as_str()), "error {code:#x} hex");
+                assert_eq!(e["body_len_bytes"].as_u64(), Some(body.len() as u64), "error {code:#x} len");
             }
         }
 
