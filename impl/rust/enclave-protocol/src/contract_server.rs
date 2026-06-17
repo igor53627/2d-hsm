@@ -151,11 +151,45 @@ fn install_mutating_op_support() {
     }
 }
 
-/// Bind the UDS socket at `socket_path` (parent `private_dir` chmod 0700, socket 0600), install the
-/// reference agent keystore (so `PUBLIC_IDENTITY` returns a real identity instead of the empty-store
-/// `0x41`), then serve 0x40 connections SERIALLY forever. Cross-platform: `std::os::unix` `UnixListener`,
-/// no vsock, no SNP boot. Returns `Err` only on a fatal setup failure (keystore install / bind); a
-/// per-connection fault is logged and the loop continues (never die on one client).
+/// The bin's boot setup, extracted so an integration test can drive it in a NON-`cfg(test)` build (where
+/// `seal_root::resolve_provisioning_root` has no fallback): seed the deviceless reference provisioning
+/// root, install the reference keystore, and install the mutating-op support. `Err` iff the keystore
+/// fails to install.
+///
+/// **Why the seal root (greptile PR #91 P1).** The mutating ops' `commit_before_emit` SEALS the candidate
+/// keystore via `resolve_provisioning_root()` BEFORE the `0x45` anchor commit. This deviceless,
+/// cross-platform server has NO SNP-firmware platform root, and `reference-seal-v1-root` cannot be enabled
+/// (it pulls `ml-dsa-65`, which is compile-banned alongside `agent-gateway`). Under `cfg(test)` a fixture
+/// root is resolved automatically — but the SHIPPED bin is NOT `cfg(test)`, so without an explicit install
+/// every mutating op would fail closed (`0x46`) before its commit (the lib unit tests are green only via
+/// that `cfg(test)` fallback). We therefore install the SAME committed fixture root
+/// (`testvectors/seal_v1_provisioning_root.bin`) the `cfg(test)` path uses, so a sealed blob the bin
+/// returns unseal-roundtrips. Best-effort install-once (a second call / an already-set platform root is
+/// fine). Gated on the mutating previews — a read-only build never seals, so it needs no root.
+pub fn prepare_contract_server() -> Result<(), ProtocolError> {
+    #[cfg(any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ))]
+    {
+        let reference_root: [u8; 32] = *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
+        let _ = crate::seal_root::set_pq_seal_v1_provisioning_root(reference_root);
+    }
+    if !install_reference_agent_keystore() {
+        return Err(ProtocolError::WireProtocol(
+            "contract server: reference keystore failed to install (validate/cap)",
+        ));
+    }
+    install_mutating_op_support();
+    Ok(())
+}
+
+/// Bind the UDS socket at `socket_path` (parent `private_dir` chmod 0700, socket 0600), run
+/// [`prepare_contract_server`] (seal root + reference keystore + mutating-op support), then serve 0x40
+/// connections SERIALLY forever. Cross-platform: `std::os::unix` `UnixListener`, no vsock, no SNP boot.
+/// Returns `Err` only on a fatal setup failure (keystore install / bind); a per-connection fault is
+/// logged and the loop continues (never die on one client).
 #[cfg(unix)]
 pub fn run_contract_server(
     socket_path: &Path,
@@ -175,15 +209,10 @@ pub fn run_contract_server(
             "contract server: private_dir must be a dedicated real directory, not empty / the root \"/\" / a symlink",
         ));
     }
-    if !install_reference_agent_keystore() {
-        return Err(ProtocolError::WireProtocol(
-            "contract server: reference keystore failed to install (validate/cap)",
-        ));
-    }
-    // Behind the mutating preview features only: install the anti-rollback binding + a deviceless mock
-    // commit channel so SIGN_FAUCET_DISPENSE / GENERATE_KEYS / CONFIGURE_TREASURY complete (seal → commit
-    // → swap → emit) instead of failing closed. No-op when no mutating preview is enabled.
-    install_mutating_op_support();
+    // Seed the deviceless reference seal root (so mutating ops can seal — greptile PR #91 P1), install the
+    // reference keystore (so PUBLIC_IDENTITY answers a real identity, not the empty-store 0x41), and the
+    // mutating-op support (anti-rollback binding + mock commit channel; a no-op without a mutating preview).
+    prepare_contract_server()?;
     let listener = crate::uds_listen::bind_unix_listener(socket_path, private_dir).map_err(ProtocolError::Io)?;
     let _ = writeln!(
         std::io::stderr(),
@@ -279,6 +308,11 @@ mod tests {
     /// against the reference `anchor_root` — and returns a SUCCESS body (minted key list + sealed blob),
     /// NOT a `0x4x` error. Proves the contract server live-contract-tests the mutating lanes with the
     /// frozen vectors, deviceless.
+    ///
+    /// NB this is a `cfg(test)` lib test, so the seal step resolves the provisioning root via the
+    /// `cfg(test)` fixture fallback. The SHIPPED bin is NOT `cfg(test)` and must install that root
+    /// explicitly (`prepare_contract_server`) — covered by the non-`cfg(test)` integration test
+    /// `tests/twod_hsm_agent_contract_server_seal.rs` (greptile PR #91 P1).
     #[cfg(feature = "agent-keygen-exec-preview")]
     #[test]
     fn generate_keys_round_trip_with_frozen_task22_cap() {

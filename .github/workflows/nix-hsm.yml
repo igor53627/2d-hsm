@@ -139,10 +139,14 @@ jobs:
       # lab lanes use lab-agent-smoke, not agent-contract-server). `cargo build --bin` exercises the
       # NON-test `agent-contract-server` cfg arm that actually installs the channel into the shipped bin
       # (the cargo-test path is cfg(test)-reachable instead), and the contract_server round-trip tests drive
-      # GENERATE_KEYS/CONFIGURE/FAUCET through the mock channel — so neither path can bit-rot off-aya.
-      - name: TASK-23 contract-server mutating lane — bin build + round-trip tests (agent-contract-server + 3 previews)
+      # GENERATE_KEYS/CONFIGURE/FAUCET through the mock channel — so neither path can bit-rot off-aya. The
+      # --test lane is the seal-root regression (greptile PR #91 P1): an integration test links the lib
+      # WITHOUT cfg(test), so it catches a mutating op failing closed (0x46) when the bin's explicit
+      # provisioning-root install is missing — the gap the cfg(test) seal fallback hides in the lib tests.
+      - name: TASK-23 contract-server mutating lane — bin build + round-trip + seal-root regression (agent-contract-server + previews)
         run: |
           cargo test --features agent-contract-server,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview --lib contract_server
+          cargo test --features agent-contract-server,agent-keygen-exec-preview --test twod_hsm_agent_contract_server_seal
           cargo build --features agent-contract-server,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview --bin twod-hsm-agent-contract-server
 
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
