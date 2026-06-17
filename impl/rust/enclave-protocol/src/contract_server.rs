@@ -73,7 +73,8 @@ impl ReferenceCommitChannel {
         let body = crate::reference_keystore::reference_keystore_body();
         Self {
             chain_id: body.config.twod_chain_id,
-            environment_identifier: body.config.environment_identifier.clone(),
+            // Partial move (not clone): `body` is owned and unused after this literal (gemini PR #91).
+            environment_identifier: body.config.environment_identifier,
             signing_key: ed25519_dalek::SigningKey::from_bytes(&crate::reference_keystore::REFERENCE_ANCHOR_SEED),
             ledger: std::collections::HashMap::new(),
         }
