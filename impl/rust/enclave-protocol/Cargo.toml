@@ -92,6 +92,10 @@ agent-sign-faucet-preview = ["agent-gateway"]
 # until the AC#5 production funding profile is armed, the independent recovery-counter rule + the AC#14
 # audit record land, and TASK-18 un-gates. Never enable in production.
 agent-configure-treasury-preview = ["agent-gateway"]
+# TASK-23: deviceless UDS 0x40 contract-test server (twod-hsm-agent-contract-server) — installs a
+# reference keystore (PUBLIC test keys) + serves the agent protocol over AF_UNIX WITHOUT SNP/anti-rollback,
+# so downstream 2d (Elixir/macOS) can live-contract-test. Test/dev-only; release-banned (see lib.rs).
+agent-contract-server = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []
