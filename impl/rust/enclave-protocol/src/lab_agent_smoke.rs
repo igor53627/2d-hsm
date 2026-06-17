@@ -1253,8 +1253,13 @@ mod faucet {
     /// Assert a SIGN_FAUCET_DISPENSE success reply: `{1: signed_rlp, …, 7: from, 8: sealed_blob}` — the
     /// signed tx is present + recovers `from`==treasury, and the resealed blob UNSEALS to a body whose
     /// faucet `cumulative_native_spend` AND `lifetime_spend` BOTH advanced by exactly `worst_case` (the
-    /// dual-counter debit) from zero (refill reset the cumulative window in F3) — the observable witness
-    /// the EpochOnly seal→commit→swap→emit completed with the §2 gate's debit.
+    /// dual-counter debit) — the observable witness the EpochOnly seal→commit→swap→emit completed with
+    /// the §2 gate's debit. Both equal `worst_case` here for DIFFERENT reasons: `cumulative_native_spend`
+    /// because F3's refill reset the refillable window to 0 and F4 is the only debit into it; `lifetime_spend`
+    /// because it is genesis-0 and F4 is the only/first dispense — refill does NOT reset `lifetime_spend` (it
+    /// is the monotone marks surface). This smoke therefore witnesses the DEBIT, not the non-reset; that
+    /// refill leaves a NON-ZERO `lifetime_spend` untouched is pinned by the handler unit test
+    /// `refill_budget_raises_and_resets_native_spend` (base 456 → "lifetime untouched").
     pub(super) fn assert_dispense_success(
         m: &[(Value, Value)],
         treasury_from: &[u8; 20],
@@ -1316,8 +1321,10 @@ mod faucet {
     /// regression that applied the config but dropped a monotonic bump / clobbered unrelated state is
     /// caught: the monotonic `config_version`, the atomic `structural_version` + `freshness_epoch`
     /// advancement (every CONFIGURE sub-op is Structural), the capability counter high-water on the
-    /// configure lane (`CONFIGURE_SCOPE_TARGET`), AND preservation of unrelated state (the seeded transfer
-    /// key + the F1-minted treasury key both survive the swap = 2 entries). The absolutes are deterministic
+    /// configure lane (`CONFIGURE_SCOPE_TARGET`), AND preservation of unrelated state. The unrelated-state
+    /// check pins `entries.len() == 2` AND directly names the seeded transfer key (`SMOKE_KEY_REF`); since no
+    /// CONFIGURE phase adds or removes entries, the only other entry is NECESSARILY the F1-minted treasury
+    /// key, so both surviving the swap follows from (len==2 ∧ transfer-key-present). The absolutes are deterministic
     /// from the fixed phase order: smoke_body base `epoch=1 / structural=1 / config_version=0`;
     /// F1 GENERATE_KEYS is Structural but does NOT bump config_version (`epoch=2 / structural=2 / cv=0`);
     /// then each CONFIGURE advances `epoch`/`structural`/`config_version` by +1 and its lane counter by +1.
@@ -2273,6 +2280,11 @@ mod tests {
         router: fn(&[u8]) -> Result<Vec<u8>, crate::ProtocolError>,
     ) -> (bool, String) {
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        // Same teardown-symmetry rationale as `run_keygen_client_against_router`: the seal root is a
+        // `seal_root`-module global (NOT an agent global), so reset it HERE to None — the process-start
+        // PRISTINE state — so commit_before_emit's resolve_provisioning_root() falls through to
+        // SMOKE_SEAL_ROOT and the client's unseal matches; resetting to None is symmetric-by-default, no
+        // teardown restore is owed.
         crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
         assert!(crate::agent_dispatch::install_agent_keystore(
             smoke_body(),
