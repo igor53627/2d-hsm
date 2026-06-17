@@ -4662,19 +4662,26 @@ mod tests {
                         crate::agent_capability::payload_binding(1, None, request_id, &generate_keys_canonical_params(purpose, count))
                     }
                     6 => {
-                        // Parse the binding-relevant fields with the SAME strictness as the live handler:
-                        // sub_op via u8::try_from (no `as u8` truncation), field2 via the production
-                        // `as_u256_minimal_be` (rejects non-minimal/over-width), gas fields only present for
-                        // set_limits(0) — so a malformed regenerated payload can't pass a looser recompute.
+                        // Mirror handle_configure_treasury's payload SHAPE checks exactly, so a malformed
+                        // regenerated payload that production would reject before binding cannot pass this
+                        // recompute: sub_op via u8::try_from + range 0..=3; field2 via the production
+                        // `as_u256_minimal_be` (rejects non-minimal/over-width); EXACT per-sub-op key counts
+                        // (set_limits(0) = 4 keys reading 3/4; sub-ops 1..=3 = 2 keys, no gas fields).
                         let sub_op = u8::try_from(map_get(&payload, 1).and_then(as_u64).unwrap())
                             .unwrap_or_else(|_| panic!("{name}: sub_op fits u8"));
+                        assert!(sub_op <= 3, "{name}: sub_op in 0..=3");
                         let field2 = crate::agent_cbor::as_u256_minimal_be(
                             map_get(&payload, 2).unwrap_or_else(|| panic!("{name}: payload key 2")),
                         )
                         .unwrap_or_else(|| panic!("{name}: field2 is canonical minimal-BE u256"));
-                        let set_limits = match (map_get(&payload, 3).and_then(as_u64), map_get(&payload, 4).and_then(as_u64)) {
-                            (Some(g), Some(f)) => Some((g, f)),
-                            _ => None,
+                        let set_limits = if sub_op == 0 {
+                            assert_eq!(payload.len(), 4, "{name}: set_limits(0) payload has exactly keys 1..=4");
+                            let g = map_get(&payload, 3).and_then(as_u64).unwrap_or_else(|| panic!("{name}: gas_limit"));
+                            let f = map_get(&payload, 4).and_then(as_u64).unwrap_or_else(|| panic!("{name}: fee_rate"));
+                            Some((g, f))
+                        } else {
+                            assert_eq!(payload.len(), 2, "{name}: sub-op {sub_op} payload has exactly keys 1..=2 (no gas)");
+                            None
                         };
                         crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &configure_treasury_canonical_params(sub_op, &field2, set_limits))
                     }
