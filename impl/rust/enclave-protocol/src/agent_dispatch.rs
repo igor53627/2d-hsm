@@ -4698,4 +4698,219 @@ mod tests {
             eprintln!("wrote 2 cap-envelope vectors + cap_envelopes_v1.json -> {dir}");
         }
     }
+
+    /// TASK-22 — byte-exact `0x40` RESPONSE-BODY golden vectors (AC#3).
+    ///
+    /// Freezes the response bodies the enclave emits: PUBLIC_IDENTITY (6-key), SIGN_TRANSFER (7-key),
+    /// SIGN_FAUCET_DISPENSE (8-key, incl. sealed_keystore_blob), GENERATE_KEYS ({1:[key maps],2:blob}),
+    /// CONFIGURE_TREASURY ({1:blob}), and the §10.9 AgentError body {1:code,2:reason} for all 7 codes.
+    ///
+    /// Minted from the REAL encoders (`encode_agent_response` / `encode_*_response` / `encode_agent_error`)
+    /// over FIXED inputs — NOT the live (preview-gated) dispatch path — so every vector builds in the base
+    /// CI lane and the sealed-blob bytes are deterministic: the signed-tx fields come from `ordinary_tx_v1`
+    /// (RFC6979/low-S), the identity from `public_identity_from_entry` on a `keys.json` key (the real eth/tron
+    /// derivation), and the sealed blob is the already-frozen `agent_keystore_genesis_v2.sealed.bin` (a valid,
+    /// byte-stable sealed keystore — opaque AEAD, so a representative blob is the right thing to pin a response
+    /// SHAPE). TEST KEYS ONLY.
+    mod golden_response_bodies {
+        use super::*;
+        use crate::agent_identity::public_identity_from_entry;
+        use crate::agent_keygen::GeneratedKey;
+        use crate::agent_keystore::{BackupExportMetadata, KeyAlgorithm, KeyEntry};
+        use crate::agent_transfer::SignedTransfer;
+        use crate::secp256k1::RecoverableSignature;
+        use sha2::{Digest, Sha256};
+
+        const KEYS: &str = include_str!("../testvectors/agent-gateway/keys.json");
+        const ORD: &str = include_str!("../testvectors/agent-gateway/ordinary_tx_v1.json");
+        /// A valid, byte-stable sealed keystore used as the representative sealed blob in the mutating
+        /// responses (the blob is opaque AEAD; the response vector pins the SHAPE around it).
+        const GENESIS_BLOB: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
+        const GOLDEN_KEY_REF: [u8; 32] = [0x33; 32];
+
+        fn hx(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        fn unhex(s: &str) -> Vec<u8> {
+            hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap()
+        }
+        fn arr<const N: usize>(s: &str) -> [u8; N] {
+            unhex(s).try_into().unwrap()
+        }
+
+        /// The seeded transfer KeyEntry (from keys.json) — `public_identity_from_entry` derives eth/tron.
+        fn transfer_entry() -> KeyEntry {
+            let k: serde_json::Value = serde_json::from_str(KEYS).unwrap();
+            KeyEntry {
+                key_ref: GOLDEN_KEY_REF,
+                purpose: KeyPurpose::AgentTransferK1,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity: unhex(k["transfer_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+                secret_scalar: zeroize::Zeroizing::new(unhex(k["transfer_key"]["privkey"].as_str().unwrap())),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                backup_export_metadata: BackupExportMetadata::default(),
+            }
+        }
+
+        /// A SignedTransfer reconstructed from the frozen `ordinary_tx_v1` golden (cross-references it).
+        fn golden_signed_transfer() -> SignedTransfer {
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            SignedTransfer {
+                signature: RecoverableSignature {
+                    r: arr::<32>(o["signature"]["r"].as_str().unwrap()),
+                    s: arr::<32>(o["signature"]["s"].as_str().unwrap()),
+                    recovery_id: o["signature"]["recovery_id"].as_u64().unwrap() as u8,
+                },
+                v: o["signature"]["v_eip155"].as_u64().unwrap(),
+                signing_hash: arr::<32>(o["signing_hash_keccak256"].as_str().unwrap()),
+                signed_rlp: unhex(o["signed_rlp"].as_str().unwrap()),
+                from: arr::<20>(o["recovered_from"].as_str().unwrap()),
+            }
+        }
+
+        fn resp_public_identity() -> Vec<u8> {
+            let id = public_identity_from_entry(&transfer_entry()).expect("derive identity");
+            encode_agent_response(&AgentResponse::PublicIdentity(id))
+        }
+        fn resp_sign_transfer() -> Vec<u8> {
+            encode_agent_response(&AgentResponse::SignTransfer(golden_signed_transfer()))
+        }
+        fn resp_sign_faucet_dispense() -> Vec<u8> {
+            encode_sign_faucet_dispense_response(golden_signed_transfer(), GENESIS_BLOB)
+        }
+        fn resp_generate_keys() -> Vec<u8> {
+            let id = public_identity_from_entry(&transfer_entry()).expect("derive identity");
+            let gk = GeneratedKey {
+                key_ref: id.key_ref,
+                pubkey_uncompressed: id.pubkey_uncompressed,
+                eth_address: id.eth_address,
+                tron_address: id.tron_address.clone(),
+                key_purpose: id.key_purpose,
+            };
+            encode_generate_keys_response(&[gk], GENESIS_BLOB)
+        }
+        fn resp_configure_treasury() -> Vec<u8> {
+            encode_configure_treasury_response(GENESIS_BLOB)
+        }
+
+        /// The 7 §10.9 AgentError codes → encoded body.
+        fn agent_errors() -> Vec<(u8, Vec<u8>)> {
+            [
+                AgentError::Malformed,
+                AgentError::WrongProfile,
+                AgentError::KeyPurposeMismatch,
+                AgentError::CapabilityRejected,
+                AgentError::CapExceeded,
+                AgentError::NotConfigured,
+                AgentError::SealFailed,
+            ]
+            .into_iter()
+            .map(|e| (e.code(), encode_agent_error(e)))
+            .collect()
+        }
+
+        /// (filename, bytes, top-level key-1 is bytes? [success] — for the decode-shape assert).
+        fn vectors() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                ("resp_configure_treasury_v1.bin", resp_configure_treasury()),
+                ("resp_generate_keys_v1.bin", resp_generate_keys()),
+                ("resp_public_identity_v1.bin", resp_public_identity()),
+                ("resp_sign_faucet_dispense_v1.bin", resp_sign_faucet_dispense()),
+                ("resp_sign_transfer_v1.bin", resp_sign_transfer()),
+            ]
+        }
+
+        #[test]
+        fn golden_response_bodies_are_byte_exact() {
+            let committed: &[(&str, &[u8])] = &[
+                ("resp_configure_treasury_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_configure_treasury_v1.bin")),
+                ("resp_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_generate_keys_v1.bin")),
+                ("resp_public_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin")),
+                ("resp_sign_faucet_dispense_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_sign_faucet_dispense_v1.bin")),
+                ("resp_sign_transfer_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_sign_transfer_v1.bin")),
+            ];
+            for (name, built) in vectors() {
+                let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(built.as_slice(), c, "{name} drifted; regen + re-mint .json in the same commit");
+            }
+        }
+
+        #[test]
+        fn golden_response_bodies_decode_to_expected_shape() {
+            // Every success body decodes to a CBOR map; the mutating ones carry the sealed blob at their
+            // documented key (GENERATE_KEYS key 2, SIGN_FAUCET_DISPENSE key 8, CONFIGURE_TREASURY key 1),
+            // and key 1 of every SUCCESS body is NOT a bare integer code (so decode_agent_error_code → None
+            // distinguishes success from a {1:code} error body).
+            let get = |b: &[u8], k: u64| -> Option<Value> {
+                match ciborium::de::from_reader::<Value, _>(b).unwrap() {
+                    Value::Map(m) => map_get(&m, k).cloned(),
+                    _ => None,
+                }
+            };
+            assert_eq!(get(&resp_configure_treasury(), 1), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "configure key1=blob");
+            assert_eq!(get(&resp_generate_keys(), 2), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "generate key2=blob");
+            assert_eq!(get(&resp_sign_faucet_dispense(), 8), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "faucet key8=blob");
+            for (name, bytes) in vectors() {
+                assert_eq!(decode_agent_error_code(&bytes), None, "{name} must be a SUCCESS body, not an error");
+            }
+            // The §10.9 error bodies, conversely, ARE decodable as {1:code,2:reason}.
+            for (code, body) in agent_errors() {
+                assert_eq!(decode_agent_error_code(&body), Some(code), "error body code {code:#x}");
+            }
+        }
+
+        #[test]
+        fn golden_response_sidecar_matches() {
+            let sidecar = include_str!("../testvectors/agent-gateway/response_bodies_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("response index is valid JSON");
+            assert_eq!(
+                v["responses"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra response entry"
+            );
+            for (name, bytes) in vectors() {
+                let e = &v["responses"][name];
+                assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
+                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
+            }
+            // The 7 error bodies, keyed by code hex.
+            for (code, body) in agent_errors() {
+                let e = &v["agent_errors"][format!("{code:#04x}")];
+                assert_eq!(e["body_hex"].as_str(), Some(hx(&body).as_str()), "error {code:#x} hex");
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_response_bodies::regen_golden_response_bodies -- --ignored --nocapture`.
+        #[test]
+        #[ignore]
+        fn regen_golden_response_bodies() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let mut responses = serde_json::Map::new();
+            for (name, bytes) in vectors() {
+                std::fs::write(format!("{dir}{name}"), &bytes).expect("write response .bin");
+                let mut e = serde_json::Map::new();
+                e.insert("blob_hex".into(), hx(&bytes).into());
+                e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
+                e.insert("blob_sha256".into(), hx(&Sha256::digest(&bytes)).into());
+                responses.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let mut errors = serde_json::Map::new();
+            for (code, body) in agent_errors() {
+                let mut e = serde_json::Map::new();
+                e.insert("body_hex".into(), hx(&body).into());
+                e.insert("body_len_bytes".into(), (body.len() as u64).into());
+                errors.insert(format!("{code:#04x}"), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#3 — byte-exact 0x40 response-body golden vectors. Minted from the real encoders over fixed inputs (ordinary_tx_v1 signed-tx fields, keys.json identity, the genesis sealed blob as the representative AEAD blob). The sealed blob is opaque; the vector pins the response SHAPE around it. TEST KEYS ONLY. Regen: cargo test --features agent-gateway golden_response_bodies::regen_golden_response_bodies -- --ignored --nocapture",
+                "sealed_blob_file": "agent_keystore_genesis_v2.sealed.bin",
+                "responses": serde_json::Value::Object(responses),
+                "agent_errors": serde_json::Value::Object(errors),
+            });
+            std::fs::write(format!("{dir}response_bodies_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
+                .expect("write response index");
+            eprintln!("wrote 5 response vectors + 7 error bodies + response_bodies_v1.json -> {dir}");
+        }
+    }
 }
