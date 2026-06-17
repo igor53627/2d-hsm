@@ -4692,6 +4692,7 @@ mod tests {
             let sidecar = include_str!("../testvectors/agent-gateway/cap_envelopes_v1.json");
             let v: serde_json::Value = serde_json::from_str(sidecar).expect("cap-envelope index is valid JSON");
             assert_eq!(v["command_domain"].as_str(), Some(COMMAND_DOMAIN), "index command_domain");
+            assert_eq!(v["agent_version"].as_u64(), Some(AGENT_GATEWAY_VERSION as u64), "index agent_version");
             assert_eq!(
                 v["vectors"].as_object().map(|o| o.len()),
                 Some(vectors().len()),

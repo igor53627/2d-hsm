@@ -1242,6 +1242,41 @@ mod tests {
         }
 
         #[test]
+        fn admin_and_recovery_lanes_accept_counter_1_independently() {
+            // The §10.6 counter lanes are keyed by (authority, env, scope_class, scope_target) and are
+            // INDEPENDENT: a counter-1 cap on one authority's lane is accepted even when the OTHER lane is
+            // already populated (highest 1). Drives the live `verify_capability` with a non-empty counter
+            // table to exercise that (the byte-exact acceptance test above only uses an empty table).
+            let admin = SigningKey::from_bytes(&[7u8; 32]);
+            let recovery = SigningKey::from_bytes(&[9u8; 32]);
+            let lane = |authority: [u8; 32], scope: &[u8]| CounterEntry {
+                authority,
+                environment_identifier: TEST_ENV.to_string(),
+                scope_class: 0,
+                scope_target: scope.to_vec(),
+                highest_accepted_counter: 1,
+            };
+            // Admin GENERATE_KEYS counter 1 accepted with a populated RECOVERY lane present.
+            let (_p, _f, admin_map) =
+                build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false);
+            let recovery_lane = lane(recovery.verifying_key().to_bytes(), SCOPE_CONFIGURE);
+            assert_eq!(
+                verify_capability(&admin_map, 1, RID_GENERATE, &test_config(), std::slice::from_ref(&recovery_lane)),
+                Ok(()),
+                "admin counter 1 accepted alongside a populated recovery lane",
+            );
+            // Symmetric: recovery RESET counter 1 accepted with a populated ADMIN lane present.
+            let (_p2, _f2, reset_map) =
+                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true);
+            let admin_lane = lane(admin.verifying_key().to_bytes(), SCOPE_GENERATE);
+            assert_eq!(
+                verify_capability(&reset_map, 6, RID_RESET, &test_config(), std::slice::from_ref(&admin_lane)),
+                Ok(()),
+                "recovery counter 1 accepted alongside a populated admin lane",
+            );
+        }
+
+        #[test]
         fn payload_binding_sub_op_asymmetry() {
             // GENERATE_KEYS binds keccak256(opcode ‖ request_id ‖ params) — NO sub_op byte; CONFIGURE folds
             // the sub_op as the 2nd preimage byte. Pin that the two derivations differ in that one byte by

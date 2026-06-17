@@ -76,8 +76,8 @@ keystore state (a stored key for `key_ref`, the sealed `chain_id`, the faucet al
 relevant preview feature; absent those, a live enclave returns the appropriate §10.9 error rather than a
 signed body (e.g. `0x42` KeyPurposeMismatch for an unknown/wrong-purpose key, or `0x45` NotConfigured for
 a preview-gated op). (NB `key_ref` here is the lab-smoke fixture's `[0x11;32]`, so it is *not* a universal
-"no such key" — what a given enclave returns depends on the installed keystore.) End-to-end response-body
-vectors land in the later TASK-22 response slices.
+"no such key" — what a given enclave returns depends on the installed keystore.) The end-to-end response
+bodies these requests would elicit are frozen separately in the **AC#3** subsection below.
 
 The **cap-bearing** envelopes (`req_generate_keys_v1.bin`, `req_configure_set_limits_v1.bin` +
 `cap_envelopes_v1.json`) carry a §10.5 capability at key 5 and NO key_ref. Each is byte-exact +
@@ -102,6 +102,13 @@ op 6 sub_op 0 (sub_op byte) — pinning the sub_op-in-binding. **Each full map i
 `verify_capability`** (admin `[7;32]` / recovery `[9;32]`), so a signer/encoder/authority-tier drift
 breaks CI. The per-sub-op **authority tier** matters: sub-ops 0..=2 are admin-signed; sub-op 3
 (`reset_lifetime_breaker`) is recovery-signed on the recovery authority's lane (see §10.7).
+
+The two CONFIGURE caps frozen here are **representative of both tiers**: `set_limits`(sub_op 0, admin)
+and `reset`(sub_op 3, recovery). Sub-ops 1 (`refill_budget`) and 2 (`raise_lifetime_breaker`) are
+admin-tier with the **identical preimage shape** as sub_op 0 — they differ only in the `treasury_sub_op`
+integer (cap key 3 / the binding's sub_op byte) and the per-sub-op params; a consumer derives them by
+substituting the sub_op value. (A trivial follow-up can freeze them explicitly if 2d wants per-sub-op
+vectors.)
 
 ### AC#3 — response bodies (`resp_*_v1.bin` + `response_bodies_v1.json`)
 
