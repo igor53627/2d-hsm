@@ -12,16 +12,19 @@
 //! release-banned (`agent-contract-server`); the production path is the AF_VSOCK + SNP
 //! `twod-hsm-agent-gateway` bin.
 //!
-//! **Downstream-2d notes.** (1) *Frozen-vector replayability is per-opcode.* `PUBLIC_IDENTITY` replays
-//! byte-exact (request → the frozen `resp_public_identity_v1.bin`); the PRIVILEGED `GENERATE_KEYS` /
-//! `CONFIGURE_TREASURY` frozen REQUESTS replay for SUCCESS (their admin-signed caps verify against the
-//! reference config — they carry no `key_ref`). The `SIGN_FAUCET_DISPENSE` frozen request is a RUNTIME op
-//! bound to the TASK-22 filler `key_ref=[0x11;32]` (and filler `from`/`to`/amounts), which the reference
-//! keystore does not hold — so replaying its bytes yields a `0x42`, not success; it is a wire-ENCODING
-//! vector. To drive the faucet lane, build a dispense against the reference treasury key (see the
-//! `sign_faucet_dispense_round_trip_*` test). (2) *Serial serving.* `run_contract_server` serves one
-//! connection at a time (`UnixListener::incoming`); a client holding a connection monopolizes the slot —
-//! run one contract suite per server instance (or one server per concurrent suite).
+//! **Downstream-2d notes.** (1) *Frozen-vector replayability is per-opcode.* Only the PRIVILEGED
+//! `GENERATE_KEYS` / `CONFIGURE_TREASURY` frozen REQUESTS replay for SUCCESS — they carry NO `key_ref`,
+//! only an admin-signed cap that verifies against the reference config (round-trip-proven by the tests
+//! below). Every NON-privileged frozen request (`PUBLIC_IDENTITY` / `PROVE_IDENTITY` / `SIGN_TRANSFER` /
+//! `SIGN_FAUCET_DISPENSE`) carries the TASK-22 filler `key_ref=[0x11;32]`, which the reference keystore
+//! does NOT hold (its keys are `[0x33;32]` transfer / `[0x44;32]` treasury) — so replaying THOSE bytes
+//! returns `0x42`, not success; they are wire-ENCODING vectors. The byte-exact frozen
+//! `resp_public_identity_v1.bin` is reproduced by a SERVER-BUILT `PUBLIC_IDENTITY` request for `[0x33;32]`
+//! (`REFERENCE_TRANSFER_KEY_REF`) — NOT by replaying the frozen request — as
+//! `uds_pair_public_identity_round_trip` does; likewise the faucet lane is driven by a server-built
+//! dispense at the reference treasury key (`sign_faucet_dispense_round_trip_*`). (2) *Serial serving.*
+//! `run_contract_server` serves one connection at a time (`UnixListener::incoming`); a client holding a
+//! connection monopolizes the slot — run one contract suite per server instance (or one server per suite).
 
 use crate::enclave_serve::{configure_unix_session_timeouts, serve_framed_pump, SESSION_IDLE_TIMEOUT};
 use crate::reference_keystore::install_reference_agent_keystore;
@@ -336,15 +339,14 @@ mod tests {
     /// SIGN_FAUCET_DISPENSE round-trip — the EpochOnly commit class (vs the Structural GENERATE/CONFIGURE
     /// above), exercising the OTHER `advance_commit_epoch` arm through the same mock channel.
     ///
-    /// REPLAYABILITY ASYMMETRY (the frozen faucet REQUEST is encoding-only, not replay-for-success): the
-    /// privileged GENERATE_KEYS/CONFIGURE frozen requests carry an admin-signed cap and NO `key_ref`, so
-    /// they replay against the reference config for SUCCESS (see the two tests above). The frozen faucet
-    /// request is a RUNTIME op bound to `key_ref=[0x11;32]` with TASK-22 filler `from`/`to`/amounts — none
-    /// of which match the reference keystore (treasury at `[0x44;32]`, keys.json Anvil addresses) — so
-    /// replaying its bytes against this server yields a 0x42, NOT success; it is a wire-ENCODING vector, not
-    /// a live-replay vector (only `resp_public_identity_v1.bin` is byte-replayable). To exercise the faucet
-    /// LANE this builds a dispense against the reference treasury key directly: `from` = its derived eth
-    /// address, `to` = the reference transfer key's address (the only stored §2 known recipient), within the
+    /// REPLAYABILITY (the frozen faucet REQUEST is encoding-only, not replay-for-success): it is a RUNTIME
+    /// op bound to `key_ref=[0x11;32]`, which the reference keystore does NOT hold (treasury is at
+    /// `[0x44;32]`) — so the handler's key-lookup rejects it `0x42` BEFORE it ever reaches the
+    /// `from`/`to`/amount checks (the rejection is the absent key_ref, NOT the payload values). The
+    /// privileged GENERATE_KEYS/CONFIGURE frozen requests, by contrast, carry an admin cap and NO `key_ref`,
+    /// so they replay against the reference config for SUCCESS (see the two tests above). To exercise the
+    /// faucet LANE this builds a dispense against the reference treasury key directly: `from` = its derived
+    /// eth address, `to` = the reference transfer key's address (the only stored §2 known recipient), within the
     /// pre-funded reference caps (per_dispense 1e6 / gas 21000 / fee 1e9 / budget 1e7 — worst_case
     /// = 1000 + 21000·1 = 22000 ≤ budget). Success body is `{1: signed_rlp, …, 8: sealed_blob}`.
     #[cfg(feature = "agent-sign-faucet-preview")]
