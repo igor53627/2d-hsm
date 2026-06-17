@@ -258,6 +258,14 @@ name = "twod-hsm-agent-faucet-smoke-client"
 path = "src/bin/twod_hsm_agent_faucet_smoke_client.rs"
 required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke", "agent-keygen-exec-preview", "agent-configure-treasury-preview", "agent-sign-faucet-preview"]
 
+# TASK-23: deviceless cross-platform 0x40 contract-test server over AF_UNIX (TEST/DEV ONLY; the
+# agent-contract-server feature is release-banned in lib.rs). PUBLIC_IDENTITY needs no preview; add the
+# agent-*-preview features to reach the signing/capability/configure contract lanes.
+[[bin]]
+name = "twod-hsm-agent-contract-server"
+path = "src/bin/agent_contract_server.rs"
+required-features = ["agent-gateway", "agent-contract-server"]
+
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 
 [[example]]

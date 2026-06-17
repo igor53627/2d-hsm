@@ -161,6 +161,9 @@ pub mod enclave_serve;
 // contract-server bin or tests, and only when `agent-gateway` provides the keystore types.
 #[cfg(all(feature = "agent-gateway", any(test, feature = "agent-contract-server")))]
 pub mod reference_keystore;
+// Deviceless cross-platform 0x40 serve loop for the contract-test server (TASK-23). Same gating.
+#[cfg(all(feature = "agent-gateway", any(test, feature = "agent-contract-server")))]
+pub mod contract_server;
 #[cfg(feature = "ml-dsa-65")]
 pub mod platform_provisioning_boot;
 mod uds_listen;
