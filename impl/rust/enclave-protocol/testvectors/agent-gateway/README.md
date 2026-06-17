@@ -68,6 +68,13 @@ the `request_envelopes_v1.json` index couples each blob's `sha256`/`len` + decod
 | `req_sign_transfer_v1.bin` | 4 SIGN_TRANSFER | {1,2,3,4,6,7} (8-field EIP-155 payload) |
 | `req_sign_faucet_dispense_v1.bin` | 5 SIGN_FAUCET_DISPENSE | {1,2,3,4,6,7} (8-field EIP-155 payload) |
 
+These are **wire-shape (decode) vectors**: each is proven to be accepted by the strict-canonical
+envelope decoder and to carry the documented field shape (incl. the 8-field EIP-155 payload, whose
+key layout matches the live `handle_sign_transfer` / `handle_sign_faucet_dispense` decoders). They are
+**not dispatch-success fixtures** — `key_ref` is a placeholder `[0x11;32]` that matches no stored key,
+so a live enclave would answer `0x42`/NotConfigured, not a signed body. End-to-end response-body
+vectors land in the later TASK-22 response slices.
+
 The cap-bearing envelopes (GENERATE_KEYS(1) / CONFIGURE_TREASURY(6)) + the §10.5 capability
 preimage/map, the response bodies, and the negative (rejection) vectors land in subsequent TASK-22
 slices. Regen: `cargo test --features agent-gateway golden_request_envelopes::regen_golden_request_envelopes -- --ignored --nocapture`,

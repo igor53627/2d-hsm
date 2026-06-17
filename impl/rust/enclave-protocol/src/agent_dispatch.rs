@@ -4280,6 +4280,9 @@ mod tests {
             s
         }
         /// Minimal big-endian bytes of a u64 (the canonical u256 wire form for values that fit u64).
+        /// Mirrors the per-mod test convention; the production source of truth for "minimal-BE" is
+        /// `crate::agent_cbor::as_u256_minimal_be` — `golden_eip155_payload_is_production_minimal_be`
+        /// couples this output to it. (Promoting the 4+ copies to one shared helper = a TASK-20 cleanup.)
         fn min_be(x: u64) -> Vec<u8> {
             let b = x.to_be_bytes();
             let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
@@ -4430,6 +4433,34 @@ mod tests {
                 assert_eq!(e["opcode"].as_u64(), Some(opcode as u64), "{name} opcode");
                 assert_eq!(e["request_id_hex"].as_str(), Some(hex(request_id).as_str()), "{name} request_id");
                 assert_eq!(e["has_payload"].as_bool(), Some(has_payload), "{name} has_payload");
+                // Couple the full bytes (blob_hex) + key_ref_hex too — the README advertises blob_hex as a
+                // decode source, so a hand-edit/merge that corrupts ONLY blob_hex must fail CI.
+                assert_eq!(e["blob_hex"].as_str(), Some(hex(&bytes).as_str()), "{name} blob_hex");
+                assert_eq!(e["key_ref_hex"].as_str(), Some(hex(&GOLDEN_KEY_REF).as_str()), "{name} key_ref_hex");
+            }
+        }
+
+        #[test]
+        fn golden_eip155_payload_is_production_minimal_be() {
+            // Couple this mod's local `min_be` to the PRODUCTION canonical u256 wire form: the value (key 4)
+            // and gas_price (key 7) of the frozen EIP-155 payload must be accepted by the real
+            // `as_u256_minimal_be` (which REJECTS non-minimal / over-width). So a `min_be` bug that froze a
+            // non-canonical vector (e.g. a leading zero) is caught here, not silently shipped to 2d.
+            let payload = eip155_payload();
+            let m = match payload {
+                Value::Map(m) => m,
+                _ => panic!("payload is a map"),
+            };
+            for key in [4u64, 7u64] {
+                let v = m
+                    .iter()
+                    .find(|(kk, _)| matches!(kk, Value::Integer(i) if u64::try_from(*i).ok() == Some(key)))
+                    .map(|(_, vv)| vv)
+                    .unwrap_or_else(|| panic!("payload key {key} present"));
+                assert!(
+                    crate::agent_cbor::as_u256_minimal_be(v).is_some(),
+                    "payload key {key} is not production-canonical minimal-BE",
+                );
             }
         }
 
@@ -4443,14 +4474,17 @@ mod tests {
             let mut index = serde_json::Map::new();
             for (name, bytes, opcode, request_id, has_payload) in vectors() {
                 std::fs::write(format!("{dir}{name}"), &bytes).expect("write envelope .bin");
+                // Insert in ALPHABETICAL key order so the serialized bytes are stable regardless of whether
+                // serde_json sorts keys (default BTreeMap) or preserves insertion order (preserve_order, if
+                // a future workspace dep ever unifies it on) — no spurious regen churn either way.
                 let mut e = serde_json::Map::new();
-                e.insert("opcode".into(), (opcode as u64).into());
-                e.insert("request_id_hex".into(), hex(request_id).into());
-                e.insert("key_ref_hex".into(), hex(&GOLDEN_KEY_REF).into());
-                e.insert("has_payload".into(), has_payload.into());
+                e.insert("blob_hex".into(), hex(&bytes).into());
                 e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
                 e.insert("blob_sha256".into(), hex(&Sha256::digest(&bytes)).into());
-                e.insert("blob_hex".into(), hex(&bytes).into());
+                e.insert("has_payload".into(), has_payload.into());
+                e.insert("key_ref_hex".into(), hex(&GOLDEN_KEY_REF).into());
+                e.insert("opcode".into(), (opcode as u64).into());
+                e.insert("request_id_hex".into(), hex(request_id).into());
                 index.insert(name.into(), serde_json::Value::Object(e));
             }
             let doc = serde_json::json!({
