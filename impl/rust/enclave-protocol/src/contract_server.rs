@@ -44,11 +44,15 @@ pub fn run_contract_server(
 ) -> Result<std::convert::Infallible, ProtocolError> {
     use std::io::Write as _;
     // Defense-in-depth: this is a pub fn whose `private_dir` is handed to bind_unix_listener, which may
-    // chmod it 0700. Refuse a root ("/") or empty private_dir so a misuse can never tighten the root
-    // filesystem (the bin always passes a fixed dedicated dir; this guards other callers).
-    if private_dir.as_os_str().is_empty() || private_dir == Path::new("/") {
+    // chmod it 0700 (following symlinks). Refuse a private_dir that resolves to the root filesystem —
+    // literally `/`/empty, OR (if it already exists) a symlink whose target canonicalizes to `/` — so a
+    // misuse can never tighten the root fs. A not-yet-created dir can't be canonicalized (bind creates it
+    // 0700); the bin passes a fixed real subdir. TOCTOU against a hostile local caller of this
+    // release-banned, test-only fn is out of scope (the trust boundary is local file permissions).
+    let resolves_to_root = private_dir.canonicalize().map(|c| c == Path::new("/")).unwrap_or(false);
+    if private_dir.as_os_str().is_empty() || private_dir == Path::new("/") || resolves_to_root {
         return Err(ProtocolError::WireProtocol(
-            "contract server: private_dir must be a dedicated directory, not empty or the root \"/\"",
+            "contract server: private_dir must be a dedicated directory, not empty / the root \"/\" / a symlink to it",
         ));
     }
     if !install_reference_agent_keystore() {
