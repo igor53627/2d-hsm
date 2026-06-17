@@ -5037,15 +5037,18 @@ mod tests {
         }
 
         /// (filename, bytes, expected code, short cause). The code is asserted in the *_codes tests below.
-        fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static str)> {
+        /// (filename, bytes, expected code, cause, PRECONDITION). The precondition is the enclave/dispatch
+        /// state a consumer must reproduce to observe `expected_code` (e.g. the anti-rollback binding state
+        /// for the gated bands) — without it, a state-dependent negative would yield a DIFFERENT code.
+        fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static str, &'static str)> {
             vec![
-                ("neg_cap_counter_gap_v1.bin", neg_cap_counter_gap(), 0x43, "non-contiguous capability counter"),
-                ("neg_cap_wrong_signature_v1.bin", neg_cap_wrong_signature(), 0x43, "capability signature verify failed"),
-                ("neg_generate_keys_not_configured_v1.bin", neg_generate_keys_not_configured(), 0x45, "anti-rollback binding not configured"),
-                ("neg_key_not_found_v1.bin", neg_key_not_found(), 0x42, "key_ref not found / wrong purpose"),
-                ("neg_runtime_op_with_capability_v1.bin", neg_runtime_op_with_capability(), 0x40, "runtime opcode carrying a capability"),
-                ("neg_unknown_envelope_key_v1.bin", neg_unknown_envelope_key(), 0x40, "unknown envelope key (strict 1..=7)"),
-                ("neg_wrong_profile_v1.bin", neg_wrong_profile_env(), 0x41, "agent opcode on the producer profile"),
+                ("neg_cap_counter_gap_v1.bin", neg_cap_counter_gap(), 0x43, "non-contiguous capability counter", "anti-rollback binding configured (so dispatch reaches cap verify, not the 0x45 gate); keystore admin authority = the cap signer, empty counter table"),
+                ("neg_cap_wrong_signature_v1.bin", neg_cap_wrong_signature(), 0x43, "capability signature verify failed", "anti-rollback binding configured (so dispatch reaches cap verify, not the 0x45 gate); keystore admin authority = the EXPECTED admin key"),
+                ("neg_generate_keys_not_configured_v1.bin", neg_generate_keys_not_configured(), 0x45, "anti-rollback binding not configured", "anti-rollback binding ABSENT (the fund-custody gate fires before cap routing)"),
+                ("neg_key_not_found_v1.bin", neg_key_not_found(), 0x42, "key_ref not found / wrong purpose", "keystore has no entry for the requested key_ref"),
+                ("neg_runtime_op_with_capability_v1.bin", neg_runtime_op_with_capability(), 0x40, "runtime opcode carrying a capability", "none (rejected at decode/allow-list, before any state)"),
+                ("neg_unknown_envelope_key_v1.bin", neg_unknown_envelope_key(), 0x40, "unknown envelope key (strict 1..=7)", "none (rejected at decode, before any state)"),
+                ("neg_wrong_profile_v1.bin", neg_wrong_profile_env(), 0x41, "agent opcode on the producer profile", "dispatched on Profile::Producer (non-agent-gateway)"),
             ]
         }
 
@@ -5119,10 +5122,11 @@ mod tests {
                 Some(vectors().len()),
                 "index has a stale/extra negative entry"
             );
-            for (name, bytes, code, cause) in vectors() {
+            for (name, bytes, code, cause, precondition) in vectors() {
                 let e = &v["negatives"][name];
                 assert_eq!(e["expected_code"].as_u64(), Some(code as u64), "{name} code");
                 assert_eq!(e["cause"].as_str(), Some(cause), "{name} cause");
+                assert_eq!(e["precondition"].as_str(), Some(precondition), "{name} precondition");
                 assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
                 assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
                 assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
@@ -5135,7 +5139,7 @@ mod tests {
         fn regen_golden_negative_vectors() {
             let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
             let mut negatives = serde_json::Map::new();
-            for (name, bytes, code, cause) in vectors() {
+            for (name, bytes, code, cause, precondition) in vectors() {
                 std::fs::write(format!("{dir}{name}"), &bytes).expect("write negative .bin");
                 let mut e = serde_json::Map::new();
                 e.insert("blob_hex".into(), hx(&bytes).into());
@@ -5143,6 +5147,7 @@ mod tests {
                 e.insert("blob_sha256".into(), hx(&Sha256::digest(&bytes)).into());
                 e.insert("cause".into(), cause.into());
                 e.insert("expected_code".into(), (code as u64).into());
+                e.insert("precondition".into(), precondition.into());
                 negatives.insert(name.into(), serde_json::Value::Object(e));
             }
             let doc = serde_json::json!({
