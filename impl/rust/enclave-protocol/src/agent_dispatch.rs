@@ -4662,11 +4662,16 @@ mod tests {
                         crate::agent_capability::payload_binding(1, None, request_id, &generate_keys_canonical_params(purpose, count))
                     }
                     6 => {
-                        let sub_op = map_get(&payload, 1).and_then(as_u64).unwrap() as u8;
-                        let field2 = match map_get(&payload, 2) {
-                            Some(Value::Bytes(b)) => b.clone(),
-                            _ => panic!("{name}: payload key 2 (field2) not bytes"),
-                        };
+                        // Parse the binding-relevant fields with the SAME strictness as the live handler:
+                        // sub_op via u8::try_from (no `as u8` truncation), field2 via the production
+                        // `as_u256_minimal_be` (rejects non-minimal/over-width), gas fields only present for
+                        // set_limits(0) — so a malformed regenerated payload can't pass a looser recompute.
+                        let sub_op = u8::try_from(map_get(&payload, 1).and_then(as_u64).unwrap())
+                            .unwrap_or_else(|_| panic!("{name}: sub_op fits u8"));
+                        let field2 = crate::agent_cbor::as_u256_minimal_be(
+                            map_get(&payload, 2).unwrap_or_else(|| panic!("{name}: payload key 2")),
+                        )
+                        .unwrap_or_else(|| panic!("{name}: field2 is canonical minimal-BE u256"));
                         let set_limits = match (map_get(&payload, 3).and_then(as_u64), map_get(&payload, 4).and_then(as_u64)) {
                             (Some(g), Some(f)) => Some((g, f)),
                             _ => None,
