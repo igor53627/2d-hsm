@@ -1256,23 +1256,28 @@ mod tests {
                 scope_target: scope.to_vec(),
                 highest_accepted_counter: 1,
             };
-            // Admin GENERATE_KEYS counter 1 accepted with a populated RECOVERY lane present.
+            // Isolate the AUTHORITY dimension: the populated "other lane" shares the SAME
+            // env/scope_class/scope_target as the cap under test and differs ONLY in authority. So the
+            // cap's counter 1 is accepted iff `authority` is part of the lane key — a verifier that keyed
+            // by (env, scope_class, scope_target) but ignored authority would see that scope already at
+            // highest 1, expect 2, and REJECT counter 1 (this test would then fail, catching the regression).
+            // Admin GENERATE_KEYS counter 1, with a RECOVERY lane on the SAME scope already at highest 1.
             let (_p, _f, admin_map) =
                 build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false);
-            let recovery_lane = lane(recovery.verifying_key().to_bytes(), SCOPE_CONFIGURE);
+            let recovery_same_scope = lane(recovery.verifying_key().to_bytes(), SCOPE_GENERATE);
             assert_eq!(
-                verify_capability(&admin_map, 1, RID_GENERATE, &test_config(), std::slice::from_ref(&recovery_lane)),
+                verify_capability(&admin_map, 1, RID_GENERATE, &test_config(), std::slice::from_ref(&recovery_same_scope)),
                 Ok(()),
-                "admin counter 1 accepted alongside a populated recovery lane",
+                "admin counter 1 accepted despite a recovery lane on the SAME scope (authority is in the lane key)",
             );
-            // Symmetric: recovery RESET counter 1 accepted with a populated ADMIN lane present.
+            // Symmetric: recovery RESET counter 1, with an ADMIN lane on the SAME scope already at highest 1.
             let (_p2, _f2, reset_map) =
                 build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true);
-            let admin_lane = lane(admin.verifying_key().to_bytes(), SCOPE_GENERATE);
+            let admin_same_scope = lane(admin.verifying_key().to_bytes(), SCOPE_CONFIGURE);
             assert_eq!(
-                verify_capability(&reset_map, 6, RID_RESET, &test_config(), std::slice::from_ref(&admin_lane)),
+                verify_capability(&reset_map, 6, RID_RESET, &test_config(), std::slice::from_ref(&admin_same_scope)),
                 Ok(()),
-                "recovery counter 1 accepted alongside a populated admin lane",
+                "recovery counter 1 accepted despite an admin lane on the SAME scope (authority is in the lane key)",
             );
         }
 
