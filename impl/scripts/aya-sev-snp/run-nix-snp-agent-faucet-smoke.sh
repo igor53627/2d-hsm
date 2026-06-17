@@ -53,11 +53,12 @@ RELAY_PORT="${RELAY_PORT:-5001}"
 ANCHOR_LISTEN="${ANCHOR_LISTEN:-127.0.0.1:5003}"
 # Boot-to-Ready budget (cached image build + boot + possible early crash-loop cycles).
 BOOT_TIMEOUT_SEC="${BOOT_TIMEOUT_SEC:-300}"
-# Client budget: two phases, each a FRESH connection with the client's own 60 s per-connection read
-# timeout (twod_hsm_agent_faucet_smoke_client.rs) + a host-relayed commit leg. Must comfortably exceed
-# 2×60 s so a legitimately-slow commit trips the CLIENT's clean per-phase FAIL, not this outer `timeout`
-# (which would surface only an ambiguous RC 124). 240 s = ~2× margin. (Observed runs finish in seconds.)
-CLIENT_TIMEOUT_SEC="${CLIENT_TIMEOUT_SEC:-240}"
+# Client budget: FIVE phases (F1-F4 each a FRESH connection with the client's own 60 s per-connection
+# read timeout (twod_hsm_agent_faucet_smoke_client.rs) + a host-relayed commit leg; F5 is a fast reject).
+# Worst case is the FOUR committing phases = 4×60 s = 240 s, so this outer `timeout` must comfortably
+# EXCEED that — else a legitimately-slow run trips this outer `timeout` (ambiguous RC 124) instead of the
+# CLIENT's clean per-phase FAIL. 600 s = ~2.5× the 4×60 s worst case. (Observed runs finish in seconds.)
+CLIENT_TIMEOUT_SEC="${CLIENT_TIMEOUT_SEC:-600}"
 
 if [[ "$SEV_MODE" != "snp" ]]; then
   echo "[skip] SEV_MODE=$SEV_MODE: the faucet write-path smoke is the SNP acceptance run." >&2
@@ -191,8 +192,8 @@ echo "      R2 boot-to-Ready OK (handshake forwarded, signed, Ready before serve
 # `|| true` (NOT `|| echo 0`): `grep -c` already prints `0` and exits non-zero on no-match — chaining
 # `echo 0` would yield the two-line value "0\n0" and break the later `(( ))` compare (a latent bug the
 # R2 gate masks today since both counts are already ≥1). `|| true` keeps grep's own `0`.
-ANCHOR_SIGNS_PRE="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null || true)"
-RELAY_PUMPS_PRE="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null || true)"
+ANCHOR_SIGNS_PRE="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null)" || ANCHOR_SIGNS_PRE=0
+RELAY_PUMPS_PRE="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null)" || RELAY_PUMPS_PRE=0
 
 # R3: the write-path client phases (fresh connection per phase; each commits via the relay+anchor).
 set +e
@@ -230,8 +231,8 @@ grep -a 'twod-hsm-agent-faucet-smoke: PHASE ' "$CLIENT_LOG" | sed 's/^/        /
 # blocking (the in-band gate dominates). Inherited from the keygen 6-7b-ii belt (TASK-20 residual).
 R3_WIRE_OK=0
 for _ in $(seq 1 20); do
-  ANCHOR_SIGNS_NOW="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null || true)"
-  RELAY_PUMPS_NOW="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null || true)"
+  ANCHOR_SIGNS_NOW="$(grep -ac 'twod-hsm-lab-anchor: signed response' "$ANCHOR_LOG" 2>/dev/null)" || ANCHOR_SIGNS_NOW=0
+  RELAY_PUMPS_NOW="$(grep -ac 'host-anchor-relay: pump ok' "$RELAY_LOG" 2>/dev/null)" || RELAY_PUMPS_NOW=0
   if (( ANCHOR_SIGNS_NOW > ANCHOR_SIGNS_PRE && RELAY_PUMPS_NOW > RELAY_PUMPS_PRE )); then
     R3_WIRE_OK=1; break
   fi
