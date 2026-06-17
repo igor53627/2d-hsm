@@ -25,8 +25,8 @@ Downstream 2d (Chain.AgentGateway.SignerProtocol, TASK-132.5.2 slices 2/3) canno
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 Frozen byte-exact golden vector for the 0x40 request ENVELOPE (canonical CBOR int-key map keys 1..7: agent_version, opcode, command_domain, request_id, capability, key_ref, payload) under testvectors/agent-gateway/
-- [ ] #2 Frozen byte-exact golden vector for the §10.5 CAPABILITY signed preimage (CAP_DOMAIN || canonical-CBOR(keys 1..12)) and the full capability map (keys 1..13)
-- [ ] #3 Frozen byte-exact golden vectors for response bodies: SIGN_TRANSFER (7-key), SIGN_FAUCET_DISPENSE (8-key, incl. sealed_keystore_blob), PUBLIC_IDENTITY (6-key), and the §10.9 AgentError body {1:code,2:reason}
+- [ ] #2 Frozen byte-exact golden vector for the §10.5 CAPABILITY signed preimage (CAP_DOMAIN || canonical-CBOR(keys 1..12)) and the full capability map (keys 1..13), INCLUDING the `treasury_sub_op` contribution to the preimage/payload_binding for a CONFIGURE_TREASURY capability (sub_op-bound — distinct preimage per sub_op 0..=3)
+- [ ] #3 Frozen byte-exact golden vectors for response bodies: SIGN_TRANSFER (7-key), SIGN_FAUCET_DISPENSE (8-key, incl. sealed_keystore_blob), PUBLIC_IDENTITY (6-key), CONFIGURE_TREASURY ({1: sealed_keystore_blob}), and the §10.9 AgentError body {1:code,2:reason}
 - [ ] #4 Negative 0x40 vectors for AC#7-class TEE-rejection assertions (wrong profile/purpose, non-contiguous counter, bad payload_binding)
 - [ ] #5 Wire-format spec promoted past 'Draft v0.2' for the vectored messages, or the vectors README states the exact spec section + commit each vector is frozen against
 <!-- AC:END -->

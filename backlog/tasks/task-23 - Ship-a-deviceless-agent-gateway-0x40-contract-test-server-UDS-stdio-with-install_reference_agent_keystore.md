@@ -28,4 +28,5 @@ Downstream 2d (TASK-132.5.2 slice 4 live identity, slice 2 privileged opcodes, A
 - [ ] #2 An install_reference_agent_keystore helper provisions a reference agent keystore (transfer key(s) + faucet treasury key) so PUBLIC_IDENTITY/PROVE_IDENTITY return real identities instead of 0x41/empty-store
 - [ ] #3 The server can be driven by the downstream 2d AF_UNIX Transport for a live PUBLIC_IDENTITY 0x40 round-trip (unblocks 2d TASK-179); signing/capability paths reachable behind the existing preview features for slice-2 contract tests
 - [ ] #4 Documented invocation (how 2d CI starts it) and its trust boundary vs the production AF_VSOCK/SNP serve path, so it is never mistaken for a production endpoint
+- [ ] #5 The contract-test server is debug/test-only: when the preview-only signing/capability/configure paths are enabled it is NEVER built or promoted as a release artifact (release-banned the same way as the preview features it exposes — a release build with these paths must fail to compile / not ship the binary)
 <!-- AC:END -->

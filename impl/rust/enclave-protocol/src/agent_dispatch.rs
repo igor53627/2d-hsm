@@ -1146,8 +1146,10 @@ fn handle_configure_treasury(
         })?;
 
     // Monotonic config_version bump (EVERY sub-op): a SEPARATE checked bump from advance_commit_epoch.
-    // Overflow ⇒ 0x46 (never wrap — a wrapped version would let a loosened config be re-applied via
-    // rollback).
+    // Overflow ⇒ 0x46 (never wrap — `config_version` is a strictly-monotone audit/version stamp, NOT
+    // itself a rollback control; wrapping would corrupt the audit trail / break monotonicity. The
+    // anti-rollback fence is the Structural `freshness_epoch`+`structural_version` bump below, which
+    // every CONFIGURE sub-op rides.)
     candidate.advance_treasury_config_version().map_err(|_| AgentError::SealFailed)?;
 
     // Anti-rollback commit-epoch bump from the SUB-OP-level classifier. ALL FOUR sub-ops are Structural
