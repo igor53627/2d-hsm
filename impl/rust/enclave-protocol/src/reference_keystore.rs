@@ -51,7 +51,9 @@ pub const REFERENCE_TREASURY_KEY_REF: [u8; 32] = [0x44; 32];
 // frozen `cap_full_*` / `req_generate_keys` / `req_configure_*` vectors VERIFY against this reference
 // keystore (the mutating-op contract lane, wired in the Slice-3 follow-up). The anchor seed is what a
 // later mock commit channel signs acks with, against `anchor_root`. `pub(crate)`-visible via the body.
-const REFERENCE_ANCHOR_SEED: [u8; 32] = [0x42; 32];
+/// The anchor signing seed — `anchor_root` = its Ed25519 verifying key. `pub(crate)` so the contract
+/// server's mock commit channel (Slice 3) signs acks with the SAME key the enclave verifies against.
+pub(crate) const REFERENCE_ANCHOR_SEED: [u8; 32] = [0x42; 32];
 const REFERENCE_ADMIN_SEED: [u8; 32] = [7u8; 32];
 const REFERENCE_RECOVERY_SEED: [u8; 32] = [9u8; 32];
 
