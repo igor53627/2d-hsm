@@ -43,6 +43,14 @@ pub fn run_contract_server(
     private_dir: &Path,
 ) -> Result<std::convert::Infallible, ProtocolError> {
     use std::io::Write as _;
+    // Defense-in-depth: this is a pub fn whose `private_dir` is handed to bind_unix_listener, which may
+    // chmod it 0700. Refuse a root ("/") or empty private_dir so a misuse can never tighten the root
+    // filesystem (the bin always passes a fixed dedicated dir; this guards other callers).
+    if private_dir.as_os_str().is_empty() || private_dir == Path::new("/") {
+        return Err(ProtocolError::WireProtocol(
+            "contract server: private_dir must be a dedicated directory, not empty or the root \"/\"",
+        ));
+    }
     if !install_reference_agent_keystore() {
         return Err(ProtocolError::WireProtocol(
             "contract server: reference keystore failed to install (validate/cap)",
