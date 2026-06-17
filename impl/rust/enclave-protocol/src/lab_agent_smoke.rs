@@ -1062,6 +1062,459 @@ where
     true
 }
 
+// ---------------------------------------------------------------------------------------------
+// TASK-15 combined FAUCET write-path smoke (15-3c / 15-6): the end-to-end fund-custody flow that only
+// became reachable once SIGN_FAUCET_DISPENSE (15-3b) AND CONFIGURE_TREASURY (15-4) both landed. Needs
+// ALL THREE preview gates: keygen-exec (mint the treasury key), configure-treasury (set caps + a
+// budget), sign-faucet (the dispense). The runtime mint+configure means NO throwaway fixture — the
+// production flow exactly. Recipient = the SEEDED transfer key (SMOKE_KEY_REF, derived from
+// SMOKE_SECRET_SCALAR), already in `smoke_body()`; only the treasury key is minted at runtime.
+// ---------------------------------------------------------------------------------------------
+
+/// CONFIGURE_TREASURY(6) / SIGN_FAUCET_DISPENSE(5) opcodes — the dispatch enum is the authority.
+#[cfg(all(
+    feature = "agent-keygen-exec-preview",
+    feature = "agent-configure-treasury-preview",
+    feature = "agent-sign-faucet-preview"
+))]
+mod faucet {
+    use super::*;
+    use ciborium::value::Value;
+    use ed25519_dalek::SigningKey;
+
+    pub(super) const OPCODE_CONFIGURE_TREASURY: u8 = 6;
+    pub(super) const OPCODE_SIGN_FAUCET_DISPENSE: u8 = 5;
+    pub(super) const FAUCET_TREASURY_PURPOSE: u64 = 2; // AgentFaucetTreasuryK1
+    /// Per-`command_class` counter lanes (each `scope_target` is its own contiguous counter; see the
+    /// host-integration contract §AC#18). The treasury keygen, the transfer recipient already seeded,
+    /// and the two CONFIGURE sub-ops each sit in their own lane — so every cap below uses counter 1
+    /// EXCEPT refill_budget (counter 2, same lane as set_limits).
+    pub(super) const GENFAUCET_SCOPE_TARGET: &[u8] = b"smoke-generate-faucet";
+    pub(super) const CONFIGURE_SCOPE_TARGET: &[u8] = b"smoke-configure-treasury";
+    // Caps set by set_limits (≥ the dispense values) + the refilled budget (≫ one worst-case).
+    pub(super) const PER_DISPENSE_MAX: u64 = 1_000_000;
+    pub(super) const MAX_GAS_LIMIT: u64 = 21_000;
+    pub(super) const MAX_FEE_RATE: u64 = 1_000_000_000;
+    pub(super) const BUDGET: u64 = 10_000_000;
+    // The dispense (within the caps): worst_case = amount + gas_limit*gas_price = 1000 + 21000*100.
+    pub(super) const DISPENSE_AMOUNT: u64 = 1_000;
+    pub(super) const DISPENSE_GAS_LIMIT: u64 = 21_000;
+    pub(super) const DISPENSE_GAS_PRICE: u64 = 100;
+    pub(super) fn worst_case() -> u64 {
+        DISPENSE_AMOUNT + DISPENSE_GAS_LIMIT * DISPENSE_GAS_PRICE
+    }
+    /// Minimal big-endian bytes of a u64 (the canonical u256 wire form for u64-fitting values).
+    pub(super) fn min_be(x: u64) -> Vec<u8> {
+        let b = x.to_be_bytes();
+        let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+        b[i..].to_vec()
+    }
+    fn u256_be(x: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..].copy_from_slice(&x.to_be_bytes());
+        out
+    }
+
+    /// Inner-envelope map with version/opcode/domain/request_id + optional key_ref(6) + cap(5) + payload(7).
+    fn envelope(
+        opcode: u8,
+        request_id: &[u8],
+        key_ref: Option<&[u8; 32]>,
+        cap: Option<Vec<(Value, Value)>>,
+        payload: Vec<(Value, Value)>,
+    ) -> Vec<u8> {
+        let mut m = vec![
+            (
+                Value::Integer(1.into()),
+                Value::Integer(u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION).into()),
+            ),
+            (Value::Integer(2.into()), Value::Integer(u64::from(opcode).into())),
+            (Value::Integer(3.into()), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
+            (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
+        ];
+        if let Some(c) = cap {
+            m.push((Value::Integer(5.into()), Value::Map(c)));
+        }
+        if let Some(kr) = key_ref {
+            m.push((Value::Integer(6.into()), Value::Bytes(kr.to_vec())));
+        }
+        m.push((Value::Integer(7.into()), Value::Map(payload)));
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(m), &mut buf).expect("faucet smoke envelope encodes");
+        buf
+    }
+
+    /// GENERATE_KEYS(purpose=2 treasury, count=1) for the faucet smoke (its own counter lane).
+    pub(super) fn treasury_keygen_envelope(request_id: &[u8], counter: u64, signer: &SigningKey) -> Vec<u8> {
+        let pb = crate::agent_capability::payload_binding(
+            OPCODE_GENERATE_KEYS,
+            None,
+            request_id,
+            &crate::agent_dispatch::generate_keys_canonical_params(FAUCET_TREASURY_PURPOSE, 1),
+        );
+        let cap = crate::agent_capability::test_signed_capability(
+            signer, OPCODE_GENERATE_KEYS, request_id, counter, false, SMOKE_CHAIN_ID, SMOKE_ENVIRONMENT,
+            0, GENFAUCET_SCOPE_TARGET, FAUCET_TREASURY_PURPOSE as u8, pb,
+        );
+        envelope(
+            OPCODE_GENERATE_KEYS,
+            request_id,
+            None,
+            Some(cap),
+            vec![
+                (Value::Integer(1.into()), Value::Integer(FAUCET_TREASURY_PURPOSE.into())),
+                (Value::Integer(2.into()), Value::Integer(1.into())),
+            ],
+        )
+    }
+
+    /// CONFIGURE_TREASURY(sub_op) — admin cap on the configure lane. set_limits carries keys 3,4.
+    pub(super) fn configure_envelope(
+        request_id: &[u8],
+        counter: u64,
+        sub_op: u8,
+        field2_min: &[u8],
+        set_limits_gas: Option<(u64, u64)>,
+        signer: &SigningKey,
+    ) -> Vec<u8> {
+        let cp = crate::agent_dispatch::configure_treasury_canonical_params(sub_op, field2_min, set_limits_gas);
+        let pb = crate::agent_capability::payload_binding(OPCODE_CONFIGURE_TREASURY, Some(sub_op), request_id, &cp);
+        let cap = crate::agent_capability::test_signed_capability_with_sub_op(
+            signer, OPCODE_CONFIGURE_TREASURY, Some(sub_op), request_id, counter, false, SMOKE_CHAIN_ID,
+            SMOKE_ENVIRONMENT, 0, CONFIGURE_SCOPE_TARGET, 2, pb,
+        );
+        let mut payload = vec![
+            (Value::Integer(1.into()), Value::Integer(u64::from(sub_op).into())),
+            (Value::Integer(2.into()), Value::Bytes(field2_min.to_vec())),
+        ];
+        if let Some((gl, fr)) = set_limits_gas {
+            payload.push((Value::Integer(3.into()), Value::Integer(gl.into())));
+            payload.push((Value::Integer(4.into()), Value::Integer(fr.into())));
+        }
+        envelope(OPCODE_CONFIGURE_TREASURY, request_id, None, Some(cap), payload)
+    }
+
+    /// SIGN_FAUCET_DISPENSE — NO cap (runtime op); the strict 8-field EIP-155 payload + key_ref(6).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispense_envelope(
+        request_id: &[u8],
+        treasury_key_ref: &[u8; 32],
+        from: &[u8; 20],
+        to: &[u8; 20],
+        amount_min: &[u8],
+        gas_price_min: &[u8],
+    ) -> Vec<u8> {
+        envelope(
+            OPCODE_SIGN_FAUCET_DISPENSE,
+            request_id,
+            Some(treasury_key_ref),
+            None,
+            vec![
+                (Value::Integer(1.into()), Value::Integer(SMOKE_CHAIN_ID.into())),
+                (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
+                (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
+                (Value::Integer(4.into()), Value::Bytes(amount_min.to_vec())),
+                (Value::Integer(5.into()), Value::Integer(0.into())), // nonce
+                (Value::Integer(6.into()), Value::Integer(DISPENSE_GAS_LIMIT.into())),
+                (Value::Integer(7.into()), Value::Bytes(gas_price_min.to_vec())),
+                (Value::Integer(8.into()), Value::Bytes(vec![])), // data MUST be empty
+            ],
+        )
+    }
+
+    /// Extract the single minted treasury key's `(key_ref, eth_address)` from a GENERATE_KEYS success
+    /// reply `{1: [{1: key_ref, 2: pubkey, 3: eth_address, …}], 2: blob}`, asserting purpose==2.
+    pub(super) fn extract_minted_treasury(
+        m: &[(Value, Value)],
+    ) -> Result<([u8; 32], [u8; 20]), String> {
+        use crate::agent_cbor::map_get;
+        let list = match map_get(m, 1) {
+            Some(Value::Array(a)) if a.len() == 1 => a,
+            other => return Err(format!("treasury keygen: key 1 is not a 1-element array: {other:?}")),
+        };
+        let km = match &list[0] {
+            Value::Map(km) => km.as_slice(),
+            _ => return Err("treasury keygen: minted key is not a map".into()),
+        };
+        if map_get(km, 5).and_then(crate::agent_cbor::as_u64) != Some(FAUCET_TREASURY_PURPOSE) {
+            return Err("treasury keygen: minted purpose != faucet treasury".into());
+        }
+        let key_ref: [u8; 32] = match map_get(km, 1) {
+            Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| "key_ref not 32B".to_string())?,
+            _ => return Err("treasury keygen: key_ref (entry key 1) missing".into()),
+        };
+        let eth: [u8; 20] = match map_get(km, 3) {
+            Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| "eth not 20B".to_string())?,
+            _ => return Err("treasury keygen: eth_address (entry key 3) missing".into()),
+        };
+        Ok((key_ref, eth))
+    }
+
+    /// Assert a SIGN_FAUCET_DISPENSE success reply: `{1: signed_rlp, …, 7: from, 8: sealed_blob}` — the
+    /// signed tx is present + recovers `from`==treasury, and the resealed blob UNSEALS to a body whose
+    /// faucet `cumulative_native_spend` AND `lifetime_spend` BOTH advanced by exactly `worst_case` (the
+    /// dual-counter debit) — the observable witness the EpochOnly seal→commit→swap→emit completed with
+    /// the §2 gate's debit. Both equal `worst_case` here for DIFFERENT reasons: `cumulative_native_spend`
+    /// because F3's refill reset the refillable window to 0 and F4 is the only debit into it; `lifetime_spend`
+    /// because it is genesis-0 and F4 is the only/first dispense — refill does NOT reset `lifetime_spend` (it
+    /// is the monotone marks surface). This smoke therefore witnesses the DEBIT, not the non-reset; that
+    /// refill leaves a NON-ZERO `lifetime_spend` untouched is pinned by the handler unit test
+    /// `refill_budget_raises_and_resets_native_spend` (base 456 → "lifetime untouched").
+    pub(super) fn assert_dispense_success(
+        m: &[(Value, Value)],
+        treasury_from: &[u8; 20],
+    ) -> Result<(), String> {
+        use crate::agent_cbor::map_get;
+        match map_get(m, 1) {
+            Some(Value::Bytes(b)) if !b.is_empty() => {}
+            other => return Err(format!("dispense: key 1 (signed_rlp) missing/empty: {other:?}")),
+        }
+        match map_get(m, 7) {
+            Some(Value::Bytes(b)) if b.as_slice() == treasury_from.as_slice() => {}
+            other => return Err(format!("dispense: key 7 (from) != treasury address: {other:?}")),
+        }
+        let blob = match map_get(m, 8) {
+            Some(Value::Bytes(b)) => b.as_slice(),
+            _ => return Err("dispense: key 8 (resealed blob) missing".into()),
+        };
+        let resealed = crate::agent_keystore::unseal_body(
+            blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+        )
+        .map_err(|e| format!("dispense: resealed blob does NOT unseal: {e:?}"))?;
+        let wc = u256_be(worst_case());
+        if resealed.faucet.cumulative_native_spend != wc {
+            return Err(format!(
+                "dispense: cumulative_native_spend {:?} != worst_case {:?}",
+                resealed.faucet.cumulative_native_spend, wc
+            ));
+        }
+        if resealed.faucet.lifetime_spend != wc {
+            return Err(format!(
+                "dispense: lifetime_spend {:?} != worst_case {:?} (dual-counter debit)",
+                resealed.faucet.lifetime_spend, wc
+            ));
+        }
+        Ok(())
+    }
+
+    /// Unseal a CONFIGURE_TREASURY success reply's `{1: sealed_keystore_blob}` so the smoke can
+    /// CONTENT-VALIDATE that the sub-op's mutation actually landed in the resealed body — not merely that
+    /// "a blob came back" (a blob that failed to apply the config would still be returned on success).
+    pub(super) fn unseal_configure_reply(
+        m: &[(Value, Value)],
+    ) -> Result<crate::agent_keystore::KeystoreBody, String> {
+        use crate::agent_cbor::map_get;
+        let blob = match map_get(m, 1) {
+            Some(Value::Bytes(b)) if !b.is_empty() => b.as_slice(),
+            other => return Err(format!("configure: key 1 (sealed blob) missing/empty: {other:?}")),
+        };
+        crate::agent_keystore::unseal_body(blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
+            .map_err(|e| format!("configure: resealed blob does NOT unseal: {e:?}"))
+    }
+
+    /// The expected u256 (big-endian `[u8; 32]`) of a u64 — for content-validating sealed faucet caps.
+    pub(super) fn u256_of(x: u64) -> [u8; 32] {
+        u256_be(x)
+    }
+
+    /// Assert the post-CONFIGURE rollback-artifact METADATA (not just the faucet business fields), so a
+    /// regression that applied the config but dropped a monotonic bump / clobbered unrelated state is
+    /// caught: the monotonic `config_version`, the atomic `structural_version` + `freshness_epoch`
+    /// advancement (every CONFIGURE sub-op is Structural), the capability counter high-water on the
+    /// configure lane (`CONFIGURE_SCOPE_TARGET`), AND preservation of unrelated state. The unrelated-state
+    /// check pins `entries.len() == 2` AND directly names the seeded transfer key (`SMOKE_KEY_REF`); since no
+    /// CONFIGURE phase adds or removes entries, the only other entry is NECESSARILY the F1-minted treasury
+    /// key, so both surviving the swap follows from (len==2 ∧ transfer-key-present). The absolutes are deterministic
+    /// from the fixed phase order: smoke_body base `epoch=1 / structural=1 / config_version=0`;
+    /// F1 GENERATE_KEYS is Structural but does NOT bump config_version (`epoch=2 / structural=2 / cv=0`);
+    /// then each CONFIGURE advances `epoch`/`structural`/`config_version` by +1 and its lane counter by +1.
+    pub(super) fn assert_configure_metadata(
+        b: &crate::agent_keystore::KeystoreBody,
+        config_version: u64,
+        structural_version: u64,
+        freshness_epoch: u64,
+        configure_counter: u64,
+    ) -> Result<(), String> {
+        if b.config.monotonic_treasury_config_version != config_version {
+            return Err(format!(
+                "config_version {} != expected {config_version}",
+                b.config.monotonic_treasury_config_version
+            ));
+        }
+        if b.structural_version != structural_version {
+            return Err(format!("structural_version {} != expected {structural_version}", b.structural_version));
+        }
+        if b.freshness_epoch != freshness_epoch {
+            return Err(format!("freshness_epoch {} != expected {freshness_epoch}", b.freshness_epoch));
+        }
+        // The configure lane's capability counter high-water advances once per accepted CONFIGURE: a row
+        // keyed by the FULL replay-protection tuple `(authority, environment, scope_class, scope_target)`
+        // (AC#8/#11) must exist with exactly `configure_counter`. Match the WHOLE tuple, not scope_target
+        // alone — a regression that advanced a row for the wrong authority or scope_class with the same
+        // CONFIGURE_SCOPE_TARGET would leave the actual admin configure lane replayable yet still pass a
+        // scope_target-only check. The admin authority is the verifying key of SMOKE_ADMIN_SEED (the cap
+        // signer); the lane is enclave-scoped (scope_class 0) in SMOKE_ENVIRONMENT.
+        let admin_authority =
+            ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED).verifying_key().to_bytes();
+        let lane = b
+            .counters
+            .iter()
+            .find(|c| {
+                c.authority == admin_authority
+                    && c.environment_identifier == SMOKE_ENVIRONMENT
+                    && c.scope_class == 0
+                    && c.scope_target.as_slice() == CONFIGURE_SCOPE_TARGET
+            })
+            .ok_or_else(|| {
+                "configure counter lane (admin authority / SMOKE_ENVIRONMENT / scope_class 0 / \
+                 CONFIGURE_SCOPE_TARGET) missing after CONFIGURE"
+                    .to_string()
+            })?;
+        if lane.highest_accepted_counter != configure_counter {
+            return Err(format!(
+                "configure lane high-water {} != expected {configure_counter}",
+                lane.highest_accepted_counter
+            ));
+        }
+        if b.entries.len() != 2 || !b.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF) {
+            return Err(format!(
+                "config swap did not preserve unrelated entries (len={}, seeded transfer key present={})",
+                b.entries.len(),
+                b.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The combined FAUCET write-path smoke client (mirrors [`run_agent_keygen_smoke_client`]). Drives the
+/// full mint→set_limits→refill→dispense fund-custody flow + a fail-closed gate phase, each through the
+/// real seal→commit→swap→emit seam. Marker prefix `twod-hsm-agent-faucet-smoke:`; terminal
+/// `RESULT PASS phases=5`. `connect` opens a FRESH stream per phase. Returns `true` iff all phases pass.
+#[cfg(all(
+    feature = "agent-keygen-exec-preview",
+    feature = "agent-configure-treasury-preview",
+    feature = "agent-sign-faucet-preview"
+))]
+pub fn run_agent_faucet_smoke_client<S, C, W>(mut connect: C, sink: &mut W) -> bool
+where
+    S: std::io::Read + std::io::Write,
+    C: FnMut() -> std::io::Result<S>,
+    W: std::io::Write,
+{
+    use faucet::*;
+    let mut mark = |args: std::fmt::Arguments<'_>| {
+        let _ = writeln!(sink, "twod-hsm-agent-faucet-smoke: {args}");
+    };
+    let mut phases_passed: u32 = 0;
+    macro_rules! phase {
+        ($name:expr, $body:expr) => {{
+            let outcome: Result<String, String> = (|| $body)();
+            match outcome {
+                Ok(detail) => {
+                    mark(format_args!("PHASE {} PASS {detail}", $name));
+                    phases_passed += 1;
+                }
+                Err(detail) => {
+                    mark(format_args!("PHASE {} FAIL {detail}", $name));
+                    mark(format_args!("RESULT FAIL phase={}", $name));
+                    return false;
+                }
+            }
+        }};
+    }
+    let admin = ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED);
+    // The recipient `to` = the SEEDED transfer key's derived eth address (already in smoke_body()).
+    let recipient = crate::secp256k1::Keypair::from_secret_bytes(&SMOKE_SECRET_SCALAR)
+        .expect("SMOKE_SECRET_SCALAR valid")
+        .eth_address();
+    // F1 returns the minted treasury key_ref + its derived `from` address; carried into F4.
+    let mut treasury: Option<([u8; 32], [u8; 20])> = None;
+
+    // F1: mint the singleton treasury key (Structural commit). Reply carries its key_ref + eth address.
+    phase!("mint-treasury", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let env = treasury_keygen_envelope(b"faucet-smoke-f1", 1, &admin);
+        let m = smoke_round_trip(&mut conn, &env)?;
+        let (kr, from) = extract_minted_treasury(&m)?;
+        treasury = Some((kr, from));
+        Ok("1 faucet treasury key minted (Structural seal→commit→swap)".to_string())
+    });
+
+    // F2: set the per-field caps so a real dispense fits (per_dispense_max raised from genesis 0).
+    // CONTENT-VALIDATE: unseal the returned blob and assert the limit triple actually landed.
+    phase!("configure-set-limits", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let env = configure_envelope(
+            b"faucet-smoke-f2", 1, 0, &min_be(PER_DISPENSE_MAX), Some((MAX_GAS_LIMIT, MAX_FEE_RATE)), &admin,
+        );
+        let m = smoke_round_trip(&mut conn, &env)?;
+        let b = unseal_configure_reply(&m)?;
+        if b.faucet.per_dispense_max_amount != u256_of(PER_DISPENSE_MAX) {
+            return Err(format!("set_limits: per_dispense_max not applied ({:?})", b.faucet.per_dispense_max_amount));
+        }
+        if b.faucet.max_gas_limit != MAX_GAS_LIMIT || b.faucet.max_effective_gas_fee_rate != MAX_FEE_RATE {
+            return Err(format!(
+                "set_limits: gas caps not applied (gas_limit={}, fee_rate={})",
+                b.faucet.max_gas_limit, b.faucet.max_effective_gas_fee_rate
+            ));
+        }
+        // Rollback-artifact METADATA: this is the FIRST CONFIGURE, so config_version=1 and the atomic
+        // Structural bump lands epoch=3 / structural=3 (base 1 → F1 GENERATE_KEYS +1 → this CONFIGURE +1);
+        // the configure lane's counter high-water is now 1 (this cap counter).
+        assert_configure_metadata(&b, 1, 3, 3, 1)?;
+        Ok("caps applied (resealed blob unseals to the limit triple; cv=1, epoch=3, structural=3, lane=1)".to_string())
+    });
+
+    // F3: refill the cumulative signing budget (resets the refillable spend window to 0).
+    // CONTENT-VALIDATE: unseal and assert the budget landed AND cumulative_native_spend was reset to 0.
+    phase!("configure-refill-budget", {
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let env = configure_envelope(b"faucet-smoke-f3", 2, 1, &min_be(BUDGET), None, &admin);
+        let m = smoke_round_trip(&mut conn, &env)?;
+        let b = unseal_configure_reply(&m)?;
+        if b.faucet.cumulative_signing_budget != u256_of(BUDGET) {
+            return Err(format!("refill_budget: budget not applied ({:?})", b.faucet.cumulative_signing_budget));
+        }
+        if b.faucet.cumulative_native_spend != [0u8; 32] {
+            return Err("refill_budget: cumulative_native_spend not reset to 0 (the fresh refill window)".to_string());
+        }
+        // Rollback-artifact METADATA: SECOND CONFIGURE ⇒ config_version=2, epoch=4 / structural=4, lane=2.
+        assert_configure_metadata(&b, 2, 4, 4, 2)?;
+        Ok(format!("budget applied (resealed blob unseals to budget={BUDGET}, spend window reset; cv=2, epoch=4, structural=4, lane=2)"))
+    });
+
+    // F4: the dispense — treasury → the seeded transfer key, within caps. Asserts the dual-counter debit.
+    phase!("dispense", {
+        let (kr, from) = treasury.ok_or("dispense: F1 did not record the treasury key")?;
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let env = dispense_envelope(
+            b"faucet-smoke-f4", &kr, &from, &recipient, &min_be(DISPENSE_AMOUNT), &min_be(DISPENSE_GAS_PRICE),
+        );
+        let m = smoke_round_trip(&mut conn, &env)?;
+        assert_dispense_success(&m, &from)?;
+        Ok(format!("dispensed; both spend counters debited by worst_case={}", worst_case()))
+    });
+
+    // F5 (fail-closed gate): a dispense to a STRANGER (not a stored transfer key) → 0x42, proving the
+    // recipient allowlist is live (non-vacuity, like the keygen W2 bad-cap phase).
+    phase!("dispense-stranger-rejected", {
+        let (kr, from) = treasury.ok_or("F1 did not record the treasury key")?;
+        let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
+        let env = dispense_envelope(
+            b"faucet-smoke-f5", &kr, &from, &[0xab; 20], &min_be(DISPENSE_AMOUNT), &min_be(DISPENSE_GAS_PRICE),
+        );
+        let m = smoke_round_trip(&mut conn, &env)?;
+        match (map_u64(&m, 1), map_get_text(&m, 2)) {
+            (Some(0x42), Some(reason)) if reason.starts_with("agent: ") => Ok("stranger recipient → 0x42".to_string()),
+            (code, reason) => Err(format!("expected {{1:0x42, 2:\"agent: …\"}}, got code={code:?} reason={reason:?}")),
+        }
+    });
+
+    mark(format_args!("RESULT PASS phases={phases_passed}"));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1670,10 +2123,12 @@ mod tests {
     /// ([`LAB_ANCHOR_TEST_SEED`]) via the SAME pure [`lab_commit_ack_for_request`] the aya
     /// `twod-hsm-lab-anchor` stub runs — so the in-process write-path proof and the live anchor can
     /// never drift on the commit semantics. `body` is the STATIC `smoke_body()` (epoch/structural at
-    /// boot): correct here because W1 is the ONLY committing phase (W2's cap is rejected pre-commit) and
-    /// the commit leg only scope-guards + signs the enclave's PROPOSED state — it does not re-derive
-    /// state from `body`. A future SECOND committing phase would need the channel to track post-commit
-    /// advancement (or re-derive its body) so its scope-guard still matches.
+    /// boot): correct across MULTIPLE committing phases (the keygen smoke commits once at W1; the TASK-15
+    /// faucet smoke reuses this channel for FOUR committing phases F1-F4) because the commit leg only
+    /// scope-guards + signs the enclave's PROPOSED state — it scope-guards ONLY the CONSTANT config
+    /// (`twod_chain_id` / `environment_identifier` / `anchor_root`, which no committing op mutates) and
+    /// never re-derives or compares against `body`'s advancing `freshness_epoch`/`structural_version`/marks.
+    /// So a static `smoke_body()` is sufficient regardless of phase count; the ledger keys by request_id.
     #[cfg(feature = "agent-keygen-exec-preview")]
     struct LabCommitChannel {
         body: KeystoreBody,
@@ -1805,6 +2260,100 @@ mod tests {
         assert!(ok, "keygen client failed against the SHIPPED glue:\n{log}");
         assert!(
             log.contains("twod-hsm-agent-keygen-smoke: RESULT PASS phases=2"),
+            "log:\n{log}"
+        );
+    }
+
+    /// TASK-15 combined FAUCET write-path deviceless cross-val (mirrors `run_keygen_client_against_router`,
+    /// all 3 preview gates): the SAME process-global setup a booted preview guest holds (installed smoke
+    /// keystore + Fresh-reconcile anti-rollback binding + the per-op `LabCommitChannel` — static body is
+    /// fine across the FOUR committing phases (F1-F4; F5 is rejected at the recipient-allowlist gate BEFORE
+    /// any commit) because the commit leg only scope-guards the constant config + signs the proposed state,
+    /// and the ledger keys by per-phase-distinct request_id). Drives the full
+    /// mint→set_limits→refill→dispense fund-custody flow through the real serve kernel.
+    #[cfg(all(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ))]
+    fn run_faucet_client_against_router(
+        router: fn(&[u8]) -> Result<Vec<u8>, crate::ProtocolError>,
+    ) -> (bool, String) {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        // Same teardown-symmetry rationale as `run_keygen_client_against_router`: the seal root is a
+        // `seal_root`-module global (NOT an agent global), so reset it HERE to None — the process-start
+        // PRISTINE state — so commit_before_emit's resolve_provisioning_root() falls through to
+        // SMOKE_SEAL_ROOT and the client's unseal matches; resetting to None is symmetric-by-default, no
+        // teardown restore is owed.
+        crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
+        assert!(crate::agent_dispatch::install_agent_keystore(
+            smoke_body(),
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT
+        ));
+        assert!(crate::agent_dispatch::install_anti_rollback_binding(
+            crate::agent_dispatch::AntiRollbackBinding { epoch: 1, active: true }
+        ));
+        assert!(crate::agent_dispatch::install_commit_channel(Box::new(LabCommitChannel::new())));
+        let connect = move || -> std::io::Result<std::os::unix::net::UnixStream> {
+            let (client, mut server) = std::os::unix::net::UnixStream::pair()?;
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            client.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            server.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+            server.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            std::thread::spawn(move || {
+                let _ = crate::enclave_serve::serve_framed_pump(
+                    &mut server,
+                    router,
+                    std::time::Duration::from_secs(5),
+                );
+            });
+            Ok(client)
+        };
+        let mut sink = Vec::new();
+        let ok = run_agent_faucet_smoke_client(connect, &mut sink);
+        (ok, String::from_utf8_lossy(&sink).into_owned())
+    }
+
+    /// Darwin-runnable combined-faucet cross-val (replica router): mint treasury → set_limits → refill →
+    /// dispense (dual-counter debit) → fail-closed stranger-recipient gate, all end-to-end through the
+    /// real seal→commit→swap→emit seam.
+    #[cfg(all(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ))]
+    #[test]
+    fn faucet_client_drives_combined_flow_against_replica_router() {
+        let (ok, log) = run_faucet_client_against_router(replica_agent_serve_one_frame);
+        assert!(ok, "faucet client phases failed:\n{log}");
+        for ph in ["mint-treasury", "configure-set-limits", "configure-refill-budget", "dispense", "dispense-stranger-rejected"] {
+            assert!(
+                log.contains(&format!("twod-hsm-agent-faucet-smoke: PHASE {ph} PASS")),
+                "phase {ph} did not pass:\n{log}"
+            );
+        }
+        assert!(
+            log.contains("twod-hsm-agent-faucet-smoke: RESULT PASS phases=5"),
+            "log:\n{log}"
+        );
+    }
+
+    /// The BINDING faucet write-path cross-val against the SHIPPED `agent_serve_one_frame` glue + real
+    /// serve kernel (linux+vsock lane + aya) — the deviceless proof the faucet SNP smoke rests on.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "vsock-transport",
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ))]
+    #[test]
+    fn faucet_client_drives_combined_flow_against_shipped_serve_glue() {
+        let (ok, log) =
+            run_faucet_client_against_router(crate::agent_gateway_boot::agent_serve_one_frame);
+        assert!(ok, "faucet client failed against the SHIPPED glue:\n{log}");
+        assert!(
+            log.contains("twod-hsm-agent-faucet-smoke: RESULT PASS phases=5"),
             "log:\n{log}"
         );
     }

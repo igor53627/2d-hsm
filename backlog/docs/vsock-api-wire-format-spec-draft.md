@@ -799,8 +799,10 @@ host-controlled).
   normative mechanism, not a choice). `RESTORE_BACKUP` and `reset_lifetime_breaker` share that same
   strict recovery counter. Audited; never rolls backward. **Implementation status (TASK-15 15-4):** the
   live `reset_lifetime_breaker` handler ADVANCES `strict_recovery_counter` (the audited marks surface)
-  but does NOT yet GATE on it — it is currently sequenced by the uniform admin contiguous counter
-  (`counter == highest+1`), not the forward-only `>` rule above. Wiring the forward-only
+  but does NOT yet GATE on it — it is currently sequenced by the uniform contiguous-counter mechanism
+  (`counter == highest+1`) on the **recovery authority's own lane** (only the contiguous-counter rule is
+  shared with admin paths; the lane is keyed by the verified recovery authority), not the forward-only `>`
+  rule above. Wiring the forward-only
   strict-recovery-counter gate is a **TASK-18 un-gate precondition** (with `RESTORE_BACKUP`, which owns
   the same counter); CONFIGURE_TREASURY is preview-banned (`agent-configure-treasury-preview`) until it
   lands, so the deferral is non-production. See §10.7.

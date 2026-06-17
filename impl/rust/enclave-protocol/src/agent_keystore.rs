@@ -738,7 +738,8 @@ impl KeystoreBody {
 
     /// Slice 15-4: advance the monotonic treasury **config version** for a committed
     /// `CONFIGURE_TREASURY` sub-op. EVERY one of the 4 sub-ops bumps it (the per-op monotonic/audit
-    /// trail — `AuditRecord::config_version` snapshots it). This is a SEPARATE checked bump from
+    /// trail — a FUTURE AC#14 privileged-op `AuditRecord::config_version` will snapshot it; that audit
+    /// record is deferred and NOT written yet, so today the bump is the monotone stamp only). This is a SEPARATE checked bump from
     /// [`Self::advance_commit_epoch`]: that fn moves `freshness_epoch` (+ `structural_version` for a
     /// STRUCTURAL op) but deliberately does NOT touch `monotonic_treasury_config_version`.
     ///

@@ -43,6 +43,12 @@
         enclave-agent-gateway-keygen = pkgs.callPackage ./enclave.nix {
           profile = "agent-gateway-keygen";
         };
+        # TASK-15: the SAME serve bin built WITH all three preview gates (keygen-exec +
+        # configure-treasury + sign-faucet) — so the guest can mint + configure + dispense (the combined
+        # faucet write-path smoke). SEPARATE derivation (all three previews are release-banned).
+        enclave-agent-gateway-faucet = pkgs.callPackage ./enclave.nix {
+          profile = "agent-gateway-faucet";
+        };
         # TASK-1.1: SNP firmware-derived pq-seal provisioning root boot helper.
         snp-derive-root = pkgs.callPackage ./snp-derive-root.nix { };
         flakeMeta = {
@@ -181,6 +187,21 @@
           guestProfile = "production-lab";
           agentGatewayPackage = enclave-agent-gateway-keygen;
         };
+        # TASK-15: the combined FAUCET write-path smoke image — identical to the keygen smoke image but
+        # the serve unit runs the all-three-previews build, so the host's twod-hsm-agent-faucet-smoke-client
+        # can drive mint-treasury → set_limits → refill_budget → dispense (see
+        # run-nix-snp-agent-faucet-smoke.sh). Same lab reference seal root, so the resealed blobs unseal.
+        diskProductionLabAgentFaucetSmoke = import ./disk-image.nix {
+          inherit
+            nixpkgs
+            enclave
+            enclave-staging
+            enclave-production-lab
+            enclave-production-transport
+            ;
+          guestProfile = "production-lab";
+          agentGatewayPackage = enclave-agent-gateway-faucet;
+        };
         ceremonySignerPath = ./ceremony-sealed-signer.bin;
         diskProductionLabSnpRooted = import ./disk-image.nix {
           inherit
@@ -210,6 +231,9 @@
           # TASK-7.7 6-7b-ii write-path (GENERATE_KEYS) live smoke: preview serve bin + bootable image.
           inherit enclave-agent-gateway-keygen;
           disk-production-lab-agent-keygen-smoke = diskProductionLabAgentKeygenSmoke;
+          # TASK-15 combined faucet write-path live smoke: all-three-previews serve bin + bootable image.
+          inherit enclave-agent-gateway-faucet;
+          disk-production-lab-agent-faucet-smoke = diskProductionLabAgentFaucetSmoke;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;
