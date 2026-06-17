@@ -4272,12 +4272,10 @@ mod tests {
         const GOLDEN_KEY_REF: [u8; 32] = [0x11; 32];
         const GOLDEN_PROVE_NONCE: [u8; 32] = [0x22; 32];
 
+        // Reuse the `hex` crate (already a dev-dependency, used by the sibling dispatch tests) rather
+        // than a hand-rolled per-byte format loop.
         fn hex(b: &[u8]) -> String {
-            let mut s = String::with_capacity(b.len() * 2);
-            for x in b {
-                s.push_str(&format!("{x:02x}"));
-            }
-            s
+            hex::encode(b)
         }
         /// Minimal big-endian bytes of a u64 (the canonical u256 wire form for values that fit u64).
         /// Mirrors the per-mod test convention; the production source of truth for "minimal-BE" is
@@ -4355,13 +4353,17 @@ mod tests {
             enc(m)
         }
 
-        /// (filename, built bytes, opcode, request_id, payload-present).
+        /// (filename, built bytes, opcode, request_id, payload-present). Ordered ALPHABETICALLY by
+        /// filename so the regen's outer-index insertion order is alphabetical too — the serialized
+        /// `.json` bytes are then stable whether serde_json sorts keys (default) or preserves insertion
+        /// order. The frozen/decode tests are order-independent (they `.find()` / loop), so the order is
+        /// purely for deterministic regen.
         fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static [u8], bool)> {
             vec![
-                ("req_public_identity_v1.bin", req_public_identity(), 2, RID_PUBLIC_IDENTITY, false),
                 ("req_prove_identity_v1.bin", req_prove_identity(), 3, RID_PROVE_IDENTITY, true),
-                ("req_sign_transfer_v1.bin", req_sign_transfer(), 4, RID_SIGN_TRANSFER, true),
+                ("req_public_identity_v1.bin", req_public_identity(), 2, RID_PUBLIC_IDENTITY, false),
                 ("req_sign_faucet_dispense_v1.bin", req_sign_faucet(), 5, RID_SIGN_FAUCET, true),
+                ("req_sign_transfer_v1.bin", req_sign_transfer(), 4, RID_SIGN_TRANSFER, true),
             ]
         }
 
@@ -4426,6 +4428,13 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(sidecar).expect("request-envelope index is valid JSON");
             assert_eq!(v["command_domain"].as_str(), Some(COMMAND_DOMAIN), "index command_domain");
             assert_eq!(v["agent_version"].as_u64(), Some(AGENT_GATEWAY_VERSION as u64), "index agent_version");
+            // No STALE/extra vector keys: the index must hold EXACTLY the current vectors, else a renamed
+            // or dropped vector would leave a lingering entry the per-vector loop below never visits.
+            assert_eq!(
+                v["vectors"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra vector entry"
+            );
             for (name, bytes, opcode, request_id, has_payload) in vectors() {
                 let e = &v["vectors"][name];
                 assert_eq!(e["blob_sha256"].as_str(), Some(hex(&Sha256::digest(&bytes)).as_str()), "{name} sha256");
