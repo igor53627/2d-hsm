@@ -1291,6 +1291,26 @@ mod faucet {
         }
         Ok(())
     }
+
+    /// Unseal a CONFIGURE_TREASURY success reply's `{1: sealed_keystore_blob}` so the smoke can
+    /// CONTENT-VALIDATE that the sub-op's mutation actually landed in the resealed body — not merely that
+    /// "a blob came back" (a blob that failed to apply the config would still be returned on success).
+    pub(super) fn unseal_configure_reply(
+        m: &[(Value, Value)],
+    ) -> Result<crate::agent_keystore::KeystoreBody, String> {
+        use crate::agent_cbor::map_get;
+        let blob = match map_get(m, 1) {
+            Some(Value::Bytes(b)) if !b.is_empty() => b.as_slice(),
+            other => return Err(format!("configure: key 1 (sealed blob) missing/empty: {other:?}")),
+        };
+        crate::agent_keystore::unseal_body(blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
+            .map_err(|e| format!("configure: resealed blob does NOT unseal: {e:?}"))
+    }
+
+    /// The expected u256 (big-endian `[u8; 32]`) of a u64 — for content-validating sealed faucet caps.
+    pub(super) fn u256_of(x: u64) -> [u8; 32] {
+        u256_be(x)
+    }
 }
 
 /// The combined FAUCET write-path smoke client (mirrors [`run_agent_keygen_smoke_client`]). Drives the
@@ -1348,27 +1368,40 @@ where
     });
 
     // F2: set the per-field caps so a real dispense fits (per_dispense_max raised from genesis 0).
+    // CONTENT-VALIDATE: unseal the returned blob and assert the limit triple actually landed.
     phase!("configure-set-limits", {
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let env = configure_envelope(
             b"faucet-smoke-f2", 1, 0, &min_be(PER_DISPENSE_MAX), Some((MAX_GAS_LIMIT, MAX_FEE_RATE)), &admin,
         );
         let m = smoke_round_trip(&mut conn, &env)?;
-        match crate::agent_cbor::map_get(&m, 1) {
-            Some(ciborium::value::Value::Bytes(b)) if !b.is_empty() => Ok("caps set (sealed blob returned)".to_string()),
-            other => Err(format!("set_limits: expected a success body with a sealed blob, got {other:?}")),
+        let b = unseal_configure_reply(&m)?;
+        if b.faucet.per_dispense_max_amount != u256_of(PER_DISPENSE_MAX) {
+            return Err(format!("set_limits: per_dispense_max not applied ({:?})", b.faucet.per_dispense_max_amount));
         }
+        if b.faucet.max_gas_limit != MAX_GAS_LIMIT || b.faucet.max_effective_gas_fee_rate != MAX_FEE_RATE {
+            return Err(format!(
+                "set_limits: gas caps not applied (gas_limit={}, fee_rate={})",
+                b.faucet.max_gas_limit, b.faucet.max_effective_gas_fee_rate
+            ));
+        }
+        Ok("caps applied (resealed blob unseals to the limit triple)".to_string())
     });
 
     // F3: refill the cumulative signing budget (resets the refillable spend window to 0).
+    // CONTENT-VALIDATE: unseal and assert the budget landed AND cumulative_native_spend was reset to 0.
     phase!("configure-refill-budget", {
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let env = configure_envelope(b"faucet-smoke-f3", 2, 1, &min_be(BUDGET), None, &admin);
         let m = smoke_round_trip(&mut conn, &env)?;
-        match crate::agent_cbor::map_get(&m, 1) {
-            Some(ciborium::value::Value::Bytes(b)) if !b.is_empty() => Ok(format!("budget refilled to {BUDGET}")),
-            other => Err(format!("refill_budget: expected a success body, got {other:?}")),
+        let b = unseal_configure_reply(&m)?;
+        if b.faucet.cumulative_signing_budget != u256_of(BUDGET) {
+            return Err(format!("refill_budget: budget not applied ({:?})", b.faucet.cumulative_signing_budget));
         }
+        if b.faucet.cumulative_native_spend != [0u8; 32] {
+            return Err("refill_budget: cumulative_native_spend not reset to 0 (the fresh refill window)".to_string());
+        }
+        Ok(format!("budget applied (resealed blob unseals to budget={BUDGET}, spend window reset)"))
     });
 
     // F4: the dispense — treasury → the seeded transfer key, within caps. Asserts the dual-counter debit.
@@ -2010,10 +2043,12 @@ mod tests {
     /// ([`LAB_ANCHOR_TEST_SEED`]) via the SAME pure [`lab_commit_ack_for_request`] the aya
     /// `twod-hsm-lab-anchor` stub runs — so the in-process write-path proof and the live anchor can
     /// never drift on the commit semantics. `body` is the STATIC `smoke_body()` (epoch/structural at
-    /// boot): correct here because W1 is the ONLY committing phase (W2's cap is rejected pre-commit) and
-    /// the commit leg only scope-guards + signs the enclave's PROPOSED state — it does not re-derive
-    /// state from `body`. A future SECOND committing phase would need the channel to track post-commit
-    /// advancement (or re-derive its body) so its scope-guard still matches.
+    /// boot): correct across MULTIPLE committing phases (the keygen smoke commits once at W1; the TASK-15
+    /// faucet smoke reuses this channel for FOUR committing phases F1-F4) because the commit leg only
+    /// scope-guards + signs the enclave's PROPOSED state — it scope-guards ONLY the CONSTANT config
+    /// (`twod_chain_id` / `environment_identifier` / `anchor_root`, which no committing op mutates) and
+    /// never re-derives or compares against `body`'s advancing `freshness_epoch`/`structural_version`/marks.
+    /// So a static `smoke_body()` is sufficient regardless of phase count; the ledger keys by request_id.
     #[cfg(feature = "agent-keygen-exec-preview")]
     struct LabCommitChannel {
         body: KeystoreBody,
@@ -2152,8 +2187,9 @@ mod tests {
     /// TASK-15 combined FAUCET write-path deviceless cross-val (mirrors `run_keygen_client_against_router`,
     /// all 3 preview gates): the SAME process-global setup a booted preview guest holds (installed smoke
     /// keystore + Fresh-reconcile anti-rollback binding + the per-op `LabCommitChannel` — static body is
-    /// fine across the FIVE committing phases because the commit leg only scope-guards the constant config
-    /// + signs the proposed state, and the ledger keys by request_id). Drives the full
+    /// fine across the FOUR committing phases (F1-F4; F5 is rejected at the recipient-allowlist gate BEFORE
+    /// any commit) because the commit leg only scope-guards the constant config + signs the proposed state,
+    /// and the ledger keys by per-phase-distinct request_id). Drives the full
     /// mint→set_limits→refill→dispense fund-custody flow through the real serve kernel.
     #[cfg(all(
         feature = "agent-keygen-exec-preview",

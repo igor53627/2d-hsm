@@ -69,7 +69,7 @@ twod_hsm_nix_init
 twod_hsm_resolve_snp_qemu
 echo "SNP: qemu=$QEMU_BIN bios=$SNP_BIOS"
 
-echo "[1/4] host bins (lab anchor stub + host relay + 0x40 KEYGEN client)"
+echo "[1/4] host bins (lab anchor stub + host relay + 0x40 FAUCET client)"
 BIN_DIR="${BIN_DIR:-$RUST_DIR/target/debug}"
 # ALWAYS rebuild (the matrix-flagged stale-target hazard — these host tools DEFINE the anchor behavior
 # + the client cap/expectations). The faucet client needs all THREE preview gates (keygen-exec to mint

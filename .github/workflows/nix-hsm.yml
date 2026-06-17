@@ -96,6 +96,16 @@ jobs:
           cargo test --features vsock-transport,agent-gateway,lab-agent-smoke,agent-keygen-exec-preview --lib lab_agent_smoke
           cargo build --features vsock-transport,agent-gateway,lab-agent-smoke,agent-keygen-exec-preview --bin twod-hsm-agent-keygen-smoke-client
 
+      # TASK-15: the COMBINED faucet WRITE-path smoke (lab-agent-smoke + all 3 previews). Same rationale as
+      # the keygen lane — the BINDING `faucet_client_drives_combined_flow_against_shipped_serve_glue`
+      # cross-val drives mint→set_limits→refill→dispense (dual-counter debit) + the stranger-reject gate
+      # through the shipped serve glue DEVICELESS, so the faucet SNP smoke rests on a CI-checked protocol
+      # contract (closes the deviceless faucet bit-rot gap the /code-review flagged — the keygen precedent).
+      - name: TASK-15 lab faucet WRITE-path smoke surface — combined client cross-val + bin (lab-agent-smoke + 3 previews)
+        run: |
+          cargo test --features vsock-transport,agent-gateway,lab-agent-smoke,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview --lib lab_agent_smoke
+          cargo build --features vsock-transport,agent-gateway,lab-agent-smoke,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview --bin twod-hsm-agent-faucet-smoke-client
+
       # TASK-7.7 5b-2c-iii: the agent-bin refusal arms (ii) validation-refusal + (iii) outcome-
       # refusal (the doc-pinned acceptance split BY PATH), deviceless — off-SNP the quote child
       # fails BEFORE any dial. Runs the existing arms (a)/(b) too (same integration file).
@@ -229,6 +239,8 @@ jobs:
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-gateway.drvPath
           # TASK-7.7 6-7b-ii: the WRITE-path (GENERATE_KEYS) smoke image — same agent unit, preview build.
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-keygen-smoke.drvPath
+          # TASK-15: the combined faucet WRITE-path smoke image (same agent unit, all-3-previews build).
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-faucet-smoke.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).
