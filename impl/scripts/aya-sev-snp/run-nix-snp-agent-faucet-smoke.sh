@@ -241,7 +241,7 @@ if (( R3_WIRE_OK != 1 )); then
   echo "[FAIL] R3: no NEW anchor sign + relay pump after boot — the guest never re-exercised the commit transport (the in-band RESULT PASS above is the authoritative proof; this belt should also hold)" >&2
   fail_dump; exit 1
 fi
-echo "      R3 wire-liveness belt OK (a fresh post-boot anchor/relay round-trip occurred; W1's in-band unseal is the authoritative commit proof)"
+echo "      R3 wire-liveness belt OK (a fresh post-boot anchor/relay round-trip occurred; F4's in-band dual-counter-debit unseal is the authoritative commit proof)"
 
 # R4 witnesses (bounded wait for the in-guest journald witness). The witness oneshot is `After=` (not
 # gating) the serve unit and retry-greps for up to ~120 s before emitting PASS/FAIL — and unlike the
