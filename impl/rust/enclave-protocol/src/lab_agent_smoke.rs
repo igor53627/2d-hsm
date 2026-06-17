@@ -1341,13 +1341,28 @@ mod faucet {
             return Err(format!("freshness_epoch {} != expected {freshness_epoch}", b.freshness_epoch));
         }
         // The configure lane's capability counter high-water advances once per accepted CONFIGURE: a row
-        // keyed by CONFIGURE_SCOPE_TARGET must exist with exactly `configure_counter` (a dropped/regressed
-        // counter advancement would let a replayed admin cap re-apply, the AC#8/#11 acceptance rule).
+        // keyed by the FULL replay-protection tuple `(authority, environment, scope_class, scope_target)`
+        // (AC#8/#11) must exist with exactly `configure_counter`. Match the WHOLE tuple, not scope_target
+        // alone — a regression that advanced a row for the wrong authority or scope_class with the same
+        // CONFIGURE_SCOPE_TARGET would leave the actual admin configure lane replayable yet still pass a
+        // scope_target-only check. The admin authority is the verifying key of SMOKE_ADMIN_SEED (the cap
+        // signer); the lane is enclave-scoped (scope_class 0) in SMOKE_ENVIRONMENT.
+        let admin_authority =
+            ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED).verifying_key().to_bytes();
         let lane = b
             .counters
             .iter()
-            .find(|c| c.scope_target.as_slice() == CONFIGURE_SCOPE_TARGET)
-            .ok_or_else(|| "configure counter lane (CONFIGURE_SCOPE_TARGET) missing after CONFIGURE".to_string())?;
+            .find(|c| {
+                c.authority == admin_authority
+                    && c.environment_identifier == SMOKE_ENVIRONMENT
+                    && c.scope_class == 0
+                    && c.scope_target.as_slice() == CONFIGURE_SCOPE_TARGET
+            })
+            .ok_or_else(|| {
+                "configure counter lane (admin authority / SMOKE_ENVIRONMENT / scope_class 0 / \
+                 CONFIGURE_SCOPE_TARGET) missing after CONFIGURE"
+                    .to_string()
+            })?;
         if lane.highest_accepted_counter != configure_counter {
             return Err(format!(
                 "configure lane high-water {} != expected {configure_counter}",
