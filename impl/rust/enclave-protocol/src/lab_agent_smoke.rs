@@ -1315,16 +1315,18 @@ mod faucet {
     /// Assert the post-CONFIGURE rollback-artifact METADATA (not just the faucet business fields), so a
     /// regression that applied the config but dropped a monotonic bump / clobbered unrelated state is
     /// caught: the monotonic `config_version`, the atomic `structural_version` + `freshness_epoch`
-    /// advancement (every CONFIGURE sub-op is Structural), AND preservation of unrelated state (the seeded
-    /// transfer key + the F1-minted treasury key both survive the swap = 2 entries). The absolutes are
-    /// deterministic from the fixed phase order: smoke_body base `epoch=1 / structural=1 / config_version=0`;
+    /// advancement (every CONFIGURE sub-op is Structural), the capability counter high-water on the
+    /// configure lane (`CONFIGURE_SCOPE_TARGET`), AND preservation of unrelated state (the seeded transfer
+    /// key + the F1-minted treasury key both survive the swap = 2 entries). The absolutes are deterministic
+    /// from the fixed phase order: smoke_body base `epoch=1 / structural=1 / config_version=0`;
     /// F1 GENERATE_KEYS is Structural but does NOT bump config_version (`epoch=2 / structural=2 / cv=0`);
-    /// then each CONFIGURE advances all three by +1.
+    /// then each CONFIGURE advances `epoch`/`structural`/`config_version` by +1 and its lane counter by +1.
     pub(super) fn assert_configure_metadata(
         b: &crate::agent_keystore::KeystoreBody,
         config_version: u64,
         structural_version: u64,
         freshness_epoch: u64,
+        configure_counter: u64,
     ) -> Result<(), String> {
         if b.config.monotonic_treasury_config_version != config_version {
             return Err(format!(
@@ -1337,6 +1339,20 @@ mod faucet {
         }
         if b.freshness_epoch != freshness_epoch {
             return Err(format!("freshness_epoch {} != expected {freshness_epoch}", b.freshness_epoch));
+        }
+        // The configure lane's capability counter high-water advances once per accepted CONFIGURE: a row
+        // keyed by CONFIGURE_SCOPE_TARGET must exist with exactly `configure_counter` (a dropped/regressed
+        // counter advancement would let a replayed admin cap re-apply, the AC#8/#11 acceptance rule).
+        let lane = b
+            .counters
+            .iter()
+            .find(|c| c.scope_target.as_slice() == CONFIGURE_SCOPE_TARGET)
+            .ok_or_else(|| "configure counter lane (CONFIGURE_SCOPE_TARGET) missing after CONFIGURE".to_string())?;
+        if lane.highest_accepted_counter != configure_counter {
+            return Err(format!(
+                "configure lane high-water {} != expected {configure_counter}",
+                lane.highest_accepted_counter
+            ));
         }
         if b.entries.len() != 2 || !b.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF) {
             return Err(format!(
@@ -1422,9 +1438,10 @@ where
             ));
         }
         // Rollback-artifact METADATA: this is the FIRST CONFIGURE, so config_version=1 and the atomic
-        // Structural bump lands epoch=3 / structural=3 (base 1 → F1 GENERATE_KEYS +1 → this CONFIGURE +1).
-        assert_configure_metadata(&b, 1, 3, 3)?;
-        Ok("caps applied (resealed blob unseals to the limit triple; cv=1, epoch=3, structural=3)".to_string())
+        // Structural bump lands epoch=3 / structural=3 (base 1 → F1 GENERATE_KEYS +1 → this CONFIGURE +1);
+        // the configure lane's counter high-water is now 1 (this cap counter).
+        assert_configure_metadata(&b, 1, 3, 3, 1)?;
+        Ok("caps applied (resealed blob unseals to the limit triple; cv=1, epoch=3, structural=3, lane=1)".to_string())
     });
 
     // F3: refill the cumulative signing budget (resets the refillable spend window to 0).
@@ -1440,9 +1457,9 @@ where
         if b.faucet.cumulative_native_spend != [0u8; 32] {
             return Err("refill_budget: cumulative_native_spend not reset to 0 (the fresh refill window)".to_string());
         }
-        // Rollback-artifact METADATA: SECOND CONFIGURE ⇒ config_version=2, epoch=4 / structural=4.
-        assert_configure_metadata(&b, 2, 4, 4)?;
-        Ok(format!("budget applied (resealed blob unseals to budget={BUDGET}, spend window reset; cv=2, epoch=4, structural=4)"))
+        // Rollback-artifact METADATA: SECOND CONFIGURE ⇒ config_version=2, epoch=4 / structural=4, lane=2.
+        assert_configure_metadata(&b, 2, 4, 4, 2)?;
+        Ok(format!("budget applied (resealed blob unseals to budget={BUDGET}, spend window reset; cv=2, epoch=4, structural=4, lane=2)"))
     });
 
     // F4: the dispense — treasury → the seeded transfer key, within caps. Asserts the dual-counter debit.
