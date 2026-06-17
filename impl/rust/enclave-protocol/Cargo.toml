@@ -92,6 +92,10 @@ agent-sign-faucet-preview = ["agent-gateway"]
 # until the AC#5 production funding profile is armed, the independent recovery-counter rule + the AC#14
 # audit record land, and TASK-18 un-gates. Never enable in production.
 agent-configure-treasury-preview = ["agent-gateway"]
+# TASK-23: deviceless UDS 0x40 contract-test server (twod-hsm-agent-contract-server) — installs a
+# reference keystore (PUBLIC test keys) + serves the agent protocol over AF_UNIX WITHOUT SNP/anti-rollback,
+# so downstream 2d (Elixir/macOS) can live-contract-test. Test/dev-only; release-banned (see lib.rs).
+agent-contract-server = ["agent-gateway"]
 # Reference relying-party SNP attestation verifier (TASK-1 AC#3/#12). NOT part of the enclave
 # signing path — off by default so it is not compiled into the production enclave binary.
 snp-verify = []
@@ -253,6 +257,14 @@ required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke", "age
 name = "twod-hsm-agent-faucet-smoke-client"
 path = "src/bin/twod_hsm_agent_faucet_smoke_client.rs"
 required-features = ["agent-gateway", "vsock-transport", "lab-agent-smoke", "agent-keygen-exec-preview", "agent-configure-treasury-preview", "agent-sign-faucet-preview"]
+
+# TASK-23: deviceless cross-platform 0x40 contract-test server over AF_UNIX (TEST/DEV ONLY; the
+# agent-contract-server feature is release-banned in lib.rs). PUBLIC_IDENTITY needs no preview; add the
+# agent-*-preview features to reach the signing/capability/configure contract lanes.
+[[bin]]
+name = "twod-hsm-agent-contract-server"
+path = "src/bin/agent_contract_server.rs"
+required-features = ["agent-gateway", "agent-contract-server"]
 
 # lab-production-vsock satisfies production-vsock via feature unification when both enabled
 

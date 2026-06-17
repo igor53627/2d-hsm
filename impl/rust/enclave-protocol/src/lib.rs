@@ -139,12 +139,31 @@ compile_error!(
      TASK-18 un-gates"
 );
 
+// TASK-23: the deviceless UDS 0x40 contract-test server (`twod-hsm-agent-contract-server`) installs a
+// reference keystore with PUBLIC test keys and serves the agent protocol WITHOUT SNP attestation or
+// anti-rollback durability. It is a dev/CI cross-language contract harness, NEVER a production endpoint
+// — release-banned so a release build cannot compile it. The production path is the AF_VSOCK + SNP
+// `twod-hsm-agent-gateway` bin.
+#[cfg(all(release_build, feature = "agent-contract-server"))]
+compile_error!(
+    "`agent-contract-server` (deviceless UDS 0x40 contract-test server) is test/dev-only and must never \
+     ship in a release build — it installs a reference keystore with PUBLIC keys, runs no SNP \
+     attestation, and has no anti-rollback durability"
+);
+
 mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
 mod chain_proof_crypto;
 pub mod env_config;
 pub mod enclave_serve;
+// Reference agent keystore for the deviceless contract-test server (TASK-23). Compiled only for the
+// contract-server bin or tests, and only when `agent-gateway` provides the keystore types.
+#[cfg(all(feature = "agent-gateway", any(test, feature = "agent-contract-server")))]
+pub mod reference_keystore;
+// Deviceless cross-platform 0x40 serve loop for the contract-test server (TASK-23). Same gating.
+#[cfg(all(feature = "agent-gateway", any(test, feature = "agent-contract-server")))]
+pub mod contract_server;
 #[cfg(feature = "ml-dsa-65")]
 pub mod platform_provisioning_boot;
 mod uds_listen;
