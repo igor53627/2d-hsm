@@ -25,6 +25,9 @@
 //! dispense at the reference treasury key (`sign_faucet_dispense_round_trip_*`). (2) *Serial serving.*
 //! `run_contract_server` serves one connection at a time (`UnixListener::incoming`); a client holding a
 //! connection monopolizes the slot — run one contract suite per server instance (or one server per suite).
+//! One-suite-per-instance is the deliberate contract here (a dev harness, not multi-tenant): there is only
+//! a `SESSION_IDLE_TIMEOUT`, NO max-session-lifetime / max-frames cap — the same serial-slot starvation
+//! already tracked as a multi-tenant precondition for the SNP serve loop, intentionally out of scope.
 
 use crate::enclave_serve::{configure_unix_session_timeouts, serve_framed_pump, SESSION_IDLE_TIMEOUT};
 use crate::reference_keystore::install_reference_agent_keystore;
@@ -174,7 +177,17 @@ pub fn prepare_contract_server() -> Result<(), ProtocolError> {
     ))]
     {
         let reference_root: [u8; 32] = *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
-        let _ = crate::seal_root::set_pq_seal_v1_provisioning_root(reference_root);
+        // Best-effort install-once. Surface a failure (not a silent `let _ =`) so a deviceless misconfig is
+        // observable at runtime: if NO provisioning root ends up configured, the mutating ops fail closed
+        // 0x46 — a 2d engineer should be able to tell that from a real reject. (An "already configured"
+        // error is benign — a pre-set platform root resolves fine — hence a [warn], not a fatal.)
+        if let Err(e) = crate::seal_root::set_pq_seal_v1_provisioning_root(reference_root) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[warn] contract server: reference seal root not installed ({e}); mutating ops need a provisioning root (else 0x46)"
+            );
+        }
     }
     if !install_reference_agent_keystore() {
         return Err(ProtocolError::WireProtocol(

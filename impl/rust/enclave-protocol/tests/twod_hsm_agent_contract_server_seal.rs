@@ -12,6 +12,11 @@
 //! performs, including the explicit reference-root install — then drives a FROZEN GENERATE_KEYS through
 //! the shipped 0x40 serve glue and asserts SUCCESS. A regression that drops the seal-root install reverts
 //! this to `0x46` here (where there is no test fallback), failing loudly.
+//!
+//! GENERATE_KEYS is the REPRESENTATIVE seal-path op: the seal-root install (`prepare_contract_server`) is
+//! op-agnostic and CONFIGURE_TREASURY / SIGN_FAUCET_DISPENSE seal through the IDENTICAL `commit_before_emit`
+//! seam, so one op proves the non-`cfg(test)` seal path for all three (the `cfg(test)` lib round-trips
+//! already cover each opcode). Enabling only `agent-keygen-exec-preview` here keeps the lane minimal.
 #![cfg(all(
     unix,
     feature = "agent-gateway",
