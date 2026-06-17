@@ -4913,4 +4913,201 @@ mod tests {
             eprintln!("wrote 5 response vectors + 7 error bodies + response_bodies_v1.json -> {dir}");
         }
     }
+
+    /// TASK-22 — byte-exact `0x40` NEGATIVE (rejection) golden vectors (AC#4).
+    ///
+    /// Freezes `{malformed request bytes → expected §10.9 error code}` pairs so the downstream 2d codec can
+    /// assert the enclave's anti-oracle band classification. Each request is deterministic; the band is
+    /// asserted by driving the REAL `dispatch_agent` (the cap/not-configured bands need the process-global
+    /// anti-rollback binding set/cleared, via the shared `gate_configured`/`gate_unconfigured` guards). The
+    /// `0x44`(CapExceeded)/`0x46`(SealFailed) bands are handler/preview-level (not reachable deviceless
+    /// without the preview features) — documented as deferred, not frozen here. **TEST KEYS ONLY.**
+    mod golden_negative_vectors {
+        use super::*;
+        use sha2::{Digest, Sha256};
+
+        const ENV_ID: &str = "env-prod-0";
+        const CHAIN: u64 = 11565;
+        /// `super::envelope()` stamps request_id `[0x11; 16]`; the cap negatives bind to the same id.
+        const RID: &[u8] = &[0x11; 16];
+        const ABSENT_KEY_REF: [u8; 32] = [0x99; 32];
+
+        fn hx(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        fn k(n: u64) -> Value {
+            Value::Integer(n.into())
+        }
+        fn admin() -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+        }
+        /// A body whose sealed config matches the cap conventions (admin authority [7;32], env-prod-0) so a
+        /// cap negative reaches the SPECIFIC rejection (bad sig / counter gap), not an env/chain mismatch.
+        fn cap_body() -> KeystoreBody {
+            let mut b = base_body();
+            b.config.admin_authority_pk = admin().verifying_key().to_bytes();
+            b.config.environment_identifier = ENV_ID.to_string();
+            b
+        }
+        fn genkeys_payload() -> Value {
+            Value::Map(vec![(k(1), Value::Integer(1u64.into())), (k(2), Value::Integer(1u64.into()))])
+        }
+        /// A GENERATE_KEYS cap on the admin lane; `pb` is unchecked by the verify layer (handler-only), so a
+        /// placeholder is fine for verify-band negatives.
+        fn genkeys_cap(signer: &ed25519_dalek::SigningKey, counter: u64) -> Vec<(Value, Value)> {
+            crate::agent_capability::test_signed_capability(
+                signer, 1, RID, counter, false, CHAIN, ENV_ID, 0, b"golden-scope-generate", 1, [0xbb; 32],
+            )
+        }
+
+        // ---- the frozen negative request envelopes (deterministic; the code is asserted separately) ----
+        fn neg_unknown_envelope_key() -> Vec<u8> {
+            // Extra key 8 — decode_envelope's strict allow-list (keys 1..=7) rejects ⇒ 0x40.
+            envelope(2, vec![(k(6), Value::Bytes(vec![0x33; 32])), (k(8), Value::Integer(0u64.into()))])
+        }
+        fn neg_runtime_op_with_capability() -> Vec<u8> {
+            // SIGN_TRANSFER(4) is a runtime op; a capability at key 5 is structurally invalid ⇒ 0x40.
+            envelope(4, vec![(k(5), Value::Map(genkeys_cap(&admin(), 1))), (k(6), Value::Bytes(vec![0x33; 32]))])
+        }
+        fn neg_wrong_profile_env() -> Vec<u8> {
+            // A well-formed PUBLIC_IDENTITY env — the negative is dispatching it on Profile::Producer ⇒ 0x41.
+            envelope(2, vec![(k(6), Value::Bytes(vec![0x33; 32]))])
+        }
+        fn neg_key_not_found() -> Vec<u8> {
+            // PUBLIC_IDENTITY for a key_ref absent from the body ⇒ 0x42 (the anti-oracle key band).
+            envelope(2, vec![(k(6), Value::Bytes(ABSENT_KEY_REF.to_vec()))])
+        }
+        fn neg_cap_wrong_signature() -> Vec<u8> {
+            // GENERATE_KEYS cap signed by a NON-admin key ⇒ Ed25519 verify fails ⇒ 0x43.
+            let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]);
+            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&wrong, 1))), (k(7), genkeys_payload())])
+        }
+        fn neg_cap_counter_gap() -> Vec<u8> {
+            // Valid admin cap but counter=5 with an empty counter table (expected 1) ⇒ non-contiguous ⇒ 0x43.
+            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&admin(), 5))), (k(7), genkeys_payload())])
+        }
+        fn neg_generate_keys_not_configured() -> Vec<u8> {
+            // A well-formed, validly-capped GENERATE_KEYS — the negative is the anti-rollback binding being
+            // ABSENT, so the fund-custody gate fires ⇒ 0x45 (before cap routing).
+            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&admin(), 1))), (k(7), genkeys_payload())])
+        }
+
+        /// (filename, bytes, expected code, short cause). The code is asserted in the *_codes tests below.
+        fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static str)> {
+            vec![
+                ("neg_cap_counter_gap_v1.bin", neg_cap_counter_gap(), 0x43, "non-contiguous capability counter"),
+                ("neg_cap_wrong_signature_v1.bin", neg_cap_wrong_signature(), 0x43, "capability signature verify failed"),
+                ("neg_generate_keys_not_configured_v1.bin", neg_generate_keys_not_configured(), 0x45, "anti-rollback binding not configured"),
+                ("neg_key_not_found_v1.bin", neg_key_not_found(), 0x42, "key_ref not found / wrong purpose"),
+                ("neg_runtime_op_with_capability_v1.bin", neg_runtime_op_with_capability(), 0x40, "runtime opcode carrying a capability"),
+                ("neg_unknown_envelope_key_v1.bin", neg_unknown_envelope_key(), 0x40, "unknown envelope key (strict 1..=7)"),
+                ("neg_wrong_profile_v1.bin", neg_wrong_profile_env(), 0x41, "agent opcode on the producer profile"),
+            ]
+        }
+
+        #[test]
+        fn golden_negative_vectors_are_byte_exact() {
+            let committed: &[(&str, &[u8])] = &[
+                ("neg_cap_counter_gap_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_cap_counter_gap_v1.bin")),
+                ("neg_cap_wrong_signature_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_cap_wrong_signature_v1.bin")),
+                ("neg_generate_keys_not_configured_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_generate_keys_not_configured_v1.bin")),
+                ("neg_key_not_found_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_key_not_found_v1.bin")),
+                ("neg_runtime_op_with_capability_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_runtime_op_with_capability_v1.bin")),
+                ("neg_unknown_envelope_key_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_unknown_envelope_key_v1.bin")),
+                ("neg_wrong_profile_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_wrong_profile_v1.bin")),
+            ];
+            for (name, built, ..) in vectors() {
+                let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(built.as_slice(), c, "{name} drifted; regen + re-mint .json in the same commit");
+            }
+        }
+
+        #[test]
+        fn golden_negative_shape_and_key_codes() {
+            // Shape (0x40) + profile (0x41) + key (0x42) bands — all reached BEFORE the anti-rollback gate /
+            // any process global, so no guard is needed. Driven through the real dispatch_agent.
+            let b = base_body();
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_unknown_envelope_key(), &b).err().unwrap().code(), 0x40);
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_runtime_op_with_capability(), &b).err().unwrap().code(), 0x40);
+            assert_eq!(dispatch_agent(Profile::Producer, &neg_wrong_profile_env(), &b).err().unwrap().code(), 0x41);
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_key_not_found(), &b).err().unwrap().code(), 0x42);
+        }
+
+        #[test]
+        fn golden_negative_capability_codes() {
+            // 0x43 band: the anti-rollback binding must be INSTALLED so dispatch reaches cap verify (else the
+            // gate would return 0x45 first). gate_configured installs it + holds the process-global guard.
+            let _g = gate_configured();
+            let b = cap_body();
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_cap_wrong_signature(), &b).err().unwrap().code(), 0x43);
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_cap_counter_gap(), &b).err().unwrap().code(), 0x43);
+        }
+
+        #[test]
+        fn golden_negative_not_configured_code() {
+            // 0x45 band: binding ABSENT ⇒ the fund-custody gate fires for the rollback-sensitive GENERATE_KEYS
+            // even with an otherwise-valid cap. gate_unconfigured clears the binding + holds the guard.
+            let _g = gate_unconfigured();
+            let b = cap_body();
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_generate_keys_not_configured(), &b).err().unwrap().code(), 0x45);
+        }
+
+        #[test]
+        fn configure_treasury_stray_key_ref_is_accepted_and_ignored() {
+            // DOCUMENTED current behavior (TASK-20 residual, document-the-ignore): §10.7 says CONFIGURE has
+            // no key_ref, but decode_envelope ACCEPTS a stray key 6 on ANY envelope (it is a valid envelope
+            // key) and the CONFIGURE handler simply ignores it — benign, since the capability binding (not the
+            // key_ref) carries integrity. A future strict-shape tightening (reject env.key_ref.is_some() for
+            // CONFIGURE) would turn this into a 0x40 negative; until then this pins the accepted-but-ignored
+            // shape so the frozen negative set stays consistent with actual behavior.
+            let env = envelope(6, vec![(k(6), Value::Bytes(vec![0x33; 32]))]);
+            let decoded = decode_envelope(&env).expect("stray key_ref on CONFIGURE is currently accepted");
+            assert_eq!(decoded.opcode, 6, "opcode preserved");
+            assert!(decoded.key_ref.is_some(), "the stray key_ref is present (decoded) but unused by the handler");
+        }
+
+        #[test]
+        fn golden_negative_sidecar_matches() {
+            let sidecar = include_str!("../testvectors/agent-gateway/negative_vectors_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("negative index is valid JSON");
+            assert_eq!(
+                v["negatives"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra negative entry"
+            );
+            for (name, bytes, code, cause) in vectors() {
+                let e = &v["negatives"][name];
+                assert_eq!(e["expected_code"].as_u64(), Some(code as u64), "{name} code");
+                assert_eq!(e["cause"].as_str(), Some(cause), "{name} cause");
+                assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
+                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_negative_vectors::regen_golden_negative_vectors -- --ignored --nocapture`.
+        #[test]
+        #[ignore]
+        fn regen_golden_negative_vectors() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let mut negatives = serde_json::Map::new();
+            for (name, bytes, code, cause) in vectors() {
+                std::fs::write(format!("{dir}{name}"), &bytes).expect("write negative .bin");
+                let mut e = serde_json::Map::new();
+                e.insert("blob_hex".into(), hx(&bytes).into());
+                e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
+                e.insert("blob_sha256".into(), hx(&Sha256::digest(&bytes)).into());
+                e.insert("cause".into(), cause.into());
+                e.insert("expected_code".into(), (code as u64).into());
+                negatives.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#4 — byte-exact 0x40 NEGATIVE vectors: {request bytes → expected §10.9 code}, asserted via the real dispatch_agent. 0x40 shape / 0x41 profile / 0x42 key / 0x43 capability / 0x45 not-configured. 0x44 (CapExceeded) and 0x46 (SealFailed) are handler/preview-level — deferred. CONFIGURE stray key_ref is accepted+ignored today (TASK-20 document-the-ignore). TEST KEYS ONLY. Regen: cargo test --features agent-gateway golden_negative_vectors::regen_golden_negative_vectors -- --ignored --nocapture",
+                "negatives": serde_json::Value::Object(negatives),
+            });
+            std::fs::write(format!("{dir}negative_vectors_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
+                .expect("write negative index");
+            eprintln!("wrote 7 negative vectors + negative_vectors_v1.json -> {dir}");
+        }
+    }
 }

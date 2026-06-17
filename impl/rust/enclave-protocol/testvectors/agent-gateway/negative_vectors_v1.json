@@ -1,0 +1,54 @@
+{
+  "_comment": "TASK-22 AC#4 — byte-exact 0x40 NEGATIVE vectors: {request bytes → expected §10.9 code}, asserted via the real dispatch_agent. 0x40 shape / 0x41 profile / 0x42 key / 0x43 capability / 0x45 not-configured. 0x44 (CapExceeded) and 0x46 (SealFailed) are handler/preview-level — deferred. CONFIGURE stray key_ref is accepted+ignored today (TASK-20 document-the-ignore). TEST KEYS ONLY. Regen: cargo test --features agent-gateway golden_negative_vectors::regen_golden_negative_vectors -- --ignored --nocapture",
+  "negatives": {
+    "neg_cap_counter_gap_v1.bin": {
+      "blob_hex": "a601010201037732642d68736d2f6167656e742d676174657761792f763104501111111111111111111111111111111105ac01010201040105192d2d066a656e762d70726f642d3007000855676f6c64656e2d73636f70652d67656e657261746509050a50111111111111111111111111111111110b5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0cf40d58404a6ebbf6f302736e7f969a859d59a306658905eb9332a5743bebf023ebfb7cee6ab1df310a883a49d2faeb452be4e2fef7de3a19374ff4b2c7bf3dc9057a820b07a201010201",
+      "blob_len_bytes": 227,
+      "blob_sha256": "c7d61bcb3addd59ff6583635791a1417f552802c594fc918ad6e3412dc565d0e",
+      "cause": "non-contiguous capability counter",
+      "expected_code": 67
+    },
+    "neg_cap_wrong_signature_v1.bin": {
+      "blob_hex": "a601010201037732642d68736d2f6167656e742d676174657761792f763104501111111111111111111111111111111105ac01010201040105192d2d066a656e762d70726f642d3007000855676f6c64656e2d73636f70652d67656e657261746509010a50111111111111111111111111111111110b5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0cf40d5840f662cbaf0f5fa3fb3d688c1529b5aa0aa303b9984e3bebe746e0b00e3fb7dd5e6259a3c033e9b6fcfc53b7fce3528fdd62f31f7503dfe3a9b8319bed7b28200407a201010201",
+      "blob_len_bytes": 227,
+      "blob_sha256": "9aca57fd8e63cdf55c84a7b0624c36a95115a2a49558cf7f76f8496db767a1ca",
+      "cause": "capability signature verify failed",
+      "expected_code": 67
+    },
+    "neg_generate_keys_not_configured_v1.bin": {
+      "blob_hex": "a601010201037732642d68736d2f6167656e742d676174657761792f763104501111111111111111111111111111111105ac01010201040105192d2d066a656e762d70726f642d3007000855676f6c64656e2d73636f70652d67656e657261746509010a50111111111111111111111111111111110b5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0cf40d58406b0ca9a4ba158e3eb37de590534af4e01e93f7a5337d04be4cbdaff726cb38c28e68f90d4fce5ddcac732987d92c244e13b83db6b9111c684dac32893104a60b07a201010201",
+      "blob_len_bytes": 227,
+      "blob_sha256": "254a67ea48ce39959a0c956a3c37954dd6aaa46ace11dfd05ade8022ae3cc534",
+      "cause": "anti-rollback binding not configured",
+      "expected_code": 69
+    },
+    "neg_key_not_found_v1.bin": {
+      "blob_hex": "a501010202037732642d68736d2f6167656e742d676174657761792f76310450111111111111111111111111111111110658209999999999999999999999999999999999999999999999999999999999999999",
+      "blob_len_bytes": 83,
+      "blob_sha256": "649300be0d87af34a1e83b9c9f8520d7e81a68d7635e517e6750badb5274853b",
+      "cause": "key_ref not found / wrong purpose",
+      "expected_code": 66
+    },
+    "neg_runtime_op_with_capability_v1.bin": {
+      "blob_hex": "a601010204037732642d68736d2f6167656e742d676174657761792f763104501111111111111111111111111111111105ac01010201040105192d2d066a656e762d70726f642d3007000855676f6c64656e2d73636f70652d67656e657261746509010a50111111111111111111111111111111110b5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0cf40d58406b0ca9a4ba158e3eb37de590534af4e01e93f7a5337d04be4cbdaff726cb38c28e68f90d4fce5ddcac732987d92c244e13b83db6b9111c684dac32893104a60b0658203333333333333333333333333333333333333333333333333333333333333333",
+      "blob_len_bytes": 256,
+      "blob_sha256": "9d84c03fddfd2e230a5e6b98e033ae3a8a5787e17fd58d1e31442c4d7b91f71d",
+      "cause": "runtime opcode carrying a capability",
+      "expected_code": 64
+    },
+    "neg_unknown_envelope_key_v1.bin": {
+      "blob_hex": "a601010202037732642d68736d2f6167656e742d676174657761792f763104501111111111111111111111111111111106582033333333333333333333333333333333333333333333333333333333333333330800",
+      "blob_len_bytes": 85,
+      "blob_sha256": "a69de8e020f2b446575563e329da561d414cc4ff109149157032fadb9a444de7",
+      "cause": "unknown envelope key (strict 1..=7)",
+      "expected_code": 64
+    },
+    "neg_wrong_profile_v1.bin": {
+      "blob_hex": "a501010202037732642d68736d2f6167656e742d676174657761792f76310450111111111111111111111111111111110658203333333333333333333333333333333333333333333333333333333333333333",
+      "blob_len_bytes": 83,
+      "blob_sha256": "e713b123dfe7af8deed97d5db418a310e0f989553b4c30563c5e671a16ae1e13",
+      "cause": "agent opcode on the producer profile",
+      "expected_code": 65
+    }
+  }
+}
