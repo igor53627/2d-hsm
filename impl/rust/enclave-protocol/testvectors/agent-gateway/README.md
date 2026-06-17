@@ -71,8 +71,12 @@ the `request_envelopes_v1.json` index couples each blob's `sha256`/`len` + decod
 These are **wire-shape (decode) vectors**: each is proven to be accepted by the strict-canonical
 envelope decoder and to carry the documented field shape (incl. the 8-field EIP-155 payload, whose
 key layout matches the live `handle_sign_transfer` / `handle_sign_faucet_dispense` decoders). They are
-**not dispatch-success fixtures** — `key_ref` is a placeholder `[0x11;32]` that matches no stored key,
-so a live enclave would answer `0x42`/NotConfigured, not a signed body. End-to-end response-body
+**not end-to-end dispatch-success fixtures** — a successful dispatch additionally needs the matching
+keystore state (a stored key for `key_ref`, the sealed `chain_id`, the faucet allowlist/config) and the
+relevant preview feature; absent those, a live enclave returns the appropriate §10.9 error rather than a
+signed body (e.g. `0x42` KeyPurposeMismatch for an unknown/wrong-purpose key, or `0x45` NotConfigured for
+a preview-gated op). (NB `key_ref` here is the lab-smoke fixture's `[0x11;32]`, so it is *not* a universal
+"no such key" — what a given enclave returns depends on the installed keystore.) End-to-end response-body
 vectors land in the later TASK-22 response slices.
 
 The cap-bearing envelopes (GENERATE_KEYS(1) / CONFIGURE_TREASURY(6)) + the §10.5 capability
