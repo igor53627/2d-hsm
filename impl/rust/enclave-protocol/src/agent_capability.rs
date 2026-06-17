@@ -1072,4 +1072,344 @@ mod tests {
             Err(AgentError::CapabilityRejected)
         );
     }
+
+    /// TASK-22 — byte-exact §10.5 CAPABILITY golden vectors (AC#2).
+    ///
+    /// Freezes, for the cap-bearing opcodes, the Ed25519-signed PREIMAGE (`CAP_DOMAIN ‖
+    /// canonical-CBOR(keys 1..12)`) AND the full capability map (keys 1..13, incl. the signature), plus the
+    /// `payload_binding` derivation (`keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical-CBOR(params))`).
+    /// These pin the two facts most likely to drift an external (2d Elixir) reimplementer: the **11-vs-12
+    /// entry preimage header** (`0xAB` no-sub_op vs `0xAC` CONFIGURE) and the **sub_op byte folded into the
+    /// binding**. Each is byte-exact vs the committed `.bin` AND the full map is ACCEPTED by the real
+    /// `verify_capability` against `test_config()` (so a signer/encoder drift breaks CI). Ed25519 (RFC 8032)
+    /// is deterministic, so the signed bytes are reproducible. **TEST KEYS ONLY** — admin Ed25519 `[7;32]`,
+    /// recovery `[9;32]`; env `env-prod-0`, chain 11565 (the agent_capability test fixtures).
+    mod golden_capability_vectors {
+        use super::*;
+        use sha2::{Digest, Sha256};
+
+        const SCOPE_GENERATE: &[u8] = b"golden-scope-generate";
+        const SCOPE_CONFIGURE: &[u8] = b"golden-scope-configure";
+        const RID_GENERATE: &[u8] = b"0x40-golden:cap:generate-keys:v1";
+        const RID_SET_LIMITS: &[u8] = b"0x40-golden:cap:configure-set-limits:v1";
+        const RID_RESET: &[u8] = b"0x40-golden:cap:configure-reset:v1";
+
+        fn hx(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        fn min_be(x: u64) -> Vec<u8> {
+            let b = x.to_be_bytes();
+            let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+            b[i..].to_vec()
+        }
+        fn enc(map: &[(Value, Value)]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&Value::Map(map.to_vec()), &mut buf).expect("cap map encodes");
+            buf
+        }
+
+        /// Build a golden cap → (signed preimage, full-map CBOR bytes, the map). Constructs the Capability
+        /// directly so BOTH the preimage (keys 1..12) and the signed full map (keys 1..13) come from ONE cap.
+        #[allow(clippy::too_many_arguments)]
+        fn build_cap(
+            key: &SigningKey,
+            opcode: u8,
+            sub_op: Option<u8>,
+            key_purpose: u8,
+            scope_target: &[u8],
+            counter: u64,
+            request_id: &[u8],
+            payload_binding: [u8; 32],
+            is_recovery: bool,
+        ) -> (Vec<u8>, Vec<u8>, Vec<(Value, Value)>) {
+            let mut cap = Capability {
+                cap_format_version: 1,
+                command_opcode: opcode,
+                treasury_sub_op: sub_op,
+                key_purpose,
+                chain_id: TEST_CHAIN,
+                environment_identifier: TEST_ENV.to_string(),
+                scope_class: 0,
+                scope_target: scope_target.to_vec(),
+                counter,
+                request_id: request_id.to_vec(),
+                payload_binding,
+                is_recovery,
+                signature: [0u8; 64],
+            };
+            let preimage = signed_preimage(&cap);
+            cap.signature = key.sign(&preimage).to_bytes();
+            let map = cap_to_map(&cap);
+            let full = enc(&map);
+            (preimage, full, map)
+        }
+
+        // The two payload_bindings (also embedded in the caps so the vectors are internally consistent).
+        fn pb_generate() -> [u8; 32] {
+            payload_binding(1, None, RID_GENERATE, &crate::agent_dispatch::generate_keys_canonical_params(1, 1))
+        }
+        fn pb_set_limits() -> [u8; 32] {
+            payload_binding(
+                6,
+                Some(0),
+                RID_SET_LIMITS,
+                &crate::agent_dispatch::configure_treasury_canonical_params(0, &min_be(1_000_000), Some((21_000, 1_000_000_000))),
+            )
+        }
+        fn pb_reset() -> [u8; 32] {
+            payload_binding(
+                6,
+                Some(3),
+                RID_RESET,
+                &crate::agent_dispatch::configure_treasury_canonical_params(3, &min_be(500), None),
+            )
+        }
+
+        /// The standalone `payload_binding_*.bin` vectors, FULLY self-describing so a consumer can
+        /// RECOMPUTE `keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical_params)` end-to-end (the binding
+        /// is otherwise just a 32-byte hash with no recoverable inputs). Returns
+        /// (file, opcode, sub_op, request_id, canonical_params bytes, binding). The binding value reuses
+        /// `pb_generate`/`pb_set_limits` so it can't drift from the caps that embed it.
+        fn payload_binding_entries() -> Vec<(&'static str, u8, Option<u8>, &'static [u8], Vec<u8>, [u8; 32])> {
+            let gen_params = crate::agent_dispatch::generate_keys_canonical_params(1, 1);
+            let set_params = crate::agent_dispatch::configure_treasury_canonical_params(
+                0,
+                &min_be(1_000_000),
+                Some((21_000, 1_000_000_000)),
+            );
+            vec![
+                ("payload_binding_generate_keys_v1.bin", 1, None, RID_GENERATE, gen_params, pb_generate()),
+                ("payload_binding_configure_set_limits_v1.bin", 6, Some(0), RID_SET_LIMITS, set_params, pb_set_limits()),
+            ]
+        }
+
+        /// (name, preimage, full-map bytes, opcode, sub_op, is_recovery, request_id, expected header byte).
+        fn caps() -> Vec<(&'static str, Vec<u8>, Vec<u8>, u8, Option<u8>, bool, &'static [u8], u8)> {
+            let admin = SigningKey::from_bytes(&[7u8; 32]);
+            let recovery = SigningKey::from_bytes(&[9u8; 32]);
+            let (p_g, f_g, _) = build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false);
+            let (p_s, f_s, _) =
+                build_cap(&admin, 6, Some(0), 2, SCOPE_CONFIGURE, 1, RID_SET_LIMITS, pb_set_limits(), false);
+            let (p_r, f_r, _) =
+                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true);
+            vec![
+                ("generate_keys", p_g, f_g, 1, None, false, RID_GENERATE, 0xAB),
+                ("configure_reset", p_r, f_r, 6, Some(3), true, RID_RESET, 0xAC),
+                ("configure_set_limits", p_s, f_s, 6, Some(0), false, RID_SET_LIMITS, 0xAC),
+            ]
+        }
+
+        #[test]
+        fn cap_vectors_are_byte_exact() {
+            let pre: &[(&str, &[u8])] = &[
+                ("generate_keys", include_bytes!("../testvectors/agent-gateway/cap_preimage_generate_keys_v1.bin")),
+                ("configure_reset", include_bytes!("../testvectors/agent-gateway/cap_preimage_configure_reset_v1.bin")),
+                ("configure_set_limits", include_bytes!("../testvectors/agent-gateway/cap_preimage_configure_set_limits_v1.bin")),
+            ];
+            let full: &[(&str, &[u8])] = &[
+                ("generate_keys", include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin")),
+                ("configure_reset", include_bytes!("../testvectors/agent-gateway/cap_full_configure_reset_v1.bin")),
+                ("configure_set_limits", include_bytes!("../testvectors/agent-gateway/cap_full_configure_set_limits_v1.bin")),
+            ];
+            for (name, preimage, fullmap, ..) in caps() {
+                let p = pre.iter().find(|(n, _)| *n == name).unwrap().1;
+                let f = full.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(preimage.as_slice(), p, "cap {name} preimage drifted; regen + re-mint .json");
+                assert_eq!(fullmap.as_slice(), f, "cap {name} full-map drifted; regen + re-mint .json");
+            }
+            // payload_binding derivation vectors (32-byte keccak outputs).
+            assert_eq!(
+                pb_generate().as_slice(),
+                include_bytes!("../testvectors/agent-gateway/payload_binding_generate_keys_v1.bin"),
+                "pb generate_keys drifted"
+            );
+            assert_eq!(
+                pb_set_limits().as_slice(),
+                include_bytes!("../testvectors/agent-gateway/payload_binding_configure_set_limits_v1.bin"),
+                "pb configure_set_limits drifted"
+            );
+        }
+
+        #[test]
+        fn cap_preimages_have_domain_and_canonical_header() {
+            // CAP_DOMAIN prefix + the map-header byte that distinguishes the 11-entry (no sub_op) preimage
+            // from the 12-entry CONFIGURE preimage — the asymmetry an external reimplementer is most likely
+            // to get wrong.
+            for (name, preimage, _full, _op, _sub, _rec, _rid, header) in caps() {
+                assert!(preimage.starts_with(CAP_DOMAIN), "cap {name} preimage missing CAP_DOMAIN prefix");
+                assert_eq!(preimage[CAP_DOMAIN.len()], header, "cap {name} preimage map-header byte");
+            }
+        }
+
+        #[test]
+        fn cap_full_maps_are_accepted_by_the_real_verifier() {
+            // The strongest coupling: each frozen full map is ACCEPTED by the live `verify_capability`
+            // against `test_config()` with an empty counter table (counter 1 == highest 0 + 1). A signer /
+            // canonical-encoder / authority-tier drift would make the real verifier REJECT and break CI.
+            for (name, _preimage, fullmap, opcode, _sub, _rec, request_id, _h) in caps() {
+                let map = match ciborium::de::from_reader::<Value, _>(fullmap.as_slice()).unwrap() {
+                    Value::Map(m) => m,
+                    _ => panic!("cap {name} full map is not a CBOR map"),
+                };
+                assert_eq!(
+                    verify_capability(&map, opcode, request_id, &test_config(), &[]),
+                    Ok(()),
+                    "cap {name} must be accepted by the real verifier"
+                );
+            }
+        }
+
+        #[test]
+        fn admin_and_recovery_lanes_accept_counter_1_independently() {
+            // The §10.6 counter lanes are keyed by (authority, env, scope_class, scope_target) and are
+            // INDEPENDENT: a counter-1 cap on one authority's lane is accepted even when the OTHER lane is
+            // already populated (highest 1). Drives the live `verify_capability` with a non-empty counter
+            // table to exercise that (the byte-exact acceptance test above only uses an empty table).
+            let admin = SigningKey::from_bytes(&[7u8; 32]);
+            let recovery = SigningKey::from_bytes(&[9u8; 32]);
+            let lane = |authority: [u8; 32], scope: &[u8]| CounterEntry {
+                authority,
+                environment_identifier: TEST_ENV.to_string(),
+                scope_class: 0,
+                scope_target: scope.to_vec(),
+                highest_accepted_counter: 1,
+            };
+            // Isolate the AUTHORITY dimension: the populated "other lane" shares the SAME
+            // env/scope_class/scope_target as the cap under test and differs ONLY in authority. So the
+            // cap's counter 1 is accepted iff `authority` is part of the lane key — a verifier that keyed
+            // by (env, scope_class, scope_target) but ignored authority would see that scope already at
+            // highest 1, expect 2, and REJECT counter 1 (this test would then fail, catching the regression).
+            // Admin GENERATE_KEYS counter 1, with a RECOVERY lane on the SAME scope already at highest 1.
+            let (_p, _f, admin_map) =
+                build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false);
+            let recovery_same_scope = lane(recovery.verifying_key().to_bytes(), SCOPE_GENERATE);
+            assert_eq!(
+                verify_capability(&admin_map, 1, RID_GENERATE, &test_config(), std::slice::from_ref(&recovery_same_scope)),
+                Ok(()),
+                "admin counter 1 accepted despite a recovery lane on the SAME scope (authority is in the lane key)",
+            );
+            // Symmetric: recovery RESET counter 1, with an ADMIN lane on the SAME scope already at highest 1.
+            let (_p2, _f2, reset_map) =
+                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true);
+            let admin_same_scope = lane(admin.verifying_key().to_bytes(), SCOPE_CONFIGURE);
+            assert_eq!(
+                verify_capability(&reset_map, 6, RID_RESET, &test_config(), std::slice::from_ref(&admin_same_scope)),
+                Ok(()),
+                "recovery counter 1 accepted despite an admin lane on the SAME scope (authority is in the lane key)",
+            );
+        }
+
+        #[test]
+        fn payload_binding_sub_op_asymmetry() {
+            // GENERATE_KEYS binds keccak256(opcode ‖ request_id ‖ params) — NO sub_op byte; CONFIGURE folds
+            // the sub_op as the 2nd preimage byte. Pin that the two derivations differ in that one byte by
+            // recomputing with/without and asserting they diverge (a reimplementer that omitted the sub_op
+            // byte would collide the two).
+            let with_sub = payload_binding(6, Some(0), RID_SET_LIMITS, b"params");
+            let without_sub = payload_binding(6, None, RID_SET_LIMITS, b"params");
+            assert_ne!(with_sub, without_sub, "sub_op byte must change the payload_binding");
+        }
+
+        #[test]
+        fn cap_vector_sidecar_matches() {
+            let sidecar = include_str!("../testvectors/agent-gateway/capability_vectors_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("capability index is valid JSON");
+            assert_eq!(v["cap_domain_hex"].as_str(), Some(hx(CAP_DOMAIN).as_str()), "index cap_domain");
+            assert_eq!(v["environment_identifier"].as_str(), Some(TEST_ENV), "index env");
+            assert_eq!(v["chain_id"].as_u64(), Some(TEST_CHAIN), "index chain_id");
+            assert_eq!(
+                v["caps"].as_object().map(|o| o.len()),
+                Some(caps().len()),
+                "index has a stale/extra cap entry"
+            );
+            for (name, preimage, fullmap, opcode, sub, is_recovery, request_id, header) in caps() {
+                let e = &v["caps"][name];
+                assert_eq!(e["opcode"].as_u64(), Some(opcode as u64), "{name} opcode");
+                assert_eq!(e["treasury_sub_op"].as_u64(), sub.map(u64::from), "{name} sub_op");
+                assert_eq!(e["is_recovery"].as_bool(), Some(is_recovery), "{name} is_recovery");
+                assert_eq!(e["request_id_hex"].as_str(), Some(hx(request_id).as_str()), "{name} request_id");
+                assert_eq!(e["preimage_header_byte"].as_u64(), Some(header as u64), "{name} header");
+                assert_eq!(e["preimage_sha256"].as_str(), Some(hx(&Sha256::digest(&preimage)).as_str()), "{name} pre sha");
+                assert_eq!(e["preimage_len_bytes"].as_u64(), Some(preimage.len() as u64), "{name} pre len");
+                assert_eq!(e["preimage_hex"].as_str(), Some(hx(&preimage).as_str()), "{name} pre hex");
+                assert_eq!(e["full_map_sha256"].as_str(), Some(hx(&Sha256::digest(&fullmap)).as_str()), "{name} full sha");
+                assert_eq!(e["full_map_len_bytes"].as_u64(), Some(fullmap.len() as u64), "{name} full len");
+                assert_eq!(e["full_map_hex"].as_str(), Some(hx(&fullmap).as_str()), "{name} full hex");
+            }
+            // payload_binding index: each entry carries the full recompute inputs (canonical_params_hex)
+            // so a consumer can reproduce the keccak — and we self-check that the indexed params DO produce
+            // the indexed binding (no stale/uncomputable hash).
+            assert_eq!(
+                v["payload_bindings"].as_object().map(|o| o.len()),
+                Some(payload_binding_entries().len()),
+                "stale/extra payload_binding entry",
+            );
+            for (name, opcode, sub_op, request_id, canonical_params, binding) in payload_binding_entries() {
+                assert_eq!(
+                    payload_binding(opcode, sub_op, request_id, &canonical_params),
+                    binding,
+                    "{name}: indexed canonical_params must recompute the indexed binding",
+                );
+                let pe = &v["payload_bindings"][name];
+                assert_eq!(pe["opcode"].as_u64(), Some(opcode as u64), "{name} pb opcode");
+                assert_eq!(pe["treasury_sub_op"].as_u64(), sub_op.map(u64::from), "{name} pb sub_op");
+                assert_eq!(pe["request_id_hex"].as_str(), Some(hx(request_id).as_str()), "{name} pb request_id");
+                assert_eq!(pe["canonical_params_hex"].as_str(), Some(hx(&canonical_params).as_str()), "{name} pb params");
+                assert_eq!(pe["binding_hex"].as_str(), Some(hx(&binding).as_str()), "{name} pb binding");
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_capability_vectors::regen_golden_capability_vectors -- --ignored --nocapture`,
+        /// then commit the `.bin`s + the re-minted `capability_vectors_v1.json`.
+        #[test]
+        #[ignore]
+        fn regen_golden_capability_vectors() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let write = |name: &str, bytes: &[u8]| std::fs::write(format!("{dir}{name}"), bytes).expect("write .bin");
+            let mut index = serde_json::Map::new();
+            for (name, preimage, fullmap, opcode, sub, is_recovery, request_id, header) in caps() {
+                write(&format!("cap_preimage_{name}_v1.bin"), &preimage);
+                write(&format!("cap_full_{name}_v1.bin"), &fullmap);
+                // Alphabetical insertion → stable .json bytes regardless of serde_json map impl.
+                let mut e = serde_json::Map::new();
+                e.insert("full_map_hex".into(), hx(&fullmap).into());
+                e.insert("full_map_len_bytes".into(), (fullmap.len() as u64).into());
+                e.insert("full_map_sha256".into(), hx(&Sha256::digest(&fullmap)).into());
+                e.insert("is_recovery".into(), is_recovery.into());
+                e.insert("opcode".into(), (opcode as u64).into());
+                e.insert("preimage_header_byte".into(), (header as u64).into());
+                e.insert("preimage_hex".into(), hx(&preimage).into());
+                e.insert("preimage_len_bytes".into(), (preimage.len() as u64).into());
+                e.insert("preimage_sha256".into(), hx(&Sha256::digest(&preimage)).into());
+                e.insert("request_id_hex".into(), hx(request_id).into());
+                e.insert("treasury_sub_op".into(), sub.map(|s| serde_json::Value::from(s as u64)).unwrap_or(serde_json::Value::Null));
+                index.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let _ = pb_reset(); // reset binding is embedded in the reset cap; not frozen standalone
+            // payload_binding vectors + a SELF-DESCRIBING index (opcode/sub_op/request_id/canonical_params/
+            // binding) so a consumer can recompute the keccak without reading the Rust source.
+            let mut pb_index = serde_json::Map::new();
+            for (name, opcode, sub_op, request_id, canonical_params, binding) in payload_binding_entries() {
+                write(name, &binding);
+                let mut e = serde_json::Map::new();
+                e.insert("binding_hex".into(), hx(&binding).into());
+                e.insert("canonical_params_hex".into(), hx(&canonical_params).into());
+                e.insert("opcode".into(), (opcode as u64).into());
+                e.insert("request_id_hex".into(), hx(request_id).into());
+                e.insert("treasury_sub_op".into(), sub_op.map(|s| serde_json::Value::from(s as u64)).unwrap_or(serde_json::Value::Null));
+                pb_index.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors. preimage = CAP_DOMAIN || canonical-CBOR(keys 1..12); full map = keys 1..13 (incl. Ed25519 signature). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params) — the payload_bindings entries carry canonical_params_hex so it is recomputable. TEST KEYS ONLY (admin [7;32], recovery [9;32]); environment_identifier 'env-prod-0' is a TEST value, NOT a production environment.",
+                "cap_domain_hex": hx(CAP_DOMAIN),
+                "environment_identifier": TEST_ENV,
+                "chain_id": TEST_CHAIN,
+                "caps": serde_json::Value::Object(index),
+                "payload_bindings": serde_json::Value::Object(pb_index),
+            });
+            std::fs::write(format!("{dir}capability_vectors_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
+                .expect("write capability index");
+            eprintln!("wrote 6 cap vectors + 2 payload_binding + capability_vectors_v1.json -> {dir}");
+        }
+    }
 }

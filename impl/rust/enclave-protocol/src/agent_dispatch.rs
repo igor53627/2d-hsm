@@ -4510,4 +4510,666 @@ mod tests {
             eprintln!("wrote 4 envelope vectors + request_envelopes_v1.json -> {dir}");
         }
     }
+
+    /// TASK-22 — byte-exact `0x40` CAP-BEARING request-envelope golden vectors (rest of AC#1).
+    ///
+    /// The privileged opcodes GENERATE_KEYS(1) / CONFIGURE_TREASURY(6) carry a §10.5 capability at envelope
+    /// key 5 (and NO key_ref). Frozen here (next to `decode_envelope`) rather than with the non-cap
+    /// envelopes because their shape differs (key 5 present, key 6 absent) and the embedded cap is the same
+    /// one frozen by the capability vectors (AC#2, `agent_capability::tests`). Each vector: (a) byte-exact
+    /// vs the committed `.bin`; (b) ACCEPTED by `decode_envelope` with the documented fields; (c) its
+    /// embedded cap (key 5), re-encoded, EQUALS the corresponding `cap_full_*_v1.bin` — cross-referencing
+    /// the already-verifier-accepted cap vector, so the envelope provably embeds a valid capability whose
+    /// `payload_binding` matches this envelope's payload. **TEST KEYS ONLY** (admin Ed25519 `[7;32]`,
+    /// recovery `[9;32]`; env `env-prod-0`, chain 11565 — matching the cap vectors).
+    mod golden_cap_envelopes {
+        use super::*;
+        use sha2::{Digest, Sha256};
+
+        const ENV_ID: &str = "env-prod-0";
+        const CHAIN: u64 = 11565;
+        const SCOPE_GENERATE: &[u8] = b"golden-scope-generate";
+        const SCOPE_CONFIGURE: &[u8] = b"golden-scope-configure";
+        const RID_GENERATE: &[u8] = b"0x40-golden:cap:generate-keys:v1";
+        const RID_SET_LIMITS: &[u8] = b"0x40-golden:cap:configure-set-limits:v1";
+
+        fn hex(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        fn min_be(x: u64) -> Vec<u8> {
+            let b = x.to_be_bytes();
+            let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+            b[i..].to_vec()
+        }
+        fn enc(map: Vec<(Value, Value)>) -> Vec<u8> {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&Value::Map(map), &mut buf).expect("canonical envelope encodes");
+            buf
+        }
+        fn k(n: u64) -> Value {
+            Value::Integer(n.into())
+        }
+
+        /// GENERATE_KEYS(1) envelope: cap(key5, no key_ref) + payload {1:purpose, 2:count}. The cap's
+        /// payload_binding is over `generate_keys_canonical_params(1, 1)` so it matches THIS payload.
+        fn req_generate_keys() -> Vec<u8> {
+            let admin = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            let pb = crate::agent_capability::payload_binding(1, None, RID_GENERATE, &generate_keys_canonical_params(1, 1));
+            let cap = crate::agent_capability::test_signed_capability(
+                &admin, 1, RID_GENERATE, 1, false, CHAIN, ENV_ID, 0, SCOPE_GENERATE, 1, pb,
+            );
+            enc(vec![
+                (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
+                (k(2), Value::Integer(1u64.into())),
+                (k(3), Value::Text(COMMAND_DOMAIN.to_string())),
+                (k(4), Value::Bytes(RID_GENERATE.to_vec())),
+                (k(5), Value::Map(cap)),
+                (k(7), Value::Map(vec![(k(1), Value::Integer(1u64.into())), (k(2), Value::Integer(1u64.into()))])),
+            ])
+        }
+
+        /// CONFIGURE_TREASURY(6) set_limits envelope: cap(key5, sub_op 0) + payload {1:0, 2:per_dispense_max,
+        /// 3:max_gas_limit, 4:max_fee_rate}. The cap's payload_binding is over
+        /// `configure_treasury_canonical_params(0, min_be(1e6), Some((21000, 1e9)))` to match THIS payload.
+        fn req_configure_set_limits() -> Vec<u8> {
+            let admin = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            let params = configure_treasury_canonical_params(0, &min_be(1_000_000), Some((21_000, 1_000_000_000)));
+            let pb = crate::agent_capability::payload_binding(6, Some(0), RID_SET_LIMITS, &params);
+            let cap = crate::agent_capability::test_signed_capability_with_sub_op(
+                &admin, 6, Some(0), RID_SET_LIMITS, 1, false, CHAIN, ENV_ID, 0, SCOPE_CONFIGURE, 2, pb,
+            );
+            enc(vec![
+                (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
+                (k(2), Value::Integer(6u64.into())),
+                (k(3), Value::Text(COMMAND_DOMAIN.to_string())),
+                (k(4), Value::Bytes(RID_SET_LIMITS.to_vec())),
+                (k(5), Value::Map(cap)),
+                (
+                    k(7),
+                    Value::Map(vec![
+                        (k(1), Value::Integer(0u64.into())),
+                        (k(2), Value::Bytes(min_be(1_000_000))),
+                        (k(3), Value::Integer(21_000u64.into())),
+                        (k(4), Value::Integer(1_000_000_000u64.into())),
+                    ]),
+                ),
+            ])
+        }
+
+        /// (filename, bytes, opcode, request_id, cap_full filename to cross-reference).
+        fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static [u8], &'static str)> {
+            vec![
+                ("req_configure_set_limits_v1.bin", req_configure_set_limits(), 6, RID_SET_LIMITS, "cap_full_configure_set_limits_v1.bin"),
+                ("req_generate_keys_v1.bin", req_generate_keys(), 1, RID_GENERATE, "cap_full_generate_keys_v1.bin"),
+            ]
+        }
+
+        #[test]
+        fn golden_cap_envelopes_are_byte_exact() {
+            let committed: &[(&str, &[u8])] = &[
+                ("req_configure_set_limits_v1.bin", include_bytes!("../testvectors/agent-gateway/req_configure_set_limits_v1.bin")),
+                ("req_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/req_generate_keys_v1.bin")),
+            ];
+            for (name, built, ..) in vectors() {
+                let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(built.as_slice(), c, "{name} golden drifted; regen + re-mint .json in the same commit");
+            }
+        }
+
+        #[test]
+        fn golden_cap_envelopes_decode_and_embed_the_verified_cap() {
+            // Decode via the real decoder; the cap-bearing envelope has key 5 (capability) + NO key 6
+            // (key_ref). Cross-reference: the embedded cap (key 5), re-encoded canonically, EQUALS the
+            // frozen cap_full_*_v1.bin (AC#2) — which the capability slice proved is accepted by the live
+            // verify_capability. So the envelope provably carries a valid, verifier-accepted capability.
+            let cap_full: &[(&str, &[u8])] = &[
+                ("cap_full_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin")),
+                ("cap_full_configure_set_limits_v1.bin", include_bytes!("../testvectors/agent-gateway/cap_full_configure_set_limits_v1.bin")),
+            ];
+            for (name, bytes, opcode, request_id, cap_file) in vectors() {
+                let env = decode_envelope(&bytes).unwrap_or_else(|_| panic!("{name} must decode"));
+                assert_eq!(env.agent_version, AGENT_GATEWAY_VERSION, "{name} version");
+                assert_eq!(env.command_domain, COMMAND_DOMAIN, "{name} domain");
+                assert_eq!(env.opcode, opcode, "{name} opcode");
+                assert_eq!(env.request_id.as_slice(), request_id, "{name} request_id");
+                assert!(env.key_ref.is_none(), "{name} privileged op carries NO key_ref");
+                assert!(env.payload.is_some(), "{name} has a payload");
+                let cap = env.capability.unwrap_or_else(|| panic!("{name} has a capability (key 5)"));
+                let cap_bytes = enc(cap);
+                let expected = cap_full.iter().find(|(n, _)| *n == cap_file).unwrap().1;
+                assert_eq!(cap_bytes.as_slice(), expected, "{name} embedded cap must equal {cap_file}");
+            }
+        }
+
+        #[test]
+        fn golden_cap_envelope_binding_covers_its_payload() {
+            // The cap's payload_binding (key 11) must equal the binding RECOMPUTED from THIS envelope's own
+            // payload (key 7) — proving the cap binds the payload it travels with (the exact recompute-and-
+            // compare the live handler does before mutating). Parses params back from the decoded payload, so
+            // a future edit that changed the payload without updating the cap's binding source would fail.
+            for (name, bytes, opcode, request_id, _cap_file) in vectors() {
+                let env = decode_envelope(&bytes).unwrap_or_else(|_| panic!("{name} decode"));
+                let cap = env.capability.unwrap_or_else(|| panic!("{name} cap"));
+                let cap_pb = match map_get(&cap, 11) {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    other => panic!("{name}: cap key 11 (payload_binding) not bytes: {other:?}"),
+                };
+                let payload = env.payload.unwrap_or_else(|| panic!("{name} payload"));
+                let recomputed = match opcode {
+                    1 => {
+                        let purpose = map_get(&payload, 1).and_then(as_u64).unwrap();
+                        let count = map_get(&payload, 2).and_then(as_u64).unwrap();
+                        crate::agent_capability::payload_binding(1, None, request_id, &generate_keys_canonical_params(purpose, count))
+                    }
+                    6 => {
+                        // Mirror handle_configure_treasury's payload SHAPE checks exactly, so a malformed
+                        // regenerated payload that production would reject before binding cannot pass this
+                        // recompute: sub_op via u8::try_from + range 0..=3; field2 via the production
+                        // `as_u256_minimal_be` (rejects non-minimal/over-width); EXACT per-sub-op key counts
+                        // (set_limits(0) = 4 keys reading 3/4; sub-ops 1..=3 = 2 keys, no gas fields).
+                        let sub_op = u8::try_from(map_get(&payload, 1).and_then(as_u64).unwrap())
+                            .unwrap_or_else(|_| panic!("{name}: sub_op fits u8"));
+                        assert!(sub_op <= 3, "{name}: sub_op in 0..=3");
+                        let field2 = crate::agent_cbor::as_u256_minimal_be(
+                            map_get(&payload, 2).unwrap_or_else(|| panic!("{name}: payload key 2")),
+                        )
+                        .unwrap_or_else(|| panic!("{name}: field2 is canonical minimal-BE u256"));
+                        let set_limits = if sub_op == 0 {
+                            assert_eq!(payload.len(), 4, "{name}: set_limits(0) payload has exactly keys 1..=4");
+                            let g = map_get(&payload, 3).and_then(as_u64).unwrap_or_else(|| panic!("{name}: gas_limit"));
+                            let f = map_get(&payload, 4).and_then(as_u64).unwrap_or_else(|| panic!("{name}: fee_rate"));
+                            Some((g, f))
+                        } else {
+                            assert_eq!(payload.len(), 2, "{name}: sub-op {sub_op} payload has exactly keys 1..=2 (no gas)");
+                            None
+                        };
+                        crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &configure_treasury_canonical_params(sub_op, &field2, set_limits))
+                    }
+                    other => panic!("{name}: unexpected opcode {other}"),
+                };
+                assert_eq!(cap_pb.as_slice(), recomputed.as_slice(), "{name}: cap payload_binding must cover its own payload");
+            }
+        }
+
+        #[test]
+        fn golden_cap_envelope_canonical_headers() {
+            // Both are 6-pair maps {1,2,3,4,5,7} → 0xA6; key 5 (capability) is a map, key 6 absent.
+            for (name, bytes, ..) in vectors() {
+                assert_eq!(bytes[0], 0xA6, "{name} = 6-pair map {{1,2,3,4,5,7}}");
+            }
+        }
+
+        #[test]
+        fn golden_cap_envelope_sidecar_matches() {
+            let sidecar = include_str!("../testvectors/agent-gateway/cap_envelopes_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("cap-envelope index is valid JSON");
+            assert_eq!(v["command_domain"].as_str(), Some(COMMAND_DOMAIN), "index command_domain");
+            assert_eq!(v["agent_version"].as_u64(), Some(AGENT_GATEWAY_VERSION as u64), "index agent_version");
+            assert_eq!(
+                v["vectors"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra vector entry"
+            );
+            for (name, bytes, opcode, request_id, cap_file) in vectors() {
+                let e = &v["vectors"][name];
+                assert_eq!(e["blob_sha256"].as_str(), Some(hex(&Sha256::digest(&bytes)).as_str()), "{name} sha256");
+                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(e["blob_hex"].as_str(), Some(hex(&bytes).as_str()), "{name} blob_hex");
+                assert_eq!(e["opcode"].as_u64(), Some(opcode as u64), "{name} opcode");
+                assert_eq!(e["request_id_hex"].as_str(), Some(hex(request_id).as_str()), "{name} request_id");
+                assert_eq!(e["embedded_cap_file"].as_str(), Some(cap_file), "{name} cap cross-ref");
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_cap_envelopes::regen_golden_cap_envelopes -- --ignored --nocapture`.
+        #[test]
+        #[ignore]
+        fn regen_golden_cap_envelopes() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let mut index = serde_json::Map::new();
+            for (name, bytes, opcode, request_id, cap_file) in vectors() {
+                std::fs::write(format!("{dir}{name}"), &bytes).expect("write cap-envelope .bin");
+                let mut e = serde_json::Map::new();
+                e.insert("blob_hex".into(), hex(&bytes).into());
+                e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
+                e.insert("blob_sha256".into(), hex(&Sha256::digest(&bytes)).into());
+                e.insert("embedded_cap_file".into(), cap_file.into());
+                e.insert("opcode".into(), (opcode as u64).into());
+                e.insert("request_id_hex".into(), hex(request_id).into());
+                index.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#1 (cap-bearing) — byte-exact 0x40 request envelopes for GENERATE_KEYS / CONFIGURE_TREASURY. Cap at key 5 (no key_ref); the embedded cap equals the cap_full_*_v1.bin frozen by AC#2 (accepted by the live verify_capability). TEST KEYS ONLY (admin [7;32]; env env-prod-0, chain 11565). Regen: cargo test --features agent-gateway golden_cap_envelopes::regen_golden_cap_envelopes -- --ignored --nocapture",
+                "agent_version": AGENT_GATEWAY_VERSION,
+                "command_domain": COMMAND_DOMAIN,
+                "vectors": serde_json::Value::Object(index),
+            });
+            std::fs::write(format!("{dir}cap_envelopes_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
+                .expect("write cap-envelope index");
+            eprintln!("wrote 2 cap-envelope vectors + cap_envelopes_v1.json -> {dir}");
+        }
+    }
+
+    /// TASK-22 — byte-exact `0x40` RESPONSE-BODY golden vectors (AC#3).
+    ///
+    /// Freezes the response bodies the enclave emits: PUBLIC_IDENTITY (6-key), SIGN_TRANSFER (7-key),
+    /// SIGN_FAUCET_DISPENSE (8-key, incl. sealed_keystore_blob), GENERATE_KEYS ({1:[key maps],2:blob}),
+    /// CONFIGURE_TREASURY ({1:blob}), and the §10.9 AgentError body {1:code,2:reason} for all 7 codes.
+    ///
+    /// Minted from the REAL encoders (`encode_agent_response` / `encode_*_response` / `encode_agent_error`)
+    /// over FIXED inputs — NOT the live (preview-gated) dispatch path — so every vector builds in the base
+    /// CI lane and the sealed-blob bytes are deterministic: the signed-tx fields come from `ordinary_tx_v1`
+    /// (RFC6979/low-S), the identity from `public_identity_from_entry` on a `keys.json` key (the real eth/tron
+    /// derivation), and the sealed blob is the already-frozen `agent_keystore_genesis_v2.sealed.bin` (a valid,
+    /// byte-stable sealed keystore — opaque AEAD, so a representative blob is the right thing to pin a response
+    /// SHAPE). TEST KEYS ONLY.
+    mod golden_response_bodies {
+        use super::*;
+        use crate::agent_identity::public_identity_from_entry;
+        use crate::agent_keygen::GeneratedKey;
+        use crate::agent_keystore::{BackupExportMetadata, KeyAlgorithm, KeyEntry};
+        use crate::agent_transfer::SignedTransfer;
+        use crate::secp256k1::RecoverableSignature;
+        use sha2::{Digest, Sha256};
+
+        const KEYS: &str = include_str!("../testvectors/agent-gateway/keys.json");
+        const ORD: &str = include_str!("../testvectors/agent-gateway/ordinary_tx_v1.json");
+        /// A valid, byte-stable sealed keystore used as the representative sealed blob in the mutating
+        /// responses (the blob is opaque AEAD; the response vector pins the SHAPE around it).
+        const GENESIS_BLOB: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
+        const GOLDEN_KEY_REF: [u8; 32] = [0x33; 32];
+
+        fn hx(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        fn unhex(s: &str) -> Vec<u8> {
+            hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap()
+        }
+        fn arr<const N: usize>(s: &str) -> [u8; N] {
+            unhex(s).try_into().unwrap()
+        }
+
+        /// The seeded transfer KeyEntry (from keys.json) — `public_identity_from_entry` derives eth/tron.
+        fn transfer_entry() -> KeyEntry {
+            let k: serde_json::Value = serde_json::from_str(KEYS).unwrap();
+            KeyEntry {
+                key_ref: GOLDEN_KEY_REF,
+                purpose: KeyPurpose::AgentTransferK1,
+                algorithm: KeyAlgorithm::Secp256k1,
+                public_identity: unhex(k["transfer_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+                secret_scalar: zeroize::Zeroizing::new(unhex(k["transfer_key"]["privkey"].as_str().unwrap())),
+                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                backup_export_metadata: BackupExportMetadata::default(),
+            }
+        }
+
+        /// A SignedTransfer reconstructed from the frozen `ordinary_tx_v1` golden (cross-references it).
+        fn golden_signed_transfer() -> SignedTransfer {
+            let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
+            SignedTransfer {
+                signature: RecoverableSignature {
+                    r: arr::<32>(o["signature"]["r"].as_str().unwrap()),
+                    s: arr::<32>(o["signature"]["s"].as_str().unwrap()),
+                    recovery_id: u8::try_from(o["signature"]["recovery_id"].as_u64().unwrap()).expect("recovery_id fits u8"),
+                },
+                v: o["signature"]["v_eip155"].as_u64().unwrap(),
+                signing_hash: arr::<32>(o["signing_hash_keccak256"].as_str().unwrap()),
+                signed_rlp: unhex(o["signed_rlp"].as_str().unwrap()),
+                from: arr::<20>(o["recovered_from"].as_str().unwrap()),
+            }
+        }
+
+        fn resp_public_identity() -> Vec<u8> {
+            let id = public_identity_from_entry(&transfer_entry()).expect("derive identity");
+            encode_agent_response(&AgentResponse::PublicIdentity(id))
+        }
+        fn resp_sign_transfer() -> Vec<u8> {
+            encode_agent_response(&AgentResponse::SignTransfer(golden_signed_transfer()))
+        }
+        fn resp_sign_faucet_dispense() -> Vec<u8> {
+            encode_sign_faucet_dispense_response(golden_signed_transfer(), GENESIS_BLOB)
+        }
+        fn resp_generate_keys() -> Vec<u8> {
+            let id = public_identity_from_entry(&transfer_entry()).expect("derive identity");
+            let gk = GeneratedKey {
+                key_ref: id.key_ref,
+                pubkey_uncompressed: id.pubkey_uncompressed,
+                eth_address: id.eth_address,
+                tron_address: id.tron_address.clone(),
+                key_purpose: id.key_purpose,
+            };
+            encode_generate_keys_response(&[gk], GENESIS_BLOB)
+        }
+        fn resp_configure_treasury() -> Vec<u8> {
+            encode_configure_treasury_response(GENESIS_BLOB)
+        }
+
+        /// The 7 §10.9 AgentError codes → encoded body.
+        fn agent_errors() -> Vec<(u8, Vec<u8>)> {
+            [
+                AgentError::Malformed,
+                AgentError::WrongProfile,
+                AgentError::KeyPurposeMismatch,
+                AgentError::CapabilityRejected,
+                AgentError::CapExceeded,
+                AgentError::NotConfigured,
+                AgentError::SealFailed,
+            ]
+            .into_iter()
+            .map(|e| (e.code(), encode_agent_error(e)))
+            .collect()
+        }
+
+        /// (filename, bytes, top-level key-1 is bytes? [success] — for the decode-shape assert).
+        fn vectors() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                ("resp_configure_treasury_v1.bin", resp_configure_treasury()),
+                ("resp_generate_keys_v1.bin", resp_generate_keys()),
+                ("resp_public_identity_v1.bin", resp_public_identity()),
+                ("resp_sign_faucet_dispense_v1.bin", resp_sign_faucet_dispense()),
+                ("resp_sign_transfer_v1.bin", resp_sign_transfer()),
+            ]
+        }
+
+        #[test]
+        fn golden_response_bodies_are_byte_exact() {
+            let committed: &[(&str, &[u8])] = &[
+                ("resp_configure_treasury_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_configure_treasury_v1.bin")),
+                ("resp_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_generate_keys_v1.bin")),
+                ("resp_public_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin")),
+                ("resp_sign_faucet_dispense_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_sign_faucet_dispense_v1.bin")),
+                ("resp_sign_transfer_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_sign_transfer_v1.bin")),
+            ];
+            for (name, built) in vectors() {
+                let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(built.as_slice(), c, "{name} drifted; regen + re-mint .json in the same commit");
+            }
+        }
+
+        #[test]
+        fn golden_response_bodies_decode_to_expected_shape() {
+            // Every success body decodes to a CBOR map; the mutating ones carry the sealed blob at their
+            // documented key (GENERATE_KEYS key 2, SIGN_FAUCET_DISPENSE key 8, CONFIGURE_TREASURY key 1),
+            // and key 1 of every SUCCESS body is NOT a bare integer code (so decode_agent_error_code → None
+            // distinguishes success from a {1:code} error body).
+            let get = |b: &[u8], k: u64| -> Option<Value> {
+                match ciborium::de::from_reader::<Value, _>(b).unwrap() {
+                    Value::Map(m) => map_get(&m, k).cloned(),
+                    _ => None,
+                }
+            };
+            assert_eq!(get(&resp_configure_treasury(), 1), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "configure key1=blob");
+            assert_eq!(get(&resp_generate_keys(), 2), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "generate key2=blob");
+            assert_eq!(get(&resp_sign_faucet_dispense(), 8), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "faucet key8=blob");
+            for (name, bytes) in vectors() {
+                assert_eq!(decode_agent_error_code(&bytes), None, "{name} must be a SUCCESS body, not an error");
+            }
+            // The §10.9 error bodies, conversely, ARE decodable as {1:code,2:reason}.
+            for (code, body) in agent_errors() {
+                assert_eq!(decode_agent_error_code(&body), Some(code), "error body code {code:#x}");
+            }
+        }
+
+        #[test]
+        fn golden_response_sidecar_matches() {
+            let sidecar = include_str!("../testvectors/agent-gateway/response_bodies_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("response index is valid JSON");
+            assert_eq!(
+                v["responses"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra response entry"
+            );
+            for (name, bytes) in vectors() {
+                let e = &v["responses"][name];
+                assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
+                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
+            }
+            // The 7 error bodies, keyed by code hex — exactly 7, no stale/extra entry.
+            assert_eq!(
+                v["agent_errors"].as_object().map(|o| o.len()),
+                Some(agent_errors().len()),
+                "index has a stale/extra agent_error entry"
+            );
+            for (code, body) in agent_errors() {
+                let e = &v["agent_errors"][format!("{code:#04x}")];
+                assert_eq!(e["body_hex"].as_str(), Some(hx(&body).as_str()), "error {code:#x} hex");
+                assert_eq!(e["body_len_bytes"].as_u64(), Some(body.len() as u64), "error {code:#x} len");
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_response_bodies::regen_golden_response_bodies -- --ignored --nocapture`.
+        #[test]
+        #[ignore]
+        fn regen_golden_response_bodies() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let mut responses = serde_json::Map::new();
+            for (name, bytes) in vectors() {
+                std::fs::write(format!("{dir}{name}"), &bytes).expect("write response .bin");
+                let mut e = serde_json::Map::new();
+                e.insert("blob_hex".into(), hx(&bytes).into());
+                e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
+                e.insert("blob_sha256".into(), hx(&Sha256::digest(&bytes)).into());
+                responses.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let mut errors = serde_json::Map::new();
+            for (code, body) in agent_errors() {
+                let mut e = serde_json::Map::new();
+                e.insert("body_hex".into(), hx(&body).into());
+                e.insert("body_len_bytes".into(), (body.len() as u64).into());
+                errors.insert(format!("{code:#04x}"), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#3 — byte-exact 0x40 response-body golden vectors. Minted from the real encoders over fixed inputs (ordinary_tx_v1 signed-tx fields, keys.json identity, the genesis sealed blob as the representative AEAD blob). The sealed blob is opaque; the vector pins the response SHAPE around it. TEST KEYS ONLY. Regen: cargo test --features agent-gateway golden_response_bodies::regen_golden_response_bodies -- --ignored --nocapture",
+                "sealed_blob_file": "agent_keystore_genesis_v2.sealed.bin",
+                "responses": serde_json::Value::Object(responses),
+                "agent_errors": serde_json::Value::Object(errors),
+            });
+            std::fs::write(format!("{dir}response_bodies_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
+                .expect("write response index");
+            eprintln!("wrote 5 response vectors + 7 error bodies + response_bodies_v1.json -> {dir}");
+        }
+    }
+
+    /// TASK-22 — byte-exact `0x40` NEGATIVE (rejection) golden vectors (AC#4).
+    ///
+    /// Freezes `{malformed request bytes → expected §10.9 error code}` pairs so the downstream 2d codec can
+    /// assert the enclave's anti-oracle band classification. Each request is deterministic; the band is
+    /// asserted by driving the REAL `dispatch_agent` (the cap/not-configured bands need the process-global
+    /// anti-rollback binding set/cleared, via the shared `gate_configured`/`gate_unconfigured` guards). The
+    /// `0x44`(CapExceeded)/`0x46`(SealFailed) bands are handler/preview-level (not reachable deviceless
+    /// without the preview features) — documented as deferred, not frozen here. **TEST KEYS ONLY.**
+    mod golden_negative_vectors {
+        use super::*;
+        use sha2::{Digest, Sha256};
+
+        const ENV_ID: &str = "env-prod-0";
+        const CHAIN: u64 = 11565;
+        /// `super::envelope()` stamps request_id `[0x11; 16]`; the cap negatives bind to the same id.
+        const RID: &[u8] = &[0x11; 16];
+        const ABSENT_KEY_REF: [u8; 32] = [0x99; 32];
+
+        fn hx(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        fn k(n: u64) -> Value {
+            Value::Integer(n.into())
+        }
+        fn admin() -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+        }
+        /// A body whose sealed config matches the cap conventions (admin authority [7;32], env-prod-0) so a
+        /// cap negative reaches the SPECIFIC rejection (bad sig / counter gap), not an env/chain mismatch.
+        fn cap_body() -> KeystoreBody {
+            let mut b = base_body();
+            b.config.admin_authority_pk = admin().verifying_key().to_bytes();
+            b.config.environment_identifier = ENV_ID.to_string();
+            b
+        }
+        fn genkeys_payload() -> Value {
+            Value::Map(vec![(k(1), Value::Integer(1u64.into())), (k(2), Value::Integer(1u64.into()))])
+        }
+        /// A GENERATE_KEYS cap on the admin lane; `pb` is unchecked by the verify layer (handler-only), so a
+        /// placeholder is fine for verify-band negatives.
+        fn genkeys_cap(signer: &ed25519_dalek::SigningKey, counter: u64) -> Vec<(Value, Value)> {
+            crate::agent_capability::test_signed_capability(
+                signer, 1, RID, counter, false, CHAIN, ENV_ID, 0, b"golden-scope-generate", 1, [0xbb; 32],
+            )
+        }
+
+        // ---- the frozen negative request envelopes (deterministic; the code is asserted separately) ----
+        fn neg_unknown_envelope_key() -> Vec<u8> {
+            // Extra key 8 — decode_envelope's strict allow-list (keys 1..=7) rejects ⇒ 0x40.
+            envelope(2, vec![(k(6), Value::Bytes(vec![0x33; 32])), (k(8), Value::Integer(0u64.into()))])
+        }
+        fn neg_runtime_op_with_capability() -> Vec<u8> {
+            // SIGN_TRANSFER(4) is a runtime op; a capability at key 5 is structurally invalid ⇒ 0x40.
+            envelope(4, vec![(k(5), Value::Map(genkeys_cap(&admin(), 1))), (k(6), Value::Bytes(vec![0x33; 32]))])
+        }
+        fn neg_wrong_profile_env() -> Vec<u8> {
+            // A well-formed PUBLIC_IDENTITY env — the negative is dispatching it on Profile::Producer ⇒ 0x41.
+            envelope(2, vec![(k(6), Value::Bytes(vec![0x33; 32]))])
+        }
+        fn neg_key_not_found() -> Vec<u8> {
+            // PUBLIC_IDENTITY for a key_ref absent from the body ⇒ 0x42 (the anti-oracle key band).
+            envelope(2, vec![(k(6), Value::Bytes(ABSENT_KEY_REF.to_vec()))])
+        }
+        fn neg_cap_wrong_signature() -> Vec<u8> {
+            // GENERATE_KEYS cap signed by a NON-admin key ⇒ Ed25519 verify fails ⇒ 0x43.
+            let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]);
+            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&wrong, 1))), (k(7), genkeys_payload())])
+        }
+        fn neg_cap_counter_gap() -> Vec<u8> {
+            // Valid admin cap but counter=5 with an empty counter table (expected 1) ⇒ non-contiguous ⇒ 0x43.
+            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&admin(), 5))), (k(7), genkeys_payload())])
+        }
+        fn neg_generate_keys_not_configured() -> Vec<u8> {
+            // A well-formed, validly-capped GENERATE_KEYS — the negative is the anti-rollback binding being
+            // ABSENT, so the fund-custody gate fires ⇒ 0x45 (before cap routing).
+            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&admin(), 1))), (k(7), genkeys_payload())])
+        }
+
+        /// (filename, bytes, expected code, short cause). The code is asserted in the *_codes tests below.
+        /// (filename, bytes, expected code, cause, PRECONDITION). The precondition is the enclave/dispatch
+        /// state a consumer must reproduce to observe `expected_code` (e.g. the anti-rollback binding state
+        /// for the gated bands) — without it, a state-dependent negative would yield a DIFFERENT code.
+        fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static str, &'static str)> {
+            vec![
+                ("neg_cap_counter_gap_v1.bin", neg_cap_counter_gap(), 0x43, "non-contiguous capability counter", "anti-rollback binding configured (so dispatch reaches cap verify, not the 0x45 gate); keystore admin authority = the cap signer, empty counter table"),
+                ("neg_cap_wrong_signature_v1.bin", neg_cap_wrong_signature(), 0x43, "capability signature verify failed", "anti-rollback binding configured (so dispatch reaches cap verify, not the 0x45 gate); keystore admin authority = the EXPECTED admin key"),
+                ("neg_generate_keys_not_configured_v1.bin", neg_generate_keys_not_configured(), 0x45, "anti-rollback binding not configured", "anti-rollback binding ABSENT (the fund-custody gate fires before cap routing)"),
+                ("neg_key_not_found_v1.bin", neg_key_not_found(), 0x42, "key_ref not found / wrong purpose", "keystore has no entry for the requested key_ref"),
+                ("neg_runtime_op_with_capability_v1.bin", neg_runtime_op_with_capability(), 0x40, "runtime opcode carrying a capability", "none (rejected at decode/allow-list, before any state)"),
+                ("neg_unknown_envelope_key_v1.bin", neg_unknown_envelope_key(), 0x40, "unknown envelope key (strict 1..=7)", "none (rejected at decode, before any state)"),
+                ("neg_wrong_profile_v1.bin", neg_wrong_profile_env(), 0x41, "agent opcode on the producer profile", "dispatched on Profile::Producer (non-agent-gateway)"),
+            ]
+        }
+
+        #[test]
+        fn golden_negative_vectors_are_byte_exact() {
+            let committed: &[(&str, &[u8])] = &[
+                ("neg_cap_counter_gap_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_cap_counter_gap_v1.bin")),
+                ("neg_cap_wrong_signature_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_cap_wrong_signature_v1.bin")),
+                ("neg_generate_keys_not_configured_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_generate_keys_not_configured_v1.bin")),
+                ("neg_key_not_found_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_key_not_found_v1.bin")),
+                ("neg_runtime_op_with_capability_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_runtime_op_with_capability_v1.bin")),
+                ("neg_unknown_envelope_key_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_unknown_envelope_key_v1.bin")),
+                ("neg_wrong_profile_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_wrong_profile_v1.bin")),
+            ];
+            for (name, built, ..) in vectors() {
+                let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(built.as_slice(), c, "{name} drifted; regen + re-mint .json in the same commit");
+            }
+        }
+
+        #[test]
+        fn golden_negative_shape_and_key_codes() {
+            // Shape (0x40) + profile (0x41) + key (0x42) bands — all reached BEFORE the anti-rollback gate /
+            // any process global, so no guard is needed. Driven through the real dispatch_agent.
+            let b = base_body();
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_unknown_envelope_key(), &b).err().unwrap().code(), 0x40);
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_runtime_op_with_capability(), &b).err().unwrap().code(), 0x40);
+            assert_eq!(dispatch_agent(Profile::Producer, &neg_wrong_profile_env(), &b).err().unwrap().code(), 0x41);
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_key_not_found(), &b).err().unwrap().code(), 0x42);
+        }
+
+        #[test]
+        fn golden_negative_capability_codes() {
+            // 0x43 band: the anti-rollback binding must be INSTALLED so dispatch reaches cap verify (else the
+            // gate would return 0x45 first). gate_configured installs it + holds the process-global guard.
+            let _g = gate_configured();
+            let b = cap_body();
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_cap_wrong_signature(), &b).err().unwrap().code(), 0x43);
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_cap_counter_gap(), &b).err().unwrap().code(), 0x43);
+        }
+
+        #[test]
+        fn golden_negative_not_configured_code() {
+            // 0x45 band: binding ABSENT ⇒ the fund-custody gate fires for the rollback-sensitive GENERATE_KEYS
+            // even with an otherwise-valid cap. gate_unconfigured clears the binding + holds the guard.
+            let _g = gate_unconfigured();
+            let b = cap_body();
+            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_generate_keys_not_configured(), &b).err().unwrap().code(), 0x45);
+        }
+
+        #[test]
+        fn configure_treasury_stray_key_ref_is_accepted_and_ignored() {
+            // DOCUMENTED current behavior (TASK-20 residual, document-the-ignore): §10.7 says CONFIGURE has
+            // no key_ref, but decode_envelope ACCEPTS a stray key 6 on ANY envelope (it is a valid envelope
+            // key) and the CONFIGURE handler simply ignores it — benign, since the capability binding (not the
+            // key_ref) carries integrity. A future strict-shape tightening (reject env.key_ref.is_some() for
+            // CONFIGURE) would turn this into a 0x40 negative; until then this pins the accepted-but-ignored
+            // shape so the frozen negative set stays consistent with actual behavior.
+            let env = envelope(6, vec![(k(6), Value::Bytes(vec![0x33; 32]))]);
+            let decoded = decode_envelope(&env).expect("stray key_ref on CONFIGURE is currently accepted");
+            assert_eq!(decoded.opcode, 6, "opcode preserved");
+            assert!(decoded.key_ref.is_some(), "the stray key_ref is present (decoded) but unused by the handler");
+        }
+
+        #[test]
+        fn golden_negative_sidecar_matches() {
+            let sidecar = include_str!("../testvectors/agent-gateway/negative_vectors_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("negative index is valid JSON");
+            assert_eq!(
+                v["negatives"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra negative entry"
+            );
+            for (name, bytes, code, cause, precondition) in vectors() {
+                let e = &v["negatives"][name];
+                assert_eq!(e["expected_code"].as_u64(), Some(code as u64), "{name} code");
+                assert_eq!(e["cause"].as_str(), Some(cause), "{name} cause");
+                assert_eq!(e["precondition"].as_str(), Some(precondition), "{name} precondition");
+                assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
+                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_negative_vectors::regen_golden_negative_vectors -- --ignored --nocapture`.
+        #[test]
+        #[ignore]
+        fn regen_golden_negative_vectors() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let mut negatives = serde_json::Map::new();
+            for (name, bytes, code, cause, precondition) in vectors() {
+                std::fs::write(format!("{dir}{name}"), &bytes).expect("write negative .bin");
+                let mut e = serde_json::Map::new();
+                e.insert("blob_hex".into(), hx(&bytes).into());
+                e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
+                e.insert("blob_sha256".into(), hx(&Sha256::digest(&bytes)).into());
+                e.insert("cause".into(), cause.into());
+                e.insert("expected_code".into(), (code as u64).into());
+                e.insert("precondition".into(), precondition.into());
+                negatives.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#4 — byte-exact 0x40 NEGATIVE vectors: {request bytes → expected §10.9 code}, asserted via the real dispatch_agent. 0x40 shape / 0x41 profile / 0x42 key / 0x43 capability / 0x45 not-configured. 0x44 (CapExceeded) and 0x46 (SealFailed) are handler/preview-level — deferred. CONFIGURE stray key_ref is accepted+ignored today (TASK-20 document-the-ignore). TEST KEYS ONLY. Regen: cargo test --features agent-gateway golden_negative_vectors::regen_golden_negative_vectors -- --ignored --nocapture",
+                "negatives": serde_json::Value::Object(negatives),
+            });
+            std::fs::write(format!("{dir}negative_vectors_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
+                .expect("write negative index");
+            eprintln!("wrote 7 negative vectors + negative_vectors_v1.json -> {dir}");
+        }
+    }
 }

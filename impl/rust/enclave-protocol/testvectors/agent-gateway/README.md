@@ -76,13 +76,70 @@ keystore state (a stored key for `key_ref`, the sealed `chain_id`, the faucet al
 relevant preview feature; absent those, a live enclave returns the appropriate §10.9 error rather than a
 signed body (e.g. `0x42` KeyPurposeMismatch for an unknown/wrong-purpose key, or `0x45` NotConfigured for
 a preview-gated op). (NB `key_ref` here is the lab-smoke fixture's `[0x11;32]`, so it is *not* a universal
-"no such key" — what a given enclave returns depends on the installed keystore.) End-to-end response-body
-vectors land in the later TASK-22 response slices.
+"no such key" — what a given enclave returns depends on the installed keystore.) The **AC#3** subsection
+below freezes the SUCCESS response-body *shapes* independently (minted from their own fixed inputs — NOT
+the dispatch output of these request envelopes; the two vector families are not request→response pairs).
 
-The cap-bearing envelopes (GENERATE_KEYS(1) / CONFIGURE_TREASURY(6)) + the §10.5 capability
-preimage/map, the response bodies, and the negative (rejection) vectors land in subsequent TASK-22
-slices. Regen: `cargo test --features agent-gateway golden_request_envelopes::regen_golden_request_envelopes -- --ignored --nocapture`,
-then commit the `.bin`s + the re-minted `request_envelopes_v1.json` in the same commit.
+The **cap-bearing** envelopes (`req_generate_keys_v1.bin`, `req_configure_set_limits_v1.bin` +
+`cap_envelopes_v1.json`) carry a §10.5 capability at key 5 and NO key_ref. Each is byte-exact +
+accepted by `decode_envelope`, and its embedded cap (key 5), re-encoded, **equals** the
+corresponding `cap_full_*_v1.bin` (AC#2) — which is itself accepted by the live `verify_capability`,
+so the envelope provably carries a valid capability. **TEST KEYS ONLY** (admin Ed25519 `[7;32]`;
+env `env-prod-0`, chain 11565).
+
+> **Conventions are incidental TEST fillers, not canonical constants.** The cap vectors use
+> `env-prod-0` / chain `11565` / admin `[7;32]` / recovery `[9;32]`; the non-cap envelopes (AC#1, from
+> #88) use `key_ref` `[0x11;32]`. These are reproducibility fillers, NOT values a real enclave must
+> match — `env-prod-0` is a **test** `environment_identifier` (the literal "prod" notwithstanding), and
+> `[7;32]`/`[9;32]` are **not** real authorities. A consumer validates the CBOR *encoding/shape* against
+> these bytes; it must not bake the values as deployment config.
+
+Regen (per group): `cargo test --features agent-gateway <mod>::regen_<...> -- --ignored --nocapture`
+where `<mod>` is `golden_request_envelopes` / `golden_cap_envelopes` / `golden_response_bodies` /
+`golden_negative_vectors` (in `agent_dispatch`) and `golden_capability_vectors` (in `agent_capability`);
+commit the `.bin`s + the re-minted `*_v1.json` in the same commit.
+
+### AC#2 — §10.5 capability (`cap_*_v1.bin` + `payload_binding_*_v1.bin` + `capability_vectors_v1.json`)
+
+The Ed25519-signed **preimage** (`CAP_DOMAIN ‖ canonical-CBOR(keys 1..12)`) and the **full capability
+map** (keys 1..13, incl. the signature), for GENERATE_KEYS (11-entry preimage, header `0xAB`) and
+CONFIGURE_TREASURY `set_limits`(sub_op 0)/`reset`(sub_op 3) (12-entry, header `0xAC`) — pinning the
+11-vs-12 header asymmetry. Plus the **`payload_binding`** derivation
+(`keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical-CBOR(params))`) for op 1 (no sub_op byte) and
+op 6 sub_op 0 (sub_op byte) — pinning the sub_op-in-binding. **Each full map is ACCEPTED by the live
+`verify_capability`** (admin `[7;32]` / recovery `[9;32]`), so a signer/encoder/authority-tier drift
+breaks CI. The per-sub-op **authority tier** matters: sub-ops 0..=2 are admin-signed; sub-op 3
+(`reset_lifetime_breaker`) is recovery-signed on the recovery authority's lane (see §10.7).
+
+The two CONFIGURE caps frozen here are **representative of both tiers**: `set_limits`(sub_op 0, admin)
+and `reset`(sub_op 3, recovery). Sub-ops 1 (`refill_budget`) and 2 (`raise_lifetime_breaker`) are
+admin-tier with the **identical preimage shape** as sub_op 0 — they differ only in the `treasury_sub_op`
+integer (cap key 3 / the binding's sub_op byte) and the per-sub-op params; a consumer derives them by
+substituting the sub_op value. (A trivial follow-up can freeze them explicitly if 2d wants per-sub-op
+vectors.)
+
+### AC#3 — response bodies (`resp_*_v1.bin` + `response_bodies_v1.json`)
+
+PUBLIC_IDENTITY (6-key), SIGN_TRANSFER (7-key), SIGN_FAUCET_DISPENSE (8-key incl. sealed blob at key 8),
+GENERATE_KEYS (`{1:[key maps], 2:blob}`), CONFIGURE_TREASURY (`{1:blob}`), and the §10.9 **AgentError**
+body `{1:code, 2:reason}` for all 7 codes. Minted from the real encoders over fixed inputs (signed-tx
+fields from `ordinary_tx_v1`, identity from `keys.json` via the real derivation); the sealed blob is the
+already-frozen `agent_keystore_genesis_v2.sealed.bin` (opaque AEAD — a representative blob pins the
+response SHAPE). Each success body's key 1 is NOT a bare int code, so it is distinguishable from an
+error body. **The sealed blob is opaque on the wire: a consumer must treat it as an echoed byte string
+and MUST NOT unseal/inspect it** — its contents are not part of the response contract (it happens to be
+the genesis keystore fixture only so the bytes are deterministic; that is an implementation detail of the
+vector, not a property of the response).
+
+### AC#4 — negatives (`neg_*_v1.bin` + `negative_vectors_v1.json`)
+
+`{request bytes → expected §10.9 code}` pairs, each asserted via the real `dispatch_agent`: `0x40`
+(unknown envelope key; runtime opcode carrying a capability), `0x41` (agent opcode on the producer
+profile), `0x42` (key_ref not found), `0x43` (capability bad signature; non-contiguous counter), `0x45`
+(GENERATE_KEYS with the anti-rollback binding absent). `0x44` (CapExceeded) / `0x46` (SealFailed) are
+handler/preview-level and deferred. NB CONFIGURE_TREASURY currently **accepts + ignores** a stray
+envelope key 6 (`key_ref`) — §10.7 specifies no key_ref, but the capability binding carries integrity
+(TASK-20 residual; document-the-ignore until a strict-shape tightening makes it a `0x40` negative).
 
 ## 3-way domain separation (AC#15)
 

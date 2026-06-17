@@ -888,6 +888,15 @@ Frozen, self-checked, in-repo artifacts in
 `tron_transfer_v1.*` (reserved surface, for the §10.8 disjointness proof),
 `identity_proof_v1.*`, `keys.json` (dual eth/TRON encodings), `domain_separation.json`.
 
+**0x40 wire vectors (TASK-22 — ✓ frozen).** Byte-exact, minted from the enclave's own canonical
+encoders and frozen alongside the above (see the README "0x40 wire vectors" section): the request
+ENVELOPES (`req_*_v1.bin`, non-privileged + cap-bearing), the §10.5 CAPABILITY preimage + full map +
+`payload_binding` (`cap_*_v1.bin` / `payload_binding_*_v1.bin` — each full map accepted by the live
+`verify_capability`), the RESPONSE bodies (`resp_*_v1.bin` + the 7 §10.9 AgentError bodies), and the
+NEGATIVE `{request → code}` vectors (`neg_*_v1.bin`). These let the downstream 2d Elixir codec
+byte-validate against the enclave (the consumer-side gap from the cross-repo audit). Per-vector
+`*_v1.json` indexes carry sha256/len/hex + decoded fields; regeneration is per-group (README).
+
 Required tests (consumed by TASK-7.3/7.4/7.6, AC#21):
 - Producer frames `0x01/0x10/0x20/0x30` still decode unchanged after adding `0x40`.
 - `peek_msg_type_from_frame` returns no-type for unknown bytes `0x42`/`0xFF` (never `GetMeasurement`);
@@ -916,7 +925,9 @@ Required tests (consumed by TASK-7.3/7.4/7.6, AC#21):
 
 - Finalize all error codes.
 - Add `PREPARE_HARD_FORK_TRANSITION` command (or decide to do everything through `SIGN_AUTHORIZATION_TICKET` + later `ARM_FOR_PRODUCTION`).
-- Write concrete CBOR test vectors for the three most important messages.
+- ~~Write concrete CBOR test vectors for the three most important messages.~~ ✓ **Done (TASK-22):**
+  byte-exact 0x40 golden vectors (request envelopes, §10.5 capability preimage/map, response bodies,
+  negatives) are frozen under `testvectors/agent-gateway/` — see §10.10 + the vectors README.
 - Start minimal Rust + Elixir skeletons that can at least do GET_MEASUREMENT roundtrip.
 
 Ready to continue with detailed hard fork flow (item B) after we lock the schemas above.
