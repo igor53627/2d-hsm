@@ -46,15 +46,19 @@ pub const REFERENCE_TREASURY_KEY_REF: [u8; 32] = [0x44; 32];
 
 // Ed25519 authority/anchor seeds — PUBLIC test constants, derived through ed25519-dalek (never pasted
 // verifying-key literals) so the body and a matching anti-rollback / commit signer can't split. The
-// anchor seed lets a later mock commit channel sign acks the enclave accepts against `anchor_root`; the
-// admin/recovery seeds let the contract client forge valid capabilities for the privileged preview ops.
+// admin/recovery seeds + the environment + chain are ALIGNED with the TASK-22 frozen capability vectors
+// (admin [7;32], recovery [9;32], env "env-prod-0", chain 11565 — see golden_capability_vectors), so the
+// frozen `cap_full_*` / `req_generate_keys` / `req_configure_*` vectors VERIFY against this reference
+// keystore (the mutating-op contract lane, wired in the Slice-3 follow-up). The anchor seed is what a
+// later mock commit channel signs acks with, against `anchor_root`. `pub(crate)`-visible via the body.
 const REFERENCE_ANCHOR_SEED: [u8; 32] = [0x42; 32];
-const REFERENCE_ADMIN_SEED: [u8; 32] = [0x0a; 32];
-const REFERENCE_RECOVERY_SEED: [u8; 32] = [0x0b; 32];
+const REFERENCE_ADMIN_SEED: [u8; 32] = [7u8; 32];
+const REFERENCE_RECOVERY_SEED: [u8; 32] = [9u8; 32];
 
-/// Reference scope `environment_identifier` (charset-valid per §10.6) — a TEST value, not production.
-pub const REFERENCE_ENVIRONMENT: &str = "contract-test";
-/// Reference `twod_chain_id` (the crate-wide vector convention).
+/// Reference scope `environment_identifier` (charset-valid per §10.6) — a **TEST** value (the literal
+/// "prod" notwithstanding), matching the TASK-22 capability vectors so their frozen caps verify here.
+pub const REFERENCE_ENVIRONMENT: &str = "env-prod-0";
+/// Reference `twod_chain_id` (the crate-wide vector convention; matches the TASK-22 cap vectors).
 pub const REFERENCE_CHAIN_ID: u64 = 11565;
 
 /// Big-endian `[u8; 32]` (u256 wire form) of a `u64` — for the faucet caps/budget.
@@ -64,12 +68,19 @@ fn u256_be(x: u64) -> [u8; 32] {
     out
 }
 
-/// The reference agent keystore body: a transfer key + a faucet treasury key (AC#2), real
-/// admin/recovery authorities + `anchor_root` (so the privileged preview ops are reachable), and a
-/// non-zero faucet budget + caps (so `SIGN_FAUCET_DISPENSE` can pass its §2 gate). `pub` so a consumer /
-/// contract test can compute the expected identities/bodies without installing the global. Models
-/// `lab_agent_smoke::smoke_body` but standalone (no anchor stub / smoke-client surface) and with BOTH
-/// keys + a funded faucet.
+/// The reference agent keystore body: a transfer key + a faucet treasury key (AC#2), admin/recovery
+/// authorities + `anchor_root` + a funded faucet + caps. `pub` so a consumer / contract test can compute
+/// the expected identities/bodies without installing the global. Models `lab_agent_smoke::smoke_body`
+/// but standalone (no anchor stub / smoke-client surface) and with BOTH keys.
+///
+/// **MVP reachability:** PUBLIC_IDENTITY (no preview) works out of the box; PROVE_IDENTITY / SIGN_TRANSFER
+/// are non-rollback-sensitive and work once their preview feature is enabled. The admin/recovery
+/// authorities + `anchor_root` + the funded faucet are config for the **rollback-sensitive / mutating**
+/// ops (SIGN_FAUCET_DISPENSE / GENERATE_KEYS / CONFIGURE_TREASURY) — those additionally need an installed
+/// anti-rollback binding + (for GENERATE/CONFIGURE) a mock commit channel, which `run_contract_server`
+/// does NOT install in the MVP, so they fail closed (0x45/0x46) until the Slice-3 follow-up wires them.
+/// The authorities/env/chain are ALIGNED with the TASK-22 capability vectors so those frozen caps will
+/// verify against this body when that lane lands.
 pub fn reference_keystore_body() -> KeystoreBody {
     let anchor_root = ed25519_dalek::SigningKey::from_bytes(&REFERENCE_ANCHOR_SEED)
         .verifying_key()
@@ -128,7 +139,8 @@ pub fn reference_keystore_body() -> KeystoreBody {
 /// Install [`reference_keystore_body`] as the process-global agent keystore via the same seam the SNP
 /// boot path uses, so the deviceless server flips from the empty-store `0x41` profile to the agent
 /// profile and answers `PUBLIC_IDENTITY` with a real identity. Returns the install result (`false` ⇒
-/// the body failed `validate()` or the cap; the caller must fail closed).
+/// empty measurement or a keystore already installed in this process — `install_agent_keystore` does NOT
+/// run `validate()`; the reference body's validity is pinned separately by the AC#2 test); fail closed.
 pub fn install_reference_agent_keystore() -> bool {
     crate::agent_dispatch::install_agent_keystore(
         reference_keystore_body(),
@@ -188,5 +200,47 @@ mod tests {
         assert!(b.entries.iter().any(|e| e.key_ref == REFERENCE_TREASURY_KEY_REF && e.purpose == KeyPurpose::AgentFaucetTreasuryK1));
         assert_ne!(b.faucet.cumulative_signing_budget, [0u8; 32], "faucet budget is non-zero");
         assert!(b.validate().is_ok(), "reference body validates");
+    }
+
+    /// Couple BOTH reference scalars to the TASK-22 golden `keys.json` (the documented source of truth):
+    /// the DERIVED uncompressed pubkeys must equal keys.json. The transfer key is also pinned via the
+    /// frozen PUBLIC_IDENTITY response; this additionally pins the TREASURY scalar (which has no frozen
+    /// response), so a rotation of keys.json breaks this test rather than silently drifting.
+    #[test]
+    fn reference_keys_match_task22_keys_json() {
+        let keys: serde_json::Value =
+            serde_json::from_str(include_str!("../testvectors/agent-gateway/keys.json")).unwrap();
+        let unhex = |s: &str| hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap();
+        let b = reference_keystore_body();
+        let pubkey = |kr: [u8; 32]| b.entries.iter().find(|e| e.key_ref == kr).unwrap().public_identity.clone();
+        assert_eq!(
+            pubkey(REFERENCE_TRANSFER_KEY_REF),
+            unhex(keys["transfer_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+            "transfer pubkey == keys.json transfer_key",
+        );
+        assert_eq!(
+            pubkey(REFERENCE_TREASURY_KEY_REF),
+            unhex(keys["treasury_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+            "treasury pubkey == keys.json treasury_key",
+        );
+    }
+
+    /// The reference scope (admin authority / env / chain) is ALIGNED with the TASK-22 capability vectors:
+    /// the frozen `cap_full_generate_keys_v1` cap (signed by admin `[7;32]` for env `env-prod-0`, counter 1)
+    /// VERIFIES against this reference keystore's config (empty counter table → highest 0 + 1). Proves the
+    /// Slice-3 mutating-op contract lane will accept the frozen vectors (not just PUBLIC_IDENTITY).
+    #[test]
+    fn task22_generate_keys_cap_verifies_against_reference_config() {
+        let cap_bytes: &[u8] = include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin");
+        let cap = match ciborium::de::from_reader::<Value, _>(cap_bytes).unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("cap_full is a CBOR map"),
+        };
+        let rid: &[u8] = b"0x40-golden:cap:generate-keys:v1";
+        assert_eq!(
+            crate::agent_capability::verify_capability(&cap, 1, rid, &reference_keystore_body().config, &[]),
+            Ok(()),
+            "frozen TASK-22 generate-keys cap must verify against the reference config",
+        );
     }
 }
