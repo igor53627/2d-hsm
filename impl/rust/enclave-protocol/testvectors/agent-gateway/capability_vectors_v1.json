@@ -1,5 +1,5 @@
 {
-  "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors. preimage = CAP_DOMAIN || canonical-CBOR(keys 1..12); full map = keys 1..13 (incl. Ed25519 signature). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params). TEST KEYS ONLY (admin [7;32], recovery [9;32]).",
+  "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors. preimage = CAP_DOMAIN || canonical-CBOR(keys 1..12); full map = keys 1..13 (incl. Ed25519 signature). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params) — the payload_bindings entries carry canonical_params_hex so it is recomputable. TEST KEYS ONLY (admin [7;32], recovery [9;32]); environment_identifier 'env-prod-0' is a TEST value, NOT a production environment.",
   "cap_domain_hex": "32642d68736d2f6167656e742d6361702f763100",
   "caps": {
     "configure_reset": {
@@ -43,5 +43,21 @@
     }
   },
   "chain_id": 11565,
-  "environment_identifier": "env-prod-0"
+  "environment_identifier": "env-prod-0",
+  "payload_bindings": {
+    "payload_binding_configure_set_limits_v1.bin": {
+      "binding_hex": "843e2e85dd8741ec82512eaaafc6f747a887a1c96e5d8f9320ac560b83cc8cbb",
+      "canonical_params_hex": "a4010002430f424003195208041a3b9aca00",
+      "opcode": 6,
+      "request_id_hex": "307834302d676f6c64656e3a6361703a636f6e6669677572652d7365742d6c696d6974733a7631",
+      "treasury_sub_op": 0
+    },
+    "payload_binding_generate_keys_v1.bin": {
+      "binding_hex": "c6aeb0dc6e8dbe60aa97f3c2aa77c1bf92857dc24441efa95af9dac5cd397e10",
+      "canonical_params_hex": "a201010201",
+      "opcode": 1,
+      "request_id_hex": "307834302d676f6c64656e3a6361703a67656e65726174652d6b6579733a7631",
+      "treasury_sub_op": null
+    }
+  }
 }

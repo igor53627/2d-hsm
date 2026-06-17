@@ -1165,6 +1165,24 @@ mod tests {
             )
         }
 
+        /// The standalone `payload_binding_*.bin` vectors, FULLY self-describing so a consumer can
+        /// RECOMPUTE `keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical_params)` end-to-end (the binding
+        /// is otherwise just a 32-byte hash with no recoverable inputs). Returns
+        /// (file, opcode, sub_op, request_id, canonical_params bytes, binding). The binding value reuses
+        /// `pb_generate`/`pb_set_limits` so it can't drift from the caps that embed it.
+        fn payload_binding_entries() -> Vec<(&'static str, u8, Option<u8>, &'static [u8], Vec<u8>, [u8; 32])> {
+            let gen_params = crate::agent_dispatch::generate_keys_canonical_params(1, 1);
+            let set_params = crate::agent_dispatch::configure_treasury_canonical_params(
+                0,
+                &min_be(1_000_000),
+                Some((21_000, 1_000_000_000)),
+            );
+            vec![
+                ("payload_binding_generate_keys_v1.bin", 1, None, RID_GENERATE, gen_params, pb_generate()),
+                ("payload_binding_configure_set_limits_v1.bin", 6, Some(0), RID_SET_LIMITS, set_params, pb_set_limits()),
+            ]
+        }
+
         /// (name, preimage, full-map bytes, opcode, sub_op, is_recovery, request_id, expected header byte).
         fn caps() -> Vec<(&'static str, Vec<u8>, Vec<u8>, u8, Option<u8>, bool, &'static [u8], u8)> {
             let admin = SigningKey::from_bytes(&[7u8; 32]);
@@ -1318,6 +1336,27 @@ mod tests {
                 assert_eq!(e["full_map_len_bytes"].as_u64(), Some(fullmap.len() as u64), "{name} full len");
                 assert_eq!(e["full_map_hex"].as_str(), Some(hx(&fullmap).as_str()), "{name} full hex");
             }
+            // payload_binding index: each entry carries the full recompute inputs (canonical_params_hex)
+            // so a consumer can reproduce the keccak — and we self-check that the indexed params DO produce
+            // the indexed binding (no stale/uncomputable hash).
+            assert_eq!(
+                v["payload_bindings"].as_object().map(|o| o.len()),
+                Some(payload_binding_entries().len()),
+                "stale/extra payload_binding entry",
+            );
+            for (name, opcode, sub_op, request_id, canonical_params, binding) in payload_binding_entries() {
+                assert_eq!(
+                    payload_binding(opcode, sub_op, request_id, &canonical_params),
+                    binding,
+                    "{name}: indexed canonical_params must recompute the indexed binding",
+                );
+                let pe = &v["payload_bindings"][name];
+                assert_eq!(pe["opcode"].as_u64(), Some(opcode as u64), "{name} pb opcode");
+                assert_eq!(pe["treasury_sub_op"].as_u64(), sub_op.map(u64::from), "{name} pb sub_op");
+                assert_eq!(pe["request_id_hex"].as_str(), Some(hx(request_id).as_str()), "{name} pb request_id");
+                assert_eq!(pe["canonical_params_hex"].as_str(), Some(hx(&canonical_params).as_str()), "{name} pb params");
+                assert_eq!(pe["binding_hex"].as_str(), Some(hx(&binding).as_str()), "{name} pb binding");
+            }
         }
 
         /// REGEN (manual): `cargo test --features agent-gateway golden_capability_vectors::regen_golden_capability_vectors -- --ignored --nocapture`,
@@ -1346,15 +1385,27 @@ mod tests {
                 e.insert("treasury_sub_op".into(), sub.map(|s| serde_json::Value::from(s as u64)).unwrap_or(serde_json::Value::Null));
                 index.insert(name.into(), serde_json::Value::Object(e));
             }
-            write("payload_binding_generate_keys_v1.bin", &pb_generate());
-            write("payload_binding_configure_set_limits_v1.bin", &pb_set_limits());
             let _ = pb_reset(); // reset binding is embedded in the reset cap; not frozen standalone
+            // payload_binding vectors + a SELF-DESCRIBING index (opcode/sub_op/request_id/canonical_params/
+            // binding) so a consumer can recompute the keccak without reading the Rust source.
+            let mut pb_index = serde_json::Map::new();
+            for (name, opcode, sub_op, request_id, canonical_params, binding) in payload_binding_entries() {
+                write(name, &binding);
+                let mut e = serde_json::Map::new();
+                e.insert("binding_hex".into(), hx(&binding).into());
+                e.insert("canonical_params_hex".into(), hx(&canonical_params).into());
+                e.insert("opcode".into(), (opcode as u64).into());
+                e.insert("request_id_hex".into(), hx(request_id).into());
+                e.insert("treasury_sub_op".into(), sub_op.map(|s| serde_json::Value::from(s as u64)).unwrap_or(serde_json::Value::Null));
+                pb_index.insert(name.into(), serde_json::Value::Object(e));
+            }
             let doc = serde_json::json!({
-                "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors. preimage = CAP_DOMAIN || canonical-CBOR(keys 1..12); full map = keys 1..13 (incl. Ed25519 signature). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params). TEST KEYS ONLY (admin [7;32], recovery [9;32]).",
+                "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors. preimage = CAP_DOMAIN || canonical-CBOR(keys 1..12); full map = keys 1..13 (incl. Ed25519 signature). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params) — the payload_bindings entries carry canonical_params_hex so it is recomputable. TEST KEYS ONLY (admin [7;32], recovery [9;32]); environment_identifier 'env-prod-0' is a TEST value, NOT a production environment.",
                 "cap_domain_hex": hx(CAP_DOMAIN),
                 "environment_identifier": TEST_ENV,
                 "chain_id": TEST_CHAIN,
                 "caps": serde_json::Value::Object(index),
+                "payload_bindings": serde_json::Value::Object(pb_index),
             });
             std::fs::write(format!("{dir}capability_vectors_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
                 .expect("write capability index");

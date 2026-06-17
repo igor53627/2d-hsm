@@ -4810,7 +4810,7 @@ mod tests {
                 signature: RecoverableSignature {
                     r: arr::<32>(o["signature"]["r"].as_str().unwrap()),
                     s: arr::<32>(o["signature"]["s"].as_str().unwrap()),
-                    recovery_id: o["signature"]["recovery_id"].as_u64().unwrap() as u8,
+                    recovery_id: u8::try_from(o["signature"]["recovery_id"].as_u64().unwrap()).expect("recovery_id fits u8"),
                 },
                 v: o["signature"]["v_eip155"].as_u64().unwrap(),
                 signing_hash: arr::<32>(o["signing_hash_keccak256"].as_str().unwrap()),

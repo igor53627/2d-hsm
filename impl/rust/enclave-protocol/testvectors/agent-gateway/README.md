@@ -76,8 +76,9 @@ keystore state (a stored key for `key_ref`, the sealed `chain_id`, the faucet al
 relevant preview feature; absent those, a live enclave returns the appropriate §10.9 error rather than a
 signed body (e.g. `0x42` KeyPurposeMismatch for an unknown/wrong-purpose key, or `0x45` NotConfigured for
 a preview-gated op). (NB `key_ref` here is the lab-smoke fixture's `[0x11;32]`, so it is *not* a universal
-"no such key" — what a given enclave returns depends on the installed keystore.) The end-to-end response
-bodies these requests would elicit are frozen separately in the **AC#3** subsection below.
+"no such key" — what a given enclave returns depends on the installed keystore.) The **AC#3** subsection
+below freezes the SUCCESS response-body *shapes* independently (minted from their own fixed inputs — NOT
+the dispatch output of these request envelopes; the two vector families are not request→response pairs).
 
 The **cap-bearing** envelopes (`req_generate_keys_v1.bin`, `req_configure_set_limits_v1.bin` +
 `cap_envelopes_v1.json`) carry a §10.5 capability at key 5 and NO key_ref. Each is byte-exact +
@@ -85,6 +86,13 @@ accepted by `decode_envelope`, and its embedded cap (key 5), re-encoded, **equal
 corresponding `cap_full_*_v1.bin` (AC#2) — which is itself accepted by the live `verify_capability`,
 so the envelope provably carries a valid capability. **TEST KEYS ONLY** (admin Ed25519 `[7;32]`;
 env `env-prod-0`, chain 11565).
+
+> **Conventions are incidental TEST fillers, not canonical constants.** The cap vectors use
+> `env-prod-0` / chain `11565` / admin `[7;32]` / recovery `[9;32]`; the non-cap envelopes (AC#1, from
+> #88) use `key_ref` `[0x11;32]`. These are reproducibility fillers, NOT values a real enclave must
+> match — `env-prod-0` is a **test** `environment_identifier` (the literal "prod" notwithstanding), and
+> `[7;32]`/`[9;32]` are **not** real authorities. A consumer validates the CBOR *encoding/shape* against
+> these bytes; it must not bake the values as deployment config.
 
 Regen (per group): `cargo test --features agent-gateway <mod>::regen_<...> -- --ignored --nocapture`
 where `<mod>` is `golden_request_envelopes` / `golden_cap_envelopes` / `golden_response_bodies` /
@@ -118,7 +126,10 @@ body `{1:code, 2:reason}` for all 7 codes. Minted from the real encoders over fi
 fields from `ordinary_tx_v1`, identity from `keys.json` via the real derivation); the sealed blob is the
 already-frozen `agent_keystore_genesis_v2.sealed.bin` (opaque AEAD — a representative blob pins the
 response SHAPE). Each success body's key 1 is NOT a bare int code, so it is distinguishable from an
-error body.
+error body. **The sealed blob is opaque on the wire: a consumer must treat it as an echoed byte string
+and MUST NOT unseal/inspect it** — its contents are not part of the response contract (it happens to be
+the genesis keystore fixture only so the bytes are deterministic; that is an implementation detail of the
+vector, not a property of the response).
 
 ### AC#4 — negatives (`neg_*_v1.bin` + `negative_vectors_v1.json`)
 
