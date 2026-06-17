@@ -656,8 +656,18 @@ pub(crate) fn verify_commit_ack_bytes(
 
 /// Test/lab-only: build the canonically-encoded, validly-signed commit-ACK bytes a conformant anchor
 /// would return. The SINGLE source of the commit-ack wire shape — the slice-6 lab anchor stub reuses it
-/// (anti-drift), exactly as [`test_signed_marks_response_bytes`] is the marks-response source.
-#[cfg(any(test, feature = "lab-agent-smoke"))]
+/// (anti-drift), exactly as [`test_signed_marks_response_bytes`] is the marks-response source. Also the
+/// TASK-23 deviceless contract server's mock commit channel signs its acks through this one source — but
+/// only when a MUTATING preview is on (the channel only exists then), so a PUBLIC_IDENTITY-only
+/// contract-server build does not compile this as dead code.
+#[cfg(any(
+    test,
+    feature = "lab-agent-smoke",
+    all(
+        feature = "agent-contract-server",
+        any(feature = "agent-keygen-exec-preview", feature = "agent-configure-treasury-preview", feature = "agent-sign-faucet-preview")
+    )
+))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn test_signed_commit_ack_bytes(
     signing_key: &ed25519_dalek::SigningKey,
