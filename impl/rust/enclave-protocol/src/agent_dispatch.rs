@@ -4241,4 +4241,273 @@ mod tests {
             reset_commit_channel_for_tests();
         }
     }
+
+    /// TASK-22 — byte-exact `0x40` REQUEST-ENVELOPE golden vectors (AC#1).
+    ///
+    /// Frozen wire bytes of the canonical int-keyed CBOR request envelope (keys 1..=7: agent_version,
+    /// opcode, command_domain, request_id, capability, key_ref, payload) for each NON-privileged opcode
+    /// (no capability — the cap-bearing GENERATE_KEYS / CONFIGURE_TREASURY envelopes are frozen in the
+    /// capability slice alongside their §10.5 cap vector). These let the downstream 2d Elixir codec
+    /// (`Chain.AgentGateway.SignerProtocol`) byte-validate its CBOR encoder against the enclave's
+    /// strict-canonical [`decode_envelope`], catching map-ordering / minimal-int / bstr-vs-uint drift
+    /// BEFORE a live capability is rejected `0x40` after a monotonic counter slot is already burned.
+    ///
+    /// Each vector is (a) byte-exact vs the committed `.bin`, (b) ACCEPTED by the real `decode_envelope`
+    /// (so an encoder/decoder drift breaks CI), and (c) canonical-header hand-audited. The `.json` index
+    /// couples each blob's sha256/len + decoded fields to the source of truth. **TEST VALUES ONLY** — the
+    /// addresses mirror `ordinary_tx_v1.json` (well-known dev accounts).
+    mod golden_request_envelopes {
+        use super::*;
+        use sha2::{Digest, Sha256};
+
+        // Addresses mirror ordinary_tx_v1.json (transfer-key `from`, treasury-key `to`).
+        const TRANSFER_FROM: [u8; 20] = [
+            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
+            0xff, 0xb9, 0x22, 0x66,
+        ];
+        const TREASURY_TO: [u8; 20] = [
+            0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01, 0x0c, 0x7d, 0x01, 0xb5, 0x0e, 0x0d,
+            0x17, 0xdc, 0x79, 0xc8,
+        ];
+        const GOLDEN_KEY_REF: [u8; 32] = [0x11; 32];
+        const GOLDEN_PROVE_NONCE: [u8; 32] = [0x22; 32];
+
+        // Reuse the `hex` crate (already a dev-dependency, used by the sibling dispatch tests) rather
+        // than a hand-rolled per-byte format loop.
+        fn hex(b: &[u8]) -> String {
+            hex::encode(b)
+        }
+        /// Minimal big-endian bytes of a u64 (the canonical u256 wire form for values that fit u64).
+        /// Mirrors the per-mod test convention; the production source of truth for "minimal-BE" is
+        /// `crate::agent_cbor::as_u256_minimal_be` — `golden_eip155_payload_is_production_minimal_be`
+        /// couples this output to it. (Promoting the 4+ copies to one shared helper = a TASK-20 cleanup.)
+        fn min_be(x: u64) -> Vec<u8> {
+            let b = x.to_be_bytes();
+            let i = b.iter().position(|&y| y != 0).unwrap_or(b.len());
+            b[i..].to_vec()
+        }
+        fn enc(map: Vec<(Value, Value)>) -> Vec<u8> {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&Value::Map(map), &mut buf).expect("canonical envelope encodes");
+            buf
+        }
+        fn k(n: u64) -> Value {
+            Value::Integer(n.into())
+        }
+        fn b(v: &[u8]) -> Value {
+            Value::Bytes(v.to_vec())
+        }
+
+        /// The shared 8-field EIP-155 transfer/dispense payload (envelope key 7) — mirrors
+        /// `ordinary_tx_v1.json`. Keys 1..=8: chain_id, from, to, value(u256-min-BE), nonce, gas_limit,
+        /// gas_price(u256-min-BE), data.
+        fn eip155_payload() -> Value {
+            Value::Map(vec![
+                (k(1), Value::Integer(11565u64.into())),
+                (k(2), b(&TRANSFER_FROM)),
+                (k(3), b(&TREASURY_TO)),
+                (k(4), b(&min_be(1_000_000_000_000_000_000))),
+                (k(5), Value::Integer(0u64.into())),
+                (k(6), Value::Integer(21_000u64.into())),
+                (k(7), b(&min_be(1_000_000_000))),
+                (k(8), b(&[])),
+            ])
+        }
+
+        fn base(opcode: u8, request_id: &[u8]) -> Vec<(Value, Value)> {
+            vec![
+                (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
+                (k(2), Value::Integer((opcode as u64).into())),
+                (k(3), Value::Text(COMMAND_DOMAIN.to_string())),
+                (k(4), b(request_id)),
+            ]
+        }
+
+        // The 4 frozen NON-cap envelopes. request_id is human-readable + <= MAX_REQUEST_ID_LEN (64).
+        const RID_PUBLIC_IDENTITY: &[u8] = b"0x40-golden:public-identity:v1";
+        const RID_PROVE_IDENTITY: &[u8] = b"0x40-golden:prove-identity:v1";
+        const RID_SIGN_TRANSFER: &[u8] = b"0x40-golden:sign-transfer:v1";
+        const RID_SIGN_FAUCET: &[u8] = b"0x40-golden:sign-faucet-dispense:v1";
+
+        fn req_public_identity() -> Vec<u8> {
+            let mut m = base(2, RID_PUBLIC_IDENTITY);
+            m.push((k(6), b(&GOLDEN_KEY_REF)));
+            enc(m)
+        }
+        fn req_prove_identity() -> Vec<u8> {
+            let mut m = base(3, RID_PROVE_IDENTITY);
+            m.push((k(6), b(&GOLDEN_KEY_REF)));
+            m.push((k(7), Value::Map(vec![(k(1), b(&GOLDEN_PROVE_NONCE))])));
+            enc(m)
+        }
+        fn req_sign_transfer() -> Vec<u8> {
+            let mut m = base(4, RID_SIGN_TRANSFER);
+            m.push((k(6), b(&GOLDEN_KEY_REF)));
+            m.push((k(7), eip155_payload()));
+            enc(m)
+        }
+        fn req_sign_faucet() -> Vec<u8> {
+            let mut m = base(5, RID_SIGN_FAUCET);
+            m.push((k(6), b(&GOLDEN_KEY_REF)));
+            m.push((k(7), eip155_payload()));
+            enc(m)
+        }
+
+        /// (filename, built bytes, opcode, request_id, payload-present). Ordered ALPHABETICALLY by
+        /// filename so the regen's outer-index insertion order is alphabetical too — the serialized
+        /// `.json` bytes are then stable whether serde_json sorts keys (default) or preserves insertion
+        /// order. The frozen/decode tests are order-independent (they `.find()` / loop), so the order is
+        /// purely for deterministic regen.
+        fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static [u8], bool)> {
+            vec![
+                ("req_prove_identity_v1.bin", req_prove_identity(), 3, RID_PROVE_IDENTITY, true),
+                ("req_public_identity_v1.bin", req_public_identity(), 2, RID_PUBLIC_IDENTITY, false),
+                ("req_sign_faucet_dispense_v1.bin", req_sign_faucet(), 5, RID_SIGN_FAUCET, true),
+                ("req_sign_transfer_v1.bin", req_sign_transfer(), 4, RID_SIGN_TRANSFER, true),
+            ]
+        }
+
+        #[test]
+        fn golden_request_envelopes_are_byte_exact() {
+            // The in-source canonical mint and the committed bytes must agree byte-for-byte — any
+            // map-ordering / minimal-int / bstr drift in the encoder flips this. Regen via
+            // `regen_golden_request_envelopes` (-- --ignored) and re-mint the .json in the same commit.
+            let committed: &[(&str, &[u8])] = &[
+                ("req_public_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/req_public_identity_v1.bin")),
+                ("req_prove_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/req_prove_identity_v1.bin")),
+                ("req_sign_transfer_v1.bin", include_bytes!("../testvectors/agent-gateway/req_sign_transfer_v1.bin")),
+                ("req_sign_faucet_dispense_v1.bin", include_bytes!("../testvectors/agent-gateway/req_sign_faucet_dispense_v1.bin")),
+            ];
+            for (name, built, ..) in vectors() {
+                let c = committed.iter().find(|(n, _)| *n == name).expect("committed vector present").1;
+                assert_eq!(built.as_slice(), c, "{name} golden drifted; regen + re-mint .json in the same commit");
+            }
+        }
+
+        #[test]
+        fn golden_request_envelopes_decode_canonically() {
+            // Each vector is a VALID wire envelope the enclave's strict-canonical decoder ACCEPTS, decoding
+            // to the intended fields — couples the frozen bytes to the real `decode_envelope` so an
+            // encoder/decoder divergence (the exact cross-language drift these vectors guard) breaks CI.
+            for (name, bytes, opcode, request_id, has_payload) in vectors() {
+                let env = decode_envelope(&bytes).unwrap_or_else(|_| panic!("{name} must decode canonically"));
+                assert_eq!(env.agent_version, AGENT_GATEWAY_VERSION, "{name} agent_version");
+                assert_eq!(env.command_domain, COMMAND_DOMAIN, "{name} command_domain");
+                assert_eq!(env.opcode, opcode, "{name} opcode");
+                assert_eq!(env.request_id.as_slice(), request_id, "{name} request_id");
+                assert_eq!(env.key_ref, Some(GOLDEN_KEY_REF), "{name} key_ref");
+                assert!(env.capability.is_none(), "{name} non-privileged ⇒ no capability");
+                assert_eq!(env.payload.is_some(), has_payload, "{name} payload presence");
+            }
+        }
+
+        #[test]
+        fn golden_request_envelope_canonical_headers() {
+            // Hand-audited canonical CBOR markers (RFC 8949 §4.2.1) a lenient re-encoder would mask: the
+            // map-pair count in the head byte, and key 3 = text(23) "2d-hsm/agent-gateway/v1".
+            assert_eq!(req_public_identity()[0], 0xA5, "public-identity = 5-pair map {{1,2,3,4,6}}");
+            assert_eq!(req_prove_identity()[0], 0xA6, "prove-identity = 6-pair map {{1,2,3,4,6,7}}");
+            assert_eq!(req_sign_transfer()[0], 0xA6, "sign-transfer = 6-pair map {{1,2,3,4,6,7}}");
+            assert_eq!(req_sign_faucet()[0], 0xA6, "sign-faucet = 6-pair map {{1,2,3,4,6,7}}");
+            // command_domain at key 3: int-key 0x03, then text(23) head 0x77 (major 3 | len 23) ‖ the bytes.
+            assert_eq!(COMMAND_DOMAIN.len(), 23, "0x77 text head assumes len 23");
+            let needle = [&[0x03u8, 0x77][..], COMMAND_DOMAIN.as_bytes()].concat();
+            for (name, bytes, ..) in vectors() {
+                assert!(
+                    bytes.windows(needle.len()).any(|w| w == needle),
+                    "{name} missing canonical text(23) command_domain marker"
+                );
+            }
+        }
+
+        #[test]
+        fn golden_request_envelope_sidecar_matches() {
+            // Couple the descriptive `.json` index (consumed by no runtime path) to the committed `.bin`s
+            // and the source constants, so a regen that forgets the manual `.json` re-mint fails CI.
+            let sidecar = include_str!("../testvectors/agent-gateway/request_envelopes_v1.json");
+            let v: serde_json::Value = serde_json::from_str(sidecar).expect("request-envelope index is valid JSON");
+            assert_eq!(v["command_domain"].as_str(), Some(COMMAND_DOMAIN), "index command_domain");
+            assert_eq!(v["agent_version"].as_u64(), Some(AGENT_GATEWAY_VERSION as u64), "index agent_version");
+            // No STALE/extra vector keys: the index must hold EXACTLY the current vectors, else a renamed
+            // or dropped vector would leave a lingering entry the per-vector loop below never visits.
+            assert_eq!(
+                v["vectors"].as_object().map(|o| o.len()),
+                Some(vectors().len()),
+                "index has a stale/extra vector entry"
+            );
+            for (name, bytes, opcode, request_id, has_payload) in vectors() {
+                let e = &v["vectors"][name];
+                assert_eq!(e["blob_sha256"].as_str(), Some(hex(&Sha256::digest(&bytes)).as_str()), "{name} sha256");
+                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(e["opcode"].as_u64(), Some(opcode as u64), "{name} opcode");
+                assert_eq!(e["request_id_hex"].as_str(), Some(hex(request_id).as_str()), "{name} request_id");
+                assert_eq!(e["has_payload"].as_bool(), Some(has_payload), "{name} has_payload");
+                // Couple the full bytes (blob_hex) + key_ref_hex too — the README advertises blob_hex as a
+                // decode source, so a hand-edit/merge that corrupts ONLY blob_hex must fail CI.
+                assert_eq!(e["blob_hex"].as_str(), Some(hex(&bytes).as_str()), "{name} blob_hex");
+                assert_eq!(e["key_ref_hex"].as_str(), Some(hex(&GOLDEN_KEY_REF).as_str()), "{name} key_ref_hex");
+            }
+        }
+
+        #[test]
+        fn golden_eip155_payload_is_production_minimal_be() {
+            // Couple this mod's local `min_be` to the PRODUCTION canonical u256 wire form: the value (key 4)
+            // and gas_price (key 7) of the frozen EIP-155 payload must be accepted by the real
+            // `as_u256_minimal_be` (which REJECTS non-minimal / over-width). So a `min_be` bug that froze a
+            // non-canonical vector (e.g. a leading zero) is caught here, not silently shipped to 2d.
+            let payload = eip155_payload();
+            let m = match payload {
+                Value::Map(m) => m,
+                _ => panic!("payload is a map"),
+            };
+            for key in [4u64, 7u64] {
+                let v = m
+                    .iter()
+                    .find(|(kk, _)| matches!(kk, Value::Integer(i) if u64::try_from(*i).ok() == Some(key)))
+                    .map(|(_, vv)| vv)
+                    .unwrap_or_else(|| panic!("payload key {key} present"));
+                assert!(
+                    crate::agent_cbor::as_u256_minimal_be(v).is_some(),
+                    "payload key {key} is not production-canonical minimal-BE",
+                );
+            }
+        }
+
+        /// REGEN (manual): `cargo test --features agent-gateway golden_request_envelopes::regen_golden_request_envelopes -- --ignored --nocapture`,
+        /// then commit the `.bin`s + the re-minted `request_envelopes_v1.json`. Mirrors
+        /// `boot_agent_keystore::regen_agent_genesis_golden_vector`.
+        #[test]
+        #[ignore]
+        fn regen_golden_request_envelopes() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+            let mut index = serde_json::Map::new();
+            for (name, bytes, opcode, request_id, has_payload) in vectors() {
+                std::fs::write(format!("{dir}{name}"), &bytes).expect("write envelope .bin");
+                // Insert in ALPHABETICAL key order so the serialized bytes are stable regardless of whether
+                // serde_json sorts keys (default BTreeMap) or preserves insertion order (preserve_order, if
+                // a future workspace dep ever unifies it on) — no spurious regen churn either way.
+                let mut e = serde_json::Map::new();
+                e.insert("blob_hex".into(), hex(&bytes).into());
+                e.insert("blob_len_bytes".into(), (bytes.len() as u64).into());
+                e.insert("blob_sha256".into(), hex(&Sha256::digest(&bytes)).into());
+                e.insert("has_payload".into(), has_payload.into());
+                e.insert("key_ref_hex".into(), hex(&GOLDEN_KEY_REF).into());
+                e.insert("opcode".into(), (opcode as u64).into());
+                e.insert("request_id_hex".into(), hex(request_id).into());
+                index.insert(name.into(), serde_json::Value::Object(e));
+            }
+            let doc = serde_json::json!({
+                "_comment": "TASK-22 AC#1 — byte-exact 0x40 request-envelope golden vectors (non-privileged opcodes). Minted from the enclave canonical CBOR encoder; each is ACCEPTED by the strict-canonical decode_envelope. TEST VALUES ONLY (addresses mirror ordinary_tx_v1.json). Regen: cargo test --features agent-gateway golden_request_envelopes::regen_golden_request_envelopes -- --ignored --nocapture",
+                "agent_version": AGENT_GATEWAY_VERSION,
+                "command_domain": COMMAND_DOMAIN,
+                "vectors": serde_json::Value::Object(index),
+            });
+            std::fs::write(
+                format!("{dir}request_envelopes_v1.json"),
+                serde_json::to_string_pretty(&doc).unwrap() + "\n",
+            )
+            .expect("write request-envelope index");
+            eprintln!("wrote 4 envelope vectors + request_envelopes_v1.json -> {dir}");
+        }
+    }
 }

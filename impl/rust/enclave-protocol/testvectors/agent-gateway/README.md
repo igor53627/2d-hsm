@@ -39,6 +39,51 @@ cd ../2d && mix run --no-start \
 | `agent_keystore_genesis_v2.{sealed.bin,json}` | **TASK-7.7 5b-2d** frozen genesis `pq-agent-keystore-v1` blob (**now keystore_format_version 3** — TASK-15 15-2b added `FaucetState.cumulative_signing_budget`; the `_v2` in the filename is the historical fixture name, kept to avoid churning `include_bytes!` paths): a deterministic-nonce seal (`seal_keystore_with_nonce`) of a minimal valid genesis body (`structural_version=1`, `strict_recovery_counter=0`, no entries/counters) over the committed reference provisioning root + the agent placeholder measurement. Consumed by the `boot_agent_keystore` deterministic from-disk loader test (`tests/agent_keystore_boot_loader.rs`) + the in-source byte-exact freeze. Re-installable (`blob_len <= MAX_KEYSTORE_BLOB_SIZE`). **TEST KEYS ONLY.** Regen: `cargo test --features agent-gateway,lab-agent-keystore-from-file regen_agent_genesis_golden_vector -- --ignored --nocapture` (re-mint the `.json` sidecar in the same commit on any `format_version`/body-layout change). |
 | `agent_keystore_smoke_v1.{sealed.bin,json}` | **TASK-7.7 5b-2c-iii** minted SMOKE keystore for the aya SNP live smoke (`lab_agent_smoke.rs`): like the genesis blob but `anchor_root` is derived from the public in-repo Ed25519 seed `[0x42; 32]` (`LAB_ANCHOR_TEST_SEED` — so the lab anchor stub can sign freshness responses the guest accepts and boot reaches `Ready`) and it carries ONE secp256k1 key entry (`key_ref=[0x11;32]`, public scalar `[0x77;32]` — so PUBLIC_IDENTITY returns a SUCCESS body; the zero-entry genesis stays the negative control). **TEST KEYS ONLY — both the anchor seed and the secp scalar are public constants in `lab_agent_smoke.rs`; no secrecy claim; the `lab-agent-smoke` feature is release-banned.** Regen (mints BOTH files): `cargo test --features agent-gateway,lab-agent-smoke regen_agent_smoke_golden_vector -- --ignored --nocapture`. |
 
+## 0x40 wire vectors (TASK-22)
+
+Byte-exact golden vectors for the **Agent Gateway `0x40` request/response wire format**, so the
+downstream **2d** Elixir codec (`Chain.AgentGateway.SignerProtocol`, TASK-132.5.2) can validate its
+CBOR encoder/decoder against the enclave — the authoritative producer of the canonical CBOR shape,
+the §10.5 capability preimage, and the sealed response bodies. These catch Elixir↔Rust drift
+(map ordering, integer minimal-encoding, `bstr`-vs-`uint`) at CI time instead of when a live
+capability is rejected `0x40`/`0x43` *after* the host has already burned a monotonic counter slot.
+
+Unlike the signing vectors above (minted from 2D's own crypto by `gen_agent_vectors.exs`), the `0x40`
+vectors are minted **from the enclave's own canonical encoders** (the inverse direction), via `#[ignore]`
+regen tests next to each producer, and frozen here. Each is byte-exact vs its committed `.bin` AND
+re-validated against the live decoder/encoder, so a drift breaks CI.
+
+### AC#1 — request envelopes (`req_*_v1.bin` + `request_envelopes_v1.json`)
+
+Canonical int-keyed CBOR request envelope (keys 1..=7: `agent_version`, `opcode`, `command_domain`,
+`request_id`, `capability`, `key_ref`, `payload`) for each **non-privileged** opcode. Each `.bin` is
+proven to be ACCEPTED by the strict-canonical `decode_envelope` and decode to the documented fields;
+the `request_envelopes_v1.json` index couples each blob's `sha256`/`len` + decoded fields + `blob_hex`.
+**TEST VALUES ONLY** (addresses mirror `ordinary_tx_v1.json`; `key_ref` = `[0x11;32]`).
+
+| File | Opcode | Keys present |
+|------|--------|--------------|
+| `req_public_identity_v1.bin` | 2 PUBLIC_IDENTITY | {1,2,3,4,6} (no cap, no payload) |
+| `req_prove_identity_v1.bin` | 3 PROVE_IDENTITY | {1,2,3,4,6,7} (payload `{1: nonce32}`) |
+| `req_sign_transfer_v1.bin` | 4 SIGN_TRANSFER | {1,2,3,4,6,7} (8-field EIP-155 payload) |
+| `req_sign_faucet_dispense_v1.bin` | 5 SIGN_FAUCET_DISPENSE | {1,2,3,4,6,7} (8-field EIP-155 payload) |
+
+These are **wire-shape (decode) vectors**: each is proven to be accepted by the strict-canonical
+envelope decoder and to carry the documented field shape (incl. the 8-field EIP-155 payload, whose
+key layout matches the live `handle_sign_transfer` / `handle_sign_faucet_dispense` decoders). They are
+**not end-to-end dispatch-success fixtures** — a successful dispatch additionally needs the matching
+keystore state (a stored key for `key_ref`, the sealed `chain_id`, the faucet allowlist/config) and the
+relevant preview feature; absent those, a live enclave returns the appropriate §10.9 error rather than a
+signed body (e.g. `0x42` KeyPurposeMismatch for an unknown/wrong-purpose key, or `0x45` NotConfigured for
+a preview-gated op). (NB `key_ref` here is the lab-smoke fixture's `[0x11;32]`, so it is *not* a universal
+"no such key" — what a given enclave returns depends on the installed keystore.) End-to-end response-body
+vectors land in the later TASK-22 response slices.
+
+The cap-bearing envelopes (GENERATE_KEYS(1) / CONFIGURE_TREASURY(6)) + the §10.5 capability
+preimage/map, the response bodies, and the negative (rejection) vectors land in subsequent TASK-22
+slices. Regen: `cargo test --features agent-gateway golden_request_envelopes::regen_golden_request_envelopes -- --ignored --nocapture`,
+then commit the `.bin`s + the re-minted `request_envelopes_v1.json` in the same commit.
+
 ## 3-way domain separation (AC#15)
 
 A single agent key must never be coerced across the three preimage domains. They are

@@ -815,8 +815,10 @@ host-controlled).
 `AGENT_K1_CONFIGURE_TREASURY` sub-ops map to tiers: `set_limits`/`refill_budget`/
 `raise_lifetime_breaker` = treasury-admin; `reset_lifetime_breaker` = recovery/quorum
 (bound to a strict recovery counter and target value — see §10.6 for the recovery-counter
-rule, deferred to TASK-18 un-gate; the live handler currently sequences it on the admin
-contiguous counter). Config version is monotonic and sealed (an audit/version stamp, not a
+rule, deferred to TASK-18 un-gate; the live handler currently sequences it on the **recovery
+authority's own lane** via the uniform contiguous-counter rule (`counter == highest+1`), NOT the
+admin lane — the cap is recovery-tier so its counter tuple is keyed by the verified recovery
+authority, pending the forward-only strict recovery-counter gate). Config version is monotonic and sealed (an audit/version stamp, not a
 rollback control). `set_limits`/`raise_lifetime_breaker` do **not** touch the spend
 counters; `refill_budget` deliberately **resets the refillable `cumulative_native_spend` →
 0** (a fresh budget window — the field is the refillable counter) while leaving the
