@@ -44,15 +44,16 @@ pub fn run_contract_server(
 ) -> Result<std::convert::Infallible, ProtocolError> {
     use std::io::Write as _;
     // Defense-in-depth: this is a pub fn whose `private_dir` is handed to bind_unix_listener, which may
-    // chmod it 0700 (following symlinks). Refuse a private_dir that resolves to the root filesystem —
-    // literally `/`/empty, OR (if it already exists) a symlink whose target canonicalizes to `/` — so a
-    // misuse can never tighten the root fs. A not-yet-created dir can't be canonicalized (bind creates it
-    // 0700); the bin passes a fixed real subdir. TOCTOU against a hostile local caller of this
-    // release-banned, test-only fn is out of scope (the trust boundary is local file permissions).
-    let resolves_to_root = private_dir.canonicalize().map(|c| c == Path::new("/")).unwrap_or(false);
-    if private_dir.as_os_str().is_empty() || private_dir == Path::new("/") || resolves_to_root {
+    // chmod it 0700 — and `set_permissions` FOLLOWS symlinks, so a symlinked private_dir would tighten its
+    // (possibly sensitive) target. Refuse empty / the root `/` / ANY existing symlink, so a misuse can
+    // never chmod a foreign directory through a link. A not-yet-created dir has no metadata (bind creates
+    // it 0700); a real dedicated directory (the bin's fixed /tmp/twod-hsm-agent-contract) passes. A caller
+    // passing a real SENSITIVE dir (e.g. /etc itself) is a blatant self-inflicted misuse out of scope —
+    // "dedicated" is uncheckable; the bin uses a fixed dir and this fn is release-banned / test-only.
+    let is_symlink = std::fs::symlink_metadata(private_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    if private_dir.as_os_str().is_empty() || private_dir == Path::new("/") || is_symlink {
         return Err(ProtocolError::WireProtocol(
-            "contract server: private_dir must be a dedicated directory, not empty / the root \"/\" / a symlink to it",
+            "contract server: private_dir must be a dedicated real directory, not empty / the root \"/\" / a symlink",
         ));
     }
     if !install_reference_agent_keystore() {
