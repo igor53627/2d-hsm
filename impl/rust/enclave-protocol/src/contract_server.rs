@@ -144,13 +144,26 @@ fn install_mutating_op_support() {
     any(test, feature = "agent-contract-server")
 ))]
     {
-        // Best-effort: the reference body makes both succeed; if either failed, the mutating ops simply
-        // stay fail-closed (0x45/0x46), which is the safe outcome for a contract harness.
-        let _ = crate::agent_dispatch::install_anti_rollback_binding(crate::agent_dispatch::AntiRollbackBinding {
+        use std::io::Write as _;
+        // Best-effort install-once: the reference body makes both succeed on a fresh process. A `false`
+        // (each fn: "already installed") is SURFACED, not silently dropped — the mutating ops depend on
+        // these globals, so a duplicate/misordered install that left one un-installed would otherwise show
+        // only as an opaque 0x45/0x46 with no server-side signal (symmetry with the seal-root warn above).
+        if !crate::agent_dispatch::install_anti_rollback_binding(crate::agent_dispatch::AntiRollbackBinding {
             epoch: 1,
             active: true,
-        });
-        let _ = crate::agent_dispatch::install_commit_channel(Box::new(ReferenceCommitChannel::new()));
+        }) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[warn] contract server: anti-rollback binding not installed (already set?); mutating ops may fail closed (0x45)"
+            );
+        }
+        if !crate::agent_dispatch::install_commit_channel(Box::new(ReferenceCommitChannel::new())) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[warn] contract server: mock commit channel not installed (already set?); mutating ops may fail closed (0x46)"
+            );
+        }
     }
 }
 
