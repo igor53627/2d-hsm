@@ -24,10 +24,16 @@ let
   # stays a debug build for the same reason as `agent-gateway`. A SEPARATE profile (not a flag on the
   # read-path image) keeps the preview feature off the read-path smoke.
   agentGatewayKeygen = profile == "agent-gateway-keygen";
+  # TASK-15: the combined FAUCET write-path smoke build — the SAME `twod-hsm-agent-gateway` bin, but with
+  # ALL THREE preview gates (keygen-exec + configure-treasury + sign-faucet) so the guest can mint the
+  # treasury key, configure caps + a budget, and dispense — the full fund-custody flow at runtime. All
+  # three are release-banned (compile_errors under STRICT_RELEASE_GUARDS), so this stays a debug build for
+  # the same reason as the keygen smoke. A SEPARATE profile keeps the preview features off the other images.
+  agentGatewayFaucet = profile == "agent-gateway-faucet";
   pname =
     if staging then "enclave-vsock-staging"
     else if quoteSmoke then "twod-hsm-quote-smoke"
-    else if (agentGateway || agentGatewayKeygen) then "twod-hsm-agent-gateway"
+    else if (agentGateway || agentGatewayKeygen || agentGatewayFaucet) then "twod-hsm-agent-gateway"
     else "enclave-vsock";
   buildFeatures =
     if staging then
@@ -38,6 +44,8 @@ let
       [ "agent-gateway" "vsock-transport" "lab-quote-smoke" ]
     else if agentGatewayKeygen then
       [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" "agent-keygen-exec-preview" ]
+    else if agentGatewayFaucet then
+      [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" "agent-keygen-exec-preview" "agent-configure-treasury-preview" "agent-sign-faucet-preview" ]
     else if agentGateway then
       [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" ]
     else
@@ -46,7 +54,7 @@ let
   # lab-agent-keystore-from-file / agent-keygen-exec-preview are release-banned (lib.rs compile_errors),
   # and debug ⇒ TWOD_HSM_STRICT_RELEASE_GUARDS unset ⇒ the bans do not trip (by design). The
   # release-built agent spawn shape stays the recorded 5b-2c residual.
-  debugBuild = staging || labProd || transportSmoke || quoteSmoke || agentGateway || agentGatewayKeygen;
+  debugBuild = staging || labProd || transportSmoke || quoteSmoke || agentGateway || agentGatewayKeygen || agentGatewayFaucet;
 in
 
 rustPlatform.buildRustPackage {
