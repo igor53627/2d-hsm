@@ -49,8 +49,8 @@ pub const REFERENCE_TREASURY_KEY_REF: [u8; 32] = [0x44; 32];
 // admin/recovery seeds + the environment + chain are ALIGNED with the TASK-22 frozen capability vectors
 // (admin [7;32], recovery [9;32], env "env-prod-0", chain 11565 — see golden_capability_vectors), so the
 // frozen `cap_full_*` / `req_generate_keys` / `req_configure_*` vectors VERIFY against this reference
-// keystore (the mutating-op contract lane, wired in the Slice-3 follow-up). The anchor seed is what a
-// later mock commit channel signs acks with, against `anchor_root`. `pub(crate)`-visible via the body.
+// keystore (the mutating-op contract lane, wired in Slice 3). The anchor seed is what the contract
+// server's mock commit channel signs acks with, against `anchor_root`. `pub(crate)`-visible via the body.
 /// The anchor signing seed — `anchor_root` = its Ed25519 verifying key. `pub(crate)` so the contract
 /// server's mock commit channel (Slice 3) signs acks with the SAME key the enclave verifies against.
 pub(crate) const REFERENCE_ANCHOR_SEED: [u8; 32] = [0x42; 32];
@@ -75,14 +75,16 @@ fn u256_be(x: u64) -> [u8; 32] {
 /// the expected identities/bodies without installing the global. Models `lab_agent_smoke::smoke_body`
 /// but standalone (no anchor stub / smoke-client surface) and with BOTH keys.
 ///
-/// **MVP reachability:** PUBLIC_IDENTITY (no preview) works out of the box; PROVE_IDENTITY / SIGN_TRANSFER
+/// **Reachability:** PUBLIC_IDENTITY (no preview) works out of the box; PROVE_IDENTITY / SIGN_TRANSFER
 /// are non-rollback-sensitive and work once their preview feature is enabled. The admin/recovery
 /// authorities + `anchor_root` + the funded faucet are config for the **rollback-sensitive / mutating**
 /// ops (SIGN_FAUCET_DISPENSE / GENERATE_KEYS / CONFIGURE_TREASURY) — those additionally need an installed
-/// anti-rollback binding + (for GENERATE/CONFIGURE) a mock commit channel, which `run_contract_server`
-/// does NOT install in the MVP, so they fail closed (0x45/0x46) until the Slice-3 follow-up wires them.
-/// The authorities/env/chain are ALIGNED with the TASK-22 capability vectors so those frozen caps will
-/// verify against this body when that lane lands.
+/// anti-rollback binding + a mock commit channel, which `run_contract_server` installs (behind the
+/// mutating preview features) via `install_mutating_op_support` (Slice 3). With no mutating preview
+/// enabled, that install is a no-op and the ops stay fail-closed (0x45/0x46). The authorities/env/chain
+/// are ALIGNED with the TASK-22 capability vectors so those frozen caps verify against this body (pinned
+/// by `task22_generate_keys_cap_verifies_against_reference_config`; round-trip-exercised by the
+/// `contract_server` mutating tests).
 pub fn reference_keystore_body() -> KeystoreBody {
     let anchor_root = ed25519_dalek::SigningKey::from_bytes(&REFERENCE_ANCHOR_SEED)
         .verifying_key()

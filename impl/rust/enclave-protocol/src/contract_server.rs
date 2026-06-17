@@ -47,6 +47,9 @@ struct ReferenceCommitChannel {
     environment_identifier: String,
     signing_key: ed25519_dalek::SigningKey,
     /// slice-6-5 idempotency: request_id → (epoch, structural, marks). Commit-at-most-once per logical op.
+    /// In-memory and NEVER reaped — fine for a dev/contract harness (the production anchor is the durable
+    /// sequencer; this mock keeps no durable state). A very-long-lived contract server would grow this by
+    /// one entry per distinct request_id; restart to reclaim.
     ledger: std::collections::HashMap<Vec<u8>, (u64, u64, [u8; 32])>,
 }
 
@@ -282,6 +285,117 @@ mod tests {
         };
         assert!(matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Array(_))), "key 1 = minted key list");
         assert!(matches!(crate::agent_cbor::map_get(&m, 2), Some(Value::Bytes(_))), "key 2 = sealed keystore blob");
+
+        crate::agent_dispatch::reset_agent_keystore_for_tests();
+        crate::agent_dispatch::reset_commit_channel_for_tests();
+    }
+
+    /// CONFIGURE_TREASURY (set_limits) round-trip through the IDENTICAL `commit_before_emit` seam as
+    /// GENERATE_KEYS, dispatching the FROZEN TASK-22 `req_configure_set_limits_v1.bin` (an admin-`[7;32]`-
+    /// signed cap for env `env-prod-0` that verifies against the reference config — pinned analogously by
+    /// `reference_keystore::task22_generate_keys_cap_verifies_against_reference_config`). A Structural-class
+    /// commit; the success body is `{1: sealed_blob}` (key 1 = Bytes ⇒ NOT a `{1: code(int)}` error). Proves
+    /// the mock channel serves a SECOND mutating opcode, not just GENERATE_KEYS.
+    #[cfg(feature = "agent-configure-treasury-preview")]
+    #[test]
+    fn configure_treasury_round_trip_with_frozen_task22_cap() {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        assert!(install_reference_agent_keystore());
+        install_mutating_op_support();
+
+        let env: &[u8] = include_bytes!("../testvectors/agent-gateway/req_configure_set_limits_v1.bin");
+        let out = crate::agent_dispatch::handle_agent_gateway_frame(env);
+
+        assert_eq!(
+            crate::agent_dispatch::decode_agent_error_code(&out),
+            None,
+            "CONFIGURE_TREASURY must succeed (not a 0x4x error) — the mock commit channel signed the ack",
+        );
+        let m = match ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("success body is a CBOR map"),
+        };
+        assert!(matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Bytes(_))), "key 1 = sealed keystore blob");
+
+        crate::agent_dispatch::reset_agent_keystore_for_tests();
+        crate::agent_dispatch::reset_commit_channel_for_tests();
+    }
+
+    /// SIGN_FAUCET_DISPENSE round-trip — the EpochOnly commit class (vs the Structural GENERATE/CONFIGURE
+    /// above), exercising the OTHER `advance_commit_epoch` arm through the same mock channel. The frozen
+    /// TASK-22 faucet vector targets a different `key_ref` (`[0x11;32]`) than the reference treasury key, so
+    /// this builds a dispense envelope against the reference treasury key directly: `from` = its derived eth
+    /// address, `to` = the reference transfer key's address (the only stored §2 known recipient), within the
+    /// pre-funded reference caps (per_dispense 1e6 / gas 21000 / fee 1e9 / budget 1e7 — worst_case
+    /// = 1000 + 21000·1 = 22000 ≤ budget). Success body is `{1: signed_rlp, …, 8: sealed_blob}`.
+    #[cfg(feature = "agent-sign-faucet-preview")]
+    #[test]
+    fn sign_faucet_dispense_round_trip_against_reference_treasury() {
+        let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
+        assert!(install_reference_agent_keystore());
+        install_mutating_op_support();
+
+        // Derive both eth addresses from the reference body's stored uncompressed pubkeys (no private
+        // scalars needed): `from` = the treasury key, `to` = the transfer key (the §2 recipient allowlist).
+        let body = crate::reference_keystore::reference_keystore_body();
+        let addr_of = |kr: [u8; 32]| -> [u8; 20] {
+            let pk: [u8; 65] = body
+                .entries
+                .iter()
+                .find(|e| e.key_ref == kr)
+                .unwrap()
+                .public_identity
+                .as_slice()
+                .try_into()
+                .unwrap();
+            crate::secp256k1::eth_address_from_uncompressed(&pk).unwrap()
+        };
+        let from = addr_of(crate::reference_keystore::REFERENCE_TREASURY_KEY_REF);
+        let to = addr_of(crate::reference_keystore::REFERENCE_TRANSFER_KEY_REF);
+        // Canonical minimal big-endian (no leading zero) of a non-zero u64, the §2 amount/gas_price wire form.
+        let min_be = |x: u64| -> Vec<u8> {
+            let b = x.to_be_bytes();
+            b[b.iter().position(|&c| c != 0).unwrap_or(7)..].to_vec()
+        };
+        let k = |n: u64| Value::Integer(n.into());
+        // §2 dispense payload: the strict 8-field native-transfer map {1:chain,2:from,3:to,4:amount,5:nonce,
+        // 6:gas_limit,7:gas_price,8:data(empty)} — mirrors `lab_agent_smoke::dispense_envelope`.
+        let payload = Value::Map(vec![
+            (k(1), k(crate::reference_keystore::REFERENCE_CHAIN_ID)),
+            (k(2), Value::Bytes(from.to_vec())),
+            (k(3), Value::Bytes(to.to_vec())),
+            (k(4), Value::Bytes(min_be(1_000))),
+            (k(5), k(0)),
+            (k(6), k(21_000)),
+            (k(7), Value::Bytes(min_be(1))),
+            (k(8), Value::Bytes(Vec::new())),
+        ]);
+        let mut env = Vec::new();
+        ciborium::ser::into_writer(
+            &Value::Map(vec![
+                (k(1), k(crate::agent_identity::AGENT_GATEWAY_VERSION as u64)),
+                (k(2), k(5)),
+                (k(3), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
+                (k(4), Value::Bytes(b"contract-test:faucet-dispense".to_vec())),
+                (k(6), Value::Bytes(crate::reference_keystore::REFERENCE_TREASURY_KEY_REF.to_vec())),
+                (k(7), payload),
+            ]),
+            &mut env,
+        )
+        .unwrap();
+
+        let out = crate::agent_dispatch::handle_agent_gateway_frame(&env);
+        assert_eq!(
+            crate::agent_dispatch::decode_agent_error_code(&out),
+            None,
+            "SIGN_FAUCET_DISPENSE must succeed (not a 0x4x error) — the mock commit channel signed the ack",
+        );
+        let m = match ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("success body is a CBOR map"),
+        };
+        assert!(matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Bytes(_))), "key 1 = signed tx RLP");
+        assert!(matches!(crate::agent_cbor::map_get(&m, 8), Some(Value::Bytes(_))), "key 8 = sealed keystore blob");
 
         crate::agent_dispatch::reset_agent_keystore_for_tests();
         crate::agent_dispatch::reset_commit_channel_for_tests();
