@@ -4349,6 +4349,40 @@ mod tests {
             );
         }
 
+        /// 4c-1 AC#14: the audit append is sub-op-INDEPENDENT — it fires for the recovery-tier
+        /// `reset_lifetime_breaker` (sub_op 3) too, recording op=6 with the RECOVERY cap's authority
+        /// (not the admin's) and the post-bump config_version. Pins that the append sits after the
+        /// `match params` block, not inside an admin-only arm.
+        #[test]
+        fn configure_audit_appended_for_recovery_tier_reset_breaker() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.faucet.lifetime_spend = crate::u256::from_u64(10_000);
+            body.faucet.circuit_breaker_threshold = Some(crate::u256::from_u64(12_000));
+            let (cap, pay) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
+            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, .. } => {
+                    assert_eq!(candidate.audit.records.len(), 1, "one record even for the recovery-tier sub-op");
+                    let r = &candidate.audit.records[0];
+                    assert_eq!(r.op, 6, "op = CONFIGURE_TREASURY");
+                    assert_eq!(
+                        r.authority,
+                        recovery.verifying_key().to_bytes(),
+                        "authority = the RECOVERY cap authority (sub_op 3 is recovery-tier)"
+                    );
+                    assert_eq!(
+                        r.config_version,
+                        body.config.monotonic_treasury_config_version + 1,
+                        "post-bump config_version"
+                    );
+                    assert_eq!(r.scope_target, SCOPE.to_vec());
+                    assert_eq!(r.request_id, vec![0x11u8; 16]);
+                }
+                _ => panic!("expected ConfigureTreasury"),
+            }
+        }
+
         /// CRASH-RECONCILE PROOF (the TASK-15 15-4 review's missing test): a dropped reset_lifetime_breaker
         /// seal (committed to the anchor, crash before swap) must reconcile **StructuralGap → restore**, NOT
         /// the AdoptForward path whose `marks_dominate_local` belt would WEDGE on the LOWERED `lifetime_spend`.

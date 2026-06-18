@@ -114,11 +114,15 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    `request_id` is non-empty or per-op-unique — distinct/non-empty operational `request_id` assignment
    is an ADMIN/orchestrator precondition (the only code guard is `MAX_REQUEST_ID_LEN`; an empty id is
    admin-cap-bound, not a host attack), the same contract as the anchor idempotency key in
-   `agent-gateway-anti-rollback.md §3`. Backpressure note: until `EXPORT_BACKUP` lands the drain
-   (`advance_export_high_water`, slice 4c), a preview build RESPECTS backpressure but cannot RELEASE it —
-   a 4b-only preview build wedges `GENERATE_KEYS` (returns 0x46) once the ring fills past `capacity`
-   un-exported records. Preview-gated/non-user-reachable until TASK-18; do not run 4b standalone past
-   `capacity` privileged ops, or land 4b+4c together.
+   `agent-gateway-anti-rollback.md §3`. **Backpressure / brick-on-undrained-ring (NORMATIVE):** every
+   committed privileged write op appends one record and the ring fails CLOSED (0x46) when full +
+   undrained — so an undrained ring DENIES all privileged write handlers that audit. As of slice 4c-1
+   that is BOTH `GENERATE_KEYS` and `CONFIGURE_TREASURY` (and `EXPORT_BACKUP` once 4c-2 lands). The only
+   release of backpressure is `EXPORT_BACKUP`'s drain (`advance_export_high_water`, slice 4c-2); until it
+   ships there is NO in-band drain, so a preview build that exhausts `capacity` un-exported records
+   permanently denies those handlers. This is intended fail-closed-for-audit-completeness, not a bug.
+   Preview-gated/non-user-reachable until TASK-18; size production `capacity` against the interim, or land
+   the EXPORT drain (4c-2) before un-gate.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version
