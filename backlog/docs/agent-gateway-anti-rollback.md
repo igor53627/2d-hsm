@@ -440,11 +440,19 @@ contract stays pending.
 
 **`structural_version` (key 5) — FROZEN v1.** A `u64` in the `pq-agent-keystore-v1` encrypted body,
 init **1** (never 0 — same-epoch Fresh equality vs a forged 0-anchor; anchor baseline 1 is normative),
-forward-only/never-reset, bumped by **exactly**: each committed GENERATE_KEYS and each key/config-changing
-CONFIGURE_TREASURY sub-op (that handler is deferred; its sub-op classifier MUST be an exhaustive `match`
-with no wildcard so a new sub-op can't default into the wrong class). MUST NOT bump on counter/spend
-advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT be aliased
-onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
+forward-only/never-reset, bumped by **exactly** the committed `Structural` set (`commit_bump_class`):
+each committed GENERATE_KEYS; each key/config-changing CONFIGURE_TREASURY sub-op; each EXPORT_BACKUP
+(TASK-13b slice 2 — advances the non-marks `audit.last_exported_seq`); and each RESTORE_BACKUP
+(TASK-13b slice 2 — wholesale body replace). The CONFIGURE/EXPORT/RESTORE handlers are deferred; the
+CONFIGURE sub-op classifier MUST be an exhaustive `match` with no wildcard so a new sub-op can't default
+into the wrong class. **RESTORE_BACKUP is the recovery-ceremony EXCEPTION to "monotone `++`":** its
+`structural_version` is SET from the backup (a NON-monotone transition, possibly `< local`), NOT a plain
+`advance_commit_epoch(Structural)` increment — the handler slice MUST define the post-restore anchor value
++ the reconcile rule that admits a restored value `≠ local+1` (a distinct recovery path tied to
+`strict_recovery_counter`, see the RESTORE note above). The one committed op that MUST NOT bump
+`structural_version` is SIGN_FAUCET_DISPENSE (EpochOnly — its full effect is in the marks). MUST NOT bump
+on counter/spend advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT
+be aliased onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
 **ATOMICITY invariant (LIVE — slice 6-4a):** the GENERATE_KEYS bump advances atomically with
 `freshness_epoch` (`advance_commit_epoch`); the frame layer then computes the sealed blob FIRST
 (side-effect-free) and commits exactly that `{epoch, structural, marks}` through the anchor BEFORE the
