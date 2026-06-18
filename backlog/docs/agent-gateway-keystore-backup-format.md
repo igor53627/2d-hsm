@@ -146,7 +146,11 @@ RESTORE ceremony re-derives or freshly-seeds them enclave-locally:
   this backup (which drained the source ring), so all restored history is treated as already-exported; the
   restored ring starts fully drained (no spurious backpressure on the first post-restore privileged op).
 - `audit.capacity` = a RESTORE-time policy/config value (NOT from the backup) — the restoring enclave's
-  own provisioning, not the source's.
+  own provisioning, not the source's. It MUST be `>= audit_records.len()`: RESTORE either raises the
+  policy capacity to fit the restored record count or FAILS CLOSED — it MUST NOT truncate restored audit
+  records (dropping AC#14 history). (`validate()` already rejects `records.len() > capacity`, so a
+  too-small capacity fails closed at seal time regardless; the restore handler should reject it earlier
+  with a clear recovery error.)
 - `structural_version`/`freshness_epoch` = enclave-local (see `agent-gateway-anti-rollback.md` — local+1
   vs a `strict_recovery_counter`-seeded value), never the source's; `anchor_root` is the restoring
   enclave's own. These rules are enforced by the (deferred) RESTORE handler slice.
