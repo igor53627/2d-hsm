@@ -763,7 +763,9 @@ impl KeystoreBody {
     /// (`records.len() >= capacity`) AND every live record is past `last_exported_seq` (the un-exported live
     /// count `(next_seq-1) - last_exported_seq >= capacity`). A `capacity==0` ring is permanently full.
     /// `EXPORT_BACKUP` drains via [`Self::advance_export_high_water`], re-enabling appends.
-    #[cfg_attr(not(test), allow(dead_code))] // staged slice-4a; consumed by the 4b/4c handler wiring
+    // Live under `agent-keygen-exec-preview` (the GENERATE_KEYS handler calls it, slice 4b) or under
+    // test; dead otherwise (the handler itself is dead-code-allowed when the preview feature is off).
+    #[cfg_attr(not(any(test, feature = "agent-keygen-exec-preview")), allow(dead_code))]
     pub(crate) fn record_audit(
         &mut self,
         op: u8,
