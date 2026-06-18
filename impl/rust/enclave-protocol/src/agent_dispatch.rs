@@ -1222,6 +1222,28 @@ fn handle_configure_treasury(
         matches!(configure_treasury_sub_op_bump_class(sub_op), CommitBumpClass::Structural);
     candidate.advance_commit_epoch(bumps_structural).map_err(|_| AgentError::SealFailed)?;
 
+    // AC#14 audit record (slice 4c-1): append this privileged CONFIGURE op's full provenance onto the
+    // finalized candidate ring — mirror of the 4b GENERATE_KEYS append. MUST be on the candidate BEFORE it
+    // leaves the handler: `commit_before_emit` re-runs `validate()` at seal time and forbids candidate
+    // mutation between seal and anchor-commit, so the record must already be in the body. The ONLY
+    // difference from 4b is `config_version`: CONFIGURE bumped it via `advance_treasury_config_version`
+    // above, so `candidate.config.monotonic_treasury_config_version` is the POST-bump value — exactly the
+    // case the 4b comment anticipated by reading from the finalized candidate, not the pre-clone live body.
+    // Fail-closed: `AuditBackpressure` / `MonotonicOverflow` → `SealFailed` (0x46), so the handler returns
+    // BEFORE the frame reaches `commit_before_emit` — no seal, no anchor commit, no swap (anti-oracle:
+    // ring fullness is sealed host-visible state, folds to the generic seal-class failure).
+    candidate
+        .record_audit(&crate::agent_keystore::AuditAppend {
+            op: env.opcode,
+            authority: &verified.authority,
+            counter: verified.counter,
+            config_version: candidate.config.monotonic_treasury_config_version,
+            scope_class: verified.scope_class,
+            scope_target: &verified.scope_target,
+            request_id: &env.request_id,
+        })
+        .map_err(|_| AgentError::SealFailed)?;
+
     Ok(AgentResponse::ConfigureTreasury {
         candidate: Box::new(candidate),
         request_id: env.request_id.clone(),
@@ -4139,6 +4161,89 @@ mod tests {
                 }
                 _ => panic!("expected ConfigureTreasury"),
             }
+        }
+
+        /// 4c-1 AC#14: a successful CONFIGURE appends EXACTLY ONE audit record with full provenance. The
+        /// CONFIGURE-specific property vs 4b GENERATE_KEYS: `config_version` is the POST-bump value
+        /// (CONFIGURE bumps it via `advance_treasury_config_version`), pinned by asserting it equals
+        /// base+1 — a pre-bump read would record the stale base value.
+        #[test]
+        fn configure_audit_record_appended_with_post_bump_provenance() {
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let body = body_with_authorities(&admin, &recovery);
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                AgentResponse::ConfigureTreasury { candidate, .. } => {
+                    assert_eq!(candidate.audit.records.len(), 1, "exactly one audit record per committed op");
+                    assert_eq!(candidate.audit.next_seq, body.audit.next_seq + 1, "next_seq advanced by 1");
+                    let r = &candidate.audit.records[0];
+                    assert_eq!(r.seq, body.audit.next_seq, "record seq = the old next_seq");
+                    assert_eq!(r.op, 6, "op = CONFIGURE_TREASURY wire opcode");
+                    assert_eq!(r.authority, admin.verifying_key().to_bytes(), "authority = cap authority");
+                    assert_eq!(r.counter, 1, "counter = the accepted cap batch sequence");
+                    assert_eq!(
+                        r.config_version,
+                        body.config.monotonic_treasury_config_version + 1,
+                        "config_version is the POST-bump value (CONFIGURE bumps it — a pre-bump read would be stale)"
+                    );
+                    assert_eq!(
+                        r.config_version, candidate.config.monotonic_treasury_config_version,
+                        "and it equals the finalized candidate's config_version"
+                    );
+                    assert_eq!(r.scope_class, 0, "scope_class = cap scope_class");
+                    assert_eq!(r.scope_target, SCOPE.to_vec(), "scope_target = cap scope");
+                    assert_eq!(r.request_id, vec![0x11u8; 16], "request_id = envelope request_id");
+                }
+                _ => panic!("expected ConfigureTreasury"),
+            }
+        }
+
+        /// 4c-1 AC#14: a CONFIGURE against a full+undrained audit ring fails closed (0x46) in Phase A —
+        /// `record_audit` returns `AuditBackpressure` → `SealFailed` BEFORE the frame reaches
+        /// `commit_before_emit` (commit-counter == 0, no anchor commit, no swap). Mirrors the 4b proof.
+        #[test]
+        fn configure_audit_backpressure_fails_closed_never_commits() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            let _g = gate_configured();
+            let (admin, recovery) = (admin_key(), recovery_key());
+            let mut body = body_with_authorities(&admin, &recovery);
+            body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+            // Saturate the ring (capacity 1, one undrained record) via record_audit so the state is
+            // guaranteed validate()-consistent (records=[seq1], next_seq=2, last_exported_seq=0).
+            body.audit.capacity = 1;
+            body.record_audit(&crate::agent_keystore::AuditAppend {
+                op: 6,
+                authority: &[0u8; 32],
+                counter: 0,
+                config_version: 0,
+                scope_class: 0,
+                scope_target: b"seed",
+                request_id: b"seed",
+            })
+            .expect("first append fills the cap-1 ring");
+            assert!(install_agent_keystore(body, b"meas"));
+            let calls = Arc::new(AtomicUsize::new(0));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
+                CommitChannelAct::Ok,
+                Arc::clone(&calls),
+            ))));
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&env_for(cap, pay))),
+                Some(0x46),
+                "a full undrained audit ring fails the CONFIGURE op closed with SealFailed"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "audit backpressure short-circuits in Phase A — the anchor commit was NEVER reached"
+            );
+            reset_agent_keystore_for_tests();
+            reset_commit_channel_for_tests();
         }
 
         #[test]
