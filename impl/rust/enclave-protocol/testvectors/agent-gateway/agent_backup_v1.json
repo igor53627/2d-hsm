@@ -1,0 +1,16 @@
+{
+  "backup_format_version": 1,
+  "blob_len_bytes": 1718,
+  "blob_sha256": "f075ec08916d87e3a592d7b81fdee1c452bf1f76bc0403c3bd9395217a2789c5",
+  "chain_id": 11565,
+  "description": "TASK-13b pq-agent-backup-v1 DR-backup KEM-DEM golden vector (envelope wire format). TEST KEYS ONLY — the recovery decaps seed is a public test constant. The payload is an opaque slice-1 stand-in; its restorable contents are defined in slice 4.",
+  "environment_identifier": "env-prod-0",
+  "kem_encaps_message_m_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "key_refs_manifest_hex": "8244333333334444444444",
+  "magic": "2DAGTBK\u0000",
+  "payload_nonce_hex": "000000000000000000000000",
+  "recovery_encaps_key_len": 1568,
+  "recovery_encaps_key_sha256": "e8f809efa14f01846e27d2f211b9fe13a5b82daddb556ab11b0dc10538f31b38",
+  "recovery_key_id_hex": "7265636f766572792d6b65792d69642d7631",
+  "recovery_keypair_seed_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+}

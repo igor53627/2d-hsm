@@ -135,22 +135,41 @@ the recovery **public** key (keystore config); the ML-KEM decapsulation **privat
 fully compromised runtime that exfiltrates all sealed + in-memory enclave material **still
 cannot decrypt** past or future DR backups (AC#13/#6 — no recovery secret in the enclave).
 
-**Layout** (all multi-byte header integers **big-endian**):
-- `magic` = `b"2DAGTBK\0"`; `backup_format_version` = `u16` (versioned **independently** of
-  the keystore version). Fail-closed on unknown version before any decapsulation.
-- `recovery_key_id` / quorum descriptor (which operator recovery material this is wrapped to;
-  single-key MVP, descriptor reserved for M-of-N and a later `X25519+ML-KEM` hybrid).
-- `chain_id` (u64) + `environment_identifier` — bound in AAD so a `testnet` blob cannot be
-  restored into a `mainnet` enclave (cross-environment restore must fail).
+**Layout** (frozen v1; all multi-byte integers **big-endian**; variable fields are length-prefixed —
+`lp16` = `u16`-length-prefix, `lp32` = `u32`-length-prefix; an over-width field is REFUSED, never
+silently truncated). On-disk byte order:
+`magic(8) ‖ backup_format_version(u16) ‖ lp16(recovery_key_id) ‖ chain_id(u64) ‖ lp16(environment_identifier)
+ ‖ kem_ct(1568) ‖ lp32(key_refs_manifest) ‖ payload_nonce(12) ‖ lp32(dem_ciphertext)`.
+- `magic` = `b"2DAGTBK\0"`; `backup_format_version` = `u16` (=1, versioned **independently** of the keystore
+  version). Fail-closed on unknown version / wrong magic BEFORE any decapsulation.
+- `recovery_key_id` / quorum descriptor (which operator recovery material this is wrapped to; single-key
+  MVP, descriptor reserved for M-of-N and a later `X25519+ML-KEM` hybrid).
+- `chain_id` (u64) + `environment_identifier` (UTF-8) — so a `testnet` blob cannot be restored into a
+  `mainnet` enclave (cross-environment restore must fail).
+- `kem_ct` = the ML-KEM-1024 encapsulation (KEM ciphertext, FIXED 1568 bytes ⇒ no length prefix).
 - authenticated `key_refs` manifest (which keys are included).
-- `kem_ct` = the ML-KEM-1024 encapsulation (KEM ciphertext) to the recovery public key.
-- `payload_nonce` (12 bytes). `payload_key` is unique per backup (fresh `ss` per `Encaps`),
-  so a fixed-zero nonce is cryptographically safe; the field is allocated explicitly so the
-  layout is unambiguous, and an implementation MAY use a random nonce instead.
-- ChaCha20Poly1305 ciphertext over the exported payload + 16-byte tag.
-- `AAD = magic ‖ backup_format_version ‖ recovery_key_id ‖ chain_id ‖ environment_identifier
-  ‖ kem_ct ‖ canonical(key_refs manifest)` — binding the KEM encapsulation and the
-  environment into payload authentication (HPKE RFC 9180 practice).
+- `payload_nonce` (12 bytes). `payload_key` is unique per backup (fresh `ss` per `Encaps`), so a fixed-zero
+  nonce is cryptographically safe; the field is explicit so the layout is unambiguous, and an implementation
+  MAY use a random nonce instead.
+- `dem_ciphertext` = ChaCha20Poly1305 over the exported payload + 16-byte tag.
+- **`AAD` = the EXACT serialized header bytes** — everything from `magic` through `payload_nonce`
+  INCLUSIVE (`magic ‖ version ‖ lp16(recovery_key_id) ‖ chain_id ‖ lp16(environment_identifier) ‖ kem_ct ‖
+  lp32(key_refs_manifest) ‖ payload_nonce`), INCLUDING the length prefixes and the nonce. This is an
+  UNAMBIGUOUS encoding (CWE-347): because the length prefixes are authenticated, a host cannot re-partition
+  the same authenticated byte string into a different `chain_id`/`environment_identifier` by mutating only
+  the (otherwise plaintext) on-disk length prefixes — the recompute-from-disk AAD would differ and the AEAD
+  tag fails. Seal and offline-open use the IDENTICAL header bytes as AAD, so they cannot diverge.
+  (Implementation: `agent_backup.rs` `build_header`/`strict_parse`.) **NB this supersedes an earlier draft
+  AAD `magic ‖ version ‖ recovery_key_id ‖ chain_id ‖ env ‖ kem_ct ‖ canonical(manifest)` that bound only
+  the field VALUES — that was CWE-347-ambiguous (the unauthenticated length prefixes permitted re-partition);
+  the length-prefixed header-as-AAD is the frozen v1.**
+
+**Freeze contract (v1).** The frozen golden vector (`testvectors/agent-gateway/agent_backup_v1.bin`,
+TASK-13b slice 3) pins the ENVELOPE (header + framing + AAD + KEM-DEM) — NOT the payload semantics. The
+payload there is an opaque slice-1 stand-in; its restorable contents are defined in slice 4. **Slice 4 may
+only define/ADD to the opaque payload; ANY change to a header / AAD / framing field (magic, version,
+field order, length-prefix widths, the AAD construction) is a `backup_format_version` 2 bump + a new
+golden vector**, never a silent edit to v1.
 
 Any randomness (a non-zero `payload_nonce`) comes from the TEE platform CSPRNG, never
 host-influenced (cf. the RFC 6979 deterministic-signing note for secp256k1).

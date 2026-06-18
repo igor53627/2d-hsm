@@ -579,4 +579,134 @@ mod tests {
         assert_eq!(put_lp16(&mut out2, &too_long), Err(BackupError::FieldTooLong));
         assert!(out2.is_empty(), "a refused field writes NOTHING (no truncated prefix)");
     }
+
+    // ─── Slice 3: frozen pq-agent-backup-v1 golden vector + ML-KEM recovery-keypair fixture ───
+    // The frozen blob (`agent_backup_v1.bin`) pins the byte-exact ENVELOPE wire format for downstream 2d;
+    // the recovery-keypair fixtures (`..._recovery_keypair_v1.{encaps,decaps}.bin`) let a consumer open it
+    // offline + verify DR-independence. ALL TEST KEYS ONLY. The PAYLOAD here is the opaque slice-1 stand-in
+    // (`payload()`); its restorable contents are defined in slice 4 — this vector freezes the envelope, not
+    // the payload semantics. Determinism: fixed keypair `SEED` + fixed encaps message `M` + fixed-zero nonce.
+
+    fn golden_backup_blob() -> Vec<u8> {
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        seal_backup_blob_with_m(&encaps, RID, CHAIN, ENV, MANIFEST, &payload(), &M).unwrap()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        // Delegate to the `hex` crate (a dev-dep, in the test graph) rather than a hand-rolled per-byte
+        // format! loop (gemini PR #94). `hex::` resolves to the crate (type namespace), not this fn.
+        hex::encode(bytes)
+    }
+
+    #[test]
+    fn agent_backup_v1_golden_is_byte_exact() {
+        // The in-source deterministic mint and the committed bytes must agree byte-for-byte — any AAD /
+        // framing / layout drift flips this. Plus the literal version byte + an offline round-trip proving
+        // the committed blob opens with the committed recovery key.
+        let committed: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        assert_eq!(
+            golden_backup_blob().as_slice(),
+            committed,
+            "backup golden drifted; if intentional, regen via `regen_agent_backup_golden_vector -- --ignored` \
+             and re-mint the .json sidecar in the same commit",
+        );
+        assert_eq!(&committed[8..10], &[0x00, 0x01], "backup_format_version 1 (literal BE u16)");
+        let (_ek, dk) = recovery_keypair(&SEED);
+        assert_eq!(open_backup_blob_offline(&dk, committed).unwrap(), payload(), "committed blob opens");
+    }
+
+    #[test]
+    fn agent_backup_recovery_keypair_fixtures_consistent() {
+        // The committed recovery keypair: `decaps.bin` = the 64-byte ML-KEM keypair seed (the OFFLINE
+        // secret — TEST ONLY), `encaps.bin` = the 1568-byte encapsulation (public) key. Couple both to the
+        // in-source `SEED` and pin decaps→encaps consistency (`from_seed(seed).encapsulation_key()`).
+        let committed_encaps: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin");
+        let committed_decaps: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.decaps.bin");
+        assert_eq!(committed_decaps, SEED, "decaps fixture is the recovery keypair seed");
+        assert_eq!(committed_encaps.len(), ML_KEM_1024_ENCAPS_KEY_LEN, "encaps key is 1568 bytes");
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        assert_eq!(committed_encaps, encaps.as_slice(), "encaps fixture == keypair-from-seed encaps key");
+        let seed: [u8; 64] = committed_decaps.try_into().expect("decaps fixture is 64 bytes");
+        let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(seed));
+        assert_eq!(
+            dk.encapsulation_key().to_bytes().as_slice(),
+            committed_encaps,
+            "the committed decaps seed reconstructs a key whose public half == the committed encaps fixture",
+        );
+    }
+
+    #[test]
+    fn agent_backup_v1_sidecar_matches() {
+        // Couple the descriptive `.json` sidecar fields to the source-of-truth constants (specific fields,
+        // not substrings) so a regen that forgets the manual `.json` re-mint ships a stale sidecar but
+        // fails CI here.
+        use sha2::{Digest, Sha256};
+        let blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let encaps: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin");
+        let sidecar = include_str!("../testvectors/agent-gateway/agent_backup_v1.json");
+        let v: serde_json::Value =
+            serde_json::from_str(sidecar).expect("backup sidecar must be valid JSON");
+        assert_eq!(v["blob_sha256"].as_str(), Some(hex(&Sha256::digest(blob)).as_str()), "sidecar blob_sha256 drift");
+        assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
+        assert_eq!(v["backup_format_version"].as_u64(), Some(u64::from(BACKUP_FORMAT_VERSION)), "sidecar version drift");
+        assert_eq!(v["magic"].as_str().map(str::as_bytes), Some(BACKUP_MAGIC.as_slice()), "sidecar magic drift");
+        assert_eq!(v["chain_id"].as_u64(), Some(CHAIN), "sidecar chain_id drift");
+        assert_eq!(v["environment_identifier"].as_str(), Some(ENV), "sidecar env drift");
+        assert_eq!(v["recovery_key_id_hex"].as_str(), Some(hex(RID).as_str()), "sidecar recovery_key_id drift");
+        assert_eq!(v["key_refs_manifest_hex"].as_str(), Some(hex(MANIFEST).as_str()), "sidecar manifest drift");
+        assert_eq!(v["payload_nonce_hex"].as_str(), Some(hex(&[0u8; PAYLOAD_NONCE_LEN]).as_str()), "sidecar nonce drift");
+        assert_eq!(v["recovery_keypair_seed_hex"].as_str(), Some(hex(&SEED).as_str()), "sidecar keypair seed drift");
+        assert_eq!(v["kem_encaps_message_m_hex"].as_str(), Some(hex(&M).as_str()), "sidecar encaps-message m drift");
+        // recovery_encaps_key_{len,sha256} are the ONLY integrity witnesses for encaps.bin in the sidecar
+        // (the encaps key is NOT embedded in the blob, so blob_sha256 does not cover it).
+        assert_eq!(v["recovery_encaps_key_len"].as_u64(), Some(encaps.len() as u64), "sidecar encaps_key_len drift");
+        assert_eq!(
+            v["recovery_encaps_key_sha256"].as_str(),
+            Some(hex(&Sha256::digest(encaps)).as_str()),
+            "sidecar recovery_encaps_key_sha256 drift",
+        );
+    }
+
+    /// REGEN (manual): `cargo test --features agent-backup-export-preview \
+    /// regen_agent_backup_golden_vector -- --ignored --nocapture`, then commit the 4 testvector files.
+    /// A deliberate envelope-format / version change re-mints the blob, the recovery-keypair fixtures, AND
+    /// the `.json` sidecar in the same commit.
+    #[test]
+    #[ignore]
+    fn regen_agent_backup_golden_vector() {
+        use sha2::{Digest, Sha256};
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        let blob = golden_backup_blob();
+        std::fs::write(format!("{dir}agent_backup_recovery_keypair_v1.encaps.bin"), &encaps).unwrap();
+        std::fs::write(format!("{dir}agent_backup_recovery_keypair_v1.decaps.bin"), SEED).unwrap();
+        std::fs::write(format!("{dir}agent_backup_v1.bin"), &blob).unwrap();
+        let sidecar = serde_json::json!({
+            "description": "TASK-13b pq-agent-backup-v1 DR-backup KEM-DEM golden vector (envelope wire format). \
+                            TEST KEYS ONLY — the recovery decaps seed is a public test constant. The payload \
+                            is an opaque slice-1 stand-in; its restorable contents are defined in slice 4.",
+            "blob_sha256": hex(&Sha256::digest(&blob)),
+            "blob_len_bytes": blob.len(),
+            "backup_format_version": BACKUP_FORMAT_VERSION,
+            "magic": "2DAGTBK\u{0000}",
+            "recovery_key_id_hex": hex(RID),
+            "chain_id": CHAIN,
+            "environment_identifier": ENV,
+            "key_refs_manifest_hex": hex(MANIFEST),
+            "payload_nonce_hex": hex(&[0u8; PAYLOAD_NONCE_LEN]),
+            "recovery_keypair_seed_hex": hex(&SEED),
+            "kem_encaps_message_m_hex": hex(&M),
+            "recovery_encaps_key_len": encaps.len(),
+            "recovery_encaps_key_sha256": hex(&Sha256::digest(&encaps)),
+        });
+        std::fs::write(
+            format!("{dir}agent_backup_v1.json"),
+            serde_json::to_string_pretty(&sidecar).unwrap() + "\n",
+        )
+        .unwrap();
+        eprintln!("wrote backup golden vector ({}-byte blob) + keypair fixtures + sidecar -> {dir}", blob.len());
+    }
 }
