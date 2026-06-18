@@ -646,17 +646,30 @@ mod tests {
         // fails CI here.
         use sha2::{Digest, Sha256};
         let blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let encaps: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin");
         let sidecar = include_str!("../testvectors/agent-gateway/agent_backup_v1.json");
         let v: serde_json::Value =
             serde_json::from_str(sidecar).expect("backup sidecar must be valid JSON");
         assert_eq!(v["blob_sha256"].as_str(), Some(hex(&Sha256::digest(blob)).as_str()), "sidecar blob_sha256 drift");
         assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
         assert_eq!(v["backup_format_version"].as_u64(), Some(u64::from(BACKUP_FORMAT_VERSION)), "sidecar version drift");
+        assert_eq!(v["magic"].as_str().map(str::as_bytes), Some(BACKUP_MAGIC.as_slice()), "sidecar magic drift");
         assert_eq!(v["chain_id"].as_u64(), Some(CHAIN), "sidecar chain_id drift");
         assert_eq!(v["environment_identifier"].as_str(), Some(ENV), "sidecar env drift");
         assert_eq!(v["recovery_key_id_hex"].as_str(), Some(hex(RID).as_str()), "sidecar recovery_key_id drift");
+        assert_eq!(v["key_refs_manifest_hex"].as_str(), Some(hex(MANIFEST).as_str()), "sidecar manifest drift");
+        assert_eq!(v["payload_nonce_hex"].as_str(), Some(hex(&[0u8; PAYLOAD_NONCE_LEN]).as_str()), "sidecar nonce drift");
         assert_eq!(v["recovery_keypair_seed_hex"].as_str(), Some(hex(&SEED).as_str()), "sidecar keypair seed drift");
         assert_eq!(v["kem_encaps_message_m_hex"].as_str(), Some(hex(&M).as_str()), "sidecar encaps-message m drift");
+        // recovery_encaps_key_{len,sha256} are the ONLY integrity witnesses for encaps.bin in the sidecar
+        // (the encaps key is NOT embedded in the blob, so blob_sha256 does not cover it).
+        assert_eq!(v["recovery_encaps_key_len"].as_u64(), Some(encaps.len() as u64), "sidecar encaps_key_len drift");
+        assert_eq!(
+            v["recovery_encaps_key_sha256"].as_str(),
+            Some(hex(&Sha256::digest(encaps)).as_str()),
+            "sidecar recovery_encaps_key_sha256 drift",
+        );
     }
 
     /// REGEN (manual): `cargo test --features agent-backup-export-preview \

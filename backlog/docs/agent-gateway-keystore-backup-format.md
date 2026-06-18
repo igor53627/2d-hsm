@@ -164,6 +164,13 @@ silently truncated). On-disk byte order:
   the field VALUES — that was CWE-347-ambiguous (the unauthenticated length prefixes permitted re-partition);
   the length-prefixed header-as-AAD is the frozen v1.**
 
+**Freeze contract (v1).** The frozen golden vector (`testvectors/agent-gateway/agent_backup_v1.bin`,
+TASK-13b slice 3) pins the ENVELOPE (header + framing + AAD + KEM-DEM) — NOT the payload semantics. The
+payload there is an opaque slice-1 stand-in; its restorable contents are defined in slice 4. **Slice 4 may
+only define/ADD to the opaque payload; ANY change to a header / AAD / framing field (magic, version,
+field order, length-prefix widths, the AAD construction) is a `backup_format_version` 2 bump + a new
+golden vector**, never a silent edit to v1.
+
 Any randomness (a non-zero `payload_nonce`) comes from the TEE platform CSPRNG, never
 host-influenced (cf. the RFC 6979 deterministic-signing note for secp256k1).
 
