@@ -834,7 +834,9 @@ impl KeystoreBody {
     /// FORWARD-ONLY toward the highest appended seq (`next_seq - 1`), marking every currently-present record
     /// as exported so subsequent appends can reuse the slots. Called by `EXPORT_BACKUP` (the authenticated
     /// pull-export). Never regresses; `next_seq-1` is already overflow-checked by [`Self::record_audit`].
-    #[cfg_attr(not(test), allow(dead_code))] // staged slice-4a; consumed by the 4c EXPORT_BACKUP handler
+    // Live under `agent-backup-export-preview` (the EXPORT_BACKUP handler drains via it, slice 4c-2b) or
+    // under test; dead otherwise (the handler is compiled only under that feature).
+    #[cfg_attr(not(any(test, feature = "agent-backup-export-preview")), allow(dead_code))]
     pub(crate) fn advance_export_high_water(&mut self) -> Result<(), KeystoreError> {
         let target = self.audit.next_seq.saturating_sub(1);
         if target > self.audit.last_exported_seq {
