@@ -122,7 +122,38 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    ships there is NO in-band drain, so a preview build that exhausts `capacity` un-exported records
    permanently denies those handlers. This is intended fail-closed-for-audit-completeness, not a bug.
    Preview-gated/non-user-reachable until TASK-18; size production `capacity` against the interim, or land
-   the EXPORT drain (4c-2) before un-gate.
+   the EXPORT drain (4c-2) before un-gate. Operators should monitor `next_seq - last_exported_seq`
+   approaching `capacity` and EXPORT before it bricks. **EXPORT_BACKUP is the self-draining exception:**
+   it is itself an auditing privileged write (appends one record) AND the sole drain, so it MUST
+   `record_audit` (append the export event) BEFORE `advance_export_high_water` (full drain to `next_seq-1`,
+   which then covers its OWN just-appended record) — append-then-drain. Because it drains the record it
+   just wrote, EXPORT always recovers a full ring (it cannot brick itself); a drain-BEFORE-append ordering
+   would leave the export's own record un-drained (a delta-export weakening). The 4c-2b handler pins this.
+
+**Payload version (`restore-ingress-v1`).** The EXPORT_BACKUP payload (the plaintext the KEM-DEM envelope
+wraps; magic `2DRIGV1\0`) is versioned INDEPENDENTLY of the keystore `format_version` and the
+backup-envelope `backup_format_version`. `parse_restore_ingress` hard-rejects any version ≠ 1 (no
+migration window) — `v1` is the permanent frozen contract for the v1 line; a future shape change is a new
+`restore_ingress_format_version` + a re-frozen golden, and the downstream RESTORE decoder decides whether
+to accept a bounded version window. Frozen golden: `testvectors/agent-gateway/restore_ingress_v1.bin`.
+
+**Restore-side reconstruction of the EXCLUDED state (normative).** `restore-ingress-v1` carries audit
+**records** but not the ring CURSORS, and no `structural_version`/`freshness_epoch`/`anchor_root` — the
+RESTORE ceremony re-derives or freshly-seeds them enclave-locally:
+- `audit.next_seq` = `max(record.seq) + 1` over the restored records (or `1` if none). `records` are
+  strictly ascending by construction, so `max` is the last record's `seq`.
+- `audit.last_exported_seq` = `next_seq - 1` — every restored record predates the export that produced
+  this backup (which drained the source ring), so all restored history is treated as already-exported; the
+  restored ring starts fully drained (no spurious backpressure on the first post-restore privileged op).
+- `audit.capacity` = a RESTORE-time policy/config value (NOT from the backup) — the restoring enclave's
+  own provisioning, not the source's. It MUST be `>= audit_records.len()`: RESTORE either raises the
+  policy capacity to fit the restored record count or FAILS CLOSED — it MUST NOT truncate restored audit
+  records (dropping AC#14 history). (`validate()` already rejects `records.len() > capacity`, so a
+  too-small capacity fails closed at seal time regardless; the restore handler should reject it earlier
+  with a clear recovery error.)
+- `structural_version`/`freshness_epoch` = enclave-local (see `agent-gateway-anti-rollback.md` — local+1
+  vs a `strict_recovery_counter`-seeded value), never the source's; `anchor_root` is the restoring
+  enclave's own. These rules are enforced by the (deferred) RESTORE handler slice.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version

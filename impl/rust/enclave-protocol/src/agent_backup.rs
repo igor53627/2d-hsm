@@ -38,6 +38,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use ml_kem::{EncapsulationKey, MlKem1024};
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -78,6 +79,9 @@ pub(crate) enum BackupError {
     BadMagic,
     /// Unknown/unsupported `backup_format_version` (rejected BEFORE any decapsulation/decrypt).
     UnsupportedVersion,
+    /// Deterministic-CBOR (de)serialization of the restore-ingress payload failed (4c-2a) — a
+    /// framing/encoding fault, fail-closed rather than shipping/accepting a malformed payload.
+    Serialization,
 }
 
 /// Derive the DEM key `SHA3-256(domain ‖ ss)` into a pre-zeroed `Zeroizing` buffer (copy_from_slice, NOT
@@ -343,6 +347,204 @@ fn strict_parse(blob: &[u8]) -> Result<ParsedBackup<'_>, BackupError> {
         header: &blob[..header_end],
         dem_ct,
     })
+}
+
+// ===========================================================================================
+// restore-ingress-v1 — the EXPORT_BACKUP payload (TASK-13b slice 4c-2a). This is the OPAQUE
+// `payload` that [`seal_backup_blob`] wraps in the KEM-DEM envelope: the RESTORABLE agent state a
+// fresh enclave needs to reconstitute the agent, EXCLUDING enclave-specific anti-rollback anchor
+// state and the operator's own recovery key. Frozen contract `2d-hsm-restore-ingress-v1` — the
+// (deferred) RESTORE_BACKUP ingress decoder parses it; freezing it now settles the format before the
+// restore handler exists. Deterministic CBOR (serde declaration-field order, all `Vec`, no maps),
+// magic+version prefixed for fail-closed header detection on the restore side.
+//
+// INCLUDE: config identity subset (chain/env/authorities/config_version/authority_epoch) + entries
+// (FULL, incl. the secret scalars — the point of the backup) + counters + faucet + strict_recovery
+// + audit RECORDS (incl. the export's own event). EXCLUDE: anchor_root + the seal root (enclave
+// anti-rollback anchor; a restored enclave gets its own), backup_recovery_wrapping_pubkey (the
+// operator's OWN key), freshness_epoch + structural_version (enclave-relative to THIS anchor; the
+// restore ceremony governs forward progress via strict_recovery_counter), and the audit ring CURSORS
+// last_exported_seq/next_seq/capacity (enclave-local; the records ARE the reviewable history).
+// ===========================================================================================
+
+/// Magic for the restore-ingress PAYLOAD — distinct from the backup ENVELOPE (`2DAGTBK\0`), the
+/// keystore (`2DAGTKS\0`), and the producer (`2DHSMV1\0`). The payload is the plaintext INSIDE the
+/// envelope's DEM ciphertext; a distinct magic means a decrypted payload can never be cross-parsed
+/// as another blob type.
+const RESTORE_INGRESS_MAGIC: &[u8; 8] = b"2DRIGV1\0";
+/// Versioned INDEPENDENTLY of the backup envelope + keystore `format_version`.
+const RESTORE_INGRESS_FORMAT_VERSION: u16 = 1;
+/// Domain for the deterministic, host-uncontrollable recovery-key id.
+const RECOVERY_KEY_ID_DOMAIN: &[u8] = b"2d-hsm-agent-backup-v1-recovery-key-id";
+/// Recovery-key-id length (truncated SHA3-256) — enough to identify WHICH offline key without
+/// reproducing it.
+const RECOVERY_KEY_ID_LEN: usize = 16;
+
+/// The config-identity SUBSET carried in a DR backup. EXCLUDES `anchor_root` (enclave anti-rollback
+/// anchor) and `backup_recovery_wrapping_pubkey` (the operator's OWN key) — neither is restorable
+/// agent state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestoreConfigSubset {
+    pub twod_chain_id: u64,
+    pub environment_identifier: String,
+    pub admin_authority_pk: [u8; 32],
+    pub recovery_authority_pk: [u8; 32],
+    pub monotonic_treasury_config_version: u64,
+    pub authority_epoch: u64,
+}
+
+/// The restore-ingress payload DATA (the CBOR body, after the magic+version prefix). Reuses the
+/// keystore's own `KeyEntry`/`CounterEntry`/`FaucetState`/`AuditRecord` types so the restore decoder
+/// reconstructs them directly. `entries` carry the secret scalars (zeroized on drop, as in the body).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestoreIngressData {
+    pub config: RestoreConfigSubset,
+    pub entries: Vec<crate::agent_keystore::KeyEntry>,
+    pub counters: Vec<crate::agent_keystore::CounterEntry>,
+    pub faucet: crate::agent_keystore::FaucetState,
+    pub strict_recovery_counter: u64,
+    pub audit_records: Vec<crate::agent_keystore::AuditRecord>,
+}
+
+/// Body-ordered intersection of the keystore's entries with `requested_refs` — the SINGLE source of
+/// the exported ref ordering, so [`build_restore_ingress_payload`] and [`build_key_refs_manifest`]
+/// can never disagree on which refs (and in which order) were exported. Order follows the BODY (not
+/// the request), so the payload is a deterministic function of the body for a given ref SET. A "full"
+/// export passes every body ref; the caller (4c-2b) resolves the EXPORT selector to `requested_refs`.
+pub(crate) fn selected_key_refs(
+    body: &crate::agent_keystore::KeystoreBody,
+    requested_refs: &[[u8; 32]],
+) -> Vec<[u8; 32]> {
+    body.entries
+        .iter()
+        .filter(|e| requested_refs.contains(&e.key_ref))
+        .map(|e| e.key_ref)
+        .collect()
+}
+
+/// A `std::io::Write` sink that COUNTS bytes without retaining them — used to pre-size the
+/// secret-bearing payload buffer so the real serialization never reallocates (mirrors
+/// `agent_keystore::seal_body`'s `CountingWriter`).
+struct CountingWriter(usize);
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Build the `restore-ingress-v1` payload bytes (`magic ‖ version_be ‖ deterministic-CBOR`) from a
+/// keystore body, including the entries named by `ordered_refs` (from [`selected_key_refs`]) IN
+/// `ordered_refs` ORDER — so the payload entry order is identical to the [`build_key_refs_manifest`]
+/// order built from the SAME `ordered_refs` (the manifest↔payload ordering invariant is structural,
+/// not by-convention). A ref absent from the body fails closed (the caller resolves the selector via
+/// `selected_key_refs`, which only yields body refs; a missing ref here is an internal invariant break).
+///
+/// Returns `Zeroizing` because the payload carries the secret scalars. **Pre-sized** (a counting pass
+/// that retains no bytes, then a single exact-capacity allocation): a growing `Zeroizing<Vec>` would
+/// reallocate mid-serialization, and `realloc` frees the old buffer WITHOUT zeroizing it — leaking
+/// already-written secret bytes to the allocator. With exact capacity the buffer never reallocates, so
+/// the only plaintext copy lives in the one scrubbed-on-drop buffer. Self-checks a strict re-parse.
+pub(crate) fn build_restore_ingress_payload(
+    body: &crate::agent_keystore::KeystoreBody,
+    ordered_refs: &[[u8; 32]],
+) -> Result<Zeroizing<Vec<u8>>, BackupError> {
+    // Map each ref → its entry in ORDERED_REFS order (not a body-order filter), so payload-entry order
+    // == manifest order for the same `ordered_refs`. Fail closed if a ref is not in the body.
+    let mut entries = Vec::with_capacity(ordered_refs.len());
+    for r in ordered_refs {
+        let entry = body
+            .entries
+            .iter()
+            .find(|e| &e.key_ref == r)
+            .ok_or(BackupError::Serialization)?;
+        entries.push(entry.clone());
+    }
+    let data = RestoreIngressData {
+        config: RestoreConfigSubset {
+            twod_chain_id: body.config.twod_chain_id,
+            environment_identifier: body.config.environment_identifier.clone(),
+            admin_authority_pk: body.config.admin_authority_pk,
+            recovery_authority_pk: body.config.recovery_authority_pk,
+            monotonic_treasury_config_version: body.config.monotonic_treasury_config_version,
+            authority_epoch: body.config.authority_epoch,
+        },
+        entries,
+        counters: body.counters.clone(),
+        faucet: body.faucet.clone(),
+        strict_recovery_counter: body.strict_recovery_counter,
+        audit_records: body.audit.records.clone(),
+    };
+    // Pass 1: count the CBOR length (the CountingWriter discards bytes — no secret retained).
+    let mut counter = CountingWriter(0);
+    ciborium::ser::into_writer(&data, &mut counter).map_err(|_| BackupError::Serialization)?;
+    let prefix_len = RESTORE_INGRESS_MAGIC.len() + 2;
+    // Pass 2: serialize into an EXACT-capacity Zeroizing buffer (no reallocation → no leaked secret copy).
+    let mut out = Zeroizing::new(Vec::with_capacity(prefix_len + counter.0));
+    out.extend_from_slice(RESTORE_INGRESS_MAGIC);
+    out.extend_from_slice(&RESTORE_INGRESS_FORMAT_VERSION.to_be_bytes());
+    ciborium::ser::into_writer(&data, &mut *out).map_err(|_| BackupError::Serialization)?;
+    // Both passes must encode the same length; a mismatch means pass 2 exceeded the reserved capacity
+    // (reallocated, leaking a copy) or encoding is non-deterministic — either way a bug.
+    debug_assert_eq!(out.len(), prefix_len + counter.0, "restore-ingress CBOR length mismatch between passes");
+    // Self-check: the just-built payload must STRICTLY re-parse (magic+version+CBOR, no trailing).
+    let _ = parse_restore_ingress(&out)?;
+    Ok(out)
+}
+
+/// Strict restore-side parse of a `restore-ingress-v1` payload: reject wrong magic / unsupported
+/// version BEFORE decoding, then decode exactly one CBOR value with NO trailing bytes
+/// (`deny_unknown_fields` on every struct rejects unexpected fields). Fail-closed on any deviation.
+pub(crate) fn parse_restore_ingress(payload: &[u8]) -> Result<RestoreIngressData, BackupError> {
+    if payload.len() < RESTORE_INGRESS_MAGIC.len() + 2 {
+        return Err(BackupError::Truncated);
+    }
+    if &payload[..RESTORE_INGRESS_MAGIC.len()] != RESTORE_INGRESS_MAGIC.as_slice() {
+        return Err(BackupError::BadMagic);
+    }
+    // Version offset is relative to the magic length (the leading guard ensures both bytes are in bounds),
+    // so a future magic-length change can't silently mis-read or panic here.
+    let ver_off = RESTORE_INGRESS_MAGIC.len();
+    let version = u16::from_be_bytes([payload[ver_off], payload[ver_off + 1]]);
+    if version != RESTORE_INGRESS_FORMAT_VERSION {
+        return Err(BackupError::UnsupportedVersion);
+    }
+    let cbor = &payload[RESTORE_INGRESS_MAGIC.len() + 2..];
+    let mut cursor = std::io::Cursor::new(cbor);
+    let data: RestoreIngressData =
+        ciborium::de::from_reader(&mut cursor).map_err(|_| BackupError::Serialization)?;
+    if cursor.position() as usize != cbor.len() {
+        return Err(BackupError::Truncated); // trailing bytes after the one CBOR value
+    }
+    Ok(data)
+}
+
+/// The canonical key-refs MANIFEST bound into the blob header (and thus the AAD): a deterministic CBOR
+/// array of the 32-byte refs in the SAME (body) order as the payload entries. Authenticated by the
+/// envelope AEAD, so the host cannot alter the exported set; the restore side matches it against the
+/// request selector. Built from the SAME `ordered_refs` as the payload, so the two cannot disagree.
+pub(crate) fn build_key_refs_manifest(ordered_refs: &[[u8; 32]]) -> Result<Vec<u8>, BackupError> {
+    let arr: Vec<ciborium::value::Value> =
+        ordered_refs.iter().map(|r| ciborium::value::Value::Bytes(r.to_vec())).collect();
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&ciborium::value::Value::Array(arr), &mut out)
+        .map_err(|_| BackupError::Serialization)?;
+    Ok(out)
+}
+
+/// Deterministic, host-uncontrollable recovery-key id: `SHA3-256(domain ‖ encaps_key)[..16]`. Derived
+/// from the SEALED recovery pubkey, so the host cannot substitute the id; it labels WHICH offline key
+/// a blob is encapsulated to without reproducing the key.
+pub(crate) fn derive_recovery_key_id(recovery_encaps_key: &[u8]) -> Vec<u8> {
+    let mut h = Sha3_256::new();
+    h.update(RECOVERY_KEY_ID_DOMAIN);
+    h.update(recovery_encaps_key);
+    h.finalize()[..RECOVERY_KEY_ID_LEN].to_vec()
 }
 
 #[cfg(test)]
@@ -708,5 +910,307 @@ mod tests {
         )
         .unwrap();
         eprintln!("wrote backup golden vector ({}-byte blob) + keypair fixtures + sidecar -> {dir}", blob.len());
+    }
+
+    // ─── restore-ingress-v1 payload format (TASK-13b slice 4c-2a) ───
+
+    /// A keystore body with two keys + counters/faucet/audit, plus DELIBERATELY-set EXCLUDED fields
+    /// (`anchor_root = [0xAA; 32]`, `freshness_epoch = 9`, `structural_version = 7`,
+    /// `last_exported_seq` cursor) so the exclusion tests can prove they never reach the payload.
+    fn body_with_two_keys() -> crate::agent_keystore::KeystoreBody {
+        use crate::agent_keystore::*;
+        let entry = |refb: u8, scalar: u8| KeyEntry {
+            key_ref: [refb; 32],
+            purpose: KeyPurpose::AgentTransferK1,
+            algorithm: KeyAlgorithm::Secp256k1,
+            public_identity: {
+                let mut p = vec![0x04u8; 65];
+                p[1] = refb;
+                p
+            },
+            secret_scalar: Zeroizing::new(vec![scalar; 32]),
+            creation_metadata: CreationMetadata { config_version: 3, counter_snapshot: 0, batch_id: 1 },
+            backup_export_metadata: BackupExportMetadata::default(),
+        };
+        KeystoreBody {
+            config: KeystoreConfig {
+                twod_chain_id: 11565,
+                environment_identifier: "testnet".to_string(),
+                admin_authority_pk: [0xa1; 32],
+                recovery_authority_pk: [0xa2; 32],
+                backup_recovery_wrapping_pubkey: vec![0xb0; ML_KEM_1024_ENCAPS_KEY_LEN],
+                monotonic_treasury_config_version: 3,
+                authority_epoch: 0,
+                anchor_root: [0xAA; 32], // EXCLUDED — exclusion test asserts this 32-byte run is absent
+            },
+            entries: vec![entry(0x11, 0x77), entry(0x22, 0x88)],
+            counters: vec![CounterEntry {
+                authority: [0xa1; 32],
+                environment_identifier: "testnet".to_string(),
+                scope_class: 0,
+                scope_target: b"generate_transfer".to_vec(),
+                highest_accepted_counter: 1,
+            }],
+            faucet: FaucetState {
+                per_dispense_max_amount: [0; 32],
+                max_gas_limit: 21000,
+                max_effective_gas_fee_rate: 100,
+                cumulative_native_spend: [0; 32],
+                lifetime_spend: [0; 32],
+                circuit_breaker_threshold: None,
+                cumulative_signing_budget: [0; 32],
+            },
+            audit: AuditRing {
+                records: vec![AuditRecord {
+                    seq: 1,
+                    op: 1,
+                    authority: [0xa1; 32],
+                    counter: 1,
+                    config_version: 3,
+                    scope_class: 0,
+                    scope_target: b"generate_transfer".to_vec(),
+                    request_id: vec![0x11; 16],
+                }],
+                capacity: 64,
+                last_exported_seq: 0, // EXCLUDED cursor
+                next_seq: 2,          // EXCLUDED cursor
+            },
+            freshness_epoch: 9,     // EXCLUDED — enclave-relative anti-rollback
+            structural_version: 7,  // EXCLUDED — enclave-relative anti-rollback
+            strict_recovery_counter: 4,
+        }
+    }
+
+    /// Full export round-trips through the KEM-DEM envelope and the offline-open + strict restore parse,
+    /// preserving every INCLUDED field (entries incl. secret scalars, counters, faucet, strict_recovery,
+    /// audit records, config-identity subset).
+    #[test]
+    fn restore_ingress_round_trips_through_seal_and_offline_open() {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        assert_eq!(refs, vec![[0x11; 32], [0x22; 32]], "all refs in body order");
+        let payload = build_restore_ingress_payload(&body, &refs).unwrap();
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let (ek, dk) = recovery_keypair(&[0x42; 64]);
+        let kid = derive_recovery_key_id(&ek);
+        let blob = seal_backup_blob(
+            &ek,
+            &kid,
+            body.config.twod_chain_id,
+            &body.config.environment_identifier,
+            &manifest,
+            &payload,
+        )
+        .unwrap();
+        let opened = open_backup_blob_offline(&dk, &blob).unwrap();
+        let data = parse_restore_ingress(&opened).unwrap();
+        assert_eq!(data.entries, body.entries, "entries (incl. secret scalars) preserved");
+        assert_eq!(data.counters, body.counters);
+        assert_eq!(data.faucet, body.faucet);
+        assert_eq!(data.strict_recovery_counter, 4);
+        assert_eq!(data.audit_records, body.audit.records, "audit records (full provenance) preserved");
+        assert_eq!(data.config.twod_chain_id, 11565);
+        assert_eq!(data.config.admin_authority_pk, [0xa1; 32]);
+        assert_eq!(data.config.recovery_authority_pk, [0xa2; 32]);
+        assert_eq!(data.config.monotonic_treasury_config_version, 3);
+        assert_eq!(data.config.authority_epoch, 0);
+    }
+
+    /// The payload EXCLUDES the enclave-specific anchor + anti-rollback state and the operator key.
+    /// STRUCTURAL check (decode the CBOR + assert the field SET) — a raw byte-scan can't prove this
+    /// because ciborium serializes `[u8;N]`/`Vec<u8>` as CBOR integer-ARRAYS (each `0xAA` → `0x18 0xAA`),
+    /// so an included `anchor_root` would never appear as a contiguous `[0xAA;32]` run. The type system
+    /// (`RestoreConfigSubset`/`RestoreIngressData` + `deny_unknown_fields`) is the real guarantee; this
+    /// pins the exact field set so a regression that re-added an excluded field fails here.
+    #[test]
+    fn restore_ingress_payload_excludes_anchor_and_anti_rollback_state() {
+        let body = body_with_two_keys(); // anchor_root=[0xAA;32], freshness=9, structural=7 set as sentinels
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        let payload = build_restore_ingress_payload(&body, &refs).unwrap();
+        let cbor = &payload[RESTORE_INGRESS_MAGIC.len() + 2..];
+        let val: ciborium::value::Value =
+            ciborium::de::from_reader(cbor).expect("payload body is a CBOR value");
+        let map_keys = |v: &ciborium::value::Value| -> Vec<String> {
+            match v {
+                ciborium::value::Value::Map(m) => m
+                    .iter()
+                    .map(|(k, _)| match k {
+                        ciborium::value::Value::Text(s) => s.clone(),
+                        other => panic!("non-text CBOR map key: {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected a CBOR map, got {other:?}"),
+            }
+        };
+        let top = map_keys(&val);
+        assert_eq!(top.len(), 6, "exactly 6 top-level fields (no anti-rollback / ring-cursor extras)");
+        for excluded in ["freshness_epoch", "structural_version", "audit", "next_seq", "capacity"] {
+            assert!(!top.contains(&excluded.to_string()), "top-level excludes `{excluded}`");
+        }
+        assert!(top.contains(&"audit_records".to_string()), "audit RECORDS are included");
+        let config = match &val {
+            ciborium::value::Value::Map(m) => m
+                .iter()
+                .find(|(k, _)| matches!(k, ciborium::value::Value::Text(s) if s == "config"))
+                .map(|(_, v)| v.clone())
+                .expect("config field present"),
+            _ => unreachable!(),
+        };
+        let cfg = map_keys(&config);
+        assert_eq!(cfg.len(), 6, "exactly 6 config fields");
+        for excluded in ["anchor_root", "backup_recovery_wrapping_pubkey"] {
+            assert!(!cfg.contains(&excluded.to_string()), "config excludes `{excluded}`");
+        }
+        assert!(parse_restore_ingress(&payload).is_ok());
+    }
+
+    /// A selective export (a subset of key_refs) includes ONLY the selected entries, but keeps the global
+    /// agent state (counters/faucet/audit) in full; the manifest reflects the selected set.
+    #[test]
+    fn restore_ingress_selective_export_includes_only_selected_entries() {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x22; 32]]); // only the second key
+        assert_eq!(refs, vec![[0x22; 32]], "body-ordered selected ref");
+        let payload = build_restore_ingress_payload(&body, &refs).unwrap();
+        let data = parse_restore_ingress(&payload).unwrap();
+        assert_eq!(data.entries.len(), 1, "only the selected key");
+        assert_eq!(data.entries[0].key_ref, [0x22; 32]);
+        assert_eq!(data.counters, body.counters, "global counters still full");
+        assert_eq!(data.audit_records, body.audit.records, "global audit still full");
+        assert_ne!(
+            build_key_refs_manifest(&refs).unwrap(),
+            build_key_refs_manifest(&[[0x11; 32], [0x22; 32]]).unwrap(),
+            "manifest reflects the selected set, not the full set"
+        );
+    }
+
+    /// Strict restore-side parse fails closed on bad magic / unsupported version / trailing / truncation.
+    #[test]
+    fn parse_restore_ingress_fails_closed() {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        let good = build_restore_ingress_payload(&body, &refs).unwrap();
+        let mut bad_magic = good.to_vec();
+        bad_magic[0] ^= 0x01;
+        assert_eq!(parse_restore_ingress(&bad_magic), Err(BackupError::BadMagic));
+        let mut bad_ver = good.to_vec();
+        bad_ver[9] = 0xff;
+        assert_eq!(parse_restore_ingress(&bad_ver), Err(BackupError::UnsupportedVersion));
+        let mut trailing = good.to_vec();
+        trailing.push(0x00);
+        assert_eq!(parse_restore_ingress(&trailing), Err(BackupError::Truncated), "trailing byte rejected");
+        assert_eq!(parse_restore_ingress(&good[..5]), Err(BackupError::Truncated), "truncated header rejected");
+    }
+
+    /// The recovery-key id is deterministic and bound to the encaps key (host cannot substitute it).
+    #[test]
+    fn recovery_key_id_is_deterministic_and_key_bound() {
+        let (ek1, _) = recovery_keypair(&[0x42; 64]);
+        let (ek2, _) = recovery_keypair(&[0x43; 64]);
+        assert_eq!(derive_recovery_key_id(&ek1), derive_recovery_key_id(&ek1), "deterministic");
+        assert_ne!(derive_recovery_key_id(&ek1), derive_recovery_key_id(&ek2), "bound to the key");
+        assert_eq!(derive_recovery_key_id(&ek1).len(), RECOVERY_KEY_ID_LEN);
+    }
+
+    // ─── 4c-2a: frozen restore-ingress-v1 PAYLOAD golden (the cross-component restore contract) ───
+    // Freezes the byte-exact restore-ingress-v1 PAYLOAD over the deterministic `body_with_two_keys()`, so
+    // this enclave and the (downstream) RESTORE decoder agree on the format forever. Distinct from
+    // `agent_backup_v1.bin` (which freezes the KEM-DEM ENVELOPE); this freezes the PAYLOAD the envelope
+    // wraps. TEST DATA ONLY (the entries carry fixed test secret scalars). `SEED` is the shared
+    // recovery-keypair seed from the envelope golden above.
+
+    fn golden_restore_ingress_payload() -> Vec<u8> {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        build_restore_ingress_payload(&body, &refs).unwrap().to_vec()
+    }
+
+    #[test]
+    fn restore_ingress_v1_golden_is_byte_exact() {
+        let committed: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        assert_eq!(
+            golden_restore_ingress_payload().as_slice(),
+            committed,
+            "restore-ingress golden drifted; if intentional, regen via \
+             `regen_restore_ingress_golden_vector -- --ignored` and re-mint the .json in the same commit",
+        );
+        assert_eq!(&committed[..8], RESTORE_INGRESS_MAGIC.as_slice(), "magic 2DRIGV1\\0");
+        assert_eq!(&committed[8..10], &[0x00, 0x01], "restore_ingress_format_version 1 (literal BE u16)");
+        // Field-level check of the COMMITTED bytes against LITERAL expected values (not against a fresh
+        // mint) — so a builder bug frozen into the .bin is caught here, not masked by mint==committed.
+        let data = parse_restore_ingress(committed).expect("committed payload strictly parses");
+        assert_eq!(data.entries.len(), 2, "2 keys");
+        assert_eq!(data.entries[0].key_ref, [0x11; 32], "entry 0 ref");
+        assert_eq!(&data.entries[0].secret_scalar[..], &[0x77; 32], "entry 0 secret scalar preserved");
+        assert_eq!(data.entries[1].key_ref, [0x22; 32], "entry 1 ref");
+        assert_eq!(&data.entries[1].secret_scalar[..], &[0x88; 32], "entry 1 secret scalar preserved");
+        assert_eq!(data.config.twod_chain_id, 11565, "config chain_id");
+        assert_eq!(data.config.monotonic_treasury_config_version, 3, "config version");
+        assert_eq!(data.config.admin_authority_pk, [0xa1; 32], "admin pk");
+        assert_eq!(data.strict_recovery_counter, 4, "strict_recovery_counter");
+        assert_eq!(data.audit_records.len(), 1, "1 audit record");
+        assert_eq!(data.audit_records[0].request_id, vec![0x11; 16], "audit record request_id");
+    }
+
+    #[test]
+    fn restore_ingress_v1_sidecar_matches() {
+        use sha2::{Digest, Sha256};
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        let sidecar = include_str!("../testvectors/agent-gateway/restore_ingress_v1.json");
+        let v: serde_json::Value =
+            serde_json::from_str(sidecar).expect("restore-ingress sidecar must be valid JSON");
+        assert_eq!(v["payload_sha256"].as_str(), Some(hex(&Sha256::digest(payload)).as_str()), "sha256 drift");
+        assert_eq!(v["payload_len_bytes"].as_u64(), Some(payload.len() as u64), "len drift");
+        assert_eq!(
+            v["restore_ingress_format_version"].as_u64(),
+            Some(u64::from(RESTORE_INGRESS_FORMAT_VERSION)),
+            "version drift",
+        );
+        assert_eq!(v["magic"].as_str().map(str::as_bytes), Some(RESTORE_INGRESS_MAGIC.as_slice()), "magic drift");
+        // recovery_key_id over the shared fixed SEED encaps key (pins the derivation for downstream 2d).
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        assert_eq!(
+            v["recovery_key_id_hex"].as_str(),
+            Some(hex(&derive_recovery_key_id(&encaps)).as_str()),
+            "recovery_key_id drift",
+        );
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        assert_eq!(
+            v["key_refs_manifest_hex"].as_str(),
+            Some(hex(&build_key_refs_manifest(&refs).unwrap()).as_str()),
+            "manifest drift",
+        );
+    }
+
+    /// REGEN (manual): `cargo test --features agent-backup-export-preview \
+    /// regen_restore_ingress_golden_vector -- --ignored --nocapture`, then commit the 2 testvector files.
+    /// A deliberate payload-format / version change re-mints the .bin AND the .json sidecar in one commit.
+    #[test]
+    #[ignore]
+    fn regen_restore_ingress_golden_vector() {
+        use sha2::{Digest, Sha256};
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+        let payload = golden_restore_ingress_payload();
+        std::fs::write(format!("{dir}restore_ingress_v1.bin"), &payload).unwrap();
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let sidecar = serde_json::json!({
+            "description": "TASK-13b restore-ingress-v1 DR-backup PAYLOAD golden (the plaintext the KEM-DEM \
+                            envelope wraps; the downstream RESTORE_BACKUP decoder parses it). TEST DATA ONLY \
+                            — entries carry fixed test secret scalars.",
+            "payload_sha256": hex(&Sha256::digest(&payload)),
+            "payload_len_bytes": payload.len(),
+            "restore_ingress_format_version": RESTORE_INGRESS_FORMAT_VERSION,
+            "magic": "2DRIGV1\u{0000}",
+            "recovery_key_id_hex": hex(&derive_recovery_key_id(&encaps)),
+            "key_refs_manifest_hex": hex(&build_key_refs_manifest(&refs).unwrap()),
+            "recovery_keypair_seed_hex": hex(&SEED),
+        });
+        std::fs::write(
+            format!("{dir}restore_ingress_v1.json"),
+            serde_json::to_string_pretty(&sidecar).unwrap() + "\n",
+        )
+        .unwrap();
+        eprintln!("wrote restore-ingress golden ({}-byte payload) + sidecar -> {dir}", payload.len());
     }
 }
