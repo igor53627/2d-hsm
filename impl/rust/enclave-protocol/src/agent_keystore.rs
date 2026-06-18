@@ -1013,10 +1013,14 @@ impl KeystoreBody {
         {
             return Err(KeystoreError::CapacityExceeded);
         }
-        // Per-record variable-length provenance is bounded (same caps as the wire/counter surfaces), so a
-        // forged/restored ring with an over-cap `scope_target`/`request_id` is rejected fail-closed here.
+        // Per-record variable-length provenance is bounded by the TRUE-ORIGIN caps of each field, so a
+        // forged/restored ring carrying values no real op could produce is rejected fail-closed here.
+        // `scope_target`/`request_id` both come from a verified capability + envelope, so use the
+        // capability's `MAX_SCOPE_TARGET_LEN` (64) and the envelope's `MAX_REQUEST_ID_LEN` (64) — NOT the
+        // looser 4096-byte marks `scope_target` bound (that surface is the AdoptForward marks payload, a
+        // different origin than a capability-authorized audit record).
         for r in &self.audit.records {
-            if r.scope_target.len() > crate::agent_cbor::MARKS_SCOPE_TARGET_MAX_LEN
+            if r.scope_target.len() > crate::agent_capability::MAX_SCOPE_TARGET_LEN
                 || r.request_id.len() > crate::agent_dispatch::MAX_REQUEST_ID_LEN
             {
                 return Err(KeystoreError::InvalidFieldLength);

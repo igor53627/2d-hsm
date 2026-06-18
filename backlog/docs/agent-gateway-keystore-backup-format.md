@@ -106,11 +106,19 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    `counter` (the per-`(authority, scope_class, scope_target)` batch sequence — scope is required
    to disambiguate, since `counter` is per-scope), `config_version` (treasury config version at the
    op), `request_id` (the logical-op / anchor idempotency id), and the ring's monotonic `seq`.
+   A record's `scope_target`/`request_id` are bounded by the SAME caps as their origin surfaces
+   (the verified capability's `MAX_SCOPE_TARGET_LEN` and the envelope's `MAX_REQUEST_ID_LEN`), enforced
+   in `validate()` so a forged ring fails closed. Because records now carry variable-length provenance,
+   a ring's contribution to `MAX_KEYSTORE_BLOB_SIZE` is record-content-dependent: size `capacity`
+   against max-length records, not a fixed per-record footprint.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version
 outside the known set ⇒ fail-closed (no zero-init, no truncation tolerance). A version bump
-requires a reviewed, vector-backed change.
+requires a reviewed, vector-backed change. (The slice-4b `AuditRecord` provenance widening —
+adding `scope_class`/`scope_target`/`request_id` — owes NO migration and NO version bump: the
+audit write path went live only in 4b, so every prior-version sealed blob has an empty `records`
+vec and serializes byte-identically; the AC#16 window need not cover the old `AuditRecord` shape.)
 
 **Atomic key generation** (AC#18): `AGENT_K1_GENERATE_KEYS` seals the counter advance **and**
 the new key metadata in one commit before returning refs; a partial/persist failure returns
