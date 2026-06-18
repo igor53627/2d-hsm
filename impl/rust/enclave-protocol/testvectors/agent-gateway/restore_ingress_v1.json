@@ -1,0 +1,10 @@
+{
+  "description": "TASK-13b restore-ingress-v1 DR-backup PAYLOAD golden (the plaintext the KEM-DEM envelope wraps; the downstream RESTORE_BACKUP decoder parses it). TEST DATA ONLY — entries carry fixed test secret scalars.",
+  "key_refs_manifest_hex": "825820111111111111111111111111111111111111111111111111111111111111111158202222222222222222222222222222222222222222222222222222222222222222",
+  "magic": "2DRIGV1\u0000",
+  "payload_len_bytes": 1806,
+  "payload_sha256": "36b01fa01bfd0ff100a317304e2c7e4e3b220afca4546f7749cc8c000c6a2068",
+  "recovery_key_id_hex": "44c25d7b1417f6d3f31a54d5bda5b798",
+  "recovery_keypair_seed_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "restore_ingress_format_version": 1
+}

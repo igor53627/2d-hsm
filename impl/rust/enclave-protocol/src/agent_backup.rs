@@ -1043,4 +1043,96 @@ mod tests {
         assert_ne!(derive_recovery_key_id(&ek1), derive_recovery_key_id(&ek2), "bound to the key");
         assert_eq!(derive_recovery_key_id(&ek1).len(), RECOVERY_KEY_ID_LEN);
     }
+
+    // ─── 4c-2a: frozen restore-ingress-v1 PAYLOAD golden (the cross-component restore contract) ───
+    // Freezes the byte-exact restore-ingress-v1 PAYLOAD over the deterministic `body_with_two_keys()`, so
+    // this enclave and the (downstream) RESTORE decoder agree on the format forever. Distinct from
+    // `agent_backup_v1.bin` (which freezes the KEM-DEM ENVELOPE); this freezes the PAYLOAD the envelope
+    // wraps. TEST DATA ONLY (the entries carry fixed test secret scalars). `SEED` is the shared
+    // recovery-keypair seed from the envelope golden above.
+
+    fn golden_restore_ingress_payload() -> Vec<u8> {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        build_restore_ingress_payload(&body, &refs).unwrap().to_vec()
+    }
+
+    #[test]
+    fn restore_ingress_v1_golden_is_byte_exact() {
+        let committed: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        assert_eq!(
+            golden_restore_ingress_payload().as_slice(),
+            committed,
+            "restore-ingress golden drifted; if intentional, regen via \
+             `regen_restore_ingress_golden_vector -- --ignored` and re-mint the .json in the same commit",
+        );
+        assert_eq!(&committed[..8], RESTORE_INGRESS_MAGIC.as_slice(), "magic 2DRIGV1\\0");
+        assert_eq!(&committed[8..10], &[0x00, 0x01], "restore_ingress_format_version 1 (literal BE u16)");
+        // The frozen payload strictly re-parses to the same data (2 keys, full provenance).
+        let data = parse_restore_ingress(committed).expect("committed payload strictly parses");
+        assert_eq!(data.entries.len(), 2, "2 keys in the golden body");
+        assert_eq!(data.audit_records.len(), 1, "1 audit record");
+    }
+
+    #[test]
+    fn restore_ingress_v1_sidecar_matches() {
+        use sha2::{Digest, Sha256};
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        let sidecar = include_str!("../testvectors/agent-gateway/restore_ingress_v1.json");
+        let v: serde_json::Value =
+            serde_json::from_str(sidecar).expect("restore-ingress sidecar must be valid JSON");
+        assert_eq!(v["payload_sha256"].as_str(), Some(hex(&Sha256::digest(payload)).as_str()), "sha256 drift");
+        assert_eq!(v["payload_len_bytes"].as_u64(), Some(payload.len() as u64), "len drift");
+        assert_eq!(
+            v["restore_ingress_format_version"].as_u64(),
+            Some(u64::from(RESTORE_INGRESS_FORMAT_VERSION)),
+            "version drift",
+        );
+        assert_eq!(v["magic"].as_str().map(str::as_bytes), Some(RESTORE_INGRESS_MAGIC.as_slice()), "magic drift");
+        // recovery_key_id over the shared fixed SEED encaps key (pins the derivation for downstream 2d).
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        assert_eq!(
+            v["recovery_key_id_hex"].as_str(),
+            Some(hex(&derive_recovery_key_id(&encaps)).as_str()),
+            "recovery_key_id drift",
+        );
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        assert_eq!(
+            v["key_refs_manifest_hex"].as_str(),
+            Some(hex(&build_key_refs_manifest(&refs).unwrap()).as_str()),
+            "manifest drift",
+        );
+    }
+
+    /// REGEN (manual): `cargo test --features agent-backup-export-preview \
+    /// regen_restore_ingress_golden_vector -- --ignored --nocapture`, then commit the 2 testvector files.
+    /// A deliberate payload-format / version change re-mints the .bin AND the .json sidecar in one commit.
+    #[test]
+    #[ignore]
+    fn regen_restore_ingress_golden_vector() {
+        use sha2::{Digest, Sha256};
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+        let payload = golden_restore_ingress_payload();
+        std::fs::write(format!("{dir}restore_ingress_v1.bin"), &payload).unwrap();
+        let (encaps, _dk) = recovery_keypair(&SEED);
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let sidecar = serde_json::json!({
+            "description": "TASK-13b restore-ingress-v1 DR-backup PAYLOAD golden (the plaintext the KEM-DEM \
+                            envelope wraps; the downstream RESTORE_BACKUP decoder parses it). TEST DATA ONLY \
+                            — entries carry fixed test secret scalars.",
+            "payload_sha256": hex(&Sha256::digest(&payload)),
+            "payload_len_bytes": payload.len(),
+            "restore_ingress_format_version": RESTORE_INGRESS_FORMAT_VERSION,
+            "magic": "2DRIGV1\u{0000}",
+            "recovery_key_id_hex": hex(&derive_recovery_key_id(&encaps)),
+            "key_refs_manifest_hex": hex(&build_key_refs_manifest(&refs).unwrap()),
+            "recovery_keypair_seed_hex": hex(&SEED),
+        });
+        std::fs::write(
+            format!("{dir}restore_ingress_v1.json"),
+            serde_json::to_string_pretty(&sidecar).unwrap() + "\n",
+        )
+        .unwrap();
+        eprintln!("wrote restore-ingress golden ({}-byte payload) + sidecar -> {dir}", payload.len());
+    }
 }
