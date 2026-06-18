@@ -159,21 +159,21 @@ impl AgentOpcode {
             // earlier note here (that `reset_lifetime_breaker` is "marks-only ⇒ EpochOnly") was WRONG
             // (TASK-15 15-4 review): reset LOWERS a marks surface, which `marks_dominate_local` rejects, so
             // EpochOnly would wedge the recovery op on a crash-before-swap. See that classifier's docs.
-            Self::GenerateKeys | Self::ConfigureTreasury => CommitBumpClass::Structural,
+            // EXPORT_BACKUP (TASK-13b slice 2): advances the AUDIT-ring backpressure high-water
+            // `audit.last_exported_seq`, which is NEITHER a marks surface NOR `structural_version`. Under
+            // EpochOnly a dropped EXPORT seal would adopt-forward and the seeder (which never touches
+            // `audit`) silently rolls `last_exported_seq` BACK, re-enabling overwrite of already-exported
+            // reviewable history (an AC#14 audit-completeness weakening — NOT a fund loss, but a
+            // reviewability hole). Classifying EXPORT **Structural** is the fail-closed-safe resolution of
+            // the design caveat: a dropped EXPORT seal ⇒ StructuralGap⇒restore re-presents the WHOLE body
+            // (including `audit.last_exported_seq`), so the high-water can never silently regress. This is
+            // the same "when in doubt ⇒ Structural" rule as CONFIGURE's `reset_lifetime_breaker`.
+            Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup => CommitBumpClass::Structural,
             // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
-            // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); EXPORT_BACKUP is a
-            // freshness-gated read; RESTORE_BACKUP re-seeds from re-presentable recovery material +
-            // advances the strict_recovery_counter (a marks surface). [All three handlers are deferred —
-            // each class is CONFIRMED at its handler slice; EpochOnly per the current design.
-            // CAVEAT for the EXPORT handler: EXPORT is specified to advance the AUDIT-ring backpressure
-            // high-water `audit.last_exported_seq`, which is NEITHER a marks surface NOR structural_version
-            // — so under EpochOnly a dropped EXPORT seal adopt-forwards and the seeder (which never touches
-            // `audit`) silently rolls `last_exported_seq` back, re-enabling overwrite of already-exported
-            // reviewable history (an AC#14 audit-completeness weakening, NOT a fund loss). The audit-ring
-            // write path is itself a deferred follow-up for ALL privileged ops; before the EXPORT handler
-            // lands, RESOLVE this: make `last_exported_seq` anti-rollback-covered, prove its rollback
-            // acceptable, or class EXPORT Structural.]
-            Self::SignFaucetDispense | Self::ExportBackup | Self::RestoreBackup => CommitBumpClass::EpochOnly,
+            // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); RESTORE_BACKUP
+            // re-seeds from re-presentable recovery material + advances the `strict_recovery_counter` (a
+            // marks surface). Both handlers are deferred — each class is RE-CONFIRMED at its handler slice.
+            Self::SignFaucetDispense | Self::RestoreBackup => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
             Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,
         }
@@ -2004,6 +2004,29 @@ mod tests {
     }
 
     #[test]
+    fn deferred_restore_backup_recovery_cap_reaches_not_configured() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
+        let recovery = SigningKey::from_bytes(&[9u8; 32]);
+        let mut body = base_body();
+        body.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+        // RESTORE_BACKUP(8) is RECOVERY-tier (agent_capability.rs: `8 => cap.is_recovery`); its handler is a
+        // FAIL-CLOSED RESERVED STUB — the full attested-ingress restore ceremony (the separate
+        // `2d-hsm-agent-restore-ingress-v1` envelope + counter-seeding AC#11/#12) is a non-goal of 13b. A
+        // valid recovery cap verifies (recovery_authority_pk + recovery-tier), then the request collapses to
+        // NotConfigured (0x45) — pinning the verify→fail-closed contract so the stub can't silently become a
+        // no-op handler. (An ADMIN-signed restore is separately rejected at the tier check, 0x43.)
+        let cap = crate::agent_capability::test_signed_capability(
+            &recovery, 8, &[0x11; 16], 1, true, 11565, "testnet", 0, b"restore_backup", 1, [0xab; 32],
+        );
+        let payload = envelope(8, vec![(Value::Integer(5.into()), Value::Map(cap))]);
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+    }
+
+    #[test]
     fn noncanonical_nested_capability_is_malformed_before_verify() {
         use ed25519_dalek::SigningKey;
         let _g = gate_configured(); // op 7 is rollback-sensitive — serialize + bind (Malformed wins at decode)
@@ -2764,7 +2787,10 @@ mod tests {
             (AgentOpcode::GenerateKeys, CommitBumpClass::Structural),
             (AgentOpcode::ConfigureTreasury, CommitBumpClass::Structural),
             (AgentOpcode::SignFaucetDispense, CommitBumpClass::EpochOnly),
-            (AgentOpcode::ExportBackup, CommitBumpClass::EpochOnly),
+            // EXPORT_BACKUP is Structural (TASK-13b slice 2): it advances `audit.last_exported_seq`, which
+            // is not a marks surface / structural_version, so a dropped seal must trigger StructuralGap⇒
+            // restore rather than silently roll the audit high-water back.
+            (AgentOpcode::ExportBackup, CommitBumpClass::Structural),
             (AgentOpcode::RestoreBackup, CommitBumpClass::EpochOnly),
             (AgentOpcode::SignTransfer, CommitBumpClass::NotCommitted),
             (AgentOpcode::PublicIdentity, CommitBumpClass::NotCommitted),
