@@ -183,21 +183,25 @@ path lands (no marks surface exists yet); accepted residual: a dropped EXPORT se
 `StructuralGap`→restore (availability cost), traded for audit completeness.
 
 **`RESTORE_BACKUP` commit class = `Structural` (TASK-13b slice 2).** RESTORE (handler deferred to slice 4)
-wholesale-REPLACES the keystore body — `entries` / `config` / `audit` / `structural_version` — from the
-backup. Those are non-marks, non-`AdoptForward`-reconstructable surfaces (`seed_marks_forward` never
-touches them), so `EpochOnly` would be UNSAFE: a dropped/crashed RESTORE seal would `AdoptForward` and
-SILENTLY LOSE the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
-already burned), and a successful RESTORE installs the backup's `structural_version` which — un-bumped on
-the anchor under EpochOnly — would mismatch next boot. `Structural` ⇒ a dropped seal triggers
-`StructuralGap`→restore (re-attempt, never a silent rollback). NB the `strict_recovery_counter` (marks key 4)
-being a marks surface is NECESSARY but NOT SUFFICIENT to make RESTORE `EpochOnly` — the wholesale body
-replace is the deciding non-marks surface. **OPEN for the RESTORE handler slice:** RESTORE is the one
-committed op whose `structural_version` is SET from the backup (a NON-monotone transition — possibly lower
-OR higher than the running enclave's), NOT a plain monotone `++`. Classing it `Structural` is the
-fail-closed-safe forward-declaration, but the handler slice MUST define the post-restore anchor
-`structural_version` (backup vs backup+1 vs local+1) + the reconcile rule that ADMITS a restored value
-`≠ local+1` — almost certainly a DISTINCT recovery-ceremony path tied to `strict_recovery_counter`
-(AC#11/#12), NOT an ordinary `advance_commit_epoch(Structural)` `++`. The full recovery-ceremony
+wholesale-REPLACES the restorable keystore state — `entries` / config-identity subset / `counters` /
+`faucet` / audit **records** / `strict_recovery_counter` — from the backup. Those are non-marks,
+non-`AdoptForward`-reconstructable surfaces (`seed_marks_forward` never touches them), so `EpochOnly` would
+be UNSAFE: a dropped/crashed RESTORE seal would `AdoptForward` and SILENTLY LOSE the restore (the enclave
+stays in the pre-restore state while the `strict_recovery_counter` already burned). `Structural` ⇒ a
+dropped seal triggers `StructuralGap`→restore (re-attempt, never a silent rollback). NB the
+`strict_recovery_counter` (marks key 4) being a marks surface is NECESSARY but NOT SUFFICIENT to make
+RESTORE `EpochOnly` — the wholesale body replace is the deciding non-marks surface.
+
+**The `structural_version`-from-backup footgun is RESOLVED by the `restore-ingress-v1` payload exclusion
+(TASK-13b slice 4c-2a):** the DR backup payload deliberately does NOT carry `structural_version` or
+`freshness_epoch` — they are enclave-relative to the SOURCE enclave's `anchor_root` and meaningless in the
+restoring enclave (which has its OWN anchor). So RESTORE CANNOT install a non-monotone backup
+`structural_version` (the earlier hazard: a value possibly `< local`). Instead the restore ceremony sets
+an ENCLAVE-LOCAL `structural_version` — a monotone-safe transition, NOT a backup-supplied one. **OPEN for
+the RESTORE handler slice:** define the exact enclave-local post-restore `structural_version` (local+1 vs
+a fresh value seeded from `strict_recovery_counter`) + the `strict_recovery_counter`-tied reconcile rule
+(AC#11/#12) that registers the recovery — a DISTINCT recovery-ceremony path, NOT an ordinary
+`advance_commit_epoch(Structural)` `++`, and NOT a backup-value install. The full recovery-ceremony
 counter-seeding (AC#11/#12) is re-confirmed at that handler slice.
 
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
@@ -446,10 +450,13 @@ each committed GENERATE_KEYS; each key/config-changing CONFIGURE_TREASURY sub-op
 (TASK-13b slice 2 — wholesale body replace). The CONFIGURE/EXPORT/RESTORE handlers are deferred; the
 CONFIGURE sub-op classifier MUST be an exhaustive `match` with no wildcard so a new sub-op can't default
 into the wrong class. **RESTORE_BACKUP is the recovery-ceremony EXCEPTION to "monotone `++`":** its
-`structural_version` is SET from the backup (a NON-monotone transition, possibly `< local`), NOT a plain
-`advance_commit_epoch(Structural)` increment — the handler slice MUST define the post-restore anchor value
-+ the reconcile rule that admits a restored value `≠ local+1` (a distinct recovery path tied to
-`strict_recovery_counter`, see the RESTORE note above). The one committed op that MUST NOT bump
+`structural_version` is set ENCLAVE-LOCALLY by the recovery ceremony — NOT from the backup (the
+`restore-ingress-v1` payload EXCLUDES `structural_version`/`freshness_epoch`; TASK-13b slice 4c-2a) and NOT
+a plain `advance_commit_epoch(Structural)` `++`. The handler slice MUST define the enclave-local
+post-restore value (local+1 vs a `strict_recovery_counter`-seeded fresh value) + the reconcile rule that
+registers the recovery (a distinct recovery path tied to `strict_recovery_counter`, see the RESTORE note
+above). This exclusion resolves the earlier "non-monotone backup value, possibly `< local`" footgun —
+there is no backup `structural_version` to install. The one committed op that MUST NOT bump
 `structural_version` is SIGN_FAUCET_DISPENSE (EpochOnly — its full effect is in the marks). MUST NOT bump
 on counter/spend advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT
 be aliased onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).

@@ -137,6 +137,20 @@ migration window) — `v1` is the permanent frozen contract for the v1 line; a f
 `restore_ingress_format_version` + a re-frozen golden, and the downstream RESTORE decoder decides whether
 to accept a bounded version window. Frozen golden: `testvectors/agent-gateway/restore_ingress_v1.bin`.
 
+**Restore-side reconstruction of the EXCLUDED state (normative).** `restore-ingress-v1` carries audit
+**records** but not the ring CURSORS, and no `structural_version`/`freshness_epoch`/`anchor_root` — the
+RESTORE ceremony re-derives or freshly-seeds them enclave-locally:
+- `audit.next_seq` = `max(record.seq) + 1` over the restored records (or `1` if none). `records` are
+  strictly ascending by construction, so `max` is the last record's `seq`.
+- `audit.last_exported_seq` = `next_seq - 1` — every restored record predates the export that produced
+  this backup (which drained the source ring), so all restored history is treated as already-exported; the
+  restored ring starts fully drained (no spurious backpressure on the first post-restore privileged op).
+- `audit.capacity` = a RESTORE-time policy/config value (NOT from the backup) — the restoring enclave's
+  own provisioning, not the source's.
+- `structural_version`/`freshness_epoch` = enclave-local (see `agent-gateway-anti-rollback.md` — local+1
+  vs a `strict_recovery_counter`-seeded value), never the source's; `anchor_root` is the restoring
+  enclave's own. These rules are enforced by the (deferred) RESTORE handler slice.
+
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version
 outside the known set ⇒ fail-closed (no zero-init, no truncation tolerance). A version bump
