@@ -100,6 +100,8 @@ pub(crate) fn smoke_body() -> KeystoreBody {
             monotonic_treasury_config_version: 0,
             authority_epoch: 0,
             anchor_root,
+            enclave_scope_id: [0xe1; 32],
+            fleet_scope_id: [0xf1; 32],
         },
         entries: vec![KeyEntry {
             key_ref: SMOKE_KEY_REF,
@@ -1534,7 +1536,7 @@ mod tests {
         let body = smoke_body();
         body.validate().expect("smoke body passes structural validation");
         let blob = smoke_sealed_blob();
-        assert_eq!(&blob[8..10], &[0x00, 0x03], "format_version 3 in the header");
+        assert_eq!(&blob[8..10], &[0x00, 0x04], "format_version 4 in the header");
         assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE, "smoke blob is re-installable");
         let unsealed =
             unseal_body(&blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
@@ -1612,6 +1614,19 @@ mod tests {
             "sidecar blob_sha256 drift — re-run the regen test (it re-mints both files)"
         );
         assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "blob_len_bytes drift");
+        // Couple the sidecar's documented format version to BOTH the const AND the actual header bytes
+        // [8],[9] (big-endian) — a 3->4-style bump that re-mints the blob but leaves the sidecar string
+        // stale (or vice versa) fails here, the gap that previously let a v3 label ship on a v4 blob.
+        assert_eq!(
+            v["envelope"]["keystore_format_version"].as_u64(),
+            Some(u64::from(crate::agent_keystore::KEYSTORE_FORMAT_VERSION)),
+            "keystore_format_version sidecar drift vs const"
+        );
+        assert_eq!(
+            v["envelope"]["keystore_format_version"].as_u64(),
+            Some(u64::from(u16::from_be_bytes([blob[8], blob[9]]))),
+            "keystore_format_version sidecar drift vs blob header"
+        );
         assert_eq!(
             v["envelope"]["nonce_hex"].as_str(),
             Some(hex(&SMOKE_SEAL_NONCE).as_str()),
@@ -2388,7 +2403,8 @@ mod tests {
             "blob_sha256": hex(&Sha256::digest(&blob)),
             "envelope": {
                 "keystore_magic_ascii": "2DAGTKS<NUL>",
-                "keystore_format_version": 3,
+                // Derived from the const so the sidecar can never drift from the blob header on a bump.
+                "keystore_format_version": crate::agent_keystore::KEYSTORE_FORMAT_VERSION,
                 "aead": "XChaCha20Poly1305",
                 "nonce_hex": hex(&SMOKE_SEAL_NONCE),
             },

@@ -50,7 +50,7 @@ pub const KEYSTORE_MAGIC: &[u8; 8] = b"2DAGTKS\0";
 /// incompatible on-disk layout/encoding change bumps this again. Note: the `KeystoreBody` fields are
 /// feature-invariant (never `#[cfg]`-gated) so the sealed layout/golden is single-valued across all
 /// feature combinations.
-pub const KEYSTORE_FORMAT_VERSION: u16 = 3;
+pub const KEYSTORE_FORMAT_VERSION: u16 = 4;
 
 const MEAS_DIGEST_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-meas";
 const AEAD_KEY_DOMAIN: &[u8] = b"2d-hsm-agent-keystore-v1-key";
@@ -259,7 +259,7 @@ pub fn unseal_keystore(
 // high-water table, faucet state, audit ring.) All structs are `deny_unknown_fields` so an
 // unexpected field fails closed rather than being silently dropped on a forward-migration read.
 //
-// Encoding note (sealed-body format, current format_version 3): this uses **deterministic** CBOR — serde emits struct fields
+// Encoding note (sealed-body format, current format_version 4): this uses **deterministic** CBOR — serde emits struct fields
 // in declaration order and every collection is a `Vec` (no map/HashMap), so a given body always
 // encodes to the same bytes (the golden vector locks this). It is NOT RFC 8949 *canonical* CBOR,
 // and byte fields (`[u8; N]`, `Vec<u8>`) serialize as CBOR integer-arrays, not byte strings.
@@ -577,6 +577,22 @@ pub struct KeystoreConfig {
     /// transition (a new sealed config), **not** a `format_version` bump — `format_version` changes
     /// only for incompatible on-disk layout/encoding changes.
     pub anchor_root: [u8; 32],
+    /// Sealed per-enclave SCOPE identity (TASK-18 slice 18-1 / AC#1): a provisioned RANDOM id installed at
+    /// provisioning and sealed here, so an enclave-scoped (`scope_class==0`) capability can be byte-pinned
+    /// to THIS enclave — a cap minted for enclave A cannot be replayed on a fresh clone B (whose counter
+    /// row is empty ⇒ `highest==0` ⇒ `incoming==1` accepted) to mint a SECOND treasury key (the AC#12
+    /// budget-multiplication guard). **INERT in 18-1** — the verifier byte-compare lands in slice 18-2.
+    /// Required (NO `serde(default)`): a body missing it fails closed as a CBOR *decode* error, never a
+    /// silent zero (the same field-PRESENCE discipline as `structural_version`). NB this is presence-only;
+    /// unlike `structural_version` (which `validate()` rejects at 0), an all-zero "unset" scope id is NOT
+    /// yet value-rejected here — that value-level guard belongs with slice 18-2, where the field first
+    /// becomes load-bearing (TASK-18 18-2 obligation). (Distinct from `anchor_root`: that is the
+    /// anti-rollback anchor pubkey; this is the cap-scope identity.)
+    pub enclave_scope_id: [u8; 32],
+    /// Sealed SHARED fleet SCOPE identity (TASK-18): fleet-scoped (`scope_class==1`) caps bind to this,
+    /// which clones of ONE fleet legitimately share (so a fleet cap is valid across the fleet's clones).
+    /// **INERT in 18-1** (verifier compare lands in 18-2). Required, same fail-closed discipline.
+    pub fleet_scope_id: [u8; 32],
 }
 
 /// The full keystore plaintext: everything sealed inside one `pq-agent-keystore-v1` commit.
@@ -1159,22 +1175,23 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails_closed_before_decrypt() {
-        // An unknown FUTURE version (4 — the current version is 3) is rejected pre-decrypt (version is
-        // AAD-bound). NB: must be 0x04, not 0x03 — 3 is now the live KEYSTORE_FORMAT_VERSION.
+        // An unknown FUTURE version (5 — the current version is 4) is rejected pre-decrypt (version is
+        // AAD-bound). NB: must be 0x05, not 0x04 — 4 is now the live KEYSTORE_FORMAT_VERSION.
         let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         blob[8] = 0x00;
-        blob[9] = 0x04;
+        blob[9] = 0x05;
         assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::UnsupportedVersion));
     }
 
     #[test]
     fn legacy_versions_rejected_after_bump() {
-        // Both pre-bump versions are now legacy with no reader: v1 never shipped a real blob, and v2 is
-        // superseded by v3 (which added cumulative_signing_budget). Each is a hard bump — a v1- or
-        // v2-stamped blob fails closed before decrypt (the version is AAD-bound, so this is the entire
-        // migration story). The live version (3) is exercised by the round-trip tests; 4 by
+        // All pre-bump versions are now legacy with no reader: v1 never shipped a real blob, v2 is
+        // superseded by v3 (which added cumulative_signing_budget), and v3 by v4 (which added the
+        // KeystoreConfig.{enclave_scope_id, fleet_scope_id} cap-scope identities). Each is a hard bump
+        // — a v1/v2/v3-stamped blob fails closed before decrypt (the version is AAD-bound, so this is the
+        // entire migration story). The live version (4) is exercised by the round-trip tests; 5 by
         // unsupported_version_fails_closed_before_decrypt.
-        for legacy in [0x01u8, 0x02u8] {
+        for legacy in [0x01u8, 0x02u8, 0x03u8] {
             let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
             blob[8] = 0x00;
             blob[9] = legacy;
@@ -1286,6 +1303,8 @@ mod tests {
                 monotonic_treasury_config_version: 3,
                 authority_epoch: 0,
                 anchor_root: [0xa3; 32],
+                enclave_scope_id: [0xe1; 32],
+                fleet_scope_id: [0xf1; 32],
             },
             entries: vec![
                 sample_entry(KeyPurpose::AgentFaucetTreasuryK1, 0x77, 0x33, 0x01),
@@ -1918,6 +1937,8 @@ mod tests {
                 monotonic_treasury_config_version: 1,
                 authority_epoch: 0,
                 anchor_root: [0x03; 32],
+                enclave_scope_id: [0xe1; 32],
+                fleet_scope_id: [0xf1; 32],
             },
             entries: vec![KeyEntry {
                 key_ref: [0x07; 32],
@@ -1956,21 +1977,21 @@ mod tests {
         let mut cbor = Zeroizing::new(Vec::new());
         ciborium::ser::into_writer(&body, &mut *cbor).unwrap();
         let blob = seal_keystore_with_nonce(&cbor, &GOLDEN_ROOT, GOLDEN_MEAS, &GOLDEN_NONCE).unwrap();
-        // Independently pin the on-wire format-version byte to the literal 3 (not just the const), so a
+        // Independently pin the on-wire format-version byte to the literal 4 (not just the const), so a
         // stealth const edit can't pass on the hash alone.
-        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), 3, "sealed format_version must be 3");
+        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), 4, "sealed format_version must be 4");
 
         let digest: [u8; 32] = {
             let mut h = Sha3_256::new();
             h.update(&blob);
             h.finalize().into()
         };
-        // format_version 3 (adds FaucetState::cumulative_signing_budget on top of v2's structural_version
-        // + strict_recovery_counter); supersedes the v2 vector 4278 / 0e8e0df5… and the never-shipped v1
-        // (4233 / c55edc09…) — see KEYSTORE_FORMAT_VERSION.
+        // format_version 4 (TASK-18 18-1: adds KeystoreConfig::{enclave_scope_id, fleet_scope_id} on top of
+        // v3's FaucetState::cumulative_signing_budget); supersedes the v3 vector 4339 / 1f24fdaf…, the v2
+        // (4278 / 0e8e0df5…) and the never-shipped v1 (4233 / c55edc09…) — see KEYSTORE_FORMAT_VERSION.
         assert_eq!(
             (blob.len(), hex::encode(digest)),
-            (4339usize, "1f24fdafbecb85c8a0d9a56a27f4a4a2ff6363090315b39f654510a8dcac636d".to_string()),
+            (4503usize, "42f32a092422201de73167475acf202f627516c91aed6ec60c4f533720ebfbfe".to_string()),
             "keystore golden blob changed — if intentional, bump format_version + update this vector"
         );
 

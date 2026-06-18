@@ -16,7 +16,7 @@
 //!
 //! ## Security boundary — structural invariant ONLY, NEVER the freshness decision
 //! The seam enforces the STRUCTURAL/seal invariant by reusing `unseal_body` VERBATIM (length → magic
-//! `2DAGTKS\0` → `format_version == 3` BEFORE decrypt → measurement-binding → strict whole-buffer CBOR →
+//! `2DAGTKS\0` → `format_version == 4` BEFORE decrypt → measurement-binding → strict whole-buffer CBOR →
 //! `validate()` incl. `structural_version != 0`). It MUST NOT judge freshness/anti-rollback: a
 //! rolled-back-but-structurally-valid blob UNSEALS fine (the seam does not judge freshness); the boot
 //! handshake's `reconcile` (NOT this module) — which runs on the returned `&body` BEFORE the keystore is
@@ -287,7 +287,7 @@ mod tests {
         crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
     }
 
-    /// A minimal valid v3 GENESIS keystore body: structural_version=1 (>=1, never 0),
+    /// A minimal valid v4 GENESIS keystore body: structural_version=1 (>=1, never 0),
     /// strict_recovery_counter=0, no entries, no counters, zeroed faucet, empty audit. All required fields
     /// present (no serde default — a body missing structural_version/strict_recovery_counter fails decode).
     fn genesis_body() -> KeystoreBody {
@@ -301,6 +301,8 @@ mod tests {
                 monotonic_treasury_config_version: 0,
                 authority_epoch: 0,
                 anchor_root: [0xa3; 32],
+                enclave_scope_id: [0xe1; 32],
+                fleet_scope_id: [0xf1; 32],
             },
             entries: vec![],
             counters: vec![],
@@ -453,8 +455,8 @@ mod tests {
     fn seam_unsupported_version_fails_closed() {
         let _g = BootAgentTestGuard::acquire();
         let mut blob = genesis_sealed_blob();
-        blob[8] = 0x00; // version big-endian bytes [8],[9] : 3 -> 4 (4 is an unsupported FUTURE version;
-        blob[9] = 0x04; // 3 is now the live KEYSTORE_FORMAT_VERSION, so injecting 3 would no longer reject)
+        blob[8] = 0x00; // version big-endian bytes [8],[9] : 4 -> 5 (5 is an unsupported FUTURE version;
+        blob[9] = 0x05; // 4 is now the live KEYSTORE_FORMAT_VERSION, so injecting 4 would no longer reject)
         let (_dir, path) = write_blob(&blob);
         std::env::set_var(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, &path);
         let err = unseal_agent_keystore_at_boot().unwrap_err();
@@ -601,9 +603,9 @@ mod tests {
 
     #[test]
     fn genesis_body_seals_and_unseals_round_trip() {
-        // The genesis fixture is a valid v3 body that round-trips through the seal envelope.
+        // The genesis fixture is a valid v4 body that round-trips through the seal envelope.
         let blob = genesis_sealed_blob();
-        assert_eq!(&blob[8..10], &[0x00, 0x03], "format_version 3 in the header");
+        assert_eq!(&blob[8..10], &[0x00, 0x04], "format_version 4 in the header");
         assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE, "genesis blob is re-installable");
         let body = unseal_body(&blob, GOLDEN_AGENT_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT).unwrap();
         assert_eq!(body, genesis_body());
@@ -621,7 +623,7 @@ mod tests {
             "genesis golden drifted; if the body layout/format_version changed intentionally, regen via \
              `regen_agent_genesis_golden_vector` and re-mint the .json sidecar in the same commit"
         );
-        assert_eq!(&committed[8..10], &[0x00, 0x03], "format_version 3 (literal)");
+        assert_eq!(&committed[8..10], &[0x00, 0x04], "format_version 4 (literal)");
         assert!(committed.len() <= MAX_KEYSTORE_BLOB_SIZE, "golden blob is re-installable");
         let body =
             unseal_body(committed, GOLDEN_AGENT_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
@@ -659,6 +661,18 @@ mod tests {
         let root = hex(GOLDEN_AGENT_ROOT);
         assert_eq!(v["blob_sha256"].as_str(), Some(sha.as_str()), "sidecar blob_sha256 drift — re-mint .json");
         assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
+        // Couple the documented format version to BOTH the const AND the actual header bytes [8],[9]
+        // (big-endian) so a version bump that re-mints the blob but leaves the sidecar string stale fails CI.
+        assert_eq!(
+            v["envelope"]["keystore_format_version"].as_u64(),
+            Some(u64::from(crate::agent_keystore::KEYSTORE_FORMAT_VERSION)),
+            "sidecar keystore_format_version drift vs const"
+        );
+        assert_eq!(
+            v["envelope"]["keystore_format_version"].as_u64(),
+            Some(u64::from(u16::from_be_bytes([blob[8], blob[9]]))),
+            "sidecar keystore_format_version drift vs blob header"
+        );
         assert_eq!(v["envelope"]["nonce_hex"].as_str(), Some(nonce.as_str()), "sidecar nonce_hex drift");
         assert_eq!(
             v["seal_inputs"]["enclave_measurement_hex"].as_str(),

@@ -374,6 +374,8 @@ mod tests {
                 monotonic_treasury_config_version: 1,
                 authority_epoch: 0,
                 anchor_root: anchor_key().verifying_key().to_bytes(),
+                enclave_scope_id: [0xe1; 32],
+                fleet_scope_id: [0xf1; 32],
             },
             entries: vec![],
             counters: vec![],
