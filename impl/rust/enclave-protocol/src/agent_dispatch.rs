@@ -982,8 +982,11 @@ fn handle_generate_keys(
     //   (authority, scope_class, scope_target) + counter = the accepted cap's full identity + its per-scope
     //                              batch sequence (counter is per-(authority,scope), so scope disambiguates)
     //   request_id               = the logical-op id (anchor idempotency key), ties the record to this call
-    //   config_version           = the live treasury config version (GENERATE_KEYS does not bump it, so
-    //                              live == candidate; same source as `CreationMetadata.config_version`)
+    //   config_version           = the FINALIZED candidate's treasury config version. GENERATE_KEYS does not
+    //                              bump it (so candidate == live here), but reading from `candidate` (the
+    //                              state actually being sealed) is the robust default: a future handler that
+    //                              copies this pattern AND bumps config before the audit append (e.g. 4c
+    //                              CONFIGURE_TREASURY) records the post-bump version, not a stale live one.
     // Fail-closed: a full undrained ring (`AuditBackpressure`) or `next_seq` overflow (`MonotonicOverflow`)
     // collapses to `SealFailed` (0x46) — UNLIKE counter-table-full (`CapExceeded`/0x44): audit-ring fullness
     // is SEALED state on the untrusted host, so a distinct code would be an oracle; it folds to the generic
@@ -994,7 +997,7 @@ fn handle_generate_keys(
             op: env.opcode,
             authority: &verified.authority,
             counter: verified.counter,
-            config_version: keystore.config.monotonic_treasury_config_version,
+            config_version: candidate.config.monotonic_treasury_config_version,
             scope_class: verified.scope_class,
             scope_target: &verified.scope_target,
             request_id: &env.request_id,
@@ -1824,11 +1827,17 @@ mod tests {
     }
 
     fn envelope(opcode: u8, extra: Vec<(Value, Value)>) -> Vec<u8> {
+        envelope_rid(opcode, &[0x11; 16], extra)
+    }
+
+    /// Like [`envelope`] but with a caller-chosen `request_id` — for multi-op tests where each logical op
+    /// must carry a DISTINCT request_id (the per-op-unique admin precondition; see the audit-ring contract).
+    fn envelope_rid(opcode: u8, request_id: &[u8], extra: Vec<(Value, Value)>) -> Vec<u8> {
         let mut m = vec![
             (Value::Integer(1.into()), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
             (Value::Integer(2.into()), Value::Integer((opcode as u64).into())),
             (Value::Integer(3.into()), Value::Text(COMMAND_DOMAIN.to_string())),
-            (Value::Integer(4.into()), Value::Bytes(vec![0x11; 16])), // request_id
+            (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
         ];
         m.extend(extra);
         enc(Value::Map(m))
@@ -2866,11 +2875,14 @@ mod tests {
             CommitChannelAct::Ok,
             Arc::clone(&calls),
         ))));
-        let op = |counter: u64| {
+        // Each logical op carries a DISTINCT request_id (the per-op-unique admin precondition) — reusing one
+        // would model a sequence a real anchor treats as an idempotent replay, not three distinct ops.
+        let op = |counter: u64, request_id: &[u8]| {
             let (cap, pay) =
-                generate_keys_cap_and_payload(&admin, &[0x11; 16], counter, 1, 1, b"generate_transfer");
-            envelope(
+                generate_keys_cap_and_payload(&admin, request_id, counter, 1, 1, b"generate_transfer");
+            envelope_rid(
                 1,
+                request_id,
                 vec![
                     (Value::Integer(5.into()), Value::Map(cap)),
                     (Value::Integer(7.into()), Value::Map(pay)),
@@ -2878,11 +2890,11 @@ mod tests {
             )
         };
         // Two contiguous ops fill the ring to capacity; each seals a growing audit ring + swaps.
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(1))), None, "op 1 (record 1) succeeds");
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(2))), None, "op 2 (record 2) succeeds");
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(1, &[0x21; 16]))), None, "op 1 (record 1) succeeds");
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(2, &[0x22; 16]))), None, "op 2 (record 2) succeeds");
         // Third op: the swapped live ring is now full AND undrained ⇒ backpressure ⇒ fail closed, no swap.
         assert_eq!(
-            decode_agent_error_code(&handle_agent_gateway_frame(&op(3))),
+            decode_agent_error_code(&handle_agent_gateway_frame(&op(3, &[0x23; 16]))),
             Some(0x46),
             "third op hits a full undrained ring ⇒ SealFailed (proves records persisted across swaps)"
         );
