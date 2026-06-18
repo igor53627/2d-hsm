@@ -507,7 +507,10 @@ pub(crate) fn parse_restore_ingress(payload: &[u8]) -> Result<RestoreIngressData
     if &payload[..RESTORE_INGRESS_MAGIC.len()] != RESTORE_INGRESS_MAGIC.as_slice() {
         return Err(BackupError::BadMagic);
     }
-    let version = u16::from_be_bytes([payload[8], payload[9]]);
+    // Version offset is relative to the magic length (the leading guard ensures both bytes are in bounds),
+    // so a future magic-length change can't silently mis-read or panic here.
+    let ver_off = RESTORE_INGRESS_MAGIC.len();
+    let version = u16::from_be_bytes([payload[ver_off], payload[ver_off + 1]]);
     if version != RESTORE_INGRESS_FORMAT_VERSION {
         return Err(BackupError::UnsupportedVersion);
     }
