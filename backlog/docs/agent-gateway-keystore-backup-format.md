@@ -253,8 +253,13 @@ Any randomness (a non-zero `payload_nonce`) comes from the TEE platform CSPRNG, 
 host-influenced (cf. the RFC 6979 deterministic-signing note for secp256k1).
 
 **Export self-check** (AC#3, the design doc §Keystore and backup model): before returning success, parse the
-header/manifest, verify the authenticated key-ref list equals the requested refs, and reject
-truncated/malformed blobs. The payload contains only agent private scalars + public
+header/manifest and reject truncated/malformed blobs. The manifest↔selector match is SET-EQUALITY,
+order- and multiplicity-INSENSITIVE: the exporter canonicalizes the selected refs into BODY order and
+de-duplicates (a `KeyRefs` request selector may be in request order and may repeat a ref), so the
+authenticated manifest is the SET of selected refs, not the literal request bytes. The (deferred) RESTORE
+decoder MUST therefore match the manifest against the request selector set-wise (a `[A, A]` or
+non-body-order `KeyRefs` selector is the same export as `[A]`/body-order) — never order/multiplicity-
+sensitively, which would wrongly reject a legitimate backup. The payload contains only agent private scalars + public
 metadata; it **excludes** producer ML-DSA/AuthorizationTicket material (AC#2), any runtime
 signing credential, and the seal root itself.
 
