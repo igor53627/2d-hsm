@@ -220,6 +220,7 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
         | K::InvalidFieldLength
         | K::DuplicateKeyRef
         | K::DuplicateCounterTuple
+        | K::AuditSeqDisorder
         | K::BlobTooLarge => "agent keystore: invalid keystore body",
         // A monotonic-counter overflow is a runtime capacity condition (epoch/structural at u64::MAX),
         // NOT structural body corruption — a distinct label so incident response looks at the counter,

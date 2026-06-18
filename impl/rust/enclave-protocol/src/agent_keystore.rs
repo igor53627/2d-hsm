@@ -129,6 +129,12 @@ pub enum KeystoreError {
     /// than silently discard reviewable history (the handler maps it to `SealFailed`/0x46). A `capacity==0`
     /// ring is treated as permanently full ⇒ always `AuditBackpressure` (never a `% 0` panic).
     AuditBackpressure,
+    /// The sealed audit ring violates its seq invariant — records are not STRICTLY ASCENDING (a duplicate
+    /// or backward `seq`), or `next_seq` is not past the last record's `seq`. `record_audit`'s FIFO
+    /// eviction (`records[0]` is the oldest) and its contiguous-seq backpressure math depend on this; a
+    /// body that breaks it (a code bug, or a forged/restored ring the AEAD seal cannot vouch for) is
+    /// rejected fail-closed at `validate()` rather than mis-evicting / under-counting live records.
+    AuditSeqDisorder,
 }
 
 /// `SHA3-256(domain ‖ enclave_measurement)` — the measurement digest bound into the header + AAD.
@@ -978,6 +984,21 @@ impl KeystoreBody {
         {
             return Err(KeystoreError::CapacityExceeded);
         }
+        // Audit-ring seq invariant (TASK-13b 4a): records STRICTLY ASCENDING (unique, no backward/duplicate
+        // seq ⇒ `records[0]` is provably the oldest, the record `record_audit` FIFO-evicts), and `next_seq`
+        // strictly past the last record's seq (so the next append's seq is fresh + the export high-water is
+        // well-defined). A body that violates it — a code bug, or a forged/restored ring the seal can't
+        // vouch for — is rejected fail-closed here, so `record_audit` can rely on the invariant structurally.
+        for w in self.audit.records.windows(2) {
+            if w[1].seq <= w[0].seq {
+                return Err(KeystoreError::AuditSeqDisorder);
+            }
+        }
+        if let Some(last) = self.audit.records.last() {
+            if self.audit.next_seq <= last.seq {
+                return Err(KeystoreError::AuditSeqDisorder);
+            }
+        }
         Ok(())
     }
 }
@@ -1352,6 +1373,34 @@ mod tests {
         b.record_audit(6, &AUD_AUTH, 4, 0).unwrap(); // full-branch remove(0)+push, net len unchanged
         assert_eq!(b.audit.records.len(), 3, "record_audit does NOT shrink an oversized ring toward capacity");
         assert_eq!(seal_body(&b, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded), "seal fails closed, not masked");
+    }
+
+    /// `validate()` (via `seal_body`) enforces the audit-ring seq invariant record_audit relies on
+    /// (strictly-ascending unique seqs + `next_seq > max`) — so a forged/restored ring with duplicate,
+    /// backward, or stale-`next_seq` seqs is rejected fail-closed (greptile PR #95 P1).
+    #[test]
+    fn validate_rejects_disordered_audit_seqs() {
+        let rec = |seq| AuditRecord { seq, op: 7, authority: AUD_AUTH, counter: 1, config_version: 0 };
+        // Duplicate seq (not strictly ascending) ⇒ records[0] not provably the oldest.
+        let mut dup = body_with_small_audit();
+        dup.audit.records = vec![rec(2), rec(2)];
+        dup.audit.next_seq = 3;
+        assert_eq!(seal_body(&dup, &ROOT, MEAS_A), Err(KeystoreError::AuditSeqDisorder), "duplicate seq rejected");
+        // Backward seq.
+        let mut backward = body_with_small_audit();
+        backward.audit.records = vec![rec(5), rec(4)];
+        backward.audit.next_seq = 6;
+        assert_eq!(seal_body(&backward, &ROOT, MEAS_A), Err(KeystoreError::AuditSeqDisorder), "backward seq rejected");
+        // next_seq not past the last seq ⇒ the next append would reuse seq 5.
+        let mut stale = body_with_small_audit();
+        stale.audit.records = vec![rec(5)];
+        stale.audit.next_seq = 5;
+        assert_eq!(seal_body(&stale, &ROOT, MEAS_A), Err(KeystoreError::AuditSeqDisorder), "next_seq <= max rejected");
+        // A well-ordered ring (what record_audit produces) validates.
+        let mut ok = body_with_small_audit();
+        ok.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        ok.record_audit(6, &AUD_AUTH, 2, 0).unwrap();
+        assert!(seal_body(&ok, &ROOT, MEAS_A).is_ok(), "strictly-ascending ring + next_seq>max validates");
     }
 
     #[test]
