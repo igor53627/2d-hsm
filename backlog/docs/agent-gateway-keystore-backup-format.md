@@ -110,7 +110,15 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    (the verified capability's `MAX_SCOPE_TARGET_LEN` and the envelope's `MAX_REQUEST_ID_LEN`), enforced
    in `validate()` so a forged ring fails closed. Because records now carry variable-length provenance,
    a ring's contribution to `MAX_KEYSTORE_BLOB_SIZE` is record-content-dependent: size `capacity`
-   against max-length records, not a fixed per-record footprint.
+   against max-length records, not a fixed per-record footprint. The ring does NOT enforce that
+   `request_id` is non-empty or per-op-unique — distinct/non-empty operational `request_id` assignment
+   is an ADMIN/orchestrator precondition (the only code guard is `MAX_REQUEST_ID_LEN`; an empty id is
+   admin-cap-bound, not a host attack), the same contract as the anchor idempotency key in
+   `agent-gateway-anti-rollback.md §3`. Backpressure note: until `EXPORT_BACKUP` lands the drain
+   (`advance_export_high_water`, slice 4c), a preview build RESPECTS backpressure but cannot RELEASE it —
+   a 4b-only preview build wedges `GENERATE_KEYS` (returns 0x46) once the ring fills past `capacity`
+   un-exported records. Preview-gated/non-user-reachable until TASK-18; do not run 4b standalone past
+   `capacity` privileged ops, or land 4b+4c together.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version
