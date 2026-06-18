@@ -226,6 +226,11 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
         // not a malformed blob. (Unreachable via the boot UNSEAL path, which performs no bump — present
         // for match-exhaustiveness; the live surface is the 6-4 per-op commit dispatch mapping.)
         K::MonotonicOverflow => "agent keystore: monotonic counter overflow",
+        // Audit-ring backpressure is a runtime capacity condition (un-exported records would be overwritten),
+        // raised only by the per-op `record_audit` write path — NOT reachable via this boot UNSEAL path (no
+        // append at boot); present for match-exhaustiveness. The live surface is the 4b/4c privileged-op
+        // dispatch mapping (→ SealFailed/0x46).
+        K::AuditBackpressure => "agent keystore: audit-ring backpressure",
     };
     ProtocolError::PqSigningUnavailable(label)
 }

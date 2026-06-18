@@ -124,6 +124,11 @@ pub enum KeystoreError {
     /// a rolled-back blob masquerade as an adoptable forward gap. Unreachable in practice (one bump per
     /// op); fail-closed by contract.
     MonotonicOverflow,
+    /// An audit-ring append would overwrite an un-exported record (AC#14 backpressure): the bounded ring
+    /// is full AND every live slot is past `last_exported_seq`. The privileged op MUST fail closed rather
+    /// than silently discard reviewable history (the handler maps it to `SealFailed`/0x46). A `capacity==0`
+    /// ring is treated as permanently full ⇒ always `AuditBackpressure` (never a `% 0` panic).
+    AuditBackpressure,
 }
 
 /// `SHA3-256(domain ‖ enclave_measurement)` — the measurement digest bound into the header + AAD.
@@ -738,6 +743,72 @@ impl KeystoreBody {
         Ok(())
     }
 
+    /// Append one privileged-op `AuditRecord` to the bounded ring (TASK-13b slice 4a, AC#14). Compute-
+    /// then-commit + checked, mirroring [`Self::advance_counter`]: a single mutation only after BOTH the
+    /// backpressure check and the `next_seq` overflow check pass (no partial mutation). The audit ring +
+    /// `next_seq` are NOT marks surfaces (absent from [`Self::encode_marks_payload`]), so this append
+    /// rides under an op's `structural_version` bump — privileged ops are `Structural` (see
+    /// `agent_dispatch::commit_bump_class`), so a dropped seal is caught as `StructuralGap`→restore and the
+    /// audit history can't silently regress. **Scoped to the `is_privileged` set** (GENERATE_KEYS /
+    /// CONFIGURE_TREASURY / EXPORT_BACKUP) — NOT SIGN_FAUCET_DISPENSE (EpochOnly; auditing it would make a
+    /// non-marks field part of an adopt-forwardable op, forcing it Structural — a separate reclassification).
+    ///
+    /// **Backpressure (fail-closed):** the ring is "would overwrite an un-exported record" when it is full
+    /// (`records.len() >= capacity`) AND every live record is past `last_exported_seq` (the un-exported live
+    /// count `(next_seq-1) - last_exported_seq >= capacity`). A `capacity==0` ring is permanently full.
+    /// `EXPORT_BACKUP` drains via [`Self::advance_export_high_water`], re-enabling appends.
+    #[cfg_attr(not(test), allow(dead_code))] // staged slice-4a; consumed by the 4b/4c handler wiring
+    pub(crate) fn record_audit(
+        &mut self,
+        op: u8,
+        authority: &[u8; 32],
+        counter: u64,
+        config_version: u64,
+    ) -> Result<(), KeystoreError> {
+        let cap = self.audit.capacity as u64;
+        if cap == 0 {
+            // A zero-capacity ring can never hold an un-exported entry — fail closed (and never `% 0`).
+            return Err(KeystoreError::AuditBackpressure);
+        }
+        // `saturating_sub` so an early-life ring (next_seq=1, last_exported_seq=0) never underflows the
+        // un-exported count; the `records.len() >= cap` gate is the primary full-ring guard.
+        let live_unexported = self
+            .audit
+            .next_seq
+            .saturating_sub(1)
+            .saturating_sub(self.audit.last_exported_seq);
+        if self.audit.records.len() as u64 >= cap && live_unexported >= cap {
+            return Err(KeystoreError::AuditBackpressure);
+        }
+        // Checked next_seq BEFORE any mutation (unreachable overflow, fail-closed by contract).
+        let new_next = self.audit.next_seq.checked_add(1).ok_or(KeystoreError::MonotonicOverflow)?;
+        let record = AuditRecord { seq: self.audit.next_seq, op, authority: *authority, counter, config_version };
+        // WRITE keeping `records.len() <= capacity` (the `validate()` belt): grow until full, then evict the
+        // oldest (logical FIFO ring — `remove(0)`; index-overwrite is an optimization not worth the `% cap`
+        // subtlety at this cadence). Both keep `len == capacity` once full.
+        if (self.audit.records.len() as u64) < cap {
+            self.audit.records.push(record);
+        } else {
+            self.audit.records.remove(0);
+            self.audit.records.push(record);
+        }
+        self.audit.next_seq = new_next;
+        Ok(())
+    }
+
+    /// Drain the audit ring's export backpressure (TASK-13b slice 4a): advance `last_exported_seq`
+    /// FORWARD-ONLY toward the highest appended seq (`next_seq - 1`), marking every currently-present record
+    /// as exported so subsequent appends can reuse the slots. Called by `EXPORT_BACKUP` (the authenticated
+    /// pull-export). Never regresses; `next_seq-1` is already overflow-checked by [`Self::record_audit`].
+    #[cfg_attr(not(test), allow(dead_code))] // staged slice-4a; consumed by the 4c EXPORT_BACKUP handler
+    pub(crate) fn advance_export_high_water(&mut self) -> Result<(), KeystoreError> {
+        let target = self.audit.next_seq.saturating_sub(1);
+        if target > self.audit.last_exported_seq {
+            self.audit.last_exported_seq = target;
+        }
+        Ok(())
+    }
+
     /// Slice 15-4: advance the monotonic treasury **config version** for a committed
     /// `CONFIGURE_TREASURY` sub-op. EVERY one of the 4 sub-ops bumps it (the per-op monotonic/audit
     /// trail — a FUTURE AC#14 privileged-op `AuditRecord::config_version` will snapshot it; that audit
@@ -1174,6 +1245,89 @@ mod tests {
         let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
         let out = unseal_body(&blob, &ROOT, MEAS_A).unwrap();
         assert_eq!(out, body);
+    }
+
+    // ─── TASK-13b slice 4a: audit-ring write path (record_audit + advance_export_high_water) ───
+
+    /// A small (cap=2) audit ring on a fresh body for the boundary tests.
+    fn body_with_small_audit() -> KeystoreBody {
+        let mut b = sample_body();
+        b.audit = AuditRing { records: vec![], capacity: 2, last_exported_seq: 0, next_seq: 1 };
+        b
+    }
+    const AUD_AUTH: [u8; 32] = [0xa1; 32];
+
+    #[test]
+    fn record_audit_seq_starts_at_one_and_grows_below_capacity() {
+        let mut b = body_with_small_audit();
+        b.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        b.record_audit(6, &AUD_AUTH, 2, 0).unwrap();
+        assert_eq!(b.audit.records.len(), 2, "two appends, ring not yet evicting");
+        assert_eq!(b.audit.records[0].seq, 1, "first record seq starts at 1");
+        assert_eq!(b.audit.records[1].seq, 2);
+        assert_eq!(b.audit.records[0].op, 7, "op byte recorded");
+        assert_eq!(b.audit.next_seq, 3, "next_seq advanced by 2");
+    }
+
+    #[test]
+    fn record_audit_backpressure_when_full_undrained() {
+        let mut b = body_with_small_audit();
+        b.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        b.record_audit(7, &AUD_AUTH, 2, 0).unwrap();
+        // Ring full (len==cap==2) and NOTHING drained (last_exported_seq=0) ⇒ fail closed.
+        assert_eq!(b.record_audit(7, &AUD_AUTH, 3, 0), Err(KeystoreError::AuditBackpressure));
+        assert_eq!(b.audit.records.len(), 2, "rejected append did not mutate the ring");
+        assert_eq!(b.audit.next_seq, 3, "rejected append did not advance next_seq");
+    }
+
+    #[test]
+    fn advance_export_high_water_frees_the_ring_and_evicts_oldest() {
+        let mut b = body_with_small_audit();
+        b.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        b.record_audit(7, &AUD_AUTH, 2, 0).unwrap();
+        // Drain marks both present records exported (last_exported_seq → next_seq-1 == 2).
+        b.advance_export_high_water().unwrap();
+        assert_eq!(b.audit.last_exported_seq, 2, "drain advances to the highest appended seq");
+        // Now a 3rd append succeeds, evicting the oldest (seq 1) and keeping len==capacity.
+        b.record_audit(6, &AUD_AUTH, 3, 0).unwrap();
+        assert_eq!(b.audit.records.len(), 2, "len stays == capacity (validate() belt)");
+        assert_eq!(b.audit.records[0].seq, 2, "oldest (seq 1) evicted");
+        assert_eq!(b.audit.records[1].seq, 3);
+    }
+
+    #[test]
+    fn advance_export_high_water_is_forward_only() {
+        let mut b = body_with_small_audit();
+        b.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        b.audit.last_exported_seq = 5; // already ahead (e.g. a prior export)
+        b.advance_export_high_water().unwrap();
+        assert_eq!(b.audit.last_exported_seq, 5, "never regresses below an already-higher water mark");
+    }
+
+    #[test]
+    fn record_audit_next_seq_checked_overflow() {
+        let mut b = body_with_small_audit();
+        b.audit.next_seq = u64::MAX;
+        // last_exported_seq high so backpressure doesn't pre-empt the overflow check.
+        b.audit.last_exported_seq = u64::MAX;
+        assert_eq!(b.record_audit(7, &AUD_AUTH, 1, 0), Err(KeystoreError::MonotonicOverflow));
+    }
+
+    #[test]
+    fn record_audit_zero_capacity_fails_closed_no_panic() {
+        let mut b = sample_body();
+        b.audit = AuditRing { records: vec![], capacity: 0, last_exported_seq: 0, next_seq: 1 };
+        assert_eq!(b.record_audit(7, &AUD_AUTH, 1, 0), Err(KeystoreError::AuditBackpressure));
+    }
+
+    #[test]
+    fn audit_record_round_trips_through_seal_unseal() {
+        let mut b = body_with_small_audit();
+        b.record_audit(7, &AUD_AUTH, 9, 3).unwrap();
+        let blob = seal_body(&b, &ROOT, MEAS_A).unwrap();
+        let out = unseal_body(&blob, &ROOT, MEAS_A).unwrap();
+        assert_eq!(out, b, "audit ring (incl. the appended record + next_seq) survives seal/unseal + validate()");
+        assert_eq!(out.audit.records[0], AuditRecord { seq: 1, op: 7, authority: AUD_AUTH, counter: 9, config_version: 3 });
     }
 
     #[test]
