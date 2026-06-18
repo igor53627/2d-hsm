@@ -87,9 +87,12 @@ fn derive_payload_key(ss: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut hasher = Sha3_256::new();
     hasher.update(BACKUP_KDF_DOMAIN);
     hasher.update(ss);
-    let digest = hasher.finalize();
+    let mut digest = hasher.finalize();
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&digest);
+    // The `finalize()` GenericArray holds the plaintext DEM key; scrub the temporary after the copy
+    // (cursor/gemini PR #92), matching agent_keystore::derive_aead_key.
+    digest.as_mut_slice().zeroize();
     key
 }
 
