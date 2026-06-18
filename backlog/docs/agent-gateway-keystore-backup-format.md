@@ -122,7 +122,20 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    ships there is NO in-band drain, so a preview build that exhausts `capacity` un-exported records
    permanently denies those handlers. This is intended fail-closed-for-audit-completeness, not a bug.
    Preview-gated/non-user-reachable until TASK-18; size production `capacity` against the interim, or land
-   the EXPORT drain (4c-2) before un-gate.
+   the EXPORT drain (4c-2) before un-gate. Operators should monitor `next_seq - last_exported_seq`
+   approaching `capacity` and EXPORT before it bricks. **EXPORT_BACKUP is the self-draining exception:**
+   it is itself an auditing privileged write (appends one record) AND the sole drain, so it MUST
+   `record_audit` (append the export event) BEFORE `advance_export_high_water` (full drain to `next_seq-1`,
+   which then covers its OWN just-appended record) — append-then-drain. Because it drains the record it
+   just wrote, EXPORT always recovers a full ring (it cannot brick itself); a drain-BEFORE-append ordering
+   would leave the export's own record un-drained (a delta-export weakening). The 4c-2b handler pins this.
+
+**Payload version (`restore-ingress-v1`).** The EXPORT_BACKUP payload (the plaintext the KEM-DEM envelope
+wraps; magic `2DRIGV1\0`) is versioned INDEPENDENTLY of the keystore `format_version` and the
+backup-envelope `backup_format_version`. `parse_restore_ingress` hard-rejects any version ≠ 1 (no
+migration window) — `v1` is the permanent frozen contract for the v1 line; a future shape change is a new
+`restore_ingress_format_version` + a re-frozen golden, and the downstream RESTORE decoder decides whether
+to accept a bounded version window. Frozen golden: `testvectors/agent-gateway/restore_ingress_v1.bin`.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version

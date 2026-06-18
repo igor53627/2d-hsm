@@ -424,17 +424,47 @@ pub(crate) fn selected_key_refs(
         .collect()
 }
 
+/// A `std::io::Write` sink that COUNTS bytes without retaining them — used to pre-size the
+/// secret-bearing payload buffer so the real serialization never reallocates (mirrors
+/// `agent_keystore::seal_body`'s `CountingWriter`).
+struct CountingWriter(usize);
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Build the `restore-ingress-v1` payload bytes (`magic ‖ version_be ‖ deterministic-CBOR`) from a
-/// keystore body, including only the entries whose `key_ref` is in `ordered_refs` (from
-/// [`selected_key_refs`]). Returns `Zeroizing` because the payload carries the secret scalars.
-/// Self-checks that the payload STRICTLY re-parses before returning (a framing/CBOR bug fails closed
-/// at the source, mirroring [`seal_backup_blob`]'s self-check).
+/// keystore body, including the entries named by `ordered_refs` (from [`selected_key_refs`]) IN
+/// `ordered_refs` ORDER — so the payload entry order is identical to the [`build_key_refs_manifest`]
+/// order built from the SAME `ordered_refs` (the manifest↔payload ordering invariant is structural,
+/// not by-convention). A ref absent from the body fails closed (the caller resolves the selector via
+/// `selected_key_refs`, which only yields body refs; a missing ref here is an internal invariant break).
+///
+/// Returns `Zeroizing` because the payload carries the secret scalars. **Pre-sized** (a counting pass
+/// that retains no bytes, then a single exact-capacity allocation): a growing `Zeroizing<Vec>` would
+/// reallocate mid-serialization, and `realloc` frees the old buffer WITHOUT zeroizing it — leaking
+/// already-written secret bytes to the allocator. With exact capacity the buffer never reallocates, so
+/// the only plaintext copy lives in the one scrubbed-on-drop buffer. Self-checks a strict re-parse.
 pub(crate) fn build_restore_ingress_payload(
     body: &crate::agent_keystore::KeystoreBody,
     ordered_refs: &[[u8; 32]],
 ) -> Result<Zeroizing<Vec<u8>>, BackupError> {
-    let entries: Vec<_> =
-        body.entries.iter().filter(|e| ordered_refs.contains(&e.key_ref)).cloned().collect();
+    // Map each ref → its entry in ORDERED_REFS order (not a body-order filter), so payload-entry order
+    // == manifest order for the same `ordered_refs`. Fail closed if a ref is not in the body.
+    let mut entries = Vec::with_capacity(ordered_refs.len());
+    for r in ordered_refs {
+        let entry = body
+            .entries
+            .iter()
+            .find(|e| &e.key_ref == r)
+            .ok_or(BackupError::Serialization)?;
+        entries.push(entry.clone());
+    }
     let data = RestoreIngressData {
         config: RestoreConfigSubset {
             twod_chain_id: body.config.twod_chain_id,
@@ -450,10 +480,18 @@ pub(crate) fn build_restore_ingress_payload(
         strict_recovery_counter: body.strict_recovery_counter,
         audit_records: body.audit.records.clone(),
     };
-    let mut out = Zeroizing::new(Vec::new());
+    // Pass 1: count the CBOR length (the CountingWriter discards bytes — no secret retained).
+    let mut counter = CountingWriter(0);
+    ciborium::ser::into_writer(&data, &mut counter).map_err(|_| BackupError::Serialization)?;
+    let prefix_len = RESTORE_INGRESS_MAGIC.len() + 2;
+    // Pass 2: serialize into an EXACT-capacity Zeroizing buffer (no reallocation → no leaked secret copy).
+    let mut out = Zeroizing::new(Vec::with_capacity(prefix_len + counter.0));
     out.extend_from_slice(RESTORE_INGRESS_MAGIC);
     out.extend_from_slice(&RESTORE_INGRESS_FORMAT_VERSION.to_be_bytes());
     ciborium::ser::into_writer(&data, &mut *out).map_err(|_| BackupError::Serialization)?;
+    // Both passes must encode the same length; a mismatch means pass 2 exceeded the reserved capacity
+    // (reallocated, leaking a copy) or encoding is non-deterministic — either way a bug.
+    debug_assert_eq!(out.len(), prefix_len + counter.0, "restore-ingress CBOR length mismatch between passes");
     // Self-check: the just-built payload must STRICTLY re-parse (magic+version+CBOR, no trailing).
     let _ = parse_restore_ingress(&out)?;
     Ok(out)
@@ -975,24 +1013,51 @@ mod tests {
         assert_eq!(data.config.authority_epoch, 0);
     }
 
-    /// The payload EXCLUDES the enclave-specific anchor + anti-rollback state and the operator key. The
-    /// `RestoreIngressData`/`RestoreConfigSubset` types have no fields for freshness/structural/cursors
-    /// (compile-enforced); this additionally proves the anchor_root bytes + the recovery pubkey never
-    /// appear in the serialized payload.
+    /// The payload EXCLUDES the enclave-specific anchor + anti-rollback state and the operator key.
+    /// STRUCTURAL check (decode the CBOR + assert the field SET) — a raw byte-scan can't prove this
+    /// because ciborium serializes `[u8;N]`/`Vec<u8>` as CBOR integer-ARRAYS (each `0xAA` → `0x18 0xAA`),
+    /// so an included `anchor_root` would never appear as a contiguous `[0xAA;32]` run. The type system
+    /// (`RestoreConfigSubset`/`RestoreIngressData` + `deny_unknown_fields`) is the real guarantee; this
+    /// pins the exact field set so a regression that re-added an excluded field fails here.
     #[test]
     fn restore_ingress_payload_excludes_anchor_and_anti_rollback_state() {
-        let body = body_with_two_keys();
+        let body = body_with_two_keys(); // anchor_root=[0xAA;32], freshness=9, structural=7 set as sentinels
         let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
         let payload = build_restore_ingress_payload(&body, &refs).unwrap();
-        assert!(
-            !payload.windows(32).any(|w| w == [0xAA; 32]),
-            "anchor_root ([0xAA;32]) is excluded from the backup payload"
-        );
-        assert!(
-            !payload.windows(64).any(|w| w.iter().all(|&b| b == 0xb0)),
-            "recovery wrapping pubkey ([0xb0;..]) is excluded from the backup payload"
-        );
-        // Round-trips; the type system carries no freshness_epoch/structural_version/ring-cursor fields.
+        let cbor = &payload[RESTORE_INGRESS_MAGIC.len() + 2..];
+        let val: ciborium::value::Value =
+            ciborium::de::from_reader(cbor).expect("payload body is a CBOR value");
+        let map_keys = |v: &ciborium::value::Value| -> Vec<String> {
+            match v {
+                ciborium::value::Value::Map(m) => m
+                    .iter()
+                    .map(|(k, _)| match k {
+                        ciborium::value::Value::Text(s) => s.clone(),
+                        other => panic!("non-text CBOR map key: {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected a CBOR map, got {other:?}"),
+            }
+        };
+        let top = map_keys(&val);
+        assert_eq!(top.len(), 6, "exactly 6 top-level fields (no anti-rollback / ring-cursor extras)");
+        for excluded in ["freshness_epoch", "structural_version", "audit", "next_seq", "capacity"] {
+            assert!(!top.contains(&excluded.to_string()), "top-level excludes `{excluded}`");
+        }
+        assert!(top.contains(&"audit_records".to_string()), "audit RECORDS are included");
+        let config = match &val {
+            ciborium::value::Value::Map(m) => m
+                .iter()
+                .find(|(k, _)| matches!(k, ciborium::value::Value::Text(s) if s == "config"))
+                .map(|(_, v)| v.clone())
+                .expect("config field present"),
+            _ => unreachable!(),
+        };
+        let cfg = map_keys(&config);
+        assert_eq!(cfg.len(), 6, "exactly 6 config fields");
+        for excluded in ["anchor_root", "backup_recovery_wrapping_pubkey"] {
+            assert!(!cfg.contains(&excluded.to_string()), "config excludes `{excluded}`");
+        }
         assert!(parse_restore_ingress(&payload).is_ok());
     }
 
@@ -1068,10 +1133,20 @@ mod tests {
         );
         assert_eq!(&committed[..8], RESTORE_INGRESS_MAGIC.as_slice(), "magic 2DRIGV1\\0");
         assert_eq!(&committed[8..10], &[0x00, 0x01], "restore_ingress_format_version 1 (literal BE u16)");
-        // The frozen payload strictly re-parses to the same data (2 keys, full provenance).
+        // Field-level check of the COMMITTED bytes against LITERAL expected values (not against a fresh
+        // mint) — so a builder bug frozen into the .bin is caught here, not masked by mint==committed.
         let data = parse_restore_ingress(committed).expect("committed payload strictly parses");
-        assert_eq!(data.entries.len(), 2, "2 keys in the golden body");
+        assert_eq!(data.entries.len(), 2, "2 keys");
+        assert_eq!(data.entries[0].key_ref, [0x11; 32], "entry 0 ref");
+        assert_eq!(&data.entries[0].secret_scalar[..], &[0x77; 32], "entry 0 secret scalar preserved");
+        assert_eq!(data.entries[1].key_ref, [0x22; 32], "entry 1 ref");
+        assert_eq!(&data.entries[1].secret_scalar[..], &[0x88; 32], "entry 1 secret scalar preserved");
+        assert_eq!(data.config.twod_chain_id, 11565, "config chain_id");
+        assert_eq!(data.config.monotonic_treasury_config_version, 3, "config version");
+        assert_eq!(data.config.admin_authority_pk, [0xa1; 32], "admin pk");
+        assert_eq!(data.strict_recovery_counter, 4, "strict_recovery_counter");
         assert_eq!(data.audit_records.len(), 1, "1 audit record");
+        assert_eq!(data.audit_records[0].request_id, vec![0x11; 16], "audit record request_id");
     }
 
     #[test]
