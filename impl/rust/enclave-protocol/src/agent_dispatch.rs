@@ -159,21 +159,53 @@ impl AgentOpcode {
             // earlier note here (that `reset_lifetime_breaker` is "marks-only ⇒ EpochOnly") was WRONG
             // (TASK-15 15-4 review): reset LOWERS a marks surface, which `marks_dominate_local` rejects, so
             // EpochOnly would wedge the recovery op on a crash-before-swap. See that classifier's docs.
-            Self::GenerateKeys | Self::ConfigureTreasury => CommitBumpClass::Structural,
-            // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
-            // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); EXPORT_BACKUP is a
-            // freshness-gated read; RESTORE_BACKUP re-seeds from re-presentable recovery material +
-            // advances the strict_recovery_counter (a marks surface). [All three handlers are deferred —
-            // each class is CONFIRMED at its handler slice; EpochOnly per the current design.
-            // CAVEAT for the EXPORT handler: EXPORT is specified to advance the AUDIT-ring backpressure
-            // high-water `audit.last_exported_seq`, which is NEITHER a marks surface NOR structural_version
-            // — so under EpochOnly a dropped EXPORT seal adopt-forwards and the seeder (which never touches
-            // `audit`) silently rolls `last_exported_seq` back, re-enabling overwrite of already-exported
-            // reviewable history (an AC#14 audit-completeness weakening, NOT a fund loss). The audit-ring
-            // write path is itself a deferred follow-up for ALL privileged ops; before the EXPORT handler
-            // lands, RESOLVE this: make `last_exported_seq` anti-rollback-covered, prove its rollback
-            // acceptable, or class EXPORT Structural.]
-            Self::SignFaucetDispense | Self::ExportBackup | Self::RestoreBackup => CommitBumpClass::EpochOnly,
+            // EXPORT_BACKUP (TASK-13b slice 2): once its handler lands (slice 4) it advances the AUDIT-ring
+            // backpressure high-water `audit.last_exported_seq`, which is NEITHER a marks surface NOR
+            // `structural_version`. Under EpochOnly a dropped/crashed EXPORT seal would adopt-forward and the
+            // seeder (which never touches `audit`) silently roll `last_exported_seq` BACK, re-enabling
+            // overwrite of already-exported reviewable history (an AC#14 audit-completeness hole — not a fund
+            // loss). DETERMINED Structural (NOT a "when in doubt" default, and a DIFFERENT mechanism than
+            // CONFIGURE `reset_lifetime_breaker`, which is Structural because it DECREASES a marks surface
+            // that `marks_dominate_local` hard-rejects): `last_exported_seq` is durable non-marks/
+            // non-structural state the adopt-forward seeder silently drops, so Structural is the resolution —
+            // a dropped EXPORT seal ⇒ StructuralGap⇒restore re-presents the WHOLE body (incl.
+            // `audit.last_exported_seq`), so the high-water can't silently regress. Why Structural and not
+            // the "make `last_exported_seq` marks-covered" route (which would allow EpochOnly): the audit-ring
+            // WRITE path is deferred for ALL privileged ops (agent_dispatch.rs ~913) — no marks surface for it
+            // exists yet — so Structural is the conservative interim; revisit only if it ever becomes
+            // marks-covered. ACCEPTED RESIDUAL: Structural means a dropped/crashed EXPORT seal forces a
+            // next-boot StructuralGap⇒restore (an availability cost for a routinely-run op), traded for
+            // audit completeness.
+            // RESTORE_BACKUP (TASK-13b slice 2; handler deferred): wholesale-REPLACES the keystore body —
+            // entries / config / audit / `structural_version` — from the backup. Those are non-marks,
+            // non-AdoptForward-reconstructable surfaces the seeder (`seed_marks_forward`) silently drops, so
+            // EpochOnly would be UNSAFE: a dropped/crashed RESTORE seal would AdoptForward and SILENTLY LOSE
+            // the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
+            // already burned), and a successful RESTORE installs the backup's `structural_version` which,
+            // un-bumped on the anchor under EpochOnly, would mismatch next boot. Structural ⇒ a dropped seal
+            // triggers StructuralGap⇒restore (re-attempt, never a silent rollback). The earlier "EpochOnly
+            // because `strict_recovery_counter` is marks-covered" reasoning was INCOMPLETE — it covered only
+            // the counter, not the body replace (gemini PR #93). OPEN for the handler slice: RESTORE is the
+            // ONE committed op whose `structural_version` is SET from the backup (a non-monotone transition —
+            // it can be lower OR higher than the running enclave's), NOT a plain monotone `++`; the handler
+            // slice MUST define the post-restore anchor structural value (backup vs backup+1 vs local+1) +
+            // the reconcile rule that ADMITS a restored value not equal to `local+1` — almost certainly a
+            // DISTINCT recovery-ceremony path tied to `strict_recovery_counter` AC#11/#12, NOT this ordinary
+            // Structural `advance_commit_epoch(true)` `++`. Classing RESTORE Structural is the fail-closed-safe
+            // forward-declaration (a dropped seal can't silently regress); the exact structural mechanism is
+            // deferred with the handler.
+            Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup | Self::RestoreBackup => {
+                CommitBumpClass::Structural
+            }
+            // EPOCH-ONLY — the op's FULL effect is captured in the anchor's authenticated marks (so
+            // AdoptForward reconstructs it byte-for-byte): ONLY SIGN_FAUCET_DISPENSE. PINNED to its handler
+            // (`handle_sign_faucet_dispense`): the sole candidate-body mutation is `candidate.faucet =
+            // new_faucet`, which advances `cumulative_native_spend` + `lifetime_spend` (both marks surfaces)
+            // and NOTHING else durable — so AdoptForward fully reconstructs it. INVARIANT: if the faucet
+            // handler is ever changed to mutate any non-marks durable field, EpochOnly becomes unsafe and
+            // this op must move to Structural (the same rule that put EXPORT/RESTORE there). Every other
+            // committed op touches a non-marks surface ⇒ Structural.
+            Self::SignFaucetDispense => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
             Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,
         }
@@ -2004,6 +2036,29 @@ mod tests {
     }
 
     #[test]
+    fn deferred_restore_backup_recovery_cap_reaches_not_configured() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
+        let recovery = SigningKey::from_bytes(&[9u8; 32]);
+        let mut body = base_body();
+        body.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+        // RESTORE_BACKUP(8) is RECOVERY-tier (agent_capability.rs: `8 => cap.is_recovery`); its handler is a
+        // FAIL-CLOSED RESERVED STUB — the full attested-ingress restore ceremony (the separate
+        // `2d-hsm-agent-restore-ingress-v1` envelope + counter-seeding AC#11/#12) is a non-goal of 13b. A
+        // valid recovery cap verifies (recovery_authority_pk + recovery-tier), then the request collapses to
+        // NotConfigured (0x45) — pinning the verify→fail-closed contract so the stub can't silently become a
+        // no-op handler. (An ADMIN-signed restore is separately rejected at the tier check, 0x43.)
+        let cap = crate::agent_capability::test_signed_capability(
+            &recovery, 8, &[0x11; 16], 1, true, 11565, "testnet", 0, b"restore_backup", 1, [0xab; 32],
+        );
+        let payload = envelope(8, vec![(Value::Integer(5.into()), Value::Map(cap))]);
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            Some(AgentError::NotConfigured)
+        );
+    }
+
+    #[test]
     fn noncanonical_nested_capability_is_malformed_before_verify() {
         use ed25519_dalek::SigningKey;
         let _g = gate_configured(); // op 7 is rollback-sensitive — serialize + bind (Malformed wins at decode)
@@ -2764,8 +2819,14 @@ mod tests {
             (AgentOpcode::GenerateKeys, CommitBumpClass::Structural),
             (AgentOpcode::ConfigureTreasury, CommitBumpClass::Structural),
             (AgentOpcode::SignFaucetDispense, CommitBumpClass::EpochOnly),
-            (AgentOpcode::ExportBackup, CommitBumpClass::EpochOnly),
-            (AgentOpcode::RestoreBackup, CommitBumpClass::EpochOnly),
+            // EXPORT_BACKUP is Structural (TASK-13b slice 2): it advances `audit.last_exported_seq`, which
+            // is not a marks surface / structural_version, so a dropped seal must trigger StructuralGap⇒
+            // restore rather than silently roll the audit high-water back.
+            (AgentOpcode::ExportBackup, CommitBumpClass::Structural),
+            // RESTORE_BACKUP is Structural (TASK-13b slice 2): it wholesale-replaces the keystore body
+            // (entries/config/audit/structural_version) — non-marks state AdoptForward can't reconstruct —
+            // so a dropped seal must StructuralGap⇒restore, never silently lose the restore (gemini PR #93).
+            (AgentOpcode::RestoreBackup, CommitBumpClass::Structural),
             (AgentOpcode::SignTransfer, CommitBumpClass::NotCommitted),
             (AgentOpcode::PublicIdentity, CommitBumpClass::NotCommitted),
             (AgentOpcode::ProveIdentity, CommitBumpClass::NotCommitted),

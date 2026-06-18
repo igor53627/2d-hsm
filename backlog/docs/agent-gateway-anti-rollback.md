@@ -169,6 +169,37 @@ alongside the `structural_version` bump. (`config_version` is an audit/version s
 control — rollback of an old sealed blob is caught by the epoch/`structural_version` anti-rollback, not by
 `config_version`.)
 
+**`EXPORT_BACKUP` commit class = `Structural` (TASK-13b slice 2).** A live EXPORT (handler deferred to
+TASK-13b slice 4) advances the audit-ring backpressure high-water `audit.last_exported_seq`, which is
+NEITHER a marks surface (absent from `encode_marks_payload`) NOR `structural_version`. Under `EpochOnly` a
+dropped/crashed EXPORT seal would `AdoptForward` and the seeder (`seed_marks_forward`, which never touches
+`audit`) would silently roll `last_exported_seq` BACK, re-enabling overwrite of already-exported reviewable
+history (an AC#14 audit-completeness hole — not a fund loss). EXPORT is therefore `Structural`: a dropped
+seal ⇒ `StructuralGap`→restore re-presents the whole body (incl. `audit.last_exported_seq`), so the
+high-water can never silently regress. This is a DETERMINED class (durable non-marks/non-structural state),
+distinct from CONFIGURE `reset_lifetime_breaker`'s marks-DECREASE belt-block mechanism. The
+"make `last_exported_seq` marks-covered to allow EpochOnly" alternative is moot until the audit-ring WRITE
+path lands (no marks surface exists yet); accepted residual: a dropped EXPORT seal forces a next-boot
+`StructuralGap`→restore (availability cost), traded for audit completeness.
+
+**`RESTORE_BACKUP` commit class = `Structural` (TASK-13b slice 2).** RESTORE (handler deferred to slice 4)
+wholesale-REPLACES the keystore body — `entries` / `config` / `audit` / `structural_version` — from the
+backup. Those are non-marks, non-`AdoptForward`-reconstructable surfaces (`seed_marks_forward` never
+touches them), so `EpochOnly` would be UNSAFE: a dropped/crashed RESTORE seal would `AdoptForward` and
+SILENTLY LOSE the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
+already burned), and a successful RESTORE installs the backup's `structural_version` which — un-bumped on
+the anchor under EpochOnly — would mismatch next boot. `Structural` ⇒ a dropped seal triggers
+`StructuralGap`→restore (re-attempt, never a silent rollback). NB the `strict_recovery_counter` (marks key 4)
+being a marks surface is NECESSARY but NOT SUFFICIENT to make RESTORE `EpochOnly` — the wholesale body
+replace is the deciding non-marks surface. **OPEN for the RESTORE handler slice:** RESTORE is the one
+committed op whose `structural_version` is SET from the backup (a NON-monotone transition — possibly lower
+OR higher than the running enclave's), NOT a plain monotone `++`. Classing it `Structural` is the
+fail-closed-safe forward-declaration, but the handler slice MUST define the post-restore anchor
+`structural_version` (backup vs backup+1 vs local+1) + the reconcile rule that ADMITS a restored value
+`≠ local+1` — almost certainly a DISTINCT recovery-ceremony path tied to `strict_recovery_counter`
+(AC#11/#12), NOT an ordinary `advance_commit_epoch(Structural)` `++`. The full recovery-ceremony
+counter-seeding (AC#11/#12) is re-confirmed at that handler slice.
+
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
 1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.
 2. **An idempotent retry RE-SIGNS for the CURRENT (fresh per-op) nonce.** A duplicate commit under an already-recorded `request_id` with **matching** `{epoch, structural, marks}` MUST return an ack **re-signed for the attempt's fresh nonce** (NOT a replay of the original ack) — the enclave's `verify_commit_ack_bytes` echoes the *current* op's nonce, so a replayed original ack fails `NonceMismatch` and wedges the retry. The durable record is NOT advanced again.
@@ -409,11 +440,19 @@ contract stays pending.
 
 **`structural_version` (key 5) — FROZEN v1.** A `u64` in the `pq-agent-keystore-v1` encrypted body,
 init **1** (never 0 — same-epoch Fresh equality vs a forged 0-anchor; anchor baseline 1 is normative),
-forward-only/never-reset, bumped by **exactly**: each committed GENERATE_KEYS and each key/config-changing
-CONFIGURE_TREASURY sub-op (that handler is deferred; its sub-op classifier MUST be an exhaustive `match`
-with no wildcard so a new sub-op can't default into the wrong class). MUST NOT bump on counter/spend
-advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT be aliased
-onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
+forward-only/never-reset, bumped by **exactly** the committed `Structural` set (`commit_bump_class`):
+each committed GENERATE_KEYS; each key/config-changing CONFIGURE_TREASURY sub-op; each EXPORT_BACKUP
+(TASK-13b slice 2 — advances the non-marks `audit.last_exported_seq`); and each RESTORE_BACKUP
+(TASK-13b slice 2 — wholesale body replace). The CONFIGURE/EXPORT/RESTORE handlers are deferred; the
+CONFIGURE sub-op classifier MUST be an exhaustive `match` with no wildcard so a new sub-op can't default
+into the wrong class. **RESTORE_BACKUP is the recovery-ceremony EXCEPTION to "monotone `++`":** its
+`structural_version` is SET from the backup (a NON-monotone transition, possibly `< local`), NOT a plain
+`advance_commit_epoch(Structural)` increment — the handler slice MUST define the post-restore anchor value
++ the reconcile rule that admits a restored value `≠ local+1` (a distinct recovery path tied to
+`strict_recovery_counter`, see the RESTORE note above). The one committed op that MUST NOT bump
+`structural_version` is SIGN_FAUCET_DISPENSE (EpochOnly — its full effect is in the marks). MUST NOT bump
+on counter/spend advances, `freshness_epoch`, `authority_epoch`, or a pure-config-version change; MUST NOT
+be aliased onto `monotonic_treasury_config_version`. Overflow: `checked_add` → fail closed (never wrap).
 **ATOMICITY invariant (LIVE — slice 6-4a):** the GENERATE_KEYS bump advances atomically with
 `freshness_epoch` (`advance_commit_epoch`); the frame layer then computes the sealed blob FIRST
 (side-effect-free) and commits exactly that `{epoch, structural, marks}` through the anchor BEFORE the

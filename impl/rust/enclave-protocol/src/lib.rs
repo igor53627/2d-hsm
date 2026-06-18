@@ -152,14 +152,15 @@ compile_error!(
 );
 
 // TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path (the pq-agent-backup-v1 ML-KEM-1024
-// KEM-DEM envelope). EXPORT advances the sealed audit `last_exported_seq` high-water — until that field is
-// anti-rollback-covered (the EpochOnly→Structural reclassification) and the audit-ring write path lands, a
-// live EXPORT is rollback-sensitive. Hard-ban it from release builds until those land and TASK-18 un-gates.
+// KEM-DEM envelope). A live EXPORT will advance the sealed audit `last_exported_seq` high-water; its
+// anti-rollback coverage is now RESOLVED (slice 2 classed EXPORT Structural — a dropped seal ⇒
+// StructuralGap⇒restore, never a silent regress). Still pending before a live EXPORT can ship: the
+// audit-ring WRITE path + the EXPORT/RESTORE handlers (slice 4; today they verify the cap then fail closed).
+// Hard-ban it from release builds until those land and TASK-18 un-gates.
 #[cfg(all(release_build, feature = "agent-backup-export-preview"))]
 compile_error!(
-    "`agent-backup-export-preview` (live EXPORT_BACKUP/RESTORE_BACKUP DR-backup KEM-DEM) must not be \
-     enabled in release builds until the anti-rollback last_exported_seq coverage + the audit-ring write \
-     path land and TASK-18 un-gates"
+    "`agent-backup-export-preview` (EXPORT_BACKUP/RESTORE_BACKUP DR-backup KEM-DEM) must not be enabled in \
+     release builds until the audit-ring write path + the EXPORT/RESTORE handlers land and TASK-18 un-gates"
 );
 
 mod boot_input;
