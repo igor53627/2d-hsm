@@ -159,15 +159,23 @@ impl AgentOpcode {
             // earlier note here (that `reset_lifetime_breaker` is "marks-only ⇒ EpochOnly") was WRONG
             // (TASK-15 15-4 review): reset LOWERS a marks surface, which `marks_dominate_local` rejects, so
             // EpochOnly would wedge the recovery op on a crash-before-swap. See that classifier's docs.
-            // EXPORT_BACKUP (TASK-13b slice 2): advances the AUDIT-ring backpressure high-water
-            // `audit.last_exported_seq`, which is NEITHER a marks surface NOR `structural_version`. Under
-            // EpochOnly a dropped EXPORT seal would adopt-forward and the seeder (which never touches
-            // `audit`) silently rolls `last_exported_seq` BACK, re-enabling overwrite of already-exported
-            // reviewable history (an AC#14 audit-completeness weakening — NOT a fund loss, but a
-            // reviewability hole). Classifying EXPORT **Structural** is the fail-closed-safe resolution of
-            // the design caveat: a dropped EXPORT seal ⇒ StructuralGap⇒restore re-presents the WHOLE body
-            // (including `audit.last_exported_seq`), so the high-water can never silently regress. This is
-            // the same "when in doubt ⇒ Structural" rule as CONFIGURE's `reset_lifetime_breaker`.
+            // EXPORT_BACKUP (TASK-13b slice 2): once its handler lands (slice 4) it advances the AUDIT-ring
+            // backpressure high-water `audit.last_exported_seq`, which is NEITHER a marks surface NOR
+            // `structural_version`. Under EpochOnly a dropped/crashed EXPORT seal would adopt-forward and the
+            // seeder (which never touches `audit`) silently roll `last_exported_seq` BACK, re-enabling
+            // overwrite of already-exported reviewable history (an AC#14 audit-completeness hole — not a fund
+            // loss). DETERMINED Structural (NOT a "when in doubt" default, and a DIFFERENT mechanism than
+            // CONFIGURE `reset_lifetime_breaker`, which is Structural because it DECREASES a marks surface
+            // that `marks_dominate_local` hard-rejects): `last_exported_seq` is durable non-marks/
+            // non-structural state the adopt-forward seeder silently drops, so Structural is the resolution —
+            // a dropped EXPORT seal ⇒ StructuralGap⇒restore re-presents the WHOLE body (incl.
+            // `audit.last_exported_seq`), so the high-water can't silently regress. Why Structural and not
+            // the "make `last_exported_seq` marks-covered" route (which would allow EpochOnly): the audit-ring
+            // WRITE path is deferred for ALL privileged ops (agent_dispatch.rs ~913) — no marks surface for it
+            // exists yet — so Structural is the conservative interim; revisit only if it ever becomes
+            // marks-covered. ACCEPTED RESIDUAL: Structural means a dropped/crashed EXPORT seal forces a
+            // next-boot StructuralGap⇒restore (an availability cost for a routinely-run op), traded for
+            // audit completeness.
             Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup => CommitBumpClass::Structural,
             // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
             // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); RESTORE_BACKUP

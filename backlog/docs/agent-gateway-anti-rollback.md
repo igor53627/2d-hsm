@@ -169,6 +169,20 @@ alongside the `structural_version` bump. (`config_version` is an audit/version s
 control — rollback of an old sealed blob is caught by the epoch/`structural_version` anti-rollback, not by
 `config_version`.)
 
+**`EXPORT_BACKUP` commit class = `Structural` (TASK-13b slice 2).** A live EXPORT (handler deferred to
+TASK-13b slice 4) advances the audit-ring backpressure high-water `audit.last_exported_seq`, which is
+NEITHER a marks surface (absent from `encode_marks_payload`) NOR `structural_version`. Under `EpochOnly` a
+dropped/crashed EXPORT seal would `AdoptForward` and the seeder (`seed_marks_forward`, which never touches
+`audit`) would silently roll `last_exported_seq` BACK, re-enabling overwrite of already-exported reviewable
+history (an AC#14 audit-completeness hole — not a fund loss). EXPORT is therefore `Structural`: a dropped
+seal ⇒ `StructuralGap`→restore re-presents the whole body (incl. `audit.last_exported_seq`), so the
+high-water can never silently regress. This is a DETERMINED class (durable non-marks/non-structural state),
+distinct from CONFIGURE `reset_lifetime_breaker`'s marks-DECREASE belt-block mechanism. The
+"make `last_exported_seq` marks-covered to allow EpochOnly" alternative is moot until the audit-ring WRITE
+path lands (no marks surface exists yet); accepted residual: a dropped EXPORT seal forces a next-boot
+`StructuralGap`→restore (availability cost), traded for audit completeness. RESTORE_BACKUP stays `EpochOnly`
+(its `strict_recovery_counter` IS a marks surface — field 5 above).
+
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
 1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.
 2. **An idempotent retry RE-SIGNS for the CURRENT (fresh per-op) nonce.** A duplicate commit under an already-recorded `request_id` with **matching** `{epoch, structural, marks}` MUST return an ack **re-signed for the attempt's fresh nonce** (NOT a replay of the original ack) — the enclave's `verify_commit_ack_bytes` echoes the *current* op's nonce, so a replayed original ack fails `NonceMismatch` and wedges the retry. The durable record is NOT advanced again.
