@@ -154,13 +154,15 @@ fn encapsulate_to_recovery_key(
     let encoded: ml_kem::Key<EncapsulationKey<MlKem1024>> =
         recovery_encaps_key.try_into().map_err(|_| BackupError::InvalidEncapsKeyLen)?;
     let ek = EncapsulationKey::<MlKem1024>::new(&encoded).map_err(|_| BackupError::InvalidEncapsKey)?;
-    let m_arr = ml_kem::B32::from(*m);
+    let mut m_arr = ml_kem::B32::from(*m);
     let (kem_ct, mut ss) = ek.encapsulate_deterministic(&m_arr);
     let mut ss_buf = Zeroizing::new([0u8; 32]);
     ss_buf.copy_from_slice(ss.as_slice());
-    // The crate's `SharedKey` (an `Array<u8, U32>`) is not auto-scrubbed on drop; zeroize the temporary
-    // so the confidentiality-root secret does not linger on the stack after we've copied it.
+    // Scrub BOTH the crate's `SharedKey` AND the `B32` copy of the encaps message `m` (neither an
+    // `Array<u8, U32>` auto-scrubs on drop): `m` together with the public recovery key deterministically
+    // re-derives `ss`, so a residual `m_arr` is as sensitive as `ss` itself (codex/gemini PR #92).
     ss.zeroize();
+    m_arr.zeroize();
     Ok((kem_ct.as_slice().to_vec(), ss_buf))
 }
 
@@ -296,7 +298,9 @@ impl<'a> Reader<'a> {
     }
     fn take_u64(&mut self) -> Result<u64, BackupError> {
         let b = self.take(8)?;
-        Ok(u64::from_be_bytes(b.try_into().expect("take(8) yields 8 bytes")))
+        // Direct indexing (like take_u16/take_u32) — no `.expect()` panic surface on untrusted bytes, even
+        // though take(8) already guarantees the length (defense for a TEE parser that must never panic).
+        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
     fn take_lp16(&mut self) -> Result<&'a [u8], BackupError> {
         let n = self.take_u16()? as usize;
@@ -475,11 +479,15 @@ mod tests {
         }
     }
 
-    /// (e') AAD canonicalization (CWE-347): re-partitioning the same authenticated bytes by mutating ONLY
-    /// the (length-prefix) framing must fail — because the length prefixes are inside the AAD. Grow
-    /// lp16(recovery_key_id) by 1 (stealing the first chain_id byte into recovery_key_id) and shrink the
-    /// downstream so the blob still strict-parses to a DIFFERENT chain_id; the recomputed header/AAD differs
-    /// ⇒ the open fails. (Without lengths in the AAD this attack would silently succeed.)
+    /// (e') CWE-347 re-partition: mutating ONLY the length-prefix framing to re-partition the same bytes
+    /// into a DIFFERENT chain_id/env must never open successfully. The original bug had TWO holes (the AAD
+    /// omitted the length prefixes AND the parser was non-strict); BOTH are now closed, so this attack is
+    /// rejected by whichever layer fires first. Here the PRIMARY defense is the strict canonical parse:
+    /// growing lp16(recovery_key_id) shifts the fixed-width chain_id + the 1568-byte kem_ct offset, so the
+    /// downstream framing no longer lines up (a bad lp32 length / a non-`len()` cursor) and `strict_parse`
+    /// rejects before any decrypt. The SECOND layer — the length prefixes being inside the AAD — is what
+    /// makes any re-partition that *did* survive framing also fail the AEAD tag; that layer is exercised
+    /// structurally (AAD = the full header slice) and by `every_header_field_is_aad_bound`.
     #[test]
     fn length_prefix_repartition_breaks_open() {
         let (blob, dk) = seal_fixed();
@@ -487,11 +495,9 @@ mod tests {
         // lp16(recovery_key_id) prefix is at bytes [10,11] (after magic(8)+ver(2)); bump its low byte +1.
         let new_len = (RID.len() as u16) + 1;
         t[10..12].copy_from_slice(&new_len.to_be_bytes());
-        // Strict-parse now reads a longer recovery_key_id + a shifted chain_id; since the TOTAL bytes are
-        // unchanged it stays parseable only if downstream framing still lines up — but even where it parses,
-        // the header (AAD) bytes are identical on disk yet the *intended* chain_id differs. The key property
-        // we assert: the open never SUCCEEDS with a re-partitioned interpretation.
         assert!(open_is_err(&dk, &t), "re-partitioning via the length prefix must not open successfully");
+        // And it is specifically the strict parse that catches THIS re-partition (the framing misaligns):
+        assert!(strict_parse(&t).is_err(), "re-partition misaligns the fixed-width framing ⇒ strict_parse rejects");
     }
 
     /// (f) Wrong-length encaps key fails closed (no panic, no partial work).
