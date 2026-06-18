@@ -1305,12 +1305,53 @@ mod tests {
     }
 
     #[test]
-    fn record_audit_next_seq_checked_overflow() {
+    fn record_audit_next_seq_checked_overflow_on_a_full_drained_ring() {
+        // Reach the overflow check on a FULL but DRAINED ring (so the backpressure gate legitimately PASSES
+        // first, not bypassed by an empty ring) — the realistic overflow path.
         let mut b = body_with_small_audit();
+        b.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        b.record_audit(7, &AUD_AUTH, 2, 0).unwrap();
+        b.advance_export_high_water().unwrap(); // full (len==cap) but drained ⇒ backpressure passes
         b.audit.next_seq = u64::MAX;
-        // last_exported_seq high so backpressure doesn't pre-empt the overflow check.
-        b.audit.last_exported_seq = u64::MAX;
-        assert_eq!(b.record_audit(7, &AUD_AUTH, 1, 0), Err(KeystoreError::MonotonicOverflow));
+        b.audit.last_exported_seq = u64::MAX; // keep drained so backpressure doesn't pre-empt at MAX
+        let before = b.audit.records.clone();
+        assert_eq!(b.record_audit(6, &AUD_AUTH, 3, 0), Err(KeystoreError::MonotonicOverflow));
+        assert_eq!(b.audit.records, before, "overflow rejection did not mutate the ring (no partial mutation)");
+        assert_eq!(b.audit.next_seq, u64::MAX, "next_seq unchanged on overflow");
+    }
+
+    /// Partial drain (`last_exported_seq` advanced by only SOME live records) is UNREACHABLE via the
+    /// full-drain-only `advance_export_high_water` today, but FORGED here to pin the eviction/backpressure
+    /// boundary for a future partial-export slice: FIFO eviction removes the OLDEST (lowest seq = first
+    /// exported), so an append at a partial-drain state evicts an EXPORTED record when backpressure allows
+    /// it, and fails closed when the next eviction would hit an un-exported record.
+    #[test]
+    fn record_audit_partial_drain_evicts_exported_then_fails_closed() {
+        let mut b = body_with_small_audit(); // cap 2
+        b.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
+        b.record_audit(7, &AUD_AUTH, 2, 0).unwrap(); // records [1,2], next_seq=3
+        b.audit.last_exported_seq = 1; // FORGE: only seq 1 exported (1 of 2 live un-exported)
+        // live_unexported = (3-1)-1 = 1 < cap 2 ⇒ append OK; FIFO evicts the EXPORTED seq 1.
+        b.record_audit(6, &AUD_AUTH, 3, 0).unwrap();
+        assert_eq!(b.audit.records[0].seq, 2, "evicted the exported oldest (seq 1), kept un-exported seq 2");
+        assert_eq!(b.audit.records[1].seq, 3);
+        // No further drain ⇒ both live (seq 2,3) un-exported relative to last_exported_seq=1:
+        // live_unexported = (4-1)-1 = 2 >= cap 2 ⇒ fail closed (the next eviction would drop un-exported seq 2).
+        assert_eq!(b.record_audit(6, &AUD_AUTH, 4, 0), Err(KeystoreError::AuditBackpressure));
+    }
+
+    /// A forged/oversized ring (`records.len() > capacity`) is NOT silently normalized by `record_audit`:
+    /// the full-branch (remove(0)+push) keeps net len unchanged (still > cap), so `seal_body`'s `validate()`
+    /// fails closed (`CapacityExceeded`) rather than masking the tampering.
+    #[test]
+    fn record_audit_does_not_normalize_an_oversized_ring() {
+        let mut b = body_with_small_audit(); // cap 2
+        b.audit.records = vec![AuditRecord { seq: 1, op: 7, authority: AUD_AUTH, counter: 1, config_version: 0 }; 3]; // FORGED len 3 > cap 2
+        b.audit.next_seq = 4;
+        b.audit.last_exported_seq = 3; // drained so backpressure doesn't pre-empt
+        b.record_audit(6, &AUD_AUTH, 4, 0).unwrap(); // full-branch remove(0)+push, net len unchanged
+        assert_eq!(b.audit.records.len(), 3, "record_audit does NOT shrink an oversized ring toward capacity");
+        assert_eq!(seal_body(&b, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded), "seal fails closed, not masked");
     }
 
     #[test]
