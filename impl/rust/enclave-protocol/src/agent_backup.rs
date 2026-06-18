@@ -593,11 +593,9 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
+        // Delegate to the `hex` crate (a dev-dep, in the test graph) rather than a hand-rolled per-byte
+        // format! loop (gemini PR #94). `hex::` resolves to the crate (type namespace), not this fn.
+        hex::encode(bytes)
     }
 
     #[test]
