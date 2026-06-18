@@ -313,6 +313,19 @@ pub enum AgentResponse {
         candidate: Box<KeystoreBody>,
         request_id: Vec<u8>,
     },
+    /// EXPORT_BACKUP result (TASK-13b slice 4c-2b): the mutated `candidate` keystore (the appended EXPORT
+    /// audit record + the FULL ring drain `last_exported_seq → next_seq-1` + the atomic Structural bump)
+    /// PLUS the minted `pq-agent-backup-v1` DR blob (the KEM-DEM envelope wrapping the `restore-ingress-v1`
+    /// payload, encapsulated to the operator's OFFLINE recovery key). Like the other mutating ops the frame
+    /// layer SEALS the candidate, COMMITS the post-op state to the anchor (seal-before-emit), SWAPS it into
+    /// the live slot, and EMITS the backup blob + the new sealed keystore blob. The backup blob is built in
+    /// the handler from the post-append candidate (so it captures the export's own audit record); the drain
+    /// high-water is enclave-local and deliberately NOT in the blob. `request_id` keys the anchor commit.
+    ExportBackup {
+        candidate: Box<KeystoreBody>,
+        backup_blob: Vec<u8>,
+        request_id: Vec<u8>,
+    },
 }
 
 /// The decoded Agent Gateway envelope (§10.2). The capability (key 5) is captured as the raw CBOR
@@ -483,8 +496,14 @@ pub(crate) fn dispatch_agent(
             // it falls through to the privileged default arm below (verify cap, then fail closed).
             #[cfg(feature = "agent-configure-treasury-preview")]
             AgentOpcode::ConfigureTreasury => handle_configure_treasury(&env, keystore, &verified),
-            // CONFIGURE_TREASURY (without its preview) / EXPORT_BACKUP / RESTORE_BACKUP (and GENERATE_KEYS
-            // without its preview) verify here but their execution lands in later slices ⇒ fail closed.
+            // EXPORT_BACKUP executes ONLY under the off-by-default `agent-backup-export-preview` feature
+            // (release-banned, pulls ml-kem): live DR-backup minting + the audit-ring drain wait for TASK-18.
+            // Without the feature it falls through to the privileged default arm below (verify, fail closed).
+            #[cfg(feature = "agent-backup-export-preview")]
+            AgentOpcode::ExportBackup => handle_export_backup(&env, keystore, &verified),
+            // CONFIGURE_TREASURY (without its preview) / EXPORT_BACKUP (without its preview) / RESTORE_BACKUP
+            // (and GENERATE_KEYS without its preview) verify here but their execution lands in later slices /
+            // is deferred ⇒ fail closed.
             _ => {
                 let _ = &verified;
                 Err(AgentError::NotConfigured)
@@ -1250,6 +1269,190 @@ fn handle_configure_treasury(
     })
 }
 
+/// EXPORT_BACKUP(7) selector (envelope key 7): `{}` (ALL keys), `{1: [key_ref…]}` (explicit refs), or
+/// `{2: batch_id}` (all keys minted under one capability batch). Exactly one form.
+#[cfg(feature = "agent-backup-export-preview")]
+enum ExportSelector {
+    All,
+    KeyRefs(Vec<[u8; 32]>),
+    BatchId(u64),
+}
+
+/// Canonical CBOR of the EXPORT selector — the exact bytes hashed into `payload_binding` (mirrors
+/// [`generate_keys_canonical_params`]); the map mirrors the request payload 1:1 so a conformant cap issuer
+/// and this verifier produce byte-identical preimages.
+#[cfg(feature = "agent-backup-export-preview")]
+fn export_canonical_params(selector: &ExportSelector) -> Vec<u8> {
+    use crate::agent_capability::{put_bytes, put_uint};
+    let mut out = Vec::new();
+    match selector {
+        ExportSelector::All => put_uint(&mut out, 5, 0), // empty map {}
+        ExportSelector::KeyRefs(refs) => {
+            put_uint(&mut out, 5, 1); // 1-key map {1: [..]}
+            put_uint(&mut out, 0, 1);
+            put_uint(&mut out, 4, refs.len() as u64); // array header
+            for r in refs {
+                put_bytes(&mut out, r);
+            }
+        }
+        ExportSelector::BatchId(id) => {
+            put_uint(&mut out, 5, 1); // 1-key map {2: id}
+            put_uint(&mut out, 0, 2);
+            put_uint(&mut out, 0, *id);
+        }
+    }
+    out
+}
+
+/// Decode + strictly validate the EXPORT selector from the key-7 payload map. Both keys present, an empty
+/// `key_refs` array, a non-32-byte ref, an over-cap array, or any stray key ⇒ Malformed.
+#[cfg(feature = "agent-backup-export-preview")]
+fn decode_export_selector(payload: &[(Value, Value)]) -> Result<ExportSelector, AgentError> {
+    match (map_get(payload, 1), map_get(payload, 2)) {
+        (None, None) if payload.is_empty() => Ok(ExportSelector::All),
+        (Some(v), None) if payload.len() == 1 => {
+            let items = match v {
+                Value::Array(a) => a,
+                _ => return Err(AgentError::Malformed),
+            };
+            if items.is_empty() || items.len() > crate::agent_keystore::MAX_TOTAL_KEY_ENTRIES {
+                return Err(AgentError::Malformed);
+            }
+            let mut refs = Vec::with_capacity(items.len());
+            for it in items {
+                refs.push(crate::agent_cbor::as_bytes32(it).ok_or(AgentError::Malformed)?);
+            }
+            Ok(ExportSelector::KeyRefs(refs))
+        }
+        (None, Some(v)) if payload.len() == 1 => {
+            Ok(ExportSelector::BatchId(as_u64(v).ok_or(AgentError::Malformed)?))
+        }
+        _ => Err(AgentError::Malformed), // both keys, or a stray key alongside one
+    }
+}
+
+/// EXPORT_BACKUP(7) (TASK-13b slice 4c-2b): after a verified admin capability, mint a `pq-agent-backup-v1`
+/// DR backup of the requested keys to the operator's OFFLINE recovery key, and DRAIN the audit ring (this
+/// op IS the authenticated pull-export). On a CANDIDATE clone: append the EXPORT audit event → FULL drain
+/// (append-then-drain, so the drain covers the export's own record — but EXPORT is subject to the SAME
+/// backpressure on its append, so it is NOT a guaranteed escape hatch; see the drain-call note below) →
+/// Structural bump → build the `restore-ingress-v1` payload from the post-append candidate → seal the
+/// KEM-DEM backup blob. Returns the candidate (for the frame layer to seal→commit→swap) + the backup blob
+/// (emitted alongside the new sealed keystore). EXPORT does NOT bump `config_version` (so the audit
+/// `config_version` reads live==candidate). Any failure ⇒ `SealFailed` (0x46) before the seam — no commit.
+///
+/// Compiled + CALLED only under `agent-backup-export-preview` (release-banned); without it EXPORT routes to
+/// NotConfigured (the deferred-stub path). `crate::agent_backup` itself only exists under this feature.
+#[cfg(feature = "agent-backup-export-preview")]
+fn handle_export_backup(
+    env: &AgentEnvelope,
+    keystore: &KeystoreBody,
+    verified: &VerifiedCapability,
+) -> Result<AgentResponse, AgentError> {
+    let payload = env.payload.as_deref().ok_or(AgentError::Malformed)?;
+    let selector = decode_export_selector(payload)?;
+
+    // payload_binding (§10.5, last gate before mutation): recompute over the canonical selector + compare to
+    // the cap's signed value, so the host cannot have altered the selector under a valid cap. → 0x43.
+    let computed = crate::agent_capability::payload_binding(
+        env.opcode,
+        None,
+        &env.request_id,
+        &export_canonical_params(&selector),
+    );
+    if computed != verified.payload_binding {
+        return Err(AgentError::CapabilityRejected);
+    }
+
+    // Resolve the selector → requested key refs (body order). An explicit ref not in the body, or a
+    // selector matching ZERO keys, collapses to the key-not-found band (0x42, anti-oracle §10.9).
+    let requested: Vec<[u8; 32]> = match &selector {
+        ExportSelector::All => keystore.entries.iter().map(|e| e.key_ref).collect(),
+        ExportSelector::KeyRefs(refs) => {
+            for r in refs {
+                if !keystore.entries.iter().any(|e| &e.key_ref == r) {
+                    return Err(AgentError::KeyPurposeMismatch);
+                }
+            }
+            refs.clone()
+        }
+        ExportSelector::BatchId(id) => keystore
+            .entries
+            .iter()
+            .filter(|e| e.creation_metadata.batch_id == *id)
+            .map(|e| e.key_ref)
+            .collect(),
+    };
+    if requested.is_empty() {
+        return Err(AgentError::KeyPurposeMismatch); // nothing matched the selector
+    }
+
+    // CANDIDATE: clone live → consume the cap counter (anti-replay) → append EXPORT audit event → FULL
+    // drain → Structural bump. ALL mutation here, BEFORE the seam (commit_before_emit forbids mutation
+    // between seal and commit).
+    let mut candidate = keystore.clone();
+    // Advance the capability counter (anti-replay), mirroring GENERATE_KEYS/CONFIGURE — a host cannot
+    // replay an EXPORT cap to re-drain/re-export. Counter-table full → CapExceeded (0x44); any other
+    // invariant break → SealFailed (0x46), no swap.
+    candidate
+        .advance_counter(
+            &verified.authority,
+            verified.scope_class,
+            &verified.scope_target,
+            verified.counter,
+        )
+        .map_err(|e| match e {
+            crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
+            _ => AgentError::SealFailed,
+        })?;
+    candidate
+        .record_audit(&crate::agent_keystore::AuditAppend {
+            op: env.opcode,
+            authority: &verified.authority,
+            counter: verified.counter,
+            config_version: candidate.config.monotonic_treasury_config_version,
+            scope_class: verified.scope_class,
+            scope_target: &verified.scope_target,
+            request_id: &env.request_id,
+        })
+        .map_err(|_| AgentError::SealFailed)?;
+    // FULL drain AFTER the append, so `last_exported_seq → next_seq-1` covers the just-appended export
+    // record ("this export IS the pull", no delta-export weakening). NOTE: because EXPORT appends FIRST, it
+    // is subject to the SAME backpressure — a ring already saturated with un-exported records fails the
+    // append above (0x46) and this drain never runs. EXPORT is NOT a guaranteed escape hatch; that is the
+    // fail-closed-safe choice (drain-before-append would evict un-exported history). See the
+    // keystore-backup-format §5 note + the `export_saturated_undrained_ring_fails_closed` test.
+    candidate.advance_export_high_water().map_err(|_| AgentError::SealFailed)?;
+    let bumps_structural =
+        matches!(AgentOpcode::ExportBackup.commit_bump_class(), CommitBumpClass::Structural);
+    candidate.advance_commit_epoch(bumps_structural).map_err(|_| AgentError::SealFailed)?;
+
+    // Build the DR blob from the POST-append candidate (so it captures the export's own audit record). The
+    // manifest is built from the SAME ordered refs as the payload entries (structural consistency).
+    let ordered = crate::agent_backup::selected_key_refs(&candidate, &requested);
+    let payload_bytes = crate::agent_backup::build_restore_ingress_payload(&candidate, &ordered)
+        .map_err(|_| AgentError::SealFailed)?;
+    let manifest =
+        crate::agent_backup::build_key_refs_manifest(&ordered).map_err(|_| AgentError::SealFailed)?;
+    let recovery_key = &candidate.config.backup_recovery_wrapping_pubkey;
+    let recovery_key_id = crate::agent_backup::derive_recovery_key_id(recovery_key);
+    let backup_blob = crate::agent_backup::seal_backup_blob(
+        recovery_key,
+        &recovery_key_id,
+        candidate.config.twod_chain_id,
+        &candidate.config.environment_identifier,
+        &manifest,
+        &payload_bytes,
+    )
+    .map_err(|_| AgentError::SealFailed)?;
+
+    Ok(AgentResponse::ExportBackup {
+        candidate: Box::new(candidate),
+        backup_blob,
+        request_id: env.request_id.clone(),
+    })
+}
+
 /// Map a keygen failure to the anti-oracle §10.9 band.
 fn map_keygen_error(e: GenerateKeysError) -> AgentError {
     match e {
@@ -1634,6 +1837,16 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 encode_configure_treasury_response(sealed)
             })
         }
+        Ok(AgentResponse::ExportBackup { candidate, backup_blob, request_id }) => {
+            // EXPORT_BACKUP (rollback-sensitive; Structural — advances last_exported_seq) goes through the
+            // SAME shared seal-before-emit seam. The backup blob was minted in the handler from the
+            // post-append candidate; the encoder (invoked by the seam ONLY after the anchor commit succeeds)
+            // emits the backup blob + the new sealed keystore, so the host receives the DR artifact iff the
+            // drain/advance is durably committed.
+            commit_before_emit(candidate, &request_id, measurement, &mut guard, move |sealed| {
+                encode_export_backup_response(&backup_blob, sealed)
+            })
+        }
         Ok(resp) => encode_agent_response(&resp),
         Err(e) => encode_agent_error(e),
     }
@@ -1701,6 +1914,10 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
         // sealed blob). Reaching the generic encoder is a mis-routed mutation ⇒ fail closed — never report
         // a config success the host can't persist (and whose anchor commit never ran).
         AgentResponse::ConfigureTreasury { .. } => encode_agent_error(AgentError::SealFailed),
+        // EXPORT_BACKUP is likewise frame-layer-only (`encode_export_backup_response` needs the sealed blob).
+        // Reaching the generic encoder is a mis-routed mutation ⇒ fail closed — never emit a DR backup whose
+        // drain/advance was not sealed/committed.
+        AgentResponse::ExportBackup { .. } => encode_agent_error(AgentError::SealFailed),
     }
 }
 
@@ -1756,6 +1973,18 @@ fn encode_sign_faucet_dispense_response(signed: SignedTransfer, sealed_blob: &[u
 /// Called by the frame layer ONLY after the anchor commit succeeds.
 fn encode_configure_treasury_response(sealed_blob: &[u8]) -> Vec<u8> {
     encode_body(vec![(Value::Integer(1.into()), Value::Bytes(sealed_blob.to_vec()))])
+}
+
+/// Encode the EXPORT_BACKUP response: `{1: backup_blob, 2: sealed_keystore_blob}`. Key 1 = the
+/// `pq-agent-backup-v1` DR blob the operator stores OFFLINE; key 2 = the new sealed keystore the host MUST
+/// persist (the drained-ring + advanced state). Key 1 is BYTES so a success body is distinguishable from a
+/// `{1: code(int)}` error body (cf. `decode_agent_error_code`). Called by the frame layer ONLY after the
+/// anchor commit succeeds, so the DR blob is emitted iff the drain/advance is durably recorded.
+fn encode_export_backup_response(backup_blob: &[u8], sealed_blob: &[u8]) -> Vec<u8> {
+    encode_body(vec![
+        (Value::Integer(1.into()), Value::Bytes(backup_blob.to_vec())),
+        (Value::Integer(2.into()), Value::Bytes(sealed_blob.to_vec())),
+    ])
 }
 
 /// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
@@ -1892,7 +2121,8 @@ mod tests {
     #[cfg(any(
         feature = "agent-keygen-exec-preview",
         feature = "agent-sign-faucet-preview",
-        feature = "agent-configure-treasury-preview"
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-backup-export-preview"
     ))]
     enum CommitChannelAct {
         Ok,
@@ -1902,7 +2132,8 @@ mod tests {
     #[cfg(any(
         feature = "agent-keygen-exec-preview",
         feature = "agent-sign-faucet-preview",
-        feature = "agent-configure-treasury-preview"
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-backup-export-preview"
     ))]
     struct TestCommitChannel {
         act: CommitChannelAct,
@@ -1914,7 +2145,8 @@ mod tests {
     #[cfg(any(
         feature = "agent-keygen-exec-preview",
         feature = "agent-sign-faucet-preview",
-        feature = "agent-configure-treasury-preview"
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-backup-export-preview"
     ))]
     impl TestCommitChannel {
         fn new(act: CommitChannelAct) -> Self {
@@ -1931,7 +2163,8 @@ mod tests {
     #[cfg(any(
         feature = "agent-keygen-exec-preview",
         feature = "agent-sign-faucet-preview",
-        feature = "agent-configure-treasury-preview"
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-backup-export-preview"
     ))]
     impl crate::agent_boot_relay::BootRelayChannel for TestCommitChannel {
         fn round_trip(
@@ -2074,6 +2307,11 @@ mod tests {
         );
     }
 
+    // EXPORT_BACKUP is the deferred-stub case ONLY without `agent-backup-export-preview`; with the feature
+    // it is LIVE (handle_export_backup) and this fixture's no-key-7 request would be Malformed, not
+    // NotConfigured. The live path is covered by the `export_backup` test module; RESTORE_BACKUP has its own
+    // always-deferred test below.
+    #[cfg(not(feature = "agent-backup-export-preview"))]
     #[test]
     fn deferred_privileged_op_valid_cap_reaches_not_configured() {
         use ed25519_dalek::SigningKey;
@@ -4659,6 +4897,234 @@ mod tests {
             );
             reset_agent_keystore_for_tests();
             reset_commit_channel_for_tests();
+        }
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    mod export_backup {
+        use super::*;
+        use ed25519_dalek::SigningKey;
+
+        const ESCOPE: &[u8] = b"export_backup";
+
+        fn admin_key() -> SigningKey {
+            SigningKey::from_bytes(&[7u8; 32])
+        }
+
+        /// A valid ML-KEM-1024 recovery ENCAPS (public) key from a fixed seed — TEST ONLY.
+        fn valid_recovery_encaps_key() -> Vec<u8> {
+            use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+            let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from([0x42u8; 64]));
+            dk.encapsulation_key().to_bytes().as_slice().to_vec()
+        }
+
+        /// A body with `n` transfer keys (batch_id 7) + `anchor_root` set + 2 pre-seeded UN-exported audit
+        /// records (so the EXPORT drain has history to advance). `valid_recovery=false` keeps base_body's
+        /// non-ML-KEM recovery key so the seal fails closed.
+        fn export_body(admin: &SigningKey, n: usize, valid_recovery: bool) -> KeystoreBody {
+            let mut body = base_body();
+            body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+            body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+            body.config.backup_recovery_wrapping_pubkey = if valid_recovery {
+                valid_recovery_encaps_key()
+            } else {
+                vec![0xb0; 100] // wrong length ⇒ seal_backup_blob InvalidEncapsKeyLen ⇒ SealFailed
+            };
+            let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 7 };
+            generate_keys(&mut body, KeyPurpose::AgentTransferK1, n, creation).unwrap();
+            for i in 0..2u64 {
+                body.record_audit(&crate::agent_keystore::AuditAppend {
+                    op: 1,
+                    authority: &[0xa1; 32],
+                    counter: i,
+                    config_version: 1,
+                    scope_class: 0,
+                    scope_target: b"seed",
+                    request_id: b"seed",
+                })
+                .unwrap();
+            }
+            body
+        }
+
+        fn export_env(admin: &SigningKey, request_id: &[u8], counter: u64, selector: &ExportSelector) -> Vec<u8> {
+            let pb = crate::agent_capability::payload_binding(
+                7,
+                None,
+                request_id,
+                &export_canonical_params(selector),
+            );
+            let cap = crate::agent_capability::test_signed_capability(
+                admin, 7, request_id, counter, false, 11565, "testnet", 0, ESCOPE, 1, pb,
+            );
+            let payload = match selector {
+                ExportSelector::All => vec![],
+                ExportSelector::KeyRefs(refs) => vec![(
+                    Value::Integer(1.into()),
+                    Value::Array(refs.iter().map(|r| Value::Bytes(r.to_vec())).collect()),
+                )],
+                ExportSelector::BatchId(id) => {
+                    vec![(Value::Integer(2.into()), Value::Integer((*id).into()))]
+                }
+            };
+            envelope_rid(
+                7,
+                request_id,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(payload)),
+                ],
+            )
+        }
+
+        /// Dispatch-level: EXPORT (all) appends the op=7 audit event, FULL-drains the ring, Structural-bumps,
+        /// and mints a pq-agent-backup-v1 blob.
+        #[test]
+        fn export_all_appends_audit_drains_and_mints_blob() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let body = export_body(&admin, 2, true);
+            let pre_next = body.audit.next_seq;
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
+            match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+                AgentResponse::ExportBackup { candidate, backup_blob, request_id } => {
+                    assert_eq!(request_id, vec![0x11; 16]);
+                    assert_eq!(&backup_blob[..8], b"2DAGTBK\0", "backup envelope magic");
+                    assert_eq!(candidate.audit.next_seq, pre_next + 1, "one EXPORT audit record appended");
+                    let last = candidate.audit.records.last().unwrap();
+                    assert_eq!(last.op, 7, "the appended record is the EXPORT event");
+                    assert_eq!(last.authority, admin.verifying_key().to_bytes());
+                    assert_eq!(
+                        candidate.audit.last_exported_seq,
+                        candidate.audit.next_seq - 1,
+                        "FULL drain covers the export's own record"
+                    );
+                    assert_eq!(candidate.structural_version, body.structural_version + 1, "Structural bump");
+                    // cap counter consumed (anti-replay).
+                    let c = candidate.counters.iter().find(|c| c.scope_target == ESCOPE).unwrap();
+                    assert_eq!(c.highest_accepted_counter, 1);
+                }
+                _ => panic!("expected ExportBackup"),
+            }
+        }
+
+        /// Frame-level: the seam seals→commits→swaps and emits {1: backup_blob, 2: sealed_keystore}.
+        #[test]
+        fn export_frame_seals_commits_swaps_and_emits() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let body = export_body(&admin, 2, true);
+            assert!(install_agent_keystore(body, b"meas"));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
+            let out = handle_agent_gateway_frame(&env);
+            assert_eq!(decode_agent_error_code(&out), None, "EXPORT success body");
+            let m = match ciborium::de::from_reader::<Value, _>(&out[..]).unwrap() {
+                Value::Map(m) => m,
+                _ => panic!("response is a map"),
+            };
+            assert_eq!(&as_bytes(map_get(&m, 1).unwrap()).unwrap()[..8], b"2DAGTBK\0", "key 1 = backup blob");
+            assert!(!as_bytes(map_get(&m, 2).unwrap()).unwrap().is_empty(), "key 2 = sealed keystore blob");
+            reset_agent_keystore_for_tests();
+            reset_commit_channel_for_tests();
+        }
+
+        /// §10.5 payload_binding gate: a cap bound to one selector but a request carrying another ⇒ 0x43.
+        #[test]
+        fn export_payload_binding_mismatch_rejected() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let body = export_body(&admin, 2, true);
+            let pb = crate::agent_capability::payload_binding(
+                7,
+                None,
+                &[0x11; 16],
+                &export_canonical_params(&ExportSelector::All),
+            );
+            let cap = crate::agent_capability::test_signed_capability(
+                &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, ESCOPE, 1, pb,
+            );
+            // Cap signed for ALL, but the request carries a batch_id selector.
+            let env = envelope(
+                7,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(vec![(Value::Integer(2.into()), Value::Integer(7.into()))])),
+                ],
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                Some(AgentError::CapabilityRejected)
+            );
+        }
+
+        /// An explicit key_ref not in the body collapses to the key-not-found band (0x42, anti-oracle).
+        #[test]
+        fn export_unknown_key_ref_is_key_not_found() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let body = export_body(&admin, 2, true);
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::KeyRefs(vec![[0xfe; 32]]));
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                Some(AgentError::KeyPurposeMismatch)
+            );
+        }
+
+        /// An invalid (non-ML-KEM) recovery key fails the seal closed (0x46) — no commit.
+        #[test]
+        fn export_invalid_recovery_key_fails_closed() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let body = export_body(&admin, 2, false); // export_body substitutes a wrong-LENGTH recovery key
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                Some(AgentError::SealFailed)
+            );
+        }
+
+        /// A ring SATURATED with un-exported records fails the EXPORT append closed (0x46): EXPORT appends
+        /// its own op=7 record BEFORE draining, so it is subject to the SAME backpressure as the other
+        /// privileged writes — it is NOT a guaranteed escape hatch, and a saturated ring cannot be rescued
+        /// (a drain-before-append would evict un-exported history). Pins the true brick semantics +
+        /// discharges TASK-20 obligation (iii) for EXPORT.
+        #[test]
+        fn export_saturated_undrained_ring_fails_closed() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let mut body = export_body(&admin, 2, true);
+            // Saturate: capacity == the pre-seeded un-exported record count (last_exported_seq == 0).
+            body.audit.capacity = body.audit.records.len() as u32;
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                Some(AgentError::SealFailed),
+                "EXPORT append on a saturated undrained ring fails closed — no drain, no commit"
+            );
+        }
+
+        /// A batch_id selector exports only that batch's keys (a valid blob, not 0x42).
+        #[test]
+        fn export_by_batch_id_selects_only_that_batch() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let mut body = export_body(&admin, 2, true); // 2 keys, batch 7
+            let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 99 };
+            generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation).unwrap();
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::BatchId(7));
+            match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+                AgentResponse::ExportBackup { backup_blob, .. } => {
+                    assert_eq!(&backup_blob[..8], b"2DAGTBK\0");
+                }
+                _ => panic!("expected ExportBackup"),
+            }
+            // A batch_id matching NO key ⇒ 0x42.
+            let env2 = export_env(&admin, &[0x12; 16], 1, &ExportSelector::BatchId(123));
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env2, &body).err(),
+                Some(AgentError::KeyPurposeMismatch)
+            );
         }
     }
 

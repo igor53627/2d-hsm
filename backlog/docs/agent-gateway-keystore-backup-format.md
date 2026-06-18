@@ -123,12 +123,21 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    permanently denies those handlers. This is intended fail-closed-for-audit-completeness, not a bug.
    Preview-gated/non-user-reachable until TASK-18; size production `capacity` against the interim, or land
    the EXPORT drain (4c-2) before un-gate. Operators should monitor `next_seq - last_exported_seq`
-   approaching `capacity` and EXPORT before it bricks. **EXPORT_BACKUP is the self-draining exception:**
-   it is itself an auditing privileged write (appends one record) AND the sole drain, so it MUST
-   `record_audit` (append the export event) BEFORE `advance_export_high_water` (full drain to `next_seq-1`,
-   which then covers its OWN just-appended record) — append-then-drain. Because it drains the record it
-   just wrote, EXPORT always recovers a full ring (it cannot brick itself); a drain-BEFORE-append ordering
-   would leave the export's own record un-drained (a delta-export weakening). The 4c-2b handler pins this.
+   approaching `capacity` and EXPORT **before** the ring saturates. **EXPORT_BACKUP is itself an auditing
+   privileged write** (it appends one op=7 record) AND the sole drain, so it `record_audit`s the export
+   event BEFORE `advance_export_high_water` (FULL drain to `next_seq-1`, which then covers its OWN
+   just-appended record) — append-then-drain, so the export's record is fully-drained in the same op (no
+   delta-export weakening). **EXPORT is NOT a guaranteed escape hatch:** because it appends first, EXPORT is
+   subject to the SAME backpressure as the other privileged writes — a ring already saturated with
+   un-exported records (e.g. `capacity` GENERATE/CONFIGURE ops with no intervening EXPORT) fails the EXPORT
+   append closed (0x46), and the drain never runs. This is the fail-closed-SAFE choice: a drain-before-append
+   ordering would let EXPORT's append EVICT an un-exported record (FIFO) before this backup captured it —
+   silently losing audit history. So the only mitigation for saturation is provisioning `capacity` against
+   the inter-export interval + monitoring; once saturated, NO op (incl. EXPORT) can append until... there is
+   no in-band drain (the ring is permanently backpressured). **OPEN design decision (TASK-18 precondition,
+   tracked in TASK-20):** whether to make EXPORT a true escape hatch (capture-payload→drain→append-after-evicting-an-EXPORTED-record,
+   accepting the export event lands in the NEXT backup) — a real DR-availability vs export-self-documentation
+   tradeoff to resolve before un-gate.
 
 **Payload version (`restore-ingress-v1`).** The EXPORT_BACKUP payload (the plaintext the KEM-DEM envelope
 wraps; magic `2DRIGV1\0`) is versioned INDEPENDENTLY of the keystore `format_version` and the
@@ -244,8 +253,13 @@ Any randomness (a non-zero `payload_nonce`) comes from the TEE platform CSPRNG, 
 host-influenced (cf. the RFC 6979 deterministic-signing note for secp256k1).
 
 **Export self-check** (AC#3, the design doc §Keystore and backup model): before returning success, parse the
-header/manifest, verify the authenticated key-ref list equals the requested refs, and reject
-truncated/malformed blobs. The payload contains only agent private scalars + public
+header/manifest and reject truncated/malformed blobs. The manifest↔selector match is SET-EQUALITY,
+order- and multiplicity-INSENSITIVE: the exporter canonicalizes the selected refs into BODY order and
+de-duplicates (a `KeyRefs` request selector may be in request order and may repeat a ref), so the
+authenticated manifest is the SET of selected refs, not the literal request bytes. The (deferred) RESTORE
+decoder MUST therefore match the manifest against the request selector set-wise (a `[A, A]` or
+non-body-order `KeyRefs` selector is the same export as `[A]`/body-order) — never order/multiplicity-
+sensitively, which would wrongly reject a legitimate backup. The payload contains only agent private scalars + public
 metadata; it **excludes** producer ML-DSA/AuthorizationTicket material (AC#2), any runtime
 signing credential, and the seal root itself.
 
