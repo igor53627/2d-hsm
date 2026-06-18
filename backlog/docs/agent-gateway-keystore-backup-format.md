@@ -100,9 +100,12 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    maintained from genesis with an **optional** circuit-breaker threshold (see TASK-7.4 §2).
    Spend counters keyed **independently of the treasury `key_ref`** so they survive
    treasury-key rotation (AC#17 — never reset on key replacement).
-5. **Audit** (AC#8/#14): bounded ring buffer of privileged-op records (op, authority,
-   counter, config_version, monotonic seq) + `last_exported_seq` so rollover cannot silently
-   drop un-exported entries.
+5. **Audit** (AC#8/#14): bounded ring buffer of privileged-op records + `last_exported_seq` so
+   rollover cannot silently drop un-exported entries. Each record carries the FULL provenance of
+   the op: `op` (wire opcode), the capability identity `(authority, scope_class, scope_target)`,
+   `counter` (the per-`(authority, scope_class, scope_target)` batch sequence — scope is required
+   to disambiguate, since `counter` is per-scope), `config_version` (treasury config version at the
+   op), `request_id` (the logical-op / anchor idempotency id), and the ring's monotonic `seq`.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version

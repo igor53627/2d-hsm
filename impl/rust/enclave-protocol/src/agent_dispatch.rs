@@ -974,23 +974,31 @@ fn handle_generate_keys(
     candidate
         .advance_commit_epoch(bumps_structural)
         .map_err(|_| AgentError::SealFailed)?;
-    // AC#14 audit record (slice 4b): append this privileged op's provenance onto the CANDIDATE ring
+    // AC#14 audit record (slice 4b): append this privileged op's FULL provenance onto the CANDIDATE ring
     // BEFORE it leaves the handler. The seam (`commit_before_emit`) re-runs `validate()` at seal time and
     // forbids candidate mutation between seal and anchor-commit, so the record MUST already be in the body
-    // here — never inside the seal/commit closure. Provenance fields mirror `CreationMetadata` exactly:
-    // op = the wire opcode, (authority, counter) = the accepted capability's (authority, batch sequence),
-    // config_version = the live treasury config version (GENERATE_KEYS does not bump it, so live ==
-    // candidate). Fail-closed: a full undrained ring (`AuditBackpressure`) or `next_seq` overflow
-    // (`MonotonicOverflow`) collapses to `SealFailed` (0x46), so the handler returns BEFORE the frame
-    // layer reaches `commit_before_emit` — no seal, no anchor commit, no swap (anti-oracle: same code as
-    // every other internal seal-class failure).
+    // here — never inside the seal/commit closure. Provenance:
+    //   op                       = the wire opcode
+    //   (authority, scope_class, scope_target) + counter = the accepted cap's full identity + its per-scope
+    //                              batch sequence (counter is per-(authority,scope), so scope disambiguates)
+    //   request_id               = the logical-op id (anchor idempotency key), ties the record to this call
+    //   config_version           = the live treasury config version (GENERATE_KEYS does not bump it, so
+    //                              live == candidate; same source as `CreationMetadata.config_version`)
+    // Fail-closed: a full undrained ring (`AuditBackpressure`) or `next_seq` overflow (`MonotonicOverflow`)
+    // collapses to `SealFailed` (0x46) — UNLIKE counter-table-full (`CapExceeded`/0x44): audit-ring fullness
+    // is SEALED state on the untrusted host, so a distinct code would be an oracle; it folds to the generic
+    // seal-class failure. The handler returns BEFORE the frame reaches `commit_before_emit` — no seal, no
+    // anchor commit, no swap.
     candidate
-        .record_audit(
-            env.opcode,
-            &verified.authority,
-            verified.counter,
-            keystore.config.monotonic_treasury_config_version,
-        )
+        .record_audit(&crate::agent_keystore::AuditAppend {
+            op: env.opcode,
+            authority: &verified.authority,
+            counter: verified.counter,
+            config_version: keystore.config.monotonic_treasury_config_version,
+            scope_class: verified.scope_class,
+            scope_target: &verified.scope_target,
+            request_id: &env.request_id,
+        })
         .map_err(|_| AgentError::SealFailed)?;
     Ok(AgentResponse::GenerateKeys {
         keys,
@@ -2790,10 +2798,11 @@ mod tests {
     }
 
     /// 4b AC#14 audit append (dispatch level): a successful GENERATE_KEYS writes EXACTLY ONE audit record
-    /// onto the candidate ring (one per committed op, regardless of `count`), with provenance mirroring
-    /// `CreationMetadata`: op = wire opcode, (authority, counter) = the accepted cap's (authority, batch
-    /// seq), config_version = the live treasury config version. The seam's seal re-runs `validate()`, so
-    /// `dispatch_agent` returning Ok already proves the audited ring is `validate()`-clean.
+    /// onto the candidate ring (one per committed op, regardless of `count`), carrying full provenance —
+    /// op = wire opcode, (authority, scope_class, scope_target) + counter = the accepted cap's identity +
+    /// per-scope batch seq, request_id = the logical-op id, config_version = the live treasury config
+    /// version. This checks the record CONTENTS at dispatch level; the seal-survives-`validate()` property
+    /// is proven by the frame-level tests below (which actually seal the audited candidate).
     #[cfg(feature = "agent-keygen-exec-preview")]
     #[test]
     fn generate_keys_appends_one_audit_record_to_candidate() {
@@ -2802,6 +2811,9 @@ mod tests {
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // Distinctive config_version (7, not the structural_version/freshness_epoch value of 1) so the
+        // config_version assertion can't pass by field-confusion with a same-valued field.
+        body.config.monotonic_treasury_config_version = 7;
         // count=3 keys in ONE op ⇒ still exactly ONE audit record (record-per-op, not per-key).
         let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
         let env = envelope(
@@ -2820,10 +2832,11 @@ mod tests {
                 assert_eq!(r.op, 1, "op = the GENERATE_KEYS wire opcode");
                 assert_eq!(r.authority, admin.verifying_key().to_bytes(), "authority = the cap authority");
                 assert_eq!(r.counter, 1, "counter = the accepted cap batch sequence");
-                assert_eq!(
-                    r.config_version, body.config.monotonic_treasury_config_version,
-                    "config_version = the live treasury config version (GENERATE_KEYS does not bump it)"
-                );
+                assert_eq!(r.config_version, 7, "config_version = the live treasury config version (==7)");
+                // Full provenance (the 4b schema widening): scope + request_id disambiguate the op.
+                assert_eq!(r.scope_class, 0, "scope_class = the cap scope_class");
+                assert_eq!(r.scope_target, b"generate_transfer".to_vec(), "scope_target = the cap scope");
+                assert_eq!(r.request_id, vec![0x11u8; 16], "request_id = the envelope request_id");
             }
             _ => panic!("expected GenerateKeys"),
         }
@@ -2899,7 +2912,17 @@ mod tests {
         // Saturate the ring (capacity 1, one un-exported record) via record_audit so the state is
         // guaranteed validate()-consistent: records=[seq1], next_seq=2, last_exported_seq=0.
         body.audit.capacity = 1;
-        body.record_audit(1, &[0u8; 32], 0, 0).expect("first append fills the cap-1 ring");
+        body
+            .record_audit(&crate::agent_keystore::AuditAppend {
+                op: 1,
+                authority: &[0u8; 32],
+                counter: 0,
+                config_version: 0,
+                scope_class: 0,
+                scope_target: b"seed",
+                request_id: b"seed",
+            })
+            .expect("first append fills the cap-1 ring");
         assert!(install_agent_keystore(body, b"meas"));
         let calls = Arc::new(AtomicUsize::new(0));
         assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
