@@ -123,10 +123,25 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version
 outside the known set ⇒ fail-closed (no zero-init, no truncation tolerance). A version bump
-requires a reviewed, vector-backed change. (The slice-4b `AuditRecord` provenance widening —
-adding `scope_class`/`scope_target`/`request_id` — owes NO migration and NO version bump: the
-audit write path went live only in 4b, so every prior-version sealed blob has an empty `records`
-vec and serializes byte-identically; the AC#16 window need not cover the old `AuditRecord` shape.)
+requires a reviewed, vector-backed change.
+
+**Slice-4b `AuditRecord` provenance widening (`scope_class`/`scope_target`/`request_id`) — no
+version bump, no migration owed.** Reasoning (precise, because the widening landed mid-PR):
+- EVERY sealed blob that exists outside this PR's discarded intermediate has an **empty audit ring**:
+  all pre-4b (≤v3 released) bodies, the frozen genesis/smoke golden vectors, and the bodies the live
+  boot path mints (genesis has `records: vec![]`). An empty `Vec<AuditRecord>` serializes
+  byte-identically regardless of `AuditRecord`'s field count, so these decode cleanly under the new
+  shape and their golden bytes are unchanged (the byte-exact freeze tests confirm this).
+- The only old-shape (5-field) records ever produced were on the intermediate PR commit that wired
+  `record_audit` BEFORE this widening. That commit is **squash-merged away** (never on `main`) and the
+  whole agent-gateway audit write path is **release-banned / not deployed** (`agent-keygen-exec-preview`,
+  un-gated only at TASK-18), so no released or `main` blob can carry an old-shape record.
+- A v3 blob that DID carry an old-shape record (reachable only by running the discarded intermediate
+  preview build) correctly **fails closed** on decode (serde "missing field") — the desired fail-closed,
+  not a silent accept. A dev/aya keystore sealed at that intermediate must be reprovisioned (test keys).
+- Therefore `format_version` stays 3 and the AC#16 window need not cover the old `AuditRecord` shape. If
+  a deployed-blob migration story is ever required before un-gate, a `format_version` bump is the lever —
+  tracked as a TASK-18 precondition in TASK-20.
 
 **Atomic key generation** (AC#18): `AGENT_K1_GENERATE_KEYS` seals the counter advance **and**
 the new key metadata in one commit before returning refs; a partial/persist failure returns
