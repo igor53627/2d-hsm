@@ -537,6 +537,18 @@ mod tests {
         assert_eq!(strict_parse(&blob).err(), Some(BackupError::Truncated), "trailing byte ⇒ reject");
     }
 
+    /// (i') Corrupted AEAD tag (framing preserved) fails specifically with `Decrypt` — the AC#3
+    /// corrupted-tag rejection. Flipping the final ciphertext byte leaves the lp32(dem_ct) length (and all
+    /// framing) intact, so `strict_parse` still passes; the AEAD tag check is what rejects it.
+    #[test]
+    fn corrupted_tag_fails_with_decrypt() {
+        let (mut blob, dk) = seal_fixed();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        assert!(strict_parse(&blob).is_ok(), "flipping a tag byte preserves the framing");
+        assert_eq!(open_backup_blob_offline(&dk, &blob), Err(BackupError::Decrypt));
+    }
+
     /// (i) A truncated blob (chopped mid-ciphertext) fails strict-parse, never panics.
     #[test]
     fn truncated_blob_fails_closed() {

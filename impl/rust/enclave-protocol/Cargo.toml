@@ -101,12 +101,15 @@ agent-sign-faucet-preview = ["agent-gateway"]
 # until the AC#5 production funding profile is armed, the independent recovery-counter rule + the AC#14
 # audit record land, and TASK-18 un-gates. Never enable in production.
 agent-configure-treasury-preview = ["agent-gateway"]
-# TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path — the pq-agent-backup-v1 ML-KEM-1024
-# KEM-DEM envelope wrapped to the operator's offline recovery public key. Pulls the pure-Rust `ml-kem`
-# crate (NOT pqcrypto/ml-dsa-65 — independent, so role isolation holds). Without this feature
-# EXPORT/RESTORE verify the capability then fail closed (AGENT_NOT_CONFIGURED). Banned in release builds
-# (see lib.rs): stays fail-closed until the anti-rollback last_exported_seq coverage + audit-ring write
-# path land and TASK-18 un-gates. Never enable in production.
+# TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path. EXPORT produces the `pq-agent-backup-v1`
+# blob — the ML-KEM-1024 KEM-DEM envelope wrapped to the operator's OFFLINE recovery public key (domain
+# `2d-hsm-agent-backup-v1-key`). RESTORE is a SEPARATE construction: the recovery ceremony re-encrypts to
+# the destination TEE's attested EPHEMERAL key via the distinct `2d-hsm-agent-restore-ingress-v1` ingress
+# envelope (NOT this blob) — Slice 1 ships only the export primitive; RESTORE stays a fail-closed reserved
+# stub. Pulls the pure-Rust `ml-kem` crate (NOT pqcrypto/ml-dsa-65 — independent, so role isolation holds).
+# Without this feature EXPORT/RESTORE verify the capability then fail closed (AGENT_NOT_CONFIGURED). Banned
+# in release builds (see lib.rs): stays fail-closed until the anti-rollback last_exported_seq coverage +
+# audit-ring write path land and TASK-18 un-gates. Never enable in production.
 agent-backup-export-preview = ["agent-gateway", "dep:ml-kem"]
 # TASK-23: deviceless UDS 0x40 contract-test server (twod-hsm-agent-contract-server) — installs a
 # reference keystore (PUBLIC test keys) + serves the agent protocol over AF_UNIX WITHOUT SNP/anti-rollback,
