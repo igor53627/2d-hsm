@@ -183,19 +183,28 @@ impl AgentOpcode {
             // the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
             // already burned), and a successful RESTORE installs the backup's `structural_version` which,
             // un-bumped on the anchor under EpochOnly, would mismatch next boot. Structural ⇒ a dropped seal
-            // triggers StructuralGap⇒restore (re-attempt, never a silent rollback), and the structural bump
-            // keeps the anchor consistent with the restored body. The earlier "EpochOnly because
-            // `strict_recovery_counter` is marks-covered" reasoning was INCOMPLETE — it covered only the
-            // counter, not the body replace (gemini PR #93). RESTORE's full recovery-ceremony semantics
-            // (counter-seeding AC#11/#12) are RE-CONFIRMED at its handler slice; Structural is the
-            // fail-closed-safe forward-declaration.
+            // triggers StructuralGap⇒restore (re-attempt, never a silent rollback). The earlier "EpochOnly
+            // because `strict_recovery_counter` is marks-covered" reasoning was INCOMPLETE — it covered only
+            // the counter, not the body replace (gemini PR #93). OPEN for the handler slice: RESTORE is the
+            // ONE committed op whose `structural_version` is SET from the backup (a non-monotone transition —
+            // it can be lower OR higher than the running enclave's), NOT a plain monotone `++`; the handler
+            // slice MUST define the post-restore anchor structural value (backup vs backup+1 vs local+1) +
+            // the reconcile rule that ADMITS a restored value not equal to `local+1` — almost certainly a
+            // DISTINCT recovery-ceremony path tied to `strict_recovery_counter` AC#11/#12, NOT this ordinary
+            // Structural `advance_commit_epoch(true)` `++`. Classing RESTORE Structural is the fail-closed-safe
+            // forward-declaration (a dropped seal can't silently regress); the exact structural mechanism is
+            // deferred with the handler.
             Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup | Self::RestoreBackup => {
                 CommitBumpClass::Structural
             }
             // EPOCH-ONLY — the op's FULL effect is captured in the anchor's authenticated marks (so
-            // AdoptForward reconstructs it byte-for-byte): ONLY SIGN_FAUCET_DISPENSE, which debits
-            // `cumulative_native_spend` + `lifetime_spend` (both marks surfaces) and mutates NOTHING else
-            // durable. Every other committed op touches a non-marks surface ⇒ Structural.
+            // AdoptForward reconstructs it byte-for-byte): ONLY SIGN_FAUCET_DISPENSE. PINNED to its handler
+            // (`handle_sign_faucet_dispense`): the sole candidate-body mutation is `candidate.faucet =
+            // new_faucet`, which advances `cumulative_native_spend` + `lifetime_spend` (both marks surfaces)
+            // and NOTHING else durable — so AdoptForward fully reconstructs it. INVARIANT: if the faucet
+            // handler is ever changed to mutate any non-marks durable field, EpochOnly becomes unsafe and
+            // this op must move to Structural (the same rule that put EXPORT/RESTORE there). Every other
+            // committed op touches a non-marks surface ⇒ Structural.
             Self::SignFaucetDispense => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
             Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,

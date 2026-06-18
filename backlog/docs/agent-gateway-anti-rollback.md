@@ -191,8 +191,14 @@ already burned), and a successful RESTORE installs the backup's `structural_vers
 the anchor under EpochOnly — would mismatch next boot. `Structural` ⇒ a dropped seal triggers
 `StructuralGap`→restore (re-attempt, never a silent rollback). NB the `strict_recovery_counter` (field 5)
 being a marks surface is NECESSARY but NOT SUFFICIENT to make RESTORE `EpochOnly` — the wholesale body
-replace is the deciding non-marks surface. RESTORE's full recovery-ceremony counter-seeding (AC#11/#12) is
-re-confirmed at the handler slice.
+replace is the deciding non-marks surface. **OPEN for the RESTORE handler slice:** RESTORE is the one
+committed op whose `structural_version` is SET from the backup (a NON-monotone transition — possibly lower
+OR higher than the running enclave's), NOT a plain monotone `++`. Classing it `Structural` is the
+fail-closed-safe forward-declaration, but the handler slice MUST define the post-restore anchor
+`structural_version` (backup vs backup+1 vs local+1) + the reconcile rule that ADMITS a restored value
+`≠ local+1` — almost certainly a DISTINCT recovery-ceremony path tied to `strict_recovery_counter`
+(AC#11/#12), NOT an ordinary `advance_commit_epoch(Structural)` `++`. The full recovery-ceremony
+counter-seeding (AC#11/#12) is re-confirmed at that handler slice.
 
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
 1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.
