@@ -67,8 +67,10 @@ const PRIVILEGED_OPCODES: [u8; 4] = [1, OPCODE_CONFIGURE_TREASURY, 7, 8];
 const MAX_TREASURY_SUB_OP: u8 = 3;
 const TREASURY_SUB_OP_RESET_LIFETIME_BREAKER: u8 = 3;
 /// Upper bound on `scope_target` bytes — a defensive read-side cap (the field is host-influenced and
-/// later lands in sealed state; keep it small here so a malformed cap is rejected cheaply).
-const MAX_SCOPE_TARGET_LEN: usize = 64;
+/// later lands in sealed state; keep it small here so a malformed cap is rejected cheaply). `pub(crate)`
+/// so the sealed-body audit ring (whose `scope_target` ORIGINATES from a verified capability) can bound
+/// its records by the same true-origin cap in [`crate::agent_keystore::KeystoreBody::validate`].
+pub(crate) const MAX_SCOPE_TARGET_LEN: usize = 64;
 /// Upper bound on `request_id` bytes — mirrors the envelope's `MAX_REQUEST_ID_LEN`.
 const MAX_CAP_REQUEST_ID_LEN: usize = 64;
 

@@ -942,9 +942,10 @@ fn handle_generate_keys(
         // SEQUENCE number, not a global id — full provenance is (authority, scope, batch_id).
         batch_id: verified.counter,
     };
-    // NOTE (deferred, AC#14): a privileged-op audit record (op, authority, counter, config_version)
-    // into `candidate.audit` + the last_exported_seq backpressure is NOT written here yet — it lands
-    // with the audit-ring slice (tracked as a TASK-7.6 follow-up).
+    // AC#14 audit record is appended AFTER the candidate is fully finalized (entries + counter +
+    // atomic epoch/structural bump) — see the `record_audit` call below at the post-bump site. The
+    // `last_exported_seq` backpressure DRAIN (re-enabling appends once the ring fills) is the
+    // EXPORT_BACKUP path and remains deferred to slice 4c; 4b only RESPECTS backpressure on append.
     let keys =
         generate_keys(&mut candidate, purpose, count_usize, creation).map_err(map_keygen_error)?;
     candidate
@@ -972,6 +973,35 @@ fn handle_generate_keys(
         matches!(AgentOpcode::GenerateKeys.commit_bump_class(), CommitBumpClass::Structural);
     candidate
         .advance_commit_epoch(bumps_structural)
+        .map_err(|_| AgentError::SealFailed)?;
+    // AC#14 audit record (slice 4b): append this privileged op's FULL provenance onto the CANDIDATE ring
+    // BEFORE it leaves the handler. The seam (`commit_before_emit`) re-runs `validate()` at seal time and
+    // forbids candidate mutation between seal and anchor-commit, so the record MUST already be in the body
+    // here — never inside the seal/commit closure. Provenance:
+    //   op                       = the wire opcode
+    //   (authority, scope_class, scope_target) + counter = the accepted cap's full identity + its per-scope
+    //                              batch sequence (counter is per-(authority,scope), so scope disambiguates)
+    //   request_id               = the logical-op id (anchor idempotency key), ties the record to this call
+    //   config_version           = the FINALIZED candidate's treasury config version. GENERATE_KEYS does not
+    //                              bump it (so candidate == live here), but reading from `candidate` (the
+    //                              state actually being sealed) is the robust default: a future handler that
+    //                              copies this pattern AND bumps config before the audit append (e.g. 4c
+    //                              CONFIGURE_TREASURY) records the post-bump version, not a stale live one.
+    // Fail-closed: a full undrained ring (`AuditBackpressure`) or `next_seq` overflow (`MonotonicOverflow`)
+    // collapses to `SealFailed` (0x46) — UNLIKE counter-table-full (`CapExceeded`/0x44): audit-ring fullness
+    // is SEALED state on the untrusted host, so a distinct code would be an oracle; it folds to the generic
+    // seal-class failure. The handler returns BEFORE the frame reaches `commit_before_emit` — no seal, no
+    // anchor commit, no swap.
+    candidate
+        .record_audit(&crate::agent_keystore::AuditAppend {
+            op: env.opcode,
+            authority: &verified.authority,
+            counter: verified.counter,
+            config_version: candidate.config.monotonic_treasury_config_version,
+            scope_class: verified.scope_class,
+            scope_target: &verified.scope_target,
+            request_id: &env.request_id,
+        })
         .map_err(|_| AgentError::SealFailed)?;
     Ok(AgentResponse::GenerateKeys {
         keys,
@@ -1797,11 +1827,17 @@ mod tests {
     }
 
     fn envelope(opcode: u8, extra: Vec<(Value, Value)>) -> Vec<u8> {
+        envelope_rid(opcode, &[0x11; 16], extra)
+    }
+
+    /// Like [`envelope`] but with a caller-chosen `request_id` — for multi-op tests where each logical op
+    /// must carry a DISTINCT request_id (the per-op-unique admin precondition; see the audit-ring contract).
+    fn envelope_rid(opcode: u8, request_id: &[u8], extra: Vec<(Value, Value)>) -> Vec<u8> {
         let mut m = vec![
             (Value::Integer(1.into()), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
             (Value::Integer(2.into()), Value::Integer((opcode as u64).into())),
             (Value::Integer(3.into()), Value::Text(COMMAND_DOMAIN.to_string())),
-            (Value::Integer(4.into()), Value::Bytes(vec![0x11; 16])), // request_id
+            (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
         ];
         m.extend(extra);
         enc(Value::Map(m))
@@ -2768,6 +2804,190 @@ mod tests {
             "the anchor commit was NEVER reached — seal failure short-circuits before the durable commit"
         );
         reset_agent_keystore_for_tests();
+    }
+
+    /// 4b AC#14 audit append (dispatch level): a successful GENERATE_KEYS writes EXACTLY ONE audit record
+    /// onto the candidate ring (one per committed op, regardless of `count`), carrying full provenance —
+    /// op = wire opcode, (authority, scope_class, scope_target) + counter = the accepted cap's identity +
+    /// per-scope batch seq, request_id = the logical-op id, config_version = the live treasury config
+    /// version. This checks the record CONTENTS at dispatch level; the seal-survives-`validate()` property
+    /// is proven by the frame-level tests below (which actually seal the audited candidate).
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_appends_one_audit_record_to_candidate() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // Distinctive config_version (7, not the structural_version/freshness_epoch value of 1) so the
+        // config_version assertion can't pass by field-confusion with a same-valued field.
+        body.config.monotonic_treasury_config_version = 7;
+        // count=3 keys in ONE op ⇒ still exactly ONE audit record (record-per-op, not per-key).
+        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+            AgentResponse::GenerateKeys { candidate, .. } => {
+                assert_eq!(candidate.audit.records.len(), 1, "exactly one audit record per committed op");
+                assert_eq!(candidate.audit.next_seq, 2, "next_seq advanced 1→2 (base next_seq was 1)");
+                let r = &candidate.audit.records[0];
+                assert_eq!(r.seq, 1, "first record gets seq 1");
+                assert_eq!(r.op, 1, "op = the GENERATE_KEYS wire opcode");
+                assert_eq!(r.authority, admin.verifying_key().to_bytes(), "authority = the cap authority");
+                assert_eq!(r.counter, 1, "counter = the accepted cap batch sequence");
+                assert_eq!(r.config_version, 7, "config_version = the live treasury config version (==7)");
+                // Full provenance (the 4b schema widening): scope + request_id disambiguate the op.
+                assert_eq!(r.scope_class, 0, "scope_class = the cap scope_class");
+                assert_eq!(r.scope_target, b"generate_transfer".to_vec(), "scope_target = the cap scope");
+                assert_eq!(r.request_id, vec![0x11u8; 16], "request_id = the envelope request_id");
+            }
+            _ => panic!("expected GenerateKeys"),
+        }
+    }
+
+    /// 4b AC#14 persistence-through-swap (frame level): successful frame ops ACCUMULATE audit records on
+    /// the swapped live state — proven via the backpressure oracle. With a small ring (capacity 2), two
+    /// contiguous ops succeed (each seals a GROWING ring through `validate()` and swaps), then the third
+    /// hits a full-undrained ring and fails closed (0x46) WITHOUT a third commit. If the records had not
+    /// persisted across the swap the ring would never fill and the third op would succeed. (The drain that
+    /// re-enables appends is EXPORT_BACKUP — slice 4c; 4b only respects backpressure.)
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_audit_records_accumulate_across_swaps_then_backpressure() {
+        use ed25519_dalek::SigningKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+        body.audit.capacity = 2; // room for exactly two un-exported records
+        assert!(install_agent_keystore(body, b"meas"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
+            CommitChannelAct::Ok,
+            Arc::clone(&calls),
+        ))));
+        // Each logical op carries a DISTINCT request_id (the per-op-unique admin precondition) — reusing one
+        // would model a sequence a real anchor treats as an idempotent replay, not three distinct ops.
+        let op = |counter: u64, request_id: &[u8]| {
+            let (cap, pay) =
+                generate_keys_cap_and_payload(&admin, request_id, counter, 1, 1, b"generate_transfer");
+            envelope_rid(
+                1,
+                request_id,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(pay)),
+                ],
+            )
+        };
+        // Two contiguous ops fill the ring to capacity; each seals a growing audit ring + swaps.
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(1, &[0x21; 16]))), None, "op 1 (record 1) succeeds");
+        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(2, &[0x22; 16]))), None, "op 2 (record 2) succeeds");
+        // Third op: the swapped live ring is now full AND undrained ⇒ backpressure ⇒ fail closed, no swap.
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&op(3, &[0x23; 16]))),
+            Some(0x46),
+            "third op hits a full undrained ring ⇒ SealFailed (proves records persisted across swaps)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "only the two successful ops committed — the backpressured third never reached the anchor"
+        );
+        reset_agent_keystore_for_tests();
+    }
+
+    /// 4b AC#14 backpressure fail-closed ordering (frame level, mirror `unsealable_candidate_never_commits`):
+    /// a GENERATE_KEYS against a body whose audit ring is ALREADY full+undrained fails closed (0x46) in
+    /// Phase A — `record_audit` returns `AuditBackpressure`, mapped to `SealFailed`, BEFORE the frame layer
+    /// reaches `commit_before_emit`. Pinned with a shared call-counter that must be 0 (no anchor commit).
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_audit_backpressure_fails_closed_never_commits() {
+        use ed25519_dalek::SigningKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
+        // Saturate the ring (capacity 1, one un-exported record) via record_audit so the state is
+        // guaranteed validate()-consistent: records=[seq1], next_seq=2, last_exported_seq=0.
+        body.audit.capacity = 1;
+        body
+            .record_audit(&crate::agent_keystore::AuditAppend {
+                op: 1,
+                authority: &[0u8; 32],
+                counter: 0,
+                config_version: 0,
+                scope_class: 0,
+                scope_target: b"seed",
+                request_id: b"seed",
+            })
+            .expect("first append fills the cap-1 ring");
+        assert!(install_agent_keystore(body, b"meas"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
+            CommitChannelAct::Ok,
+            Arc::clone(&calls),
+        ))));
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
+        let gen_env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
+            Some(0x46),
+            "a full undrained audit ring fails the op closed with SealFailed"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "audit backpressure short-circuits in Phase A — the anchor commit was NEVER reached"
+        );
+        reset_agent_keystore_for_tests();
+    }
+
+    /// 4b AC#14 overflow fail-closed (dispatch level, mirror `structural_overflow_fails_closed`): a body
+    /// whose `audit.next_seq == u64::MAX` makes `record_audit`'s checked `next_seq` increment overflow →
+    /// `MonotonicOverflow` → `SealFailed`. Confirms the SECOND `record_audit` error variant also fails
+    /// closed (empty ring, so backpressure does not pre-empt the overflow path).
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_audit_next_seq_overflow_fails_closed() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        body.audit.next_seq = u64::MAX; // checked_add(1) → None → MonotonicOverflow → SealFailed
+        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            Some(AgentError::SealFailed)
+        );
     }
 
     /// Production (preview OFF): a fully-valid GENERATE_KEYS request verifies the capability then

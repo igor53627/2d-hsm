@@ -100,14 +100,48 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    maintained from genesis with an **optional** circuit-breaker threshold (see TASK-7.4 §2).
    Spend counters keyed **independently of the treasury `key_ref`** so they survive
    treasury-key rotation (AC#17 — never reset on key replacement).
-5. **Audit** (AC#8/#14): bounded ring buffer of privileged-op records (op, authority,
-   counter, config_version, monotonic seq) + `last_exported_seq` so rollover cannot silently
-   drop un-exported entries.
+5. **Audit** (AC#8/#14): bounded ring buffer of privileged-op records + `last_exported_seq` so
+   rollover cannot silently drop un-exported entries. Each record carries the FULL provenance of
+   the op: `op` (wire opcode), the capability identity `(authority, scope_class, scope_target)`,
+   `counter` (the per-`(authority, scope_class, scope_target)` batch sequence — scope is required
+   to disambiguate, since `counter` is per-scope), `config_version` (treasury config version at the
+   op), `request_id` (the logical-op / anchor idempotency id), and the ring's monotonic `seq`.
+   A record's `scope_target`/`request_id` are bounded by the SAME caps as their origin surfaces
+   (the verified capability's `MAX_SCOPE_TARGET_LEN` and the envelope's `MAX_REQUEST_ID_LEN`), enforced
+   in `validate()` so a forged ring fails closed. Because records now carry variable-length provenance,
+   a ring's contribution to `MAX_KEYSTORE_BLOB_SIZE` is record-content-dependent: size `capacity`
+   against max-length records, not a fixed per-record footprint. The ring does NOT enforce that
+   `request_id` is non-empty or per-op-unique — distinct/non-empty operational `request_id` assignment
+   is an ADMIN/orchestrator precondition (the only code guard is `MAX_REQUEST_ID_LEN`; an empty id is
+   admin-cap-bound, not a host attack), the same contract as the anchor idempotency key in
+   `agent-gateway-anti-rollback.md §3`. Backpressure note: until `EXPORT_BACKUP` lands the drain
+   (`advance_export_high_water`, slice 4c), a preview build RESPECTS backpressure but cannot RELEASE it —
+   a 4b-only preview build wedges `GENERATE_KEYS` (returns 0x46) once the ring fills past `capacity`
+   un-exported records. Preview-gated/non-user-reachable until TASK-18; do not run 4b standalone past
+   `capacity` privileged ops, or land 4b+4c together.
 
 **Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
 migration window and re-seals to current on the next privileged mutation; any version
 outside the known set ⇒ fail-closed (no zero-init, no truncation tolerance). A version bump
 requires a reviewed, vector-backed change.
+
+**Slice-4b `AuditRecord` provenance widening (`scope_class`/`scope_target`/`request_id`) — no
+version bump, no migration owed.** Reasoning (precise, because the widening landed mid-PR):
+- EVERY sealed blob that exists outside this PR's discarded intermediate has an **empty audit ring**:
+  all pre-4b (≤v3 released) bodies, the frozen genesis/smoke golden vectors, and the bodies the live
+  boot path mints (genesis has `records: vec![]`). An empty `Vec<AuditRecord>` serializes
+  byte-identically regardless of `AuditRecord`'s field count, so these decode cleanly under the new
+  shape and their golden bytes are unchanged (the byte-exact freeze tests confirm this).
+- The only old-shape (5-field) records ever produced were on the intermediate PR commit that wired
+  `record_audit` BEFORE this widening. That commit is **squash-merged away** (never on `main`) and the
+  whole agent-gateway audit write path is **release-banned / not deployed** (`agent-keygen-exec-preview`,
+  un-gated only at TASK-18), so no released or `main` blob can carry an old-shape record.
+- A v3 blob that DID carry an old-shape record (reachable only by running the discarded intermediate
+  preview build) correctly **fails closed** on decode (serde "missing field") — the desired fail-closed,
+  not a silent accept. A dev/aya keystore sealed at that intermediate must be reprovisioned (test keys).
+- Therefore `format_version` stays 3 and the AC#16 window need not cover the old `AuditRecord` shape. If
+  a deployed-blob migration story is ever required before un-gate, a `format_version` bump is the lever —
+  tracked as a TASK-18 precondition in TASK-20.
 
 **Atomic key generation** (AC#18): `AGENT_K1_GENERATE_KEYS` seals the counter advance **and**
 the new key metadata in one commit before returning refs; a partial/persist failure returns
