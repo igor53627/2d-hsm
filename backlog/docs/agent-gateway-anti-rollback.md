@@ -180,8 +180,19 @@ high-water can never silently regress. This is a DETERMINED class (durable non-m
 distinct from CONFIGURE `reset_lifetime_breaker`'s marks-DECREASE belt-block mechanism. The
 "make `last_exported_seq` marks-covered to allow EpochOnly" alternative is moot until the audit-ring WRITE
 path lands (no marks surface exists yet); accepted residual: a dropped EXPORT seal forces a next-boot
-`StructuralGap`→restore (availability cost), traded for audit completeness. RESTORE_BACKUP stays `EpochOnly`
-(its `strict_recovery_counter` IS a marks surface — field 5 above).
+`StructuralGap`→restore (availability cost), traded for audit completeness.
+
+**`RESTORE_BACKUP` commit class = `Structural` (TASK-13b slice 2).** RESTORE (handler deferred to slice 4)
+wholesale-REPLACES the keystore body — `entries` / `config` / `audit` / `structural_version` — from the
+backup. Those are non-marks, non-`AdoptForward`-reconstructable surfaces (`seed_marks_forward` never
+touches them), so `EpochOnly` would be UNSAFE: a dropped/crashed RESTORE seal would `AdoptForward` and
+SILENTLY LOSE the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
+already burned), and a successful RESTORE installs the backup's `structural_version` which — un-bumped on
+the anchor under EpochOnly — would mismatch next boot. `Structural` ⇒ a dropped seal triggers
+`StructuralGap`→restore (re-attempt, never a silent rollback). NB the `strict_recovery_counter` (field 5)
+being a marks surface is NECESSARY but NOT SUFFICIENT to make RESTORE `EpochOnly` — the wholesale body
+replace is the deciding non-marks surface. RESTORE's full recovery-ceremony counter-seeding (AC#11/#12) is
+re-confirmed at the handler slice.
 
 **Anchor commit idempotency/conflict contract (NORMATIVE — the out-of-repo anchor MUST honor this; the enclave only verifies the signed ack, so these rules live at the anchor. Pinned against the lab stub in slice 6-5).** The per-op `0x45` commit durably records the post-op `(epoch, structural_version, marks_digest)` **keyed by the `request_id` ALONE** — the request_id is the *logical-op identity*, and a logical op commits **at most once**. Three rules:
 1. **Key by `request_id` alone, NOT `(request_id, epoch)`.** After an `EpochOnly` crash + `AdoptForward`, a re-issue of the same logical op proposes the *next* epoch; keying by `(request_id, epoch)` would wrongly admit it as a fresh record → a double-advance / double-spend. The request_id must dedup **across epochs**.

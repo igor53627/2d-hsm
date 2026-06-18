@@ -176,12 +176,27 @@ impl AgentOpcode {
             // marks-covered. ACCEPTED RESIDUAL: Structural means a dropped/crashed EXPORT seal forces a
             // next-boot StructuralGap⇒restore (an availability cost for a routinely-run op), traded for
             // audit completeness.
-            Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup => CommitBumpClass::Structural,
-            // EPOCH-ONLY — full effect captured in the anchor's authenticated marks OR re-presentable:
-            // SIGN_FAUCET_DISPENSE debits cumulative/lifetime spend (marks surfaces); RESTORE_BACKUP
-            // re-seeds from re-presentable recovery material + advances the `strict_recovery_counter` (a
-            // marks surface). Both handlers are deferred — each class is RE-CONFIRMED at its handler slice.
-            Self::SignFaucetDispense | Self::RestoreBackup => CommitBumpClass::EpochOnly,
+            // RESTORE_BACKUP (TASK-13b slice 2; handler deferred): wholesale-REPLACES the keystore body —
+            // entries / config / audit / `structural_version` — from the backup. Those are non-marks,
+            // non-AdoptForward-reconstructable surfaces the seeder (`seed_marks_forward`) silently drops, so
+            // EpochOnly would be UNSAFE: a dropped/crashed RESTORE seal would AdoptForward and SILENTLY LOSE
+            // the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
+            // already burned), and a successful RESTORE installs the backup's `structural_version` which,
+            // un-bumped on the anchor under EpochOnly, would mismatch next boot. Structural ⇒ a dropped seal
+            // triggers StructuralGap⇒restore (re-attempt, never a silent rollback), and the structural bump
+            // keeps the anchor consistent with the restored body. The earlier "EpochOnly because
+            // `strict_recovery_counter` is marks-covered" reasoning was INCOMPLETE — it covered only the
+            // counter, not the body replace (gemini PR #93). RESTORE's full recovery-ceremony semantics
+            // (counter-seeding AC#11/#12) are RE-CONFIRMED at its handler slice; Structural is the
+            // fail-closed-safe forward-declaration.
+            Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup | Self::RestoreBackup => {
+                CommitBumpClass::Structural
+            }
+            // EPOCH-ONLY — the op's FULL effect is captured in the anchor's authenticated marks (so
+            // AdoptForward reconstructs it byte-for-byte): ONLY SIGN_FAUCET_DISPENSE, which debits
+            // `cumulative_native_spend` + `lifetime_spend` (both marks surfaces) and mutates NOTHING else
+            // durable. Every other committed op touches a non-marks surface ⇒ Structural.
+            Self::SignFaucetDispense => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
             Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,
         }
@@ -2799,7 +2814,10 @@ mod tests {
             // is not a marks surface / structural_version, so a dropped seal must trigger StructuralGap⇒
             // restore rather than silently roll the audit high-water back.
             (AgentOpcode::ExportBackup, CommitBumpClass::Structural),
-            (AgentOpcode::RestoreBackup, CommitBumpClass::EpochOnly),
+            // RESTORE_BACKUP is Structural (TASK-13b slice 2): it wholesale-replaces the keystore body
+            // (entries/config/audit/structural_version) — non-marks state AdoptForward can't reconstruct —
+            // so a dropped seal must StructuralGap⇒restore, never silently lose the restore (gemini PR #93).
+            (AgentOpcode::RestoreBackup, CommitBumpClass::Structural),
             (AgentOpcode::SignTransfer, CommitBumpClass::NotCommitted),
             (AgentOpcode::PublicIdentity, CommitBumpClass::NotCommitted),
             (AgentOpcode::ProveIdentity, CommitBumpClass::NotCommitted),
