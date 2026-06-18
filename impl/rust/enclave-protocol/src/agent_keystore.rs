@@ -291,7 +291,9 @@ const SECP256K1_UNCOMPRESSED_LEN: usize = 65;
 const SECRET_SCALAR_LEN: usize = 32;
 /// ML-KEM-1024 encapsulation (public) key length, FIPS 203 (the DR-backup wrapping key). v1 wraps
 /// to a single ML-KEM-1024 key; a future `X25519+ML-KEM` hybrid would be a `format_version` bump.
-const ML_KEM_1024_ENCAPS_KEY_LEN: usize = 1568;
+/// `pub(crate)` so `agent_backup` (TASK-13b) length-checks the SAME wrapping key against one source of
+/// truth — keystore `validate()` and the backup encapsulator must never skew.
+pub(crate) const ML_KEM_1024_ENCAPS_KEY_LEN: usize = 1568;
 
 /// Purpose of a stored key — singleton treasury/faucet source vs batch transfer-signing key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
