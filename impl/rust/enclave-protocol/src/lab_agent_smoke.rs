@@ -100,6 +100,8 @@ pub(crate) fn smoke_body() -> KeystoreBody {
             monotonic_treasury_config_version: 0,
             authority_epoch: 0,
             anchor_root,
+            enclave_scope_id: [0xe1; 32],
+            fleet_scope_id: [0xf1; 32],
         },
         entries: vec![KeyEntry {
             key_ref: SMOKE_KEY_REF,
@@ -1534,7 +1536,7 @@ mod tests {
         let body = smoke_body();
         body.validate().expect("smoke body passes structural validation");
         let blob = smoke_sealed_blob();
-        assert_eq!(&blob[8..10], &[0x00, 0x03], "format_version 3 in the header");
+        assert_eq!(&blob[8..10], &[0x00, 0x04], "format_version 4 in the header");
         assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE, "smoke blob is re-installable");
         let unsealed =
             unseal_body(&blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)

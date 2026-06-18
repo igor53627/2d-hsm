@@ -381,8 +381,9 @@ const RECOVERY_KEY_ID_DOMAIN: &[u8] = b"2d-hsm-agent-backup-v1-recovery-key-id";
 const RECOVERY_KEY_ID_LEN: usize = 16;
 
 /// The config-identity SUBSET carried in a DR backup. EXCLUDES `anchor_root` (enclave anti-rollback
-/// anchor) and `backup_recovery_wrapping_pubkey` (the operator's OWN key) — neither is restorable
-/// agent state.
+/// anchor), `backup_recovery_wrapping_pubkey` (the operator's OWN key), and the TASK-18
+/// `enclave_scope_id`/`fleet_scope_id` cap-scope identities (enclave-local, like `anchor_root`) —
+/// none is restorable agent state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RestoreConfigSubset {
@@ -942,6 +943,8 @@ mod tests {
                 monotonic_treasury_config_version: 3,
                 authority_epoch: 0,
                 anchor_root: [0xAA; 32], // EXCLUDED — exclusion test asserts this 32-byte run is absent
+                enclave_scope_id: [0xe1; 32], // EXCLUDED from the restore payload (config subset)
+                fleet_scope_id: [0xf1; 32], // EXCLUDED from the restore payload (config subset)
             },
             entries: vec![entry(0x11, 0x77), entry(0x22, 0x88)],
             counters: vec![CounterEntry {
@@ -1058,7 +1061,9 @@ mod tests {
         };
         let cfg = map_keys(&config);
         assert_eq!(cfg.len(), 6, "exactly 6 config fields");
-        for excluded in ["anchor_root", "backup_recovery_wrapping_pubkey"] {
+        for excluded in
+            ["anchor_root", "backup_recovery_wrapping_pubkey", "enclave_scope_id", "fleet_scope_id"]
+        {
             assert!(!cfg.contains(&excluded.to_string()), "config excludes `{excluded}`");
         }
         assert!(parse_restore_ingress(&payload).is_ok());

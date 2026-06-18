@@ -336,6 +336,8 @@ mod tests {
                 monotonic_treasury_config_version: 0,
                 authority_epoch: 0,
                 anchor_root: [0; 32],
+                enclave_scope_id: [0xe1; 32],
+                fleet_scope_id: [0xf1; 32],
             },
             entries: vec![
                 entry_from_keys("transfer_key", KeyPurpose::AgentTransferK1, [0x11; 32]),
