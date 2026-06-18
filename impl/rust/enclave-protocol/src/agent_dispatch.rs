@@ -5071,11 +5071,31 @@ mod tests {
         fn export_invalid_recovery_key_fails_closed() {
             let _g = gate_configured();
             let admin = admin_key();
-            let body = export_body(&admin, 2, false); // base_body's [0xb0;1568] is not a valid ML-KEM key
+            let body = export_body(&admin, 2, false); // export_body substitutes a wrong-LENGTH recovery key
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &body).err(),
                 Some(AgentError::SealFailed)
+            );
+        }
+
+        /// A ring SATURATED with un-exported records fails the EXPORT append closed (0x46): EXPORT appends
+        /// its own op=7 record BEFORE draining, so it is subject to the SAME backpressure as the other
+        /// privileged writes — it is NOT a guaranteed escape hatch, and a saturated ring cannot be rescued
+        /// (a drain-before-append would evict un-exported history). Pins the true brick semantics +
+        /// discharges TASK-20 obligation (iii) for EXPORT.
+        #[test]
+        fn export_saturated_undrained_ring_fails_closed() {
+            let _g = gate_configured();
+            let admin = admin_key();
+            let mut body = export_body(&admin, 2, true);
+            // Saturate: capacity == the pre-seeded un-exported record count (last_exported_seq == 0).
+            body.audit.capacity = body.audit.records.len() as u32;
+            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                Some(AgentError::SealFailed),
+                "EXPORT append on a saturated undrained ring fails closed — no drain, no commit"
             );
         }
 
