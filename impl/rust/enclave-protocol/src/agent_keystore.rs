@@ -582,8 +582,11 @@ pub struct KeystoreConfig {
     /// to THIS enclave — a cap minted for enclave A cannot be replayed on a fresh clone B (whose counter
     /// row is empty ⇒ `highest==0` ⇒ `incoming==1` accepted) to mint a SECOND treasury key (the AC#12
     /// budget-multiplication guard). **INERT in 18-1** — the verifier byte-compare lands in slice 18-2.
-    /// Required (NO `serde(default)`): a body missing it fails closed as a CBOR decode error, never a
-    /// silent zero — same discipline as `structural_version`. (Distinct from `anchor_root`: that is the
+    /// Required (NO `serde(default)`): a body missing it fails closed as a CBOR *decode* error, never a
+    /// silent zero (the same field-PRESENCE discipline as `structural_version`). NB this is presence-only;
+    /// unlike `structural_version` (which `validate()` rejects at 0), an all-zero "unset" scope id is NOT
+    /// yet value-rejected here — that value-level guard belongs with slice 18-2, where the field first
+    /// becomes load-bearing (TASK-18 18-2 obligation). (Distinct from `anchor_root`: that is the
     /// anti-rollback anchor pubkey; this is the cap-scope identity.)
     pub enclave_scope_id: [u8; 32],
     /// Sealed SHARED fleet SCOPE identity (TASK-18): fleet-scoped (`scope_class==1`) caps bind to this,

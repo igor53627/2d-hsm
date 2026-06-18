@@ -661,6 +661,18 @@ mod tests {
         let root = hex(GOLDEN_AGENT_ROOT);
         assert_eq!(v["blob_sha256"].as_str(), Some(sha.as_str()), "sidecar blob_sha256 drift — re-mint .json");
         assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
+        // Couple the documented format version to BOTH the const AND the actual header bytes [8],[9]
+        // (big-endian) so a version bump that re-mints the blob but leaves the sidecar string stale fails CI.
+        assert_eq!(
+            v["envelope"]["keystore_format_version"].as_u64(),
+            Some(u64::from(crate::agent_keystore::KEYSTORE_FORMAT_VERSION)),
+            "sidecar keystore_format_version drift vs const"
+        );
+        assert_eq!(
+            v["envelope"]["keystore_format_version"].as_u64(),
+            Some(u64::from(u16::from_be_bytes([blob[8], blob[9]]))),
+            "sidecar keystore_format_version drift vs blob header"
+        );
         assert_eq!(v["envelope"]["nonce_hex"].as_str(), Some(nonce.as_str()), "sidecar nonce_hex drift");
         assert_eq!(
             v["seal_inputs"]["enclave_measurement_hex"].as_str(),
