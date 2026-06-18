@@ -189,7 +189,7 @@ touches them), so `EpochOnly` would be UNSAFE: a dropped/crashed RESTORE seal wo
 SILENTLY LOSE the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
 already burned), and a successful RESTORE installs the backup's `structural_version` which — un-bumped on
 the anchor under EpochOnly — would mismatch next boot. `Structural` ⇒ a dropped seal triggers
-`StructuralGap`→restore (re-attempt, never a silent rollback). NB the `strict_recovery_counter` (field 5)
+`StructuralGap`→restore (re-attempt, never a silent rollback). NB the `strict_recovery_counter` (marks key 4)
 being a marks surface is NECESSARY but NOT SUFFICIENT to make RESTORE `EpochOnly` — the wholesale body
 replace is the deciding non-marks surface. **OPEN for the RESTORE handler slice:** RESTORE is the one
 committed op whose `structural_version` is SET from the backup (a NON-monotone transition — possibly lower
