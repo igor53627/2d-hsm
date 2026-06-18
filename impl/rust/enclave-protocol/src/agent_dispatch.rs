@@ -1334,7 +1334,8 @@ fn decode_export_selector(payload: &[(Value, Value)]) -> Result<ExportSelector, 
 /// EXPORT_BACKUP(7) (TASK-13b slice 4c-2b): after a verified admin capability, mint a `pq-agent-backup-v1`
 /// DR backup of the requested keys to the operator's OFFLINE recovery key, and DRAIN the audit ring (this
 /// op IS the authenticated pull-export). On a CANDIDATE clone: append the EXPORT audit event → FULL drain
-/// (append-then-drain, so the drain covers the export's own record — EXPORT is the self-draining op) →
+/// (append-then-drain, so the drain covers the export's own record — but EXPORT is subject to the SAME
+/// backpressure on its append, so it is NOT a guaranteed escape hatch; see the drain-call note below) →
 /// Structural bump → build the `restore-ingress-v1` payload from the post-append candidate → seal the
 /// KEM-DEM backup blob. Returns the candidate (for the frame layer to seal→commit→swap) + the backup blob
 /// (emitted alongside the new sealed keystore). EXPORT does NOT bump `config_version` (so the audit
@@ -1416,7 +1417,11 @@ fn handle_export_backup(
         })
         .map_err(|_| AgentError::SealFailed)?;
     // FULL drain AFTER the append, so `last_exported_seq → next_seq-1` covers the just-appended export
-    // record ("this export IS the pull"); EXPORT is the self-draining op (cannot brick its own ring).
+    // record ("this export IS the pull", no delta-export weakening). NOTE: because EXPORT appends FIRST, it
+    // is subject to the SAME backpressure — a ring already saturated with un-exported records fails the
+    // append above (0x46) and this drain never runs. EXPORT is NOT a guaranteed escape hatch; that is the
+    // fail-closed-safe choice (drain-before-append would evict un-exported history). See the
+    // keystore-backup-format §5 note + the `export_saturated_undrained_ring_fails_closed` test.
     candidate.advance_export_high_water().map_err(|_| AgentError::SealFailed)?;
     let bumps_structural =
         matches!(AgentOpcode::ExportBackup.commit_bump_class(), CommitBumpClass::Structural);
