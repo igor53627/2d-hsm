@@ -999,6 +999,16 @@ impl KeystoreBody {
                 return Err(KeystoreError::AuditSeqDisorder);
             }
         }
+        // Export high-water invariant (auto-review PR #95): `last_exported_seq` must be STRICTLY below
+        // `next_seq` — the highest seq that can have been exported is the highest ever issued, `next_seq-1`.
+        // This also rejects the degenerate `next_seq==0` (no `u64 last_exported_seq` is `< 0`, so `0 >= 0`
+        // fails). Without it, a forged/restored body with `last_exported_seq` past `next_seq` makes
+        // `record_audit`'s `live_unexported = (next_seq-1).saturating_sub(last_exported_seq)` saturate to 0,
+        // under-counting un-exported records and BYPASSING backpressure (silently evicting un-exported audit
+        // history). `validate()` gates `unseal_body`, so this fail-closes the restore/load path.
+        if self.audit.last_exported_seq >= self.audit.next_seq {
+            return Err(KeystoreError::AuditSeqDisorder);
+        }
         Ok(())
     }
 }
@@ -1401,6 +1411,54 @@ mod tests {
         ok.record_audit(7, &AUD_AUTH, 1, 0).unwrap();
         ok.record_audit(6, &AUD_AUTH, 2, 0).unwrap();
         assert!(seal_body(&ok, &ROOT, MEAS_A).is_ok(), "strictly-ascending ring + next_seq>max validates");
+    }
+
+    /// `validate()` rejects an export high-water (`last_exported_seq`) at or past `next_seq` (auto-review
+    /// PR #95): exporting a seq never issued is impossible, and a body that claims it would make
+    /// `record_audit`'s `live_unexported` saturating_sub to 0, bypassing backpressure. Covers the
+    /// degenerate `next_seq==0` empty ring (no `u64 last_exported_seq < 0`, so `0 >= 0` rejects).
+    #[test]
+    fn validate_rejects_export_high_water_past_next_seq() {
+        let rec = |seq| AuditRecord { seq, op: 7, authority: AUD_AUTH, counter: 1, config_version: 0 };
+        // FORGE: a full ring whose last_exported_seq sits far past the highest issued seq.
+        let mut ahead = body_with_small_audit(); // cap 2
+        ahead.audit.records = vec![rec(1), rec(2)];
+        ahead.audit.next_seq = 3;
+        ahead.audit.last_exported_seq = 100; // claims to have exported a seq never issued
+        assert_eq!(
+            seal_body(&ahead, &ROOT, MEAS_A),
+            Err(KeystoreError::AuditSeqDisorder),
+            "last_exported_seq past next_seq rejected"
+        );
+        // last_exported_seq == next_seq-1 is the legitimate fully-drained boundary; == next_seq is not.
+        let mut at_boundary = body_with_small_audit();
+        at_boundary.audit.records = vec![rec(1), rec(2)];
+        at_boundary.audit.next_seq = 3;
+        at_boundary.audit.last_exported_seq = 3; // == next_seq ⇒ still rejected
+        assert_eq!(
+            seal_body(&at_boundary, &ROOT, MEAS_A),
+            Err(KeystoreError::AuditSeqDisorder),
+            "last_exported_seq == next_seq rejected"
+        );
+        // Degenerate empty ring with next_seq==0 (last_exported_seq 0 >= next_seq 0).
+        let mut degenerate = body_with_small_audit();
+        degenerate.audit.records = vec![];
+        degenerate.audit.next_seq = 0;
+        degenerate.audit.last_exported_seq = 0;
+        assert_eq!(
+            seal_body(&degenerate, &ROOT, MEAS_A),
+            Err(KeystoreError::AuditSeqDisorder),
+            "next_seq==0 empty ring rejected"
+        );
+        // The fully-drained boundary (last_exported_seq == next_seq-1) is legitimate and validates.
+        let mut drained = body_with_small_audit();
+        drained.audit.records = vec![rec(1), rec(2)];
+        drained.audit.next_seq = 3;
+        drained.audit.last_exported_seq = 2; // == next_seq-1, fully drained
+        assert!(
+            seal_body(&drained, &ROOT, MEAS_A).is_ok(),
+            "fully-drained boundary (last_exported_seq == next_seq-1) validates"
+        );
     }
 
     #[test]
