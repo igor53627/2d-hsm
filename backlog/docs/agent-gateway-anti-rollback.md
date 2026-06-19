@@ -55,6 +55,26 @@ again per rollback).
 5. **Strict recovery counter** — forward-only, shared by `RESTORE_BACKUP` + `reset_lifetime_breaker`;
    the mechanism must protect it too or the restore/recovery path becomes replayable.
 
+**Clone-replay-on-empty-row — a DISTINCT threat (TASK-18 18-2 / AC#1), NOT anchor rollback.** A
+**separate** replay surface from the host-rollback attack above: the host **fresh-provisions a clone
+B** (own measurement/sealing/anchor counter) and **replays a capability minted for enclave A** against
+B's **empty** counter row (`highest == 0 ⇒ incoming == 1` accepted at §10.6 contiguity) — re-minting a
+*second* treasury key from one logical authority (the AC#12 budget-multiplication guard). The anchor
+(Option A) does **not** stop this: B has its own legitimate anchor counter at epoch 0. The guard is
+the **TASK-18 18-2 capability `scope_identity` binding**: the cap's *signed* `scope_identity` (cap
+key 13) is byte-compared against the sealed per-enclave `enclave_scope_id` (`scope_class==0`) — a
+cap minted for A carries A's id and fails the compare on B (`0x43`). **Scope of the guard (reconciled
+with §4):** it closes **replay-on-empty-row ONLY**. It does **NOT** close (a) honest **active-active**
+clones of one treasury key (each clone legitimately shares a fleet/anchor state; that is §4, needs
+Option B's global ledger — residual hole, deferred), nor (b) the **host copying the WHOLE sealed
+keystore** to a clone (counters travel with the blob → caught by this §3 anchor anti-rollback, not by
+AC#1), nor (c) `fleet_scope_id`-scoped caps replayed across clones (fleet id is shared **by design**;
+the 18-5 `financial ⇒ scope_class==0` policy is what makes the guard non-bypassable for budget-
+sensitive ops). **NB: the guard is conditional on provenance** — it is security theater unless
+`enclave_scope_id` is host-uncontrollable (minted in-TEE via `getrandom` at provisioning over the
+attested install channel); that is the TASK-25/G3 hard precondition for the 18-6..9 un-gate. Until
+then the verifier compare is correct code under a preview gate, not a production guarantee.
+
 ## §2 Platform finding — no SNP monotonic counter ⇒ external anchor required
 
 Surveyed against `impl`: SNP `ATTESTATION_REPORT.reported_tcb` is a platform-wide firmware TCB
@@ -246,6 +266,13 @@ compare-and-append conflict resolution, and boot/restore replays the ledger tail
 authoritative high-water marks (never zero). Option B is the mandatory mechanism for any
 active-active or HA topology; its per-dispense append is effectively the synchronous round-trip of
 `lease=1`.
+
+**Reconciliation (TASK-18 18-4): the 18-2 `scope_identity` binding (§1) does NOT relax this §4
+prohibition.** AC#1 closes only the **replay-on-empty-row** sub-case (a cap minted for A replayed on
+a fresh clone B); it does **not** detect or prevent honest concurrent clones of one treasury key
+sharing one fleet/anchor state — that is the §4 active-active topology, and it remains **Option B /
+operator-procedural**. Tracked as the deferred Option-B follow-up (TASK-20). Do not read the 18-2
+guard as a substitute for single-instance deployment under Option A.
 
 ## §5 Production-funding gate (AC#5) — hard block + audited opt-out
 

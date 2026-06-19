@@ -801,7 +801,13 @@ host-controlled).
   `key_purpose`, both signed); TASK-18 18-3 fails closed at decode (`0x40`) on a MALFORMED label
   (empty / non-`[a-z0-9_-]` / over 64 B) but does NOT enforce a strict whitelist — AC#18 permits the
   issuer to narrow further (sub-lanes). Replay is caught by counter contiguity + the signed
-  `scope_identity` (§10.5, TASK-18 18-2), not by this label. Each distinct `scope_target` is its own
+  `scope_identity` (§10.5, TASK-18 18-2), not by this label. **Scope of the `scope_identity` guard
+  (TASK-18 18-4):** it closes **replay-on-empty-row only** (a cap minted for enclave A cannot replay
+  on a fresh clone B whose counter row is empty); it does **NOT** close honest active-active clones
+  of one treasury key (each clone legitimately shares fleet/anchor state) — that is an operator-
+  procedural prohibition under Option A / requires Option B's global ledger, see
+  `agent-gateway-anti-rollback.md` §1 + §4. Do not read the guard as a substitute for single-
+  instance deployment. Each distinct `scope_target` is its own
   counter-tuple key, so a new label grows the sealed counter table / marks payload — bounded by
   `MAX_COUNTER_ENTRIES` / the marks-grammar cap / `MAX_KEYSTORE_BLOB_SIZE` (the lane count is the
   issuer's discipline; a churned label set is an admin-trusted, self-inflicted DoS, not a wrong-accept).

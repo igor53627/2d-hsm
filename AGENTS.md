@@ -75,6 +75,8 @@ This is the normal operating mode for incremental work inside an already-reviewe
 
 After any matrix (Reduced or Full), the consolidation step (`roborev compact` or equivalent) + explicit resolution of findings remains mandatory.
 
+**Compact is iterative, not once-and-done.** A fix commit is itself a change to high-risk code, and the fixes can be incomplete or introduce a new gap. After applying findings, **re-run `roborev compact --wait`** (the post-commit codex hook will have re-reviewed the fix commit; the next compact consolidates THAT). Keep closing rounds until a compact returns **"No issues found"**. Concrete example (18-3, 2026-06-19): compact #1 caught the original test-vacuity; the fix commit was itself incomplete (valid-sig-only did not prove parse-before-sig-check); compact #2 (on the post-commit re-review of the fix) caught THAT; compact #3 returned clean. Stopping after compact #1 would have left the vacuity half-fixed. **Also verify `roborev status` is not `paused` before relying on a compact — a paused queue produces an empty "No open jobs" result that looks like "clean" but is just a stalled queue.**
+
 ### How to Run a Review
 
 See the "Reduced vs Full Matrix" section above for when to use which level.
