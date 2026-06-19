@@ -2622,8 +2622,54 @@ mod tests {
         );
     }
 
+    /// TASK-18 18-5 — the NEGATIVE CONTROL for `generate_keys_fleet_scoped_treasury_rejected` (above):
+    /// a fleet-scoped (`scope_class=1`) GENERATE_KEYS cap for purpose=1 (transfer pool) IS accepted
+    /// (§10.3 "transfer pool: fleet allowed"), proving the AC#12 enclave-only rule is scoped to the
+    /// FAUCET TREASURY keygen (purpose=2) and does NOT accidentally reject transfer-pool keygen. Without
+    /// this control, someone could tighten the handler to reject fleet scope on ALL generate_keys
+    /// (incl. transfer) and the suite would stay green — a false-confidence gap the 18-5 completeness
+    /// audit explicitly calls out. Transfer keys are NOT spend-authority: a clone minting its own
+    /// transfer pool does not multiply a treasury budget (design doc "Financial budget mutations"), so
+    /// fleet-scoped transfer keygen is the one permitted fleet-scoped GENERATE_KEYS variant.
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    #[test]
+    fn generate_keys_fleet_scoped_transfer_accepted() {
+        use ed25519_dalek::SigningKey;
+        let _g = gate_configured();
+        let admin = SigningKey::from_bytes(&[7u8; 32]);
+        let mut body = base_body();
+        body.config.admin_authority_pk = admin.verifying_key().to_bytes();
+        // Fleet-scoped (scope_class=1) cap binding to fleet_scope_id [0xf1;32]; purpose=1 (transfer).
+        let pb = crate::agent_capability::payload_binding(
+            1,
+            None,
+            &[0x11; 16],
+            &generate_keys_canonical_params(1, 1),
+        );
+        let cap = crate::agent_capability::test_signed_capability(
+            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 1, b"generate_transfer", 1, pb, [0xf1; 32],
+        );
+        let pay = vec![
+            (Value::Integer(1.into()), Value::Integer(1.into())), // purpose 1 (transfer)
+            (Value::Integer(2.into()), Value::Integer(1.into())),
+        ];
+        let env = envelope(
+            1,
+            vec![
+                (Value::Integer(5.into()), Value::Map(cap)),
+                (Value::Integer(7.into()), Value::Map(pay)),
+            ],
+        );
+        // Accepted (Success) — NOT CapabilityRejected. Transfer-pool keygen is the fleet-allowed case.
+        assert!(
+            dispatch_agent(Profile::AgentGateway, &env, &body).is_ok(),
+            "fleet-scoped transfer-pool keygen (purpose=1) MUST be accepted (§10.3 transfer pool: fleet allowed); \
+             only faucet-treasury keygen (purpose=2) is enclave-only (AC#12)"
+        );
+    }
+
     /// slice 6-5 VALIDATION PIN: the per-op commit reuses `env.request_id` VERBATIM as the anchor's
-    /// `request_id` idempotency key (the LOGICAL-op identity — keyed ALONE, NOT `(request_id, epoch)`)
+    /// `request_id` idempotency key (the LOGICAL-op identity — keyed ALONE, NOT `(request_id, epoch)`) 
     /// with NO length check of its own — its SOLE guard is this
     /// envelope (key-4) decode bound, `MAX_REQUEST_ID_LEN`=64. Pin that dependency: a 65-byte request_id
     /// is rejected `Malformed` at decode (so it never reaches the commit); a 64-byte and an EMPTY (len 0)
