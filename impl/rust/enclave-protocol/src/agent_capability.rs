@@ -7,19 +7,34 @@
 //!
 //! ## What this slice implements (verify-only)
 //! [`verify_capability`] performs the read-only half of the §10.5 verify order:
-//! 1. strict structural decode of the capability map (keys `1..=13`, no unknown/dup, required keys
+//! 1. strict structural decode of the capability map (keys `1..=14`, no unknown/dup, required keys
 //!    present, key `3` present iff `command_opcode == 6`) — any shape error ⇒ `0x40 MALFORMED`;
-//! 2. `cap_format_version == 1` (unknown version ⇒ `0x40`);
-//! 3. **Ed25519 verify** of key `13` over `"2d-hsm/agent-cap/v1\0" ‖ canonical-CBOR({1..12})`
+//! 2. `cap_format_version == 2` (unknown version ⇒ `0x40`; v1 caps fail closed — TASK-18 18-2a);
+//! 3. **Ed25519 verify** of key `14` over `CAP_DOMAIN ‖ canonical-CBOR({1..13})`
 //!    against the `is_recovery`-selected sealed authority (`admin_authority_pk` /
-//!    `recovery_authority_pk`);
+//!    `recovery_authority_pk`). Key `13` is the signed `scope_identity` (18-2a); it is INSIDE the
+//!    signed bytes, key `14` (the signature) is excluded.
 //! 4. `command_opcode == request.opcode` and `request_id(key 10) == envelope.request_id`;
 //! 5. `chain_id` and `environment_identifier` equal the sealed config (byte-exact);
+//! 5b. **`scope_identity` byte-bound** (TASK-18 18-2 / AC#1): `scope_class==0` ⇒ equals the sealed
+//!    `enclave_scope_id`; `scope_class==1` ⇒ equals `fleet_scope_id`. This is the clone-replay guard
+//!    (a cap minted for enclave A cannot replay on clone B). NB: this holds ONLY if `enclave_scope_id`
+//!    is host-uncontrollable — TASK-25 AC#3 (in-TEE RNG provenance) is the un-gate precondition.
 //! 6. **contiguous counter CHECK** (§10.6): `counter == highest_accepted_counter + 1` for the tuple
 //!    `(authority, environment_identifier, scope_class, scope_target)` — read-only, no advance.
 //!
 //! Every semantic failure collapses to `0x43 AGENT_CAPABILITY_REJECTED` (anti-oracle, §10.9); only
 //! structural/format errors surface as `0x40 AGENT_MALFORMED`.
+//!
+//! ## Domain string vs format version
+//! `CAP_DOMAIN` is the fixed domain-separation label `"2d-hsm/agent-cap/v1\0"`; the `v1` there is
+//! the DOMAIN label, NOT the capability format version. The wire-format version authority is
+//! `cap_format_version` (cap key 1, currently `2`). They intentionally diverge: the domain string
+//! pins the Ed25519 domain-separation prefix (stable across format bumps unless the signing domain
+//! itself changes), while `cap_format_version` gates the signed-shape evolution (18-2a added the
+//! signed `scope_identity` at key 13 and moved the signature 13 → 14). No production cap has ever
+//! been minted, so the v1 → v2 bump is a clean break (a future bump after G3/TASK-25 ships a real
+//! provisioned keystore is NOT clean and needs a migration plan).
 //!
 //! ## Deferred to the per-opcode handler / mutation slices (NOT done here)
 //! - **`treasury_sub_op == request.sub_op` binding** (§10.5, opcode 6): the cap's signed sub-op is
@@ -32,8 +47,13 @@
 //! - **`payload_binding`** (`keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical params)`): needs the
 //!   per-opcode canonical command-param encoding, which lands with the handlers.
 //! - **`scope_class` "financial MUST be enclave" policy** (§10.5/§10.6, AC#12): the structural range
-//!   `{0,1}` is enforced here, but the per-opcode rule (faucet keygen + all treasury config require
-//!   `scope_class == 0`) is a handler concern.
+//!   `{0,1}` is enforced here, and the per-opcode rule (faucet/treasury keygen + treasury config
+//!   require `scope_class == 0`) is ALREADY enforced at the live handlers
+//!   (`agent_dispatch.rs` GENERATE_KEYS treasury-keygen + CONFIGURE_TREASURY reject `scope_class != 0`,
+//!   with a paired `fleet-scoped treasury cap ⇒ 0x43` test). TASK-18 slice 18-5 owns the COMPLETENESS
+//!   audit — enumerate EVERY budget-/rollback-sensitive opcode (incl. the still-preview-banned
+//!   sign-faucet / export-backup) and prove none is fleet-scoped — plus the paired
+//!   fleet-financial-reject test; it is NOT re-adding the two already-live checks.
 //! - **recovery-tier counter semantics** (§10.6, AC#11): a recovery (`is_recovery`) capability is
 //!   sequenced by an **independent strict recovery counter** and resyncs a wedged scope
 //!   **forward-only** (`counter > highest`, not `== highest+1`); `RESTORE_BACKUP` +
@@ -56,7 +76,13 @@ use ed25519_dalek::{Signature, VerifyingKey};
 /// Domain prefix for the capability signing preimage (§10.5). The trailing NUL is part of the label.
 const CAP_DOMAIN: &[u8] = b"2d-hsm/agent-cap/v1\0";
 /// Only version understood by this build.
-const CAP_FORMAT_VERSION: u64 = 1;
+// v2 (TASK-18 18-2a): adds the signed `scope_identity` field at key 13 (the enclave/fleet id this
+// cap binds to, byte-compared against the sealed `enclave_scope_id`/`fleet_scope_id` in 18-2b). The
+// Ed25519 signature moved from key 13 → key 14. A v1 cap (no scope_identity) fails closed here as
+// 0x40 before any state touch. No production cap has ever been minted, so this is a clean break (no
+// migration story needed) — a future bump after G3 ships a real provisioned keystore is NOT (see
+// TASK-25 AC#5).
+const CAP_FORMAT_VERSION: u64 = 2;
 /// `treasury_sub_op` (cap key 3) is present iff the capability authorizes `CONFIGURE_TREASURY`.
 const OPCODE_CONFIGURE_TREASURY: u8 = 6;
 /// Opcodes a capability may authorize — the privileged set (§10.3/§10.5):
@@ -89,6 +115,14 @@ struct Capability {
     request_id: Vec<u8>,
     payload_binding: [u8; 32],
     is_recovery: bool,
+    /// The signed scope identity this cap binds to (cap key 13, TASK-18 18-2a): for `scope_class==0`
+    /// it is the target enclave id (byte-compared vs the sealed `enclave_scope_id`); for
+    /// `scope_class==1` it is the fleet id (vs `fleet_scope_id`). Signed so a host cannot alter it
+    /// under a valid cap — this is the field that makes AC#1's clone-replay guard enforceable.
+    /// 18-2a added the field (parsed + signed + emitted); 18-2b ENFORCES it in
+    /// `verify_capability_extract_inner` (step 5b) + the `KeystoreBody::validate()` value-level guards
+    /// (reject all-zero / `enclave == fleet`).
+    scope_identity: [u8; 32],
     signature: [u8; 64],
 }
 
@@ -123,7 +157,8 @@ use crate::agent_cbor::{as_bytes, as_bytes32, as_bytes_n, as_u64, check_strict_k
 /// violation ⇒ [`AgentError::Malformed`] (`0x40`, syntax only).
 fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
     // Strict keys: every key is an integer in 1..=13, none repeats.
-    if !check_strict_keys(map, |n| (1..=13).contains(&n)) {
+    // 18-2a: key 13 is now `scope_identity`; the Ed25519 signature is key 14. A v2 cap MUST carry both.
+    if !check_strict_keys(map, |n| (1..=14).contains(&n)) {
         return Err(AgentError::Malformed);
     }
 
@@ -197,8 +232,12 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
         Some(Value::Bool(b)) => *b,
         _ => return Err(AgentError::Malformed),
     };
+    // 18-2a: signed scope identity (enclave/fleet id this cap binds to). Required on every v2 cap.
+    let scope_identity: [u8; 32] =
+        map_get(map, 13).and_then(as_bytes32).ok_or(AgentError::Malformed)?;
+    // 18-2a: signature moved key 13 → 14.
     let signature: [u8; 64] =
-        map_get(map, 13).and_then(as_bytes_n::<64>).ok_or(AgentError::Malformed)?;
+        map_get(map, 14).and_then(as_bytes_n::<64>).ok_or(AgentError::Malformed)?;
 
     Ok(Capability {
         cap_format_version,
@@ -213,6 +252,7 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
         request_id,
         payload_binding,
         is_recovery,
+        scope_identity,
         signature,
     })
 }
@@ -248,15 +288,16 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
-/// The Ed25519-signed message: `CAP_DOMAIN ‖ canonical-CBOR({keys 1..12})`.
+/// The Ed25519-signed message: `CAP_DOMAIN ‖ canonical-CBOR({keys 1..13})`.
 ///
 /// Keys are emitted in ascending order with shortest-form integer keys and a definite-length map
 /// header — RFC 8949 §4.2.1 core deterministic encoding — so a conformant host signer and this
-/// verifier produce byte-identical preimages. Key `13` (the signature) is excluded.
+/// verifier produce byte-identical preimages. Key `14` (the signature) is excluded; keys `1..=13`
+/// are signed (key 13 = `scope_identity`, added 18-2a).
 fn signed_preimage(cap: &Capability) -> Vec<u8> {
     let mut out = Vec::with_capacity(CAP_DOMAIN.len() + 96 + cap.environment_identifier.len());
     out.extend_from_slice(CAP_DOMAIN);
-    let count: u64 = if cap.treasury_sub_op.is_some() { 12 } else { 11 };
+    let count: u64 = if cap.treasury_sub_op.is_some() { 13 } else { 12 };
     put_uint(&mut out, 5, count); // map header
     put_uint(&mut out, 0, 1);
     put_uint(&mut out, 0, cap.cap_format_version);
@@ -284,6 +325,8 @@ fn signed_preimage(cap: &Capability) -> Vec<u8> {
     put_bytes(&mut out, &cap.payload_binding);
     put_uint(&mut out, 0, 12);
     out.push(if cap.is_recovery { 0xf5 } else { 0xf4 });
+    put_uint(&mut out, 0, 13);
+    put_bytes(&mut out, &cap.scope_identity);
     out
 }
 
@@ -384,6 +427,25 @@ fn verify_capability_extract_inner(
         return Err(AgentError::CapabilityRejected);
     }
 
+    // (5b) scope_identity byte-bound to the sealed scope id selected by scope_class (TASK-18 18-2 / AC#1).
+    // This is the clone-replay guard: a cap minted for enclave A (carrying A's `enclave_scope_id` in its
+    // signed `scope_identity`) cannot be replayed on a fresh clone B, because B's sealed `enclave_scope_id`
+    // differs and this byte-compare fails (0x43) BEFORE the empty-counter-row check at (6) would otherwise
+    // accept `incoming==1`. `scope_class==0` (enclave) pins to the per-enclave `enclave_scope_id`;
+    // `scope_class==1` (fleet) pins to the shared `fleet_scope_id` (legitimately equal across one fleet's
+    // clones). The signed `scope_identity` field (cap key 13, 18-2a) makes this host-unalterable under a
+    // valid cap. NB: this guard holds ONLY if `enclave_scope_id` was minted in-TEE and is not host-selectable
+    // — see TASK-25 AC#3 (G3 provenance precondition). The `financial ⇒ scope_class==0` policy that makes
+    // this guard non-bypassable for budget-sensitive ops is enforced at the handler (18-5).
+    let sealed_scope_id = if cap.scope_class == 0 {
+        &config.enclave_scope_id
+    } else {
+        &config.fleet_scope_id
+    };
+    if &cap.scope_identity != sealed_scope_id {
+        return Err(AgentError::CapabilityRejected);
+    }
+
     // (6) strict contiguous counter CHECK (§10.6) for the tuple
     // (authority, environment_identifier, scope_class, scope_target). No entry yet ⇒ highest = 0, so
     // the first accepted counter is 1. Read-only: the advance + re-seal lands with the mutation slice.
@@ -457,7 +519,8 @@ fn cap_to_map(c: &Capability) -> Vec<(Value, Value)> {
     m.push((Value::Integer(10.into()), Value::Bytes(c.request_id.clone())));
     m.push((Value::Integer(11.into()), Value::Bytes(c.payload_binding.to_vec())));
     m.push((Value::Integer(12.into()), Value::Bool(c.is_recovery)));
-    m.push((Value::Integer(13.into()), Value::Bytes(c.signature.to_vec())));
+    m.push((Value::Integer(13.into()), Value::Bytes(c.scope_identity.to_vec())));
+    m.push((Value::Integer(14.into()), Value::Bytes(c.signature.to_vec())));
     m
 }
 
@@ -487,6 +550,7 @@ pub(crate) fn test_signed_capability(
     scope_target: &[u8],
     key_purpose: u8,
     payload_binding: [u8; 32],
+    scope_identity: [u8; 32],
 ) -> Vec<(Value, Value)> {
     // Default treasury sub-op for opcode 6 = `refill_budget`(1) (admin-tier) — back-compat for the
     // existing callers (none of which exercise sub-ops 0/2/3). Treasury tests that need a specific
@@ -505,6 +569,7 @@ pub(crate) fn test_signed_capability(
         scope_target,
         key_purpose,
         payload_binding,
+        scope_identity,
     )
 }
 
@@ -527,10 +592,11 @@ pub(crate) fn test_signed_capability_with_sub_op(
     scope_target: &[u8],
     key_purpose: u8,
     payload_binding: [u8; 32],
+    scope_identity: [u8; 32],
 ) -> Vec<(Value, Value)> {
     use ed25519_dalek::Signer;
     let mut cap = Capability {
-        cap_format_version: 1,
+        cap_format_version: CAP_FORMAT_VERSION,
         command_opcode: opcode,
         treasury_sub_op,
         key_purpose,
@@ -542,6 +608,7 @@ pub(crate) fn test_signed_capability_with_sub_op(
         request_id: request_id.to_vec(),
         payload_binding,
         is_recovery,
+        scope_identity,
         signature: [0u8; 64],
     };
     cap.signature = signing_key.sign(&signed_preimage(&cap)).to_bytes();
@@ -556,6 +623,13 @@ mod tests {
 
     const TEST_ENV: &str = "env-prod-0";
     const TEST_CHAIN: u64 = 11565;
+    /// Test enclave/fleet scope identities — mirror the genesis/reference fixture sentinels
+    /// (`[0xe1;32]` / `[0xf1;32]` in `agent_keystore.rs`). TEST FIXTURES ONLY: a production
+    /// provisioning path mints a RANDOM `enclave_scope_id` in-TEE (TASK-25 AC#3/#4) and never
+    /// reuses these predictable sentinels. The two are DISTINCT so `scope_class` 0-vs-1 does not
+    /// collapse (the 18-2b `KeystoreBody::validate()` distinctness invariant).
+    const TEST_ENCLAVE_SCOPE_ID: [u8; 32] = [0xe1; 32];
+    const TEST_FLEET_SCOPE_ID: [u8; 32] = [0xf1; 32];
 
     fn admin_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])
@@ -593,7 +667,7 @@ mod tests {
             };
             CapBuilder {
                 cap: Capability {
-                    cap_format_version: 1,
+                    cap_format_version: CAP_FORMAT_VERSION,
                     command_opcode: opcode,
                     treasury_sub_op: sub,
                     key_purpose: 1,
@@ -605,12 +679,13 @@ mod tests {
                     request_id: request_id.to_vec(),
                     payload_binding: [0xab; 32],
                     is_recovery: false,
+                    scope_identity: TEST_ENCLAVE_SCOPE_ID,
                     signature: [0u8; 64],
                 },
             }
         }
 
-        /// Encode to the inner-envelope key-5 CBOR map, signing keys 1..12 with `key`.
+        /// Encode to the inner-envelope key-5 CBOR map, signing keys 1..13 with `key`.
         fn build(mut self, key: &SigningKey) -> Vec<(Value, Value)> {
             let sig = key.sign(&signed_preimage(&self.cap));
             self.cap.signature = sig.to_bytes();
@@ -629,6 +704,67 @@ mod tests {
         let rid = b"req-1";
         let cap = CapBuilder::new(1, rid, 1).build(&admin_signing_key());
         assert_eq!(verify_capability(&cap, 1, rid, &cfg, &[]), Ok(()));
+    }
+
+    /// TASK-18 18-2b / AC#1 — the clone-replay guard. A cap minted for enclave A (signed with A's
+    /// `enclave_scope_id` in `scope_identity`) is presented against clone B, whose sealed
+    /// `enclave_scope_id` DIFFERS and whose counter row for this tuple is EMPTY (so without this guard
+    /// `incoming==1` would be accepted at step 6). The 18-2b scope_identity byte-compare (step 5b) must
+    /// fire FIRST ⇒ 0x43. This is the core anti-replay test; it MUST be paired with the
+    /// `fleet_scoped_cap_binds_to_fleet_id` + `financial_must_be_enclave_scoped` tests (else the suite
+    /// gives false confidence — see TASK-18 18-5 carry-in).
+    #[test]
+    fn enclave_scoped_cap_rejected_on_clone_with_different_enclave_id() {
+        // Cap carries A's enclave_scope_id (CapBuilder defaults scope_identity = TEST_ENCLAVE_SCOPE_ID).
+        let rid = b"req-clone";
+        let cap = CapBuilder::new(1, rid, 1).build(&admin_signing_key());
+        // Clone B: identical config EXCEPT enclave_scope_id is B's own (distinct, non-zero).
+        let mut clone_b = test_config();
+        clone_b.enclave_scope_id = [0xe2; 32];
+        // Empty counter table ⇒ without the scope guard, highest=0 + incoming=1 ⇒ accepted.
+        // The scope_identity byte-compare (cap has [0xe1;32], config has [0xe2;32]) ⇒ 0x43.
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &clone_b, &[]),
+            Err(AgentError::CapabilityRejected),
+            "enclave-scoped cap for A must NOT replay on clone B (different enclave_scope_id)",
+        );
+        // Sanity: the SAME cap against A's config (matching enclave_scope_id) IS accepted.
+        assert_eq!(
+            verify_capability(&cap, 1, rid, &test_config(), &[]),
+            Ok(()),
+            "enclave-scoped cap accepted against the matching enclave config",
+        );
+    }
+
+    /// TASK-18 18-2b — `scope_class` selects which sealed id the cap binds to. A fleet-scoped cap
+    /// (scope_class==1) binds to `fleet_scope_id` (shared across one fleet's clones by design), NOT to
+    /// `enclave_scope_id`. This documents WHY the enclave byte-compare alone does not protect
+    /// fleet-scoped caps — motivating the 18-5 `financial ⇒ scope_class==0` policy that prevents an
+    /// attacker from minting a fleet-scoped keygen/treasury cap to bypass the enclave compare.
+    #[test]
+    fn fleet_scoped_cap_binds_to_fleet_id_not_enclave_id() {
+        let cfg = test_config(); // enclave_scope_id=[0xe1;32], fleet_scope_id=[0xf1;32]
+        let rid = b"req-fleet";
+        // Fleet cap: scope_class=1, scope_identity = fleet_scope_id ⇒ accepted.
+        let mut b = CapBuilder::new(1, rid, 1);
+        b.cap.scope_class = 1;
+        b.cap.scope_identity = TEST_FLEET_SCOPE_ID;
+        let fleet_cap = b.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&fleet_cap, 1, rid, &cfg, &[]),
+            Ok(()),
+            "fleet-scoped cap with the matching fleet_scope_id is accepted",
+        );
+        // A cap that claims scope_class=1 but carries the ENCLAVE id must fail (binds to fleet id).
+        let mut b2 = CapBuilder::new(1, rid, 1);
+        b2.cap.scope_class = 1;
+        b2.cap.scope_identity = TEST_ENCLAVE_SCOPE_ID; // wrong: enclave id, not fleet id
+        let wrong = b2.build(&admin_signing_key());
+        assert_eq!(
+            verify_capability(&wrong, 1, rid, &cfg, &[]),
+            Err(AgentError::CapabilityRejected),
+            "scope_class==1 binds to fleet_scope_id, not enclave_scope_id",
+        );
     }
 
     #[test]
@@ -820,7 +956,8 @@ mod tests {
         let cfg = test_config();
         let rid = b"req-1";
         let mut b = CapBuilder::new(1, rid, 1);
-        b.cap.cap_format_version = 2;
+        // v2 is current (18-2a); an unknown FUTURE version (3) must fail closed as Malformed.
+        b.cap.cap_format_version = 3;
         let cap = b.build(&admin_signing_key());
         assert_eq!(
             verify_capability(&cap, 1, rid, &cfg, &[]),
@@ -882,15 +1019,16 @@ mod tests {
 
     #[test]
     fn canonical_preimage_is_deterministic_and_excludes_signature() {
-        // Two builds of the same cap produce identical preimages; key 13 is not in the preimage.
+        // Two builds of the same cap produce identical preimages; key 14 (the signature) is not in the
+        // preimage. Key 13 (scope_identity, 18-2a) IS signed.
         let a = CapBuilder::new(1, b"req-1", 1).cap;
         let b = CapBuilder::new(1, b"req-1", 1).cap;
         let pa = signed_preimage(&a);
         let pb = signed_preimage(&b);
         assert_eq!(pa, pb);
         assert!(pa.starts_with(CAP_DOMAIN));
-        // map header for 11 entries (no sub-op) = 0xA0 | 11 = 0xAB, right after the domain.
-        assert_eq!(pa[CAP_DOMAIN.len()], 0xAB);
+        // map header for 12 entries (no sub-op) = 0xA0 | 12 = 0xAC, right after the domain.
+        assert_eq!(pa[CAP_DOMAIN.len()], 0xAC);
     }
 
     #[test]
@@ -1017,13 +1155,13 @@ mod tests {
     }
 
     #[test]
-    fn valid_treasury_capability_accepted_with_12_entry_preimage() {
+    fn valid_treasury_capability_accepted_with_13_entry_preimage() {
         let cfg = test_config();
         let rid = b"req-1";
-        let b = CapBuilder::new(6, rid, 1); // CONFIGURE_TREASURY ⇒ sub_op present (12-entry preimage)
-        // 12 entries ⇒ map header 0xA0 | 12 = 0xAC right after the domain.
+        let b = CapBuilder::new(6, rid, 1); // CONFIGURE_TREASURY ⇒ sub_op present (13-entry preimage)
+        // 13 entries ⇒ map header 0xA0 | 13 = 0xAD right after the domain.
         let pre = signed_preimage(&b.cap);
-        assert_eq!(pre[CAP_DOMAIN.len()], 0xAC);
+        assert_eq!(pre[CAP_DOMAIN.len()], 0xAD);
         let cap = b.build(&admin_signing_key());
         assert_eq!(verify_capability(&cap, 6, rid, &cfg, &[]), Ok(()));
     }
@@ -1080,11 +1218,11 @@ mod tests {
     /// TASK-22 — byte-exact §10.5 CAPABILITY golden vectors (AC#2).
     ///
     /// Freezes, for the cap-bearing opcodes, the Ed25519-signed PREIMAGE (`CAP_DOMAIN ‖
-    /// canonical-CBOR(keys 1..12)`) AND the full capability map (keys 1..13, incl. the signature), plus the
+    /// canonical-CBOR(keys 1..13)`) AND the full capability map (keys 1..14, incl. the signature at key 14), plus the
     /// `payload_binding` derivation (`keccak256(opcode ‖ [sub_op] ‖ request_id ‖ canonical-CBOR(params))`).
-    /// These pin the two facts most likely to drift an external (2d Elixir) reimplementer: the **11-vs-12
-    /// entry preimage header** (`0xAB` no-sub_op vs `0xAC` CONFIGURE) and the **sub_op byte folded into the
-    /// binding**. Each is byte-exact vs the committed `.bin` AND the full map is ACCEPTED by the real
+    /// These pin the two facts most likely to drift an external (2d Elixir) reimplementer: the **12-vs-13
+    /// entry preimage header** (`0xAC` no-sub_op vs `0xAD` CONFIGURE; 18-2a added the signed `scope_identity`
+    /// key 13) and the **sub_op byte folded into the binding**. Each is byte-exact vs the committed `.bin` AND the full map is ACCEPTED by the real
     /// `verify_capability` against `test_config()` (so a signer/encoder drift breaks CI). Ed25519 (RFC 8032)
     /// is deterministic, so the signed bytes are reproducible. **TEST KEYS ONLY** — admin Ed25519 `[7;32]`,
     /// recovery `[9;32]`; env `env-prod-0`, chain 11565 (the agent_capability test fixtures).
@@ -1113,7 +1251,7 @@ mod tests {
         }
 
         /// Build a golden cap → (signed preimage, full-map CBOR bytes, the map). Constructs the Capability
-        /// directly so BOTH the preimage (keys 1..12) and the signed full map (keys 1..13) come from ONE cap.
+        /// directly so BOTH the preimage (keys 1..13) and the signed full map (keys 1..14) come from ONE cap.
         #[allow(clippy::too_many_arguments)]
         fn build_cap(
             key: &SigningKey,
@@ -1125,9 +1263,10 @@ mod tests {
             request_id: &[u8],
             payload_binding: [u8; 32],
             is_recovery: bool,
+            scope_identity: [u8; 32],
         ) -> (Vec<u8>, Vec<u8>, Vec<(Value, Value)>) {
             let mut cap = Capability {
-                cap_format_version: 1,
+                cap_format_version: CAP_FORMAT_VERSION,
                 command_opcode: opcode,
                 treasury_sub_op: sub_op,
                 key_purpose,
@@ -1139,6 +1278,7 @@ mod tests {
                 request_id: request_id.to_vec(),
                 payload_binding,
                 is_recovery,
+                scope_identity,
                 signature: [0u8; 64],
             };
             let preimage = signed_preimage(&cap);
@@ -1191,15 +1331,15 @@ mod tests {
         fn caps() -> Vec<(&'static str, Vec<u8>, Vec<u8>, u8, Option<u8>, bool, &'static [u8], u8)> {
             let admin = SigningKey::from_bytes(&[7u8; 32]);
             let recovery = SigningKey::from_bytes(&[9u8; 32]);
-            let (p_g, f_g, _) = build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false);
+            let (p_g, f_g, _) = build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false, TEST_ENCLAVE_SCOPE_ID);
             let (p_s, f_s, _) =
-                build_cap(&admin, 6, Some(0), 2, SCOPE_CONFIGURE, 1, RID_SET_LIMITS, pb_set_limits(), false);
+                build_cap(&admin, 6, Some(0), 2, SCOPE_CONFIGURE, 1, RID_SET_LIMITS, pb_set_limits(), false, TEST_ENCLAVE_SCOPE_ID);
             let (p_r, f_r, _) =
-                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true);
+                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true, TEST_ENCLAVE_SCOPE_ID);
             vec![
-                ("generate_keys", p_g, f_g, 1, None, false, RID_GENERATE, 0xAB),
-                ("configure_reset", p_r, f_r, 6, Some(3), true, RID_RESET, 0xAC),
-                ("configure_set_limits", p_s, f_s, 6, Some(0), false, RID_SET_LIMITS, 0xAC),
+                ("generate_keys", p_g, f_g, 1, None, false, RID_GENERATE, 0xAC),
+                ("configure_reset", p_r, f_r, 6, Some(3), true, RID_RESET, 0xAD),
+                ("configure_set_limits", p_s, f_s, 6, Some(0), false, RID_SET_LIMITS, 0xAD),
             ]
         }
 
@@ -1236,8 +1376,8 @@ mod tests {
 
         #[test]
         fn cap_preimages_have_domain_and_canonical_header() {
-            // CAP_DOMAIN prefix + the map-header byte that distinguishes the 11-entry (no sub_op) preimage
-            // from the 12-entry CONFIGURE preimage — the asymmetry an external reimplementer is most likely
+            // CAP_DOMAIN prefix + the map-header byte that distinguishes the 12-entry (no sub_op) preimage
+            // from the 13-entry CONFIGURE preimage — the asymmetry an external reimplementer is most likely
             // to get wrong.
             for (name, preimage, _full, _op, _sub, _rec, _rid, header) in caps() {
                 assert!(preimage.starts_with(CAP_DOMAIN), "cap {name} preimage missing CAP_DOMAIN prefix");
@@ -1285,7 +1425,7 @@ mod tests {
             // highest 1, expect 2, and REJECT counter 1 (this test would then fail, catching the regression).
             // Admin GENERATE_KEYS counter 1, with a RECOVERY lane on the SAME scope already at highest 1.
             let (_p, _f, admin_map) =
-                build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false);
+                build_cap(&admin, 1, None, 1, SCOPE_GENERATE, 1, RID_GENERATE, pb_generate(), false, TEST_ENCLAVE_SCOPE_ID);
             let recovery_same_scope = lane(recovery.verifying_key().to_bytes(), SCOPE_GENERATE);
             assert_eq!(
                 verify_capability(&admin_map, 1, RID_GENERATE, &test_config(), std::slice::from_ref(&recovery_same_scope)),
@@ -1294,7 +1434,7 @@ mod tests {
             );
             // Symmetric: recovery RESET counter 1, with an ADMIN lane on the SAME scope already at highest 1.
             let (_p2, _f2, reset_map) =
-                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true);
+                build_cap(&recovery, 6, Some(3), 2, SCOPE_CONFIGURE, 1, RID_RESET, pb_reset(), true, TEST_ENCLAVE_SCOPE_ID);
             let admin_same_scope = lane(admin.verifying_key().to_bytes(), SCOPE_CONFIGURE);
             assert_eq!(
                 verify_capability(&reset_map, 6, RID_RESET, &test_config(), std::slice::from_ref(&admin_same_scope)),
@@ -1404,7 +1544,9 @@ mod tests {
                 pb_index.insert(name.into(), serde_json::Value::Object(e));
             }
             let doc = serde_json::json!({
-                "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors. preimage = CAP_DOMAIN || canonical-CBOR(keys 1..12); full map = keys 1..13 (incl. Ed25519 signature). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params) — the payload_bindings entries carry canonical_params_hex so it is recomputable. TEST KEYS ONLY (admin [7;32], recovery [9;32]); environment_identifier 'env-prod-0' is a TEST value, NOT a production environment.",
+                "_comment": "TASK-22 AC#2 — byte-exact §10.5 capability golden vectors (cap_format_version 2, TASK-18 18-2a). preimage = CAP_DOMAIN || canonical-CBOR(keys 1..13); full map = keys 1..14 (incl. Ed25519 signature at key 14; key 13 = scope_identity). Each full map is ACCEPTED by the live verify_capability against the test config. payload_binding = keccak256(opcode || [sub_op] || request_id || canonical_params) — the payload_bindings entries carry canonical_params_hex so it is recomputable. TEST KEYS ONLY (admin [7;32], recovery [9;32]); environment_identifier 'env-prod-0' is a TEST value, NOT a production environment.",
+                "_versioning_note": "THREE distinct version counters, do not conflate: (1) cap_format_version = 2 (cap key 1, the WIRE-FORMAT authority — 18-2a bumped 1→2 adding signed scope_identity at key 13, signature moved 13→14); (2) CAP_DOMAIN label = '2d-hsm/agent-cap/v1' (the Ed25519 domain-separation PREFIX, intentionally NOT bumped — it pins the signing domain, not the format; the format version lives in cap key 1); (3) the FILENAME suffix _v1 = the agent-gateway ENVELOPE/TESTVECTOR-SCHEMA version (retained to avoid churning include_bytes! paths, same precedent as agent_keystore_genesis_v2). A v1-shaped cap (no scope_identity, signature at key 13) FAILS CLOSED at the cap_format_version check.",
+                "cap_format_version": CAP_FORMAT_VERSION,
                 "cap_domain_hex": hx(CAP_DOMAIN),
                 "environment_identifier": TEST_ENV,
                 "chain_id": TEST_CHAIN,

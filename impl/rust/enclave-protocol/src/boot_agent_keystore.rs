@@ -215,6 +215,7 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
         K::InvalidStructuralVersion => "agent keystore: invalid structural_version (must be >= 1)",
         K::Cbor
         | K::InvalidEnvironmentId
+        | K::InvalidScopeId
         | K::CapacityExceeded
         | K::CounterRegression
         | K::InvalidFieldLength
