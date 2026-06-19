@@ -2324,7 +2324,7 @@ mod tests {
         // EXPORT_BACKUP(7) is admin-tier but its handler is still deferred: a valid cap verifies,
         // then the request collapses to NotConfigured (0x45) — proves verify→handler routing.
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
         );
         let payload = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -2347,7 +2347,7 @@ mod tests {
         // NotConfigured (0x45) — pinning the verify→fail-closed contract so the stub can't silently become a
         // no-op handler. (An ADMIN-signed restore is separately rejected at the tier check, 0x43.)
         let cap = crate::agent_capability::test_signed_capability(
-            &recovery, 8, &[0x11; 16], 1, true, 11565, "testnet", 0, b"restore_backup", 1, [0xab; 32],
+            &recovery, 8, &[0x11; 16], 1, true, 11565, "testnet", 0, b"restore_backup", 1, [0xab; 32], [0xe1; 32],
         );
         let payload = envelope(8, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -2364,7 +2364,7 @@ mod tests {
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         let mut cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
         );
         // Reverse the cap entries so the nested submap's keys are DESCENDING (non-canonical) while the
         // signed VALUES are unchanged. In ascending order this exact cap reaches NotConfigured (see
@@ -2398,7 +2398,7 @@ mod tests {
         );
         let cap = crate::agent_capability::test_signed_capability(
             admin, 1, request_id, counter, false, 11565, "testnet", 0, scope_target,
-            purpose_code as u8, pb,
+            purpose_code as u8, pb, [0xe1; 32],
         );
         let payload = vec![
             (Value::Integer(1.into()), Value::Integer(purpose_code.into())),
@@ -2540,7 +2540,7 @@ mod tests {
             &generate_keys_canonical_params(2, 1),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_faucet", 1, pb,
+            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_faucet", 1, pb, [0xe1; 32],
         );
         let pay = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())), // purpose 2 (faucet)
@@ -2603,7 +2603,7 @@ mod tests {
             &generate_keys_canonical_params(2, 1),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 1, b"generate_faucet", 2, pb,
+            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 1, b"generate_faucet", 2, pb, [0xf1; 32],
         );
         let pay = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
@@ -2696,7 +2696,7 @@ mod tests {
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // A well-formed cap signed by the wrong key ⇒ Ed25519 fails ⇒ CapabilityRejected (0x43).
         let cap = crate::agent_capability::test_signed_capability(
-            &wrong, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer", 1, [0xab; 32],
+            &wrong, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer", 1, [0xab; 32], [0xe1; 32],
         );
         let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -3439,7 +3439,7 @@ mod tests {
         // verify_capability, which rejects the wrong key (0x43). Proves the binding unblocks the gate.
         let wrong = SigningKey::from_bytes(&[9u8; 32]);
         let cap = crate::agent_capability::test_signed_capability(
-            &wrong, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+            &wrong, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
         );
         let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -3460,7 +3460,7 @@ mod tests {
         // EXPORT_BACKUP(7) with a valid cap, through the REAL frame handler, no anti-rollback binding ⇒
         // the gate fires ⇒ 0x45 (proves the gate is on the production frame path).
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32],
+            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
         );
         let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&env)), Some(0x45));
@@ -4337,7 +4337,7 @@ mod tests {
             let pb = crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &cp);
             let cap = crate::agent_capability::test_signed_capability_with_sub_op(
                 authority, 6, Some(sub_op), request_id, counter, is_recovery, 11565, "testnet", 0, SCOPE,
-                2, pb,
+                2, pb, [0xe1; 32],
             );
             let mut payload = vec![
                 (Value::Integer(1.into()), Value::Integer(u64::from(sub_op).into())),
@@ -4755,7 +4755,7 @@ mod tests {
             let cp = configure_treasury_canonical_params(0, &min_be(1), Some((1, 1)));
             let pb = crate::agent_capability::payload_binding(6, Some(0), &[0x11; 16], &cp);
             let cap = crate::agent_capability::test_signed_capability_with_sub_op(
-                &admin, 6, Some(0), &[0x11; 16], 1, false, 11565, "testnet", 1, SCOPE, 2, pb,
+                &admin, 6, Some(0), &[0x11; 16], 1, false, 11565, "testnet", 1, SCOPE, 2, pb, [0xf1; 32],
             );
             let pay = vec![
                 (Value::Integer(1.into()), Value::Integer(0u64.into())),
@@ -4957,7 +4957,7 @@ mod tests {
                 &export_canonical_params(selector),
             );
             let cap = crate::agent_capability::test_signed_capability(
-                admin, 7, request_id, counter, false, 11565, "testnet", 0, ESCOPE, 1, pb,
+                admin, 7, request_id, counter, false, 11565, "testnet", 0, ESCOPE, 1, pb, [0xe1; 32],
             );
             let payload = match selector {
                 ExportSelector::All => vec![],
@@ -5044,7 +5044,7 @@ mod tests {
                 &export_canonical_params(&ExportSelector::All),
             );
             let cap = crate::agent_capability::test_signed_capability(
-                &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, ESCOPE, 1, pb,
+                &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, ESCOPE, 1, pb, [0xe1; 32],
             );
             // Cap signed for ALL, but the request carries a batch_id selector.
             let env = envelope(
@@ -5444,7 +5444,7 @@ mod tests {
             let admin = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
             let pb = crate::agent_capability::payload_binding(1, None, RID_GENERATE, &generate_keys_canonical_params(1, 1));
             let cap = crate::agent_capability::test_signed_capability(
-                &admin, 1, RID_GENERATE, 1, false, CHAIN, ENV_ID, 0, SCOPE_GENERATE, 1, pb,
+                &admin, 1, RID_GENERATE, 1, false, CHAIN, ENV_ID, 0, SCOPE_GENERATE, 1, pb, [0xe1; 32],
             );
             enc(vec![
                 (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
@@ -5464,7 +5464,7 @@ mod tests {
             let params = configure_treasury_canonical_params(0, &min_be(1_000_000), Some((21_000, 1_000_000_000)));
             let pb = crate::agent_capability::payload_binding(6, Some(0), RID_SET_LIMITS, &params);
             let cap = crate::agent_capability::test_signed_capability_with_sub_op(
-                &admin, 6, Some(0), RID_SET_LIMITS, 1, false, CHAIN, ENV_ID, 0, SCOPE_CONFIGURE, 2, pb,
+                &admin, 6, Some(0), RID_SET_LIMITS, 1, false, CHAIN, ENV_ID, 0, SCOPE_CONFIGURE, 2, pb, [0xe1; 32],
             );
             enc(vec![
                 (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
@@ -5901,7 +5901,7 @@ mod tests {
         /// placeholder is fine for verify-band negatives.
         fn genkeys_cap(signer: &ed25519_dalek::SigningKey, counter: u64) -> Vec<(Value, Value)> {
             crate::agent_capability::test_signed_capability(
-                signer, 1, RID, counter, false, CHAIN, ENV_ID, 0, b"golden-scope-generate", 1, [0xbb; 32],
+                signer, 1, RID, counter, false, CHAIN, ENV_ID, 0, b"golden-scope-generate", 1, [0xbb; 32], [0xe1; 32],
             )
         }
 

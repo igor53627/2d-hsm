@@ -842,6 +842,11 @@ const EXPECTED_CAP_REJECTED_CODE: u64 = 0x43;
 /// contiguous-counter key); a single in-repo constant for the cap's scope binding.
 #[cfg(feature = "agent-keygen-exec-preview")]
 const SMOKE_KEYGEN_SCOPE_TARGET: &[u8] = b"smoke-generate-transfer";
+/// The enclave scope identity the smoke keystore is provisioned with (`config.enclave_scope_id` =
+/// `[0xe1;32]`, the same TEST fixture sentinel as the genesis/reference bodies). Every smoke cap
+/// binds here so the 18-2b enclave byte-compare passes. TEST FIXTURE ONLY — production mints a
+/// random id in-TEE (TASK-25 AC#3/#4).
+const SMOKE_ENCLAVE_SCOPE_ID: [u8; 32] = [0xe1; 32];
 
 /// Build a strict-canonical 0x40 GENERATE_KEYS request envelope for the smoke scope, signing the
 /// capability with `signer` (the W1 success path passes the [`SMOKE_ADMIN_SEED`] key whose verifying
@@ -876,6 +881,7 @@ fn smoke_generate_keys_envelope(
         SMOKE_KEYGEN_SCOPE_TARGET,
         SMOKE_KEYGEN_PURPOSE as u8,
         pb,
+        SMOKE_ENCLAVE_SCOPE_ID,
     );
     let payload = vec![
         (Value::Integer(1.into()), Value::Integer(SMOKE_KEYGEN_PURPOSE.into())),
@@ -1156,7 +1162,7 @@ mod faucet {
         );
         let cap = crate::agent_capability::test_signed_capability(
             signer, OPCODE_GENERATE_KEYS, request_id, counter, false, SMOKE_CHAIN_ID, SMOKE_ENVIRONMENT,
-            0, GENFAUCET_SCOPE_TARGET, FAUCET_TREASURY_PURPOSE as u8, pb,
+            0, GENFAUCET_SCOPE_TARGET, FAUCET_TREASURY_PURPOSE as u8, pb, SMOKE_ENCLAVE_SCOPE_ID,
         );
         envelope(
             OPCODE_GENERATE_KEYS,
@@ -1183,7 +1189,7 @@ mod faucet {
         let pb = crate::agent_capability::payload_binding(OPCODE_CONFIGURE_TREASURY, Some(sub_op), request_id, &cp);
         let cap = crate::agent_capability::test_signed_capability_with_sub_op(
             signer, OPCODE_CONFIGURE_TREASURY, Some(sub_op), request_id, counter, false, SMOKE_CHAIN_ID,
-            SMOKE_ENVIRONMENT, 0, CONFIGURE_SCOPE_TARGET, 2, pb,
+            SMOKE_ENVIRONMENT, 0, CONFIGURE_SCOPE_TARGET, 2, pb, SMOKE_ENCLAVE_SCOPE_ID,
         );
         let mut payload = vec![
             (Value::Integer(1.into()), Value::Integer(u64::from(sub_op).into())),

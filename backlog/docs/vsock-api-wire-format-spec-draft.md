@@ -744,19 +744,28 @@ privileged opcodes. **Host-side Vault/OPA authorization alone is never sufficien
   domain `"2d-hsm/agent-cap/v1\0"` before verification:
 
 ```
-1 cap_format_version (=1)        7 scope_class (0=enclave,1=fleet; financial MUST be enclave)
-2 command_opcode                 8 scope_target (enclave_id|fleet_id, command_class folded in)
+1 cap_format_version (=2, TASK-18 18-2a)  7 scope_class (0=enclave,1=fleet; financial MUST be enclave)
+2 command_opcode                 8 scope_target (command_class lane label: generate_transfer|generate_faucet|configure_treasury|export_backup|restore_backup)
 3 treasury_sub_op (if opcode 6)  9 counter (monotonic for the tuple)
 4 key_purpose (1=transfer,2=faucet) 10 request_id
 5 chain_id (= sealed 11565)      11 payload_binding = keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical command params)
 6 environment_identifier (= sealed)  12 is_recovery (bool → verify vs recovery_authority_pk)
+13 scope_identity (enclave_id if scope_class==0, else fleet_id; byte-compared vs the sealed KeystoreConfig scope id — the AC#1 clone-replay guard, TASK-18 18-2)
 --- below is NOT part of the signed bytes ---
-13 ed25519_signature (64B)
+14 ed25519_signature (64B)
 ```
 
+> **v1 → v2 (TASK-18 18-2a).** v1 had no `scope_identity` (key 13 was the signature, and `scope_target`
+> was overloaded as `enclave_id|fleet_id`). v2 separates the two concerns per the 2026-06-19 locked
+> decision Q2: `scope_target` STAYS the command-class lane label (counter-tuple semantics unchanged),
+> and `scope_identity` is an INDEPENDENT signed byte-compare pinning the cap to one enclave/fleet.
+> A v1 cap fails closed as `0x40` at the `cap_format_version` check. No production cap has ever been
+> minted, so this is a clean break (no migration story); a future bump after G3 (TASK-25) ships a real
+> provisioned keystore is NOT clean and needs a migration plan.
+
 **Signature transmission.** The capability map carries the 64-byte Ed25519 signature at key
-`13`. The signed message is `"2d-hsm/agent-cap/v1\0" ‖ canonical-CBOR({1..12})` — keys `1–12`
-only, with key `13` excluded before verification — so "the capability map minus key 13 = the
+`14`. The signed message is `"2d-hsm/agent-cap/v1\0" ‖ canonical-CBOR({1..13})` — keys `1–13`
+only, with key `14` excluded before verification — so "the capability map minus key 14 = the
 signed bytes" is unambiguous and wire-stable.
 
 The design doc's "key refs or batch/count" capability binding is covered transitively by
@@ -764,10 +773,12 @@ The design doc's "key refs or batch/count" capability binding is covered transit
 there is no separate key-ref field in the signed capability.
 
 **Verify order (all before state touch):** role/profile gate → opcode allow-list →
-`cap_format_version` → Ed25519 verify over keys `1–12` (key 13 excluded) vs the correct
+`cap_format_version` → Ed25519 verify over keys `1–13` (key 14 excluded) vs the correct
 sealed authority → `cap.command_opcode == request.opcode` **and** `cap.treasury_sub_op ==
 request.sub_op` (opcode 6) **and** `cap.request_id == envelope.request_id` →
-`chain_id`/`env`/`scope` equal sealed values → contiguous counter (§10.6) → `payload_binding
+`chain_id`/`env` equal sealed values → `scope_identity` byte-equals the sealed scope id selected
+by `scope_class` (enclave_scope_id vs fleet_scope_id; the AC#1 clone-replay guard, TASK-18 18-2) →
+contiguous counter (§10.6) → `payload_binding
 == keccak256(actual params)` → mutate + seal-before-return. The opcode/sub-op/request_id
 equality checks stop a capability issued for one opcode/sub-op/request from authorizing
 another (e.g. a `set_limits` cap cannot authorize `reset_lifetime_breaker`).

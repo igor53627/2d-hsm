@@ -97,6 +97,13 @@ pub enum KeystoreError {
     /// `environment_identifier` failed the TASK-7.1 §10.6 rules (1..=64, `[a-z0-9-]`, no
     /// leading/trailing/double hyphen).
     InvalidEnvironmentId,
+    /// A sealed scope identity (`KeystoreConfig::enclave_scope_id` / `fleet_scope_id`) violated a
+    /// TASK-18 18-2b value-level invariant: an all-zero "unset" id, or `enclave_scope_id ==
+    /// fleet_scope_id` (which collapses the `scope_class` 0-vs-1 distinction so a fleet-scoped cap
+    /// matches the enclave byte-compare). Both make the AC#1 clone-replay guard unenforceable, so a
+    /// body carrying them fails closed at seal/unseal rather than binding caps to a reproducible /
+    /// ambiguous id.
+    InvalidScopeId,
     /// `structural_version` violated the frozen v2 invariant: it must be `>= 1` (init 1, never 0 —
     /// a 0 would fail the same-epoch `reconcile` Fresh-equality vs a forged 0-anchor).
     InvalidStructuralVersion,
@@ -581,17 +588,23 @@ pub struct KeystoreConfig {
     /// provisioning and sealed here, so an enclave-scoped (`scope_class==0`) capability can be byte-pinned
     /// to THIS enclave — a cap minted for enclave A cannot be replayed on a fresh clone B (whose counter
     /// row is empty ⇒ `highest==0` ⇒ `incoming==1` accepted) to mint a SECOND treasury key (the AC#12
-    /// budget-multiplication guard). **INERT in 18-1** — the verifier byte-compare lands in slice 18-2.
-    /// Required (NO `serde(default)`): a body missing it fails closed as a CBOR *decode* error, never a
-    /// silent zero (the same field-PRESENCE discipline as `structural_version`). NB this is presence-only;
-    /// unlike `structural_version` (which `validate()` rejects at 0), an all-zero "unset" scope id is NOT
-    /// yet value-rejected here — that value-level guard belongs with slice 18-2, where the field first
-    /// becomes load-bearing (TASK-18 18-2 obligation). (Distinct from `anchor_root`: that is the
+    /// budget-multiplication guard). 18-1 added the field (presence-only, INERT); 18-2 makes it
+    /// load-bearing — the verifier byte-compares the cap's signed `scope_identity` against it
+    /// (`verify_capability_extract_inner` step 5b), and `validate()` rejects an all-zero or
+    /// `enclave==fleet` value (`InvalidScopeId`). Required (NO `serde(default)`): a body missing it fails
+    /// closed as a CBOR *decode* error, never a silent zero (the same field-PRESENCE discipline as
+    /// `structural_version`). NB this guarantee holds ONLY if the id is host-uncontrollable — minted
+    /// in-TEE via `getrandom` at provisioning (TASK-25 AC#3); a host that can select/copy it across clones
+    /// defeats the guard. The genesis/reference `[0xe1;32]` is a TEST FIXTURE — production MUST mint a
+    /// random id (TASK-25 AC#4), never copy the sentinel. (Distinct from `anchor_root`: that is the
     /// anti-rollback anchor pubkey; this is the cap-scope identity.)
     pub enclave_scope_id: [u8; 32],
     /// Sealed SHARED fleet SCOPE identity (TASK-18): fleet-scoped (`scope_class==1`) caps bind to this,
     /// which clones of ONE fleet legitimately share (so a fleet cap is valid across the fleet's clones).
-    /// **INERT in 18-1** (verifier compare lands in 18-2). Required, same fail-closed discipline.
+    /// 18-2 makes it load-bearing (verifier step 5b compares the cap's `scope_identity` when
+    /// `scope_class==1`); `validate()` requires it non-zero AND distinct from `enclave_scope_id` (else
+    /// the 0-vs-1 distinction collapses — `InvalidScopeId`). Required, same fail-closed discipline.
+    /// Provenance + lifecycle (who assigns the fleet id, rotation) owned by TASK-25 AC#7.
     pub fleet_scope_id: [u8; 32],
 }
 
@@ -975,6 +988,18 @@ impl KeystoreBody {
             return Err(KeystoreError::InvalidStructuralVersion);
         }
         validate_environment_identifier(&self.config.environment_identifier)?;
+        // TASK-18 18-2b value-level scope-id invariants (the AC#1 clone-replay guard is only enforceable
+        // when the sealed scope ids are real, distinct identities). An all-zero id is the canonical value
+        // a clone could most easily reproduce, and `enclave_scope_id == fleet_scope_id` collapses the
+        // `scope_class` 0-vs-1 distinction (a fleet-scoped cap would match the enclave byte-compare).
+        // Both fail closed at the seal/unseal boundary. The genesis/reference `[0xe1;32]`/`[0xf1;32]`
+        // sentinels satisfy this (distinct, non-zero); production mints a random in-TEE id (TASK-25 AC#3).
+        if self.config.enclave_scope_id == [0u8; 32]
+            || self.config.fleet_scope_id == [0u8; 32]
+            || self.config.enclave_scope_id == self.config.fleet_scope_id
+        {
+            return Err(KeystoreError::InvalidScopeId);
+        }
         // The DR-backup wrapping key must be a well-formed ML-KEM-1024 encapsulation key.
         if self.config.backup_recovery_wrapping_pubkey.len() != ML_KEM_1024_ENCAPS_KEY_LEN {
             return Err(KeystoreError::InvalidFieldLength);
@@ -2267,6 +2292,33 @@ mod tests {
         // and it fails closed through the seal/unseal path too (validate is called on both).
         b.structural_version = 1;
         assert!(b.validate().is_ok());
+    }
+
+    /// TASK-18 18-2b — the sealed scope ids must be real, distinct identities or the AC#1 clone-replay
+    /// guard is unenforceable. An all-zero id is the canonical value a clone could most easily reproduce;
+    /// `enclave_scope_id == fleet_scope_id` collapses the `scope_class` 0-vs-1 distinction so a
+    /// fleet-scoped cap matches the enclave byte-compare. All three fail closed at `validate()` (the
+    /// seal/unseal boundary).
+    #[test]
+    fn validate_rejects_invalid_scope_ids() {
+        // all-zero enclave_scope_id.
+        let mut b = sample_body();
+        b.config.enclave_scope_id = [0u8; 32];
+        assert_eq!(b.validate(), Err(KeystoreError::InvalidScopeId), "all-zero enclave_scope_id");
+        // all-zero fleet_scope_id.
+        let mut b = sample_body();
+        b.config.fleet_scope_id = [0u8; 32];
+        assert_eq!(b.validate(), Err(KeystoreError::InvalidScopeId), "all-zero fleet_scope_id");
+        // collapsing equality: enclave == fleet.
+        let mut b = sample_body();
+        b.config.fleet_scope_id = b.config.enclave_scope_id;
+        assert_eq!(
+            b.validate(),
+            Err(KeystoreError::InvalidScopeId),
+            "enclave_scope_id == fleet_scope_id collapses scope_class 0-vs-1",
+        );
+        // sanity: the sample body's real sentinels (distinct, non-zero) are accepted.
+        assert!(sample_body().validate().is_ok());
     }
 
     #[test]
