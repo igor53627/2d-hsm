@@ -797,6 +797,11 @@ host-controlled).
 - **Command-class split (AC#18 default):** fold `command_class` into `scope_target`
   (`generate_transfer`, `generate_faucet`, `configure_treasury`, `export_backup`,
   `restore_backup`) so a stalled/withheld capability for one class cannot wedge the others.
+  `scope_target` is a counter-lane LABEL, not a dispatch key (handlers route on `command_opcode` +
+  `key_purpose`, both signed); TASK-18 18-3 fails closed at decode (`0x40`) on a MALFORMED label
+  (empty / non-`[a-z0-9_-]` / over 64 B) but does NOT enforce a strict whitelist — AC#18 permits the
+  issuer to narrow further (sub-lanes). Replay is caught by counter contiguity + the signed
+  `scope_identity` (§10.5, TASK-18 18-2), not by this label.
 - **Default `scope_class`:** transfer-pool keygen — fleet allowed; faucet keygen and
   **all** treasury config — enclave required (AC#12, no budget multiplication across clones);
   export — enclave default; restore — recovery tier with an independent strict recovery

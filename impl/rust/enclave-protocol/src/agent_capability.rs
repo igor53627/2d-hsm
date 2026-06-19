@@ -97,6 +97,23 @@ const TREASURY_SUB_OP_RESET_LIFETIME_BREAKER: u8 = 3;
 /// so the sealed-body audit ring (whose `scope_target` ORIGINATES from a verified capability) can bound
 /// its records by the same true-origin cap in [`crate::agent_keystore::KeystoreBody::validate`].
 pub(crate) const MAX_SCOPE_TARGET_LEN: usize = 64;
+/// TASK-18 18-3 — `scope_target` well-formedness (the field is a command-class counter-lane LABEL, not
+/// an opcode/purpose the enclave dispatches on; dispatch is by `command_opcode` + `key_purpose`, both
+/// signed). Format: non-empty, ≤ [`MAX_SCOPE_TARGET_LEN`] bytes, `[a-z0-9_-]+` (lowercase ASCII
+/// alphanumeric + underscore + hyphen). This is NOT a strict whitelist — the canonical command-class
+/// lanes (`generate_transfer` / `generate_faucet` / `configure_treasury` / `export_backup` /
+/// `restore_backup`, §10.6) are an ISSUANCE convention, and AC#18 explicitly permits the issuer to
+/// narrow further (sub-lanes); the enclave fails closed only on a malformed (unset/garbage) label, not
+/// on a non-canonical one. Defense-in-depth: `scope_target` is not a security boundary after 18-2
+/// (replay is caught by the counter contiguity + the signed `scope_identity`), so this guard rejects
+/// the degenerate cases (empty, non-canonical-charset, host garbage) rather than enumerate lanes.
+/// Mirrors the style of [`crate::agent_keystore::is_valid_environment_identifier`].
+pub(crate) fn is_valid_scope_target(b: &[u8]) -> bool {
+    if b.is_empty() || b.len() > MAX_SCOPE_TARGET_LEN {
+        return false;
+    }
+    b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
 /// Upper bound on `request_id` bytes — mirrors the envelope's `MAX_REQUEST_ID_LEN`.
 const MAX_CAP_REQUEST_ID_LEN: usize = 64;
 
@@ -218,7 +235,7 @@ fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
         return Err(AgentError::Malformed);
     }
     let scope_target = match map_get(map, 8).and_then(as_bytes) {
-        Some(b) if b.len() <= MAX_SCOPE_TARGET_LEN => b.to_vec(),
+        Some(b) if is_valid_scope_target(b) => b.to_vec(),
         _ => return Err(AgentError::Malformed),
     };
     let counter = req_u64(9)?;
@@ -765,6 +782,99 @@ mod tests {
             Err(AgentError::CapabilityRejected),
             "scope_class==1 binds to fleet_scope_id, not enclave_scope_id",
         );
+    }
+
+    /// TASK-18 18-3 — `scope_target` well-formedness. The field is a command-class counter-lane label
+    /// (NOT a dispatch key — handlers route on `command_opcode` + `key_purpose`), so the verifier fails
+    /// closed (0x40, structural) only on a MALFORMED label (empty / non-`[a-z0-9_-]` / over-long), not on
+    /// a non-canonical one. The canonical 5 lanes (`generate_transfer` / `generate_faucet` /
+    /// `configure_treasury` / `export_backup` / `restore_backup`) are an issuance convention; AC#18
+    /// permits the issuer to narrow further (sub-lanes like `golden-scope-generate`), which this guard
+    /// must NOT reject. (Replay itself is caught by counter contiguity + signed `scope_identity`, 18-2.)
+    #[test]
+    fn malformed_scope_target_is_rejected_canonical_and_sublanes_accepted() {
+        let cfg = test_config();
+        let rid = b"req-1";
+        // Canonical lanes accepted.
+        for ok in [
+            b"generate_transfer".as_slice(),
+            b"generate_faucet",
+            b"configure_treasury",
+            b"export_backup",
+            b"restore_backup",
+        ] {
+            let mut b = CapBuilder::new(1, rid, 1);
+            b.cap.scope_target = ok.to_vec();
+            assert_eq!(
+                verify_capability(&b.build(&admin_signing_key()), 1, rid, &cfg, &[]),
+                Ok(()),
+                "canonical scope_target {:?} accepted", String::from_utf8_lossy(ok),
+            );
+        }
+        // AC#18 sub-lanes (issuer-narrowed) accepted — the guard is NOT a strict whitelist.
+        for ok in [b"golden-scope-generate".as_slice(), b"smoke-c1", b"faucet-smoke-f1"] {
+            let mut b = CapBuilder::new(1, rid, 1);
+            b.cap.scope_target = ok.to_vec();
+            assert_eq!(
+                verify_capability(&b.build(&admin_signing_key()), 1, rid, &cfg, &[]),
+                Ok(()),
+                "AC#18 sub-lane {:?} accepted (guard is charset+length, not a strict set)",
+                String::from_utf8_lossy(ok),
+            );
+        }
+        // Malformed labels fail closed at decode (0x40) — empty, over-long, non-charset.
+        let overlong = vec![b'a'; MAX_SCOPE_TARGET_LEN + 1];
+        for bad in [
+            b"".as_slice(),
+            &overlong,
+            b"Generate_Transfer", // uppercase
+            b"generate transfer",  // space
+            b"generate.transfer",  // dot
+            b"generate_transfer#1", // `#`
+            b"\0generate",         // NUL / control
+        ] {
+            let mut bld = CapBuilder::new(1, rid, 1);
+            bld.cap.scope_target = bad.to_vec();
+            // CapBuilder signs whatever is in the struct; the verifier's parse_capability must reject
+            // the malformed label BEFORE the signature check would matter (0x40 Malformed).
+            assert_eq!(
+                verify_capability(&bld.into_map(), 1, rid, &cfg, &[]),
+                Err(AgentError::Malformed),
+                "malformed scope_target {:?} rejected as Malformed (0x40)",
+                String::from_utf8_lossy(bad),
+            );
+        }
+    }
+
+    /// TASK-18 18-3 — handler-discipline contract: `scope_target` is a counter-lane label, NOT a
+    /// dispatch key. This pins the invariant at the verifier level: the verified capability's
+    /// `scope_target` is returned to the handler as an opaque lane label (used only as the counter-tuple
+    /// key + audit provenance), and dispatch is by `command_opcode` + `key_purpose` (both signed). A
+    /// reviewer extending a handler MUST NOT introduce a `match scope_target` / `scope_target == "..."`
+    /// dispatch decision — if the op needs a signed discriminator, add a signed cap field (as 18-2a did
+    /// for `scope_identity`), do not overload this label. (No runtime assertion here — this is a static
+    /// contract; the runtime guard is the `is_valid_scope_target` charset/length check above, and the
+    /// real routing happens by opcode/purpose in `agent_dispatch.rs`.)
+    #[test]
+    fn scope_target_is_not_a_dispatch_key_contract() {
+        // Two caps identical except for scope_target both verify and return VerifiedCapability with
+        // the SAME opcode/key_purpose — the field carries no routing authority.
+        let cfg = test_config();
+        let rid = b"req-1";
+        let mut a = CapBuilder::new(1, rid, 1);
+        a.cap.scope_target = b"generate_transfer".to_vec();
+        let mut b_ = CapBuilder::new(1, rid, 1);
+        b_.cap.scope_target = b"generate_transfer-v2-pool".to_vec(); // a sub-lane label
+        let va = verify_capability_extract(&a.build(&admin_signing_key()), 1, rid, &cfg, &[])
+            .expect("cap a verifies");
+        let vb = verify_capability_extract(&b_.build(&admin_signing_key()), 1, rid, &cfg, &[])
+            .expect("cap b verifies");
+        // Dispatch-relevant fields are IDENTICAL regardless of the lane label.
+        assert_eq!(va.key_purpose, vb.key_purpose);
+        assert_eq!(va.payload_binding, vb.payload_binding);
+        assert_eq!(va.counter, vb.counter);
+        // Only the opaque lane label (counter-tuple key + audit provenance) differs — by construction.
+        assert_ne!(va.scope_target, vb.scope_target);
     }
 
     #[test]
