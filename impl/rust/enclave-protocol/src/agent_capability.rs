@@ -862,15 +862,21 @@ mod tests {
             // would surface 0x43 (bad signature) and the assertion would fail, catching the regression.
             let mut tampered = signed.clone();
             // Find the signature bytes within the map (key 14) and flip the first one. The map is
-            // Vec<(Value,Value)>; locate key 14 (the signature).
+            // Vec<(Value,Value)>; locate key 14 (the signature). Track whether we actually mutated it
+            // so the test cannot pass through silently if the map shape changes (key 14 absent / not
+            // Bytes) — without this guard the tampered variant could equal the signed one and the
+            // assertion would prove nothing about the parse-before-sig-check order.
+            let mut signature_tampered = false;
             for (k, v) in tampered.iter_mut() {
                 if matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(14)) {
                     if let Value::Bytes(bytes) = v {
                         bytes[0] ^= 0xff;
+                        signature_tampered = true;
                     }
                     break;
                 }
             }
+            assert!(signature_tampered, "key 14 (signature) must be present and Bytes for the tampered-sig assertion to be meaningful");
             assert_eq!(
                 verify_capability(&tampered, 1, rid, &cfg, &[]),
                 Err(AgentError::Malformed),
