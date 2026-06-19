@@ -745,7 +745,7 @@ privileged opcodes. **Host-side Vault/OPA authorization alone is never sufficien
 
 ```
 1 cap_format_version (=2, TASK-18 18-2a)  7 scope_class (0=enclave,1=fleet; financial MUST be enclave)
-2 command_opcode                 8 scope_target (command_class lane label: generate_transfer|generate_faucet|configure_treasury|export_backup|restore_backup)
+2 command_opcode                 8 scope_target (command_class counter-lane label; canonical defaults: generate_transfer|generate_faucet|configure_treasury|export_backup|restore_backup — see §10.6 for the well-formedness rule + issuer sub-lanes)
 3 treasury_sub_op (if opcode 6)  9 counter (monotonic for the tuple)
 4 key_purpose (1=transfer,2=faucet) 10 request_id
 5 chain_id (= sealed 11565)      11 payload_binding = keccak256(opcode ‖ sub_op ‖ request_id ‖ canonical command params)
@@ -801,7 +801,10 @@ host-controlled).
   `key_purpose`, both signed); TASK-18 18-3 fails closed at decode (`0x40`) on a MALFORMED label
   (empty / non-`[a-z0-9_-]` / over 64 B) but does NOT enforce a strict whitelist — AC#18 permits the
   issuer to narrow further (sub-lanes). Replay is caught by counter contiguity + the signed
-  `scope_identity` (§10.5, TASK-18 18-2), not by this label.
+  `scope_identity` (§10.5, TASK-18 18-2), not by this label. Each distinct `scope_target` is its own
+  counter-tuple key, so a new label grows the sealed counter table / marks payload — bounded by
+  `MAX_COUNTER_ENTRIES` / the marks-grammar cap / `MAX_KEYSTORE_BLOB_SIZE` (the lane count is the
+  issuer's discipline; a churned label set is an admin-trusted, self-inflicted DoS, not a wrong-accept).
 - **Default `scope_class`:** transfer-pool keygen — fleet allowed; faucet keygen and
   **all** treasury config — enclave required (AC#12, no budget multiplication across clones);
   export — enclave default; restore — recovery tier with an independent strict recovery

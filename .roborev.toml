@@ -28,7 +28,8 @@ exclude_patterns = [
 
 [ci]
 # PR CI: three vendors × two lenses (6 cells). Per-agent models are not
-# configurable on `roborev ci review` — pin gemini/claude locally via scripts.
+# configurable on `roborev ci review`. Locally, codex/claude are model-pinned via
+# the shared scripts; gemini runs via agy with NO model (see AGENTS.md).
 agents = ["codex", "gemini", "claude-code"]
 review_types = ["security", "design"]
 
