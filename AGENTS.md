@@ -37,10 +37,12 @@ For every high-risk change:
 - Major or architecture-changing work also gets a human gate
 
 ### Current Matrix (as of 2026-06)
-- Agents: codex, gemini, claude-code, grok (vendor diversity across lineages). Grok has no native roborev agent — it runs via the `opencode` agent (`--agent opencode --model xai/grok-4.3`, auth = `XAI_API_KEY` in the daemon env).
+- Agents: codex, gemini, claude-code, grok (vendor diversity across lineages).
+- **gemini cell runs via the Antigravity `agy` CLI** (Google deprecated gemini-cli's free tier → `IneligibleTierError`; roborev issue #730 made `agy` the preferred gemini binary). The working invocation is **`roborev review --agent gemini` with NO `--model`** — roborev resolves `agy` and uses its built-in gemini model. Passing `--model gemini-3.1-pro-preview` (as older docs/CI did) forces roborev's gemini agent to fall back to the legacy gemini-cli (gemini.go `WithModel` escape hatch, because `agy` cannot take `--model`) and the cell fails closed with `IneligibleTierError`. The shared scripts (`pse-review-reduced.sh` / `pse-review-2x3.sh`) were updated 2026-06-19 to drop the gemini `--model`. NB: `roborev check-agents` still reports gemini `FAIL` — that is a known cosmetic bug (roborev #854, fixed post-v0.58.0, not yet in our release) in the *diagnostic* command, NOT the review cell — verify the cell via job status (`done`) instead of trusting `check-agents`.
+- **grok cell runs via the native `grok` CLI** (`~/pse/roborev/grok-cell.sh`, NOT the roborev `opencode` agent — opencode isn't installed on this host and routes to codex; `XAI_API_KEY` in the daemon env is irrelevant for the native CLI, which self-authenticates). Its findings print to stdout / a saved file and are **OUTSIDE the roborev DB**, so `roborev compact` does NOT consolidate grok — read the printed `===== grok/security =====` block directly.
 - Lenses: `security` + `design` (roborev CLI); **concurrency-sensitive** work adds `design` with `--reasoning maximum` (see `~/pse/roborev/pse-review-2x3.sh`)
 - Config lives in `.roborev.toml` at repo root; shared scripts in `~/pse/roborev/`
-- **grok-cell precondition (verify, don't assume):** the opencode/grok cell only authenticates if the roborev **daemon** has `XAI_API_KEY` in its env (true if the daemon was started from a login shell; if not, `roborev daemon restart` from one). A missing/empty key does **not** fail loudly: roborev maps the opencode agent's non-zero exit to status **`skipped`** (not `failed`), and **`roborev compact` ignores `skipped` jobs** — so an absent grok review is silently treated as clean unless you check. Therefore: confirm the grok cell actually reached **`done`** (run `roborev review --dirty --agent opencode --model xai/grok-4.3 --type security --wait` and check it returns a review, or inspect the job status), treat any non-`done` grok cell as a **gap, never as compacted-clean**, and if xAI is genuinely unavailable, note the missing cell explicitly rather than degrading silently to 3 cells.
+- **gemini/grok cell precondition (verify, don't assume):** neither cell fails loudly when misconfigured. For gemini: if a `--model` slips back in, roborev silently falls back to gemini-cli → `failed` (compact drops it); a quota exhaustion surfaces as `skipped` (compact also drops it) — confirm the gemini cell reached **`done`**. For grok: if the native CLI isn't authed, `grok-cell.sh` emits `[grok-cell failed; see <file>]` into its block (the script never aborts the matrix). In BOTH cases treat any non-`done` / failed / skipped cell as a **gap, never as compacted-clean** — the Reduced Matrix needs all 4 cells live (or an explicitly noted degradation) before a high-risk change is "reviewed".
 
 ### Reduced vs Full Matrix — Decision Rules
 
@@ -48,14 +50,14 @@ For high-risk work we distinguish two levels of review:
 
 **Reduced Matrix** (default practical 4-review set)
 - security + codex
-- security + gemini
+- security + gemini  (via agy — NO `--model`)
 - design + claude-code
-- security + grok (via the `opencode` agent, `xai/grok-4.3`)
+- security + grok  (native grok CLI via `grok-cell.sh`)
 
 This is the normal operating mode for incremental work inside an already-reviewed direction.
 
 **Full Matrix** (more complete coverage)
-- The four reviews above (the full Reduced Matrix, grok included — Full ⊇ Reduced), plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max), or equivalent manual cells with explicit `--model` per agent
+- The four reviews above (the full Reduced Matrix, grok included — Full ⊇ Reduced), plus the **2×3 concurrency floor** from `~/pse/roborev/pse-review-2x3.sh` (codex + gemini × security + design + design-max). NB: the gemini cells in `pse-review-2x3.sh` also run via agy (no `--model`); only the codex cells pin an explicit model.
 
 **When Full Matrix is required (mandatory):**
 - First introduction of significant state / state machine logic (e.g., `EnclaveState`, arming state, freshness tracking).
@@ -79,12 +81,13 @@ See the "Reduced vs Full Matrix" section above for when to use which level.
 
 **Typical Reduced Matrix (most common):**
 ```bash
-~/pse/roborev/pse-review-reduced.sh --dirty   # 4 cells: codex+gemini security, claude-code design, grok security
+~/pse/roborev/pse-review-reduced.sh --dirty   # 4 cells: codex+gemini security, claude-code design, grok security (via grok-cell.sh)
 # …or run the cells by hand:
 roborev review --dirty --type security --agent codex --model gpt-5.5
-roborev review --dirty --type security --agent gemini --model gemini-3.1-pro-preview
-roborev review --dirty --type design --agent claude-code --model opus
-roborev review --dirty --type security --agent opencode --model xai/grok-4.3   # grok lens
+roborev review --dirty --type security --agent gemini             # NO --model: roborev resolves agy (Antigravity CLI); passing --model forces legacy gemini-cli and fails
+roborev review --dirty --type design   --agent claude-code --model opus
+# grok cell (native grok CLI via grok-cell.sh — findings OUTSIDE the roborev DB):
+~/pse/roborev/grok-cell.sh --dirty
 ```
 
 **Full Matrix (when required by the rules above):**
