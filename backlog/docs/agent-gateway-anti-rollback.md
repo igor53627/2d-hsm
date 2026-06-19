@@ -70,9 +70,12 @@ Option B's global ledger — residual hole, deferred), nor (b) the **host copyin
 keystore** to a clone (counters travel with the blob → caught by this §3 anchor anti-rollback, not by
 AC#1), nor (c) `fleet_scope_id`-scoped caps replayed across clones (fleet id is shared **by design**;
 the 18-5 `financial ⇒ scope_class==0` policy is what makes the guard non-bypassable for budget-
-sensitive ops — COMPLETE per the TASK-18 18-5 audit (§10.6 table): treasury-keygen +
-treasury-config REJECT `scope_class != 0`; transfer-pool keygen is fleet-allowed (not spend
-authority); EXPORT is enclave-by-convention (DR-read, not spend authority). **NB: the guard is
+sensitive ops — COMPLETE **for spend-authority ops** per the TASK-18 18-5 audit (§10.6 table):
+treasury-keygen + treasury-config REJECT `scope_class != 0`; transfer-pool keygen is fleet-allowed
+(not spend authority). **EXPORT_BACKUP is NOT spend-authority and stays an issuance convention (NOT
+enforced)** — it carries a SEPARATE rollback surface (`last_exported_seq` / AC#14 audit-completeness,
+see §3) independent of spend; its scope_class decision is DR-convenience, deferred to the 18-6
+EXPORT un-gate with a paired fleet-rejected test if hardened. **NB: the guard is
 conditional on provenance** — it is security theater unless
 `enclave_scope_id` is host-uncontrollable (minted in-TEE via `getrandom` at provisioning over the
 attested install channel); that is the TASK-25/G3 hard precondition for the 18-6..9 un-gate. Until
