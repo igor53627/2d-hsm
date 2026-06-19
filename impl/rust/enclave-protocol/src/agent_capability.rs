@@ -841,15 +841,40 @@ mod tests {
             // Drive the malformed label through the FULL production path: sign it (build) then verify.
             // parse_capability runs FIRST in verify_capability_extract_inner (before the Ed25519
             // check), so a malformed label fails closed at decode (0x40) regardless of whether the
-            // signature is valid — this asserts that end-to-end on a SIGNED cap (not just an unsigned
-            // map), closing the test-vacuity gap a `.into_map()`-only path would leave (a remote issued
-            // cap is always signed, so the signed form is the path that matters).
+            // signature is valid. Below asserts BOTH directions:
+            //   (a) VALID signature  — proves a remote issued cap (always signed) still fails at parse;
+            //   (b) TAMPERED signature — proves parse precedes the sig check (a reorder that verified
+            //       the signature first would surface 0x43 CapabilityRejected for the bad sig here,
+            //       NOT 0x40 Malformed; so the tampered assertion pins the order). Together they close
+            // the test-vacuity gap a `.into_map()`-only OR valid-sig-only path would leave.
             let mut bld = CapBuilder::new(1, rid, 1);
             bld.cap.scope_target = bad.to_vec();
+            let signed = bld.build(&admin_signing_key());
+            // (a) valid signature
             assert_eq!(
-                verify_capability(&bld.build(&admin_signing_key()), 1, rid, &cfg, &[]),
+                verify_capability(&signed, 1, rid, &cfg, &[]),
                 Err(AgentError::Malformed),
                 "malformed scope_target {:?} rejected as Malformed (0x40) even with a valid signature",
+                String::from_utf8_lossy(bad),
+            );
+            // (b) tampered signature (flip one byte in the signature field, key 14) — must STILL be
+            // Malformed (0x40), proving parse_capability ran first; if the order were reversed, this
+            // would surface 0x43 (bad signature) and the assertion would fail, catching the regression.
+            let mut tampered = signed.clone();
+            // Find the signature bytes within the map (key 14) and flip the first one. The map is
+            // Vec<(Value,Value)>; locate key 14 (the signature).
+            for (k, v) in tampered.iter_mut() {
+                if matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(14)) {
+                    if let Value::Bytes(bytes) = v {
+                        bytes[0] ^= 0xff;
+                    }
+                    break;
+                }
+            }
+            assert_eq!(
+                verify_capability(&tampered, 1, rid, &cfg, &[]),
+                Err(AgentError::Malformed),
+                "malformed scope_target {:?} with TAMPERED sig is still Malformed (parse precedes sig check)",
                 String::from_utf8_lossy(bad),
             );
         }
@@ -863,8 +888,9 @@ mod tests {
     /// a STATIC, source-level invariant, enforced by review (this test pins field independence so a
     /// future refactor doesn't accidentally thread `scope_target` into a routing field). If a handler
     /// needs a signed discriminator, add a SIGNED cap field (as 18-2a did for `scope_identity`) — do
-    /// NOT overload this label. (For a mechanical dispatch-invariance guard, see the dispatch-level
-    /// tests in `agent_dispatch.rs`; this test is verifier-side field-independence only.)
+    /// NOT overload this label. NB: there is currently NO mechanical dispatch-invariance test in
+    /// `agent_dispatch.rs` — the no-dispatch contract is enforced by review of handler routing code, not
+    /// by a runtime assertion; this verifier-side test covers only field independence.
     #[test]
     fn scope_target_is_independent_of_verified_routing_fields() {
         // Two caps identical except for scope_target both verify and return VerifiedCapability with
