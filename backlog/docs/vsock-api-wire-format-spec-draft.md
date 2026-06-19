@@ -811,10 +811,27 @@ host-controlled).
   counter-tuple key, so a new label grows the sealed counter table / marks payload — bounded by
   `MAX_COUNTER_ENTRIES` / the marks-grammar cap / `MAX_KEYSTORE_BLOB_SIZE` (the lane count is the
   issuer's discipline; a churned label set is an admin-trusted, self-inflicted DoS, not a wrong-accept).
-- **Default `scope_class`:** transfer-pool keygen — fleet allowed; faucet keygen and
-  **all** treasury config — enclave required (AC#12, no budget multiplication across clones);
-  export — enclave default; restore — recovery tier with an independent strict recovery
-  counter.
+- **`scope_class` policy per op (TASK-18 18-5 completeness audit).** The 18-2 `scope_identity`
+  byte-compare protects `scope_class==0` (enclave) caps; a `scope_class==1` (fleet) cap is replayable
+  across clones (fleet id shared by design). So every op that raises/mints/resets **spend authority**
+  (a "financial budget mutation" — design doc §"Financial budget mutations": CONFIGURE_TREASURY +
+  faucet-treasury keygen) MUST reject `scope_class != 0`, or an attacker mints a fleet-scoped cap and
+  the enclave compare is bypassed. Non-financial ops may be fleet-scoped.
+
+  | Opcode / variant | scope_class policy | Enforced? | Justification |
+  |---|---|---|---|
+  | `GENERATE_KEYS` purpose=1 (transfer pool) | **fleet allowed** (scope_class ∈ {0,1}) | n/a (no check) | transfer keys are NOT spend authority — a clone minting its own transfer pool does not multiply a treasury budget. Pinned by `generate_keys_fleet_scoped_transfer_accepted`. |
+  | `GENERATE_KEYS` purpose=2 (faucet treasury) | **enclave only** (`scope_class != 0` → 0x43) | ✅ `agent_dispatch.rs:949` | mints the on-chain treasury key → budget-multiplication guard (AC#12). Pinned by `generate_keys_fleet_scoped_treasury_rejected`. |
+  | `CONFIGURE_TREASURY` (all sub_ops 0..=3) | **enclave only** (`scope_class != 0` → 0x43) | ✅ `agent_dispatch.rs:1157` | raises/refills/resets spend authority + lifetime breaker (AC#12). Pinned by `fleet_scope_rejected_0x43`. |
+  | `EXPORT_BACKUP` | **enclave default** (issuance convention, NOT enforced) | ❌ convention | EXPORT is DR-read (not spend authority); a fleet-scoped export on a clone exports that clone's own keystore (no budget multiplication); whole-blob-copy clones are caught by the §3 anchor anti-rollback (counters travel with the blob), not by AC#1. A future fleet-export DR scenario may legitimately want scope_class=1. NB: this is an issuance convention — the operator MUST mint enclave-scoped EXPORT caps unless they explicitly accept the residual; if hardened to enforced, do so at/before the EXPORT un-gate (18-6) with a paired fleet-rejected test. |
+  | `RESTORE_BACKUP` | recovery tier (own counter, not a fleet/enclave policy) | n/a | no handler yet (TASK-24); restore is wholesale-replace + recovery-counter, not a fleet/enclave policy decision. |
+  | `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE` | n/a (no capability) | n/a | runtime signing — no cap ⇒ no scope_class; bound by the secp256k1 key entry + payload, not by a cap. |
+  | `PUBLIC_IDENTITY`, `PROVE_IDENTITY` | n/a (no capability) | n/a | low-privilege reads. |
+
+  **This table IS the 18-5 completeness proof:** for every privileged/runtime opcode, the audit
+  either shows the enclave-only enforcement with its paired test, or justifies (with a reason + the
+  residual) why a non-financial op is legitimately fleet-allowed / convention-only. A new privileged
+  op MUST be added here with its enforcement decision + paired test before its un-gate (18-6..9).
 - **`environment_identifier` (AC#10):** UTF-8, `1..=64` bytes, `[a-z0-9-]`, no
   leading/trailing/double hyphen; byte-exact case-sensitive compare against the sealed value;
   malformed → fail closed at decode.
