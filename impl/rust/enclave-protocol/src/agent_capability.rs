@@ -107,7 +107,11 @@ pub(crate) const MAX_SCOPE_TARGET_LEN: usize = 64;
 /// on a non-canonical one. Defense-in-depth: `scope_target` is not a security boundary after 18-2
 /// (replay is caught by the counter contiguity + the signed `scope_identity`), so this guard rejects
 /// the degenerate cases (empty, non-canonical-charset, host garbage) rather than enumerate lanes.
-/// Mirrors the style of [`crate::agent_keystore::is_valid_environment_identifier`].
+/// NB it does NOT mirror [`crate::agent_keystore::is_valid_environment_identifier`] exactly — it uses
+/// the same small-helper SHAPE but DIFFERENT rules: `scope_target` allows `_` (required by the
+/// canonical `generate_transfer` lanes) and has NO positional-hyphen constraints (no leading/trailing/
+/// double-hyphen ban), because the field is not a security boundary and canonical labels use `_`.
+/// Do not "harden" this to match env-identifier rules — it would break the canonical lanes.
 pub(crate) fn is_valid_scope_target(b: &[u8]) -> bool {
     if b.is_empty() || b.len() > MAX_SCOPE_TARGET_LEN {
         return false;
@@ -117,8 +121,8 @@ pub(crate) fn is_valid_scope_target(b: &[u8]) -> bool {
 /// Upper bound on `request_id` bytes — mirrors the envelope's `MAX_REQUEST_ID_LEN`.
 const MAX_CAP_REQUEST_ID_LEN: usize = 64;
 
-/// Parsed, type-checked capability (keys `1..=13`). Field types follow §10.5; `treasury_sub_op` is
-/// `Some` iff `command_opcode == 6`.
+/// Parsed, type-checked capability (keys `1..=14`; key 14 = Ed25519 signature, key 13 =
+/// `scope_identity`). Field types follow §10.5; `treasury_sub_op` is `Some` iff `command_opcode == 6`.
 struct Capability {
     cap_format_version: u64,
     command_opcode: u8,
@@ -173,8 +177,9 @@ use crate::agent_cbor::{as_bytes, as_bytes32, as_bytes_n, as_u64, check_strict_k
 /// Strict structural decode of the capability map → typed [`Capability`]. Any shape/type/range
 /// violation ⇒ [`AgentError::Malformed`] (`0x40`, syntax only).
 fn parse_capability(map: &[(Value, Value)]) -> Result<Capability, AgentError> {
-    // Strict keys: every key is an integer in 1..=13, none repeats.
-    // 18-2a: key 13 is now `scope_identity`; the Ed25519 signature is key 14. A v2 cap MUST carry both.
+    // Strict keys: every key is an integer in 1..=14, none repeats.
+    // 18-2a: key 13 is `scope_identity` (signed); key 14 is the Ed25519 signature (NOT signed). A v2
+    // cap MUST carry both.
     if !check_strict_keys(map, |n| (1..=14).contains(&n)) {
         return Err(AgentError::Malformed);
     }
@@ -414,8 +419,8 @@ fn verify_capability_extract_inner(
         return Err(AgentError::CapabilityRejected);
     }
 
-    // (3) Ed25519 verify over canonical CBOR(1..12), against the is_recovery-selected sealed
-    // authority (now tier-validated above).
+    // (3) Ed25519 verify over canonical CBOR(1..13), against the is_recovery-selected sealed
+    // authority (now tier-validated above). Key 14 (the signature itself) is excluded from the signed bytes.
     let authority = if cap.is_recovery {
         &config.recovery_authority_pk
     } else {
@@ -833,32 +838,38 @@ mod tests {
             b"generate_transfer#1", // `#`
             b"\0generate",         // NUL / control
         ] {
+            // Drive the malformed label through the FULL production path: sign it (build) then verify.
+            // parse_capability runs FIRST in verify_capability_extract_inner (before the Ed25519
+            // check), so a malformed label fails closed at decode (0x40) regardless of whether the
+            // signature is valid — this asserts that end-to-end on a SIGNED cap (not just an unsigned
+            // map), closing the test-vacuity gap a `.into_map()`-only path would leave (a remote issued
+            // cap is always signed, so the signed form is the path that matters).
             let mut bld = CapBuilder::new(1, rid, 1);
             bld.cap.scope_target = bad.to_vec();
-            // CapBuilder signs whatever is in the struct; the verifier's parse_capability must reject
-            // the malformed label BEFORE the signature check would matter (0x40 Malformed).
             assert_eq!(
-                verify_capability(&bld.into_map(), 1, rid, &cfg, &[]),
+                verify_capability(&bld.build(&admin_signing_key()), 1, rid, &cfg, &[]),
                 Err(AgentError::Malformed),
-                "malformed scope_target {:?} rejected as Malformed (0x40)",
+                "malformed scope_target {:?} rejected as Malformed (0x40) even with a valid signature",
                 String::from_utf8_lossy(bad),
             );
         }
     }
 
-    /// TASK-18 18-3 — handler-discipline contract: `scope_target` is a counter-lane label, NOT a
-    /// dispatch key. This pins the invariant at the verifier level: the verified capability's
-    /// `scope_target` is returned to the handler as an opaque lane label (used only as the counter-tuple
-    /// key + audit provenance), and dispatch is by `command_opcode` + `key_purpose` (both signed). A
-    /// reviewer extending a handler MUST NOT introduce a `match scope_target` / `scope_target == "..."`
-    /// dispatch decision — if the op needs a signed discriminator, add a signed cap field (as 18-2a did
-    /// for `scope_identity`), do not overload this label. (No runtime assertion here — this is a static
-    /// contract; the runtime guard is the `is_valid_scope_target` charset/length check above, and the
-    /// real routing happens by opcode/purpose in `agent_dispatch.rs`.)
+    /// TASK-18 18-3 — `scope_target` field-independence pin (NOT a runtime dispatch guard). This
+    /// test asserts only that the VERIFIED-capability fields a handler routes on (`key_purpose`,
+    /// `payload_binding`, `counter`) are structurally independent of `scope_target` — i.e. changing
+    /// the lane label does not perturb them. It does NOT mechanically prevent a future handler in
+    /// `agent_dispatch.rs` from introducing `match scope_target { ... }`; the no-dispatch contract is
+    /// a STATIC, source-level invariant, enforced by review (this test pins field independence so a
+    /// future refactor doesn't accidentally thread `scope_target` into a routing field). If a handler
+    /// needs a signed discriminator, add a SIGNED cap field (as 18-2a did for `scope_identity`) — do
+    /// NOT overload this label. (For a mechanical dispatch-invariance guard, see the dispatch-level
+    /// tests in `agent_dispatch.rs`; this test is verifier-side field-independence only.)
     #[test]
-    fn scope_target_is_not_a_dispatch_key_contract() {
+    fn scope_target_is_independent_of_verified_routing_fields() {
         // Two caps identical except for scope_target both verify and return VerifiedCapability with
-        // the SAME opcode/key_purpose — the field carries no routing authority.
+        // the SAME routing fields (opcode/purpose/binding/counter) — scope_target carries no routing
+        // authority at the verifier boundary, only an opaque counter-tuple key + audit provenance.
         let cfg = test_config();
         let rid = b"req-1";
         let mut a = CapBuilder::new(1, rid, 1);
@@ -869,7 +880,7 @@ mod tests {
             .expect("cap a verifies");
         let vb = verify_capability_extract(&b_.build(&admin_signing_key()), 1, rid, &cfg, &[])
             .expect("cap b verifies");
-        // Dispatch-relevant fields are IDENTICAL regardless of the lane label.
+        // Routing fields are IDENTICAL regardless of the lane label.
         assert_eq!(va.key_purpose, vb.key_purpose);
         assert_eq!(va.payload_binding, vb.payload_binding);
         assert_eq!(va.counter, vb.counter);
