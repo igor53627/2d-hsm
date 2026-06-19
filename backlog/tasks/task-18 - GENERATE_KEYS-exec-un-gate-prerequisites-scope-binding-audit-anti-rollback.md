@@ -3,7 +3,7 @@ id: TASK-18
 title: >-
   GENERATE_KEYS exec un-gate prerequisites (scope-binding + audit +
   anti-rollback)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-08 19:05'
 labels:
@@ -31,6 +31,16 @@ GENERATE_KEYS live execution is implemented behind the off-by-default, release-b
 
 ## Notes
 <!-- SECTION:NOTES:BEGIN -->
+**AC status (2026-06-19, code-ready + reviewed — HUMAN GATE before G3).**
+
+- **AC#2 (audit record):** DONE, preview-gated (PRs #96–#99 + TASK-13b).
+- **AC#3 (anti-rollback durable commit):** DONE, preview-gated (`commit_before_emit` seal→anchor-commit→swap, TASK-7.7 slice 6).
+- **AC#1 (scope-binding):** DONE + reviewed, preview-gated. Slices 18-1 (fields, PR #102) → 18-2 (cap format v2 + signed `scope_identity` byte-compare vs sealed `enclave_scope_id`/`fleet_scope_id`, Full Matrix clean) → 18-3 (`scope_target` well-formedness + handler-discipline contract) → 18-5 (completeness audit: §10.6 scope_class-policy table + transfer-pool negative-control test). 18-4 (docs) reconciled anti-rollback.md + vsock §10.6 (AC#1 = replay-on-empty-row ONLY, NOT active-active → Option B/TASK-20). **Caveat (load-bearing):** AC#1's byte-compare is correct code but is **security theater until TASK-25/G3** — `enclave_scope_id` must be minted in-TEE via `getrandom` over the attested install channel or a host can clone the id and bypass the guard. Inline-documented at the verifier + KeystoreConfig fields.
+
+**Remaining work (BLOCKED on TASK-25/G3):** 18-6..9 per-op un-gate (keygen → configure-treasury → sign-faucet → backup-export; PROVE/SIGN already live; RESTORE stays banned → TASK-24). Each un-gate = remove the one `compile_error!` (lib.rs) + add the feature to release `buildFeatures` (enclave.nix) + provision the runtime anti-rollback gate, in ONE change, with its own Full Matrix + human gate (irreversible production step). **TASK-25 not started** — needs its own Understand phase first (nix/aya image + attested vsock channel design + in-TEE RNG provenance; codex flagged it as too-large-to-review-at-once + the attestation handshake as underspecified, both addressed in the task-spec but not yet in code).
+
+---
+
 **Understand phase (2026-06-19) — status + locked plan.**
 
 AC#2 (audit) and AC#3 (durable anchor commit) are **DONE, preview-gated**: `record_audit` is wired into all three live handlers (4b/4c, PRs #96–#99) with backpressure in `record_audit`; `commit_before_emit` enforces seal→anchor-commit→swap (TASK-7.7 slice 6). They are satisfied for the preview build; un-gating is the remaining lift, contingent on AC#1.
