@@ -320,6 +320,11 @@ mod agent_cbor;
 // agent_cbor/agent_anchor — no crypto deps beyond the shared CBOR + keystore-validators).
 #[cfg(feature = "agent-gateway")]
 mod agent_provision;
+// Runtime driver for the one-shot provisioning bootstrap ceremony (TASK-25). Connects
+// ProvisionSession to a transport stream (vsock/stdio) + a SNP report-producer seam.
+// Crate-private; `agent-gateway`-gated. The vsock binding adds `vsock-transport` + `target_os="linux"`.
+#[cfg(feature = "agent-gateway")]
+pub(crate) mod provision_bootstrap;
 // Agent Gateway anti-rollback freshness-challenge (nonce) state machine (TASK-7.7). CSPRNG issue +
 // single-use lifecycle + handshake report_data binding. Crate-private; dead-code until boot wiring.
 #[cfg(feature = "agent-gateway")]

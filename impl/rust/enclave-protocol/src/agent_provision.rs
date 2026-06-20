@@ -1050,6 +1050,8 @@ impl ProvisionSession {
     }
 }
 
+// (The driver test lives inside `mod tests` below — it has direct access to all helpers, no re-export needed.)
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2338,6 +2340,83 @@ mod tests {
         // (envelope → cert → transcript → Sig_PROV → config re-decode) and the verifier reaches the
         // mint+seal precondition (the Ok config + pubkey are exactly what seal_provisioned_keystore +
         // ProvisionSession::on_m3 consume). The mint+seal step itself is exercised by session_happy_path.
+    }
+
+    // ── Runtime driver integration (provision_bootstrap) ──────────────────────
+
+    /// A mock SNP report producer for the driver test (returns a fixed 1184-byte report).
+    struct MockReportProducer;
+    impl crate::provision_bootstrap::ProvisionReportProducer for MockReportProducer {
+        fn fetch_report(&self, _report_data: &[u8; 64]) -> Result<Vec<u8>, ProvisionError> {
+            Ok(vec![0x77u8; SNP_REPORT_LEN])
+        }
+    }
+
+    /// Full M1→M2→M3→M4 ceremony over a UnixStream pair — exercises the provision_bootstrap driver
+    /// (framing, ProvisionSession composition, report-producer seam) end-to-end. No vsock/SNP needed.
+    #[test]
+    fn driver_ceremony_over_unix_stream() {
+        use std::os::unix::net::UnixStream;
+
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[eku_oid()]));
+        let config_map = encode_config_map(&sample_config());
+        let n_p = [0x11u8; 32];
+        let seal_root = [0x42u8; 32];
+        let measurement = b"driver-meas".to_vec();
+        let pinned = ca.verifying_key();
+
+        let (server_sock, client_sock) = UnixStream::pair().expect("pair");
+
+        // Server thread: run the ceremony.
+        let handle = std::thread::spawn(move || {
+            let mut reader = server_sock.try_clone().expect("clone");
+            let mut writer = server_sock;
+            crate::provision_bootstrap::run_provisioning_ceremony(
+                &mut reader,
+                &mut writer,
+                &pinned,
+                &seal_root,
+                &measurement,
+                &MockReportProducer,
+                std::time::Duration::from_secs(10),
+            )
+        });
+
+        // Client (provisioner): write M1 → read M2 → write M3 → read M4.
+        let mut sock = client_sock;
+
+        // M1 (prepend u32 length to the provision envelope — the standard framing).
+        let m1_env = encode_envelope(MSG_M1_CHALLENGE, &encode_m1(&n_p));
+        let mut m1_frame = Vec::with_capacity(4 + m1_env.len());
+        m1_frame.extend_from_slice(&(m1_env.len() as u32).to_be_bytes());
+        m1_frame.extend_from_slice(&m1_env);
+        crate::write_framed_message(&mut sock, &m1_frame).expect("write M1");
+
+        // M2 (strip the 4-byte u32 prefix from read_framed_message's return).
+        let m2_raw = crate::read_framed_message(&mut sock).expect("read M2");
+        let (_, m2_payload) = decode_envelope(&m2_raw[4..]).expect("decode M2");
+        let m2 = decode_m2(m2_payload).expect("decode M2 body");
+        let report_hash = compute_report_hash(&m2.report);
+
+        // M3 (prepend u32 length).
+        let m3_env = mint_m3_message(&prov, &cert, &config_map, &n_p, &m2.n_e, &report_hash);
+        let mut m3_frame = Vec::with_capacity(4 + m3_env.len());
+        m3_frame.extend_from_slice(&(m3_env.len() as u32).to_be_bytes());
+        m3_frame.extend_from_slice(&m3_env);
+        crate::write_framed_message(&mut sock, &m3_frame).expect("write M3");
+
+        // M4 (strip u32 prefix).
+        let m4_raw = crate::read_framed_message(&mut sock).expect("read M4");
+        let (_, m4_payload) = decode_envelope(&m4_raw[4..]).expect("decode M4");
+        let m4 = decode_m4(m4_payload).expect("decode M4 body");
+        assert!(!m4.sealed_blob.is_empty(), "M4 carries a sealed blob");
+
+        // Server result.
+        let (decoded_config, sealed_blob) = handle.join().unwrap().expect("ceremony succeeds");
+        assert_eq!(sealed_blob, m4.sealed_blob);
+        assert_eq!(decoded_config, sample_config());
     }
 
 }
