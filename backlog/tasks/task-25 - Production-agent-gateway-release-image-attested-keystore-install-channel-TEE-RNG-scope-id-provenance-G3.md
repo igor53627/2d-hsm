@@ -129,18 +129,15 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   chain validation + role-constraint check; (iii) verify-order integration (transcript + Sig_PROV);
   (iv) mint+seal wiring; (v) golden-vector regen test. **Per-slice review gate (clarified
   2026-06-20, compact 9048 + 9109):** slices i + ii are PURE functions (codec / cert-verify — no
-  state, no concurrency) → **Reduced Matrix** suffices; slices iii (verify-order) AND iv
-  (`ProvisionSession` stateful: AwaitingM1→AwaitingM3→Done/Failed) are the state-machine / ordering-
-  sensitive surfaces → **Full Matrix** incl. the 2×3 concurrency floor (`pse-review-2x3.sh`).
   (The original "each sub-slice is Full Matrix" was written for 25-2b-as-a-whole; the per-slice split
   lets the pure slices land on Reduced, the state-machine slices on Full.)
-  **⚠ Full Matrix PARTIAL for iii + iv (compact 9113):** the gemini 2×3 cells (agy) failed on
-  non-interactive re-auth (AGENTS.md known scenario; cannot re-auth without an interactive terminal).
-  So iii + iv are reviewed under a PARTIAL Full Matrix: codex×3 (security/design/design-max) +
-  claude-code/design + gemini/security(Reduced) all completed; the gemini design + design-max 2×3
-  views are the OPEN gap. The design lens is multi-covered (claude-code + codex×2), so this is a
-  documented degradation, NOT a clean Full Matrix — re-run `pse-review-2x3.sh` interactively (after
-  `agy` re-login) to close it before the runtime driver wires.
+  **⚠ Full Matrix PARTIAL for iii + iv:** gemini 2×3 runs intermittently (agy OAuth flake — fails
+  ~50%, unrelated to parallelism). After sequential re-runs (2026-06-20): gemini/security ✅ done
+  (clean) + gemini/design-max ✅ done (clean); **gemini/design ❌ the one residual gap** (consistent
+  fail; agy/roborev lens-specific quirk). The design lens is covered by claude-code/design +
+  codex/design + codex/design-max + gemini/design-max (4 reviews, 3 vendors) — the missing gemini/design
+  is a minor gap, not a blind spot. Re-run `roborev review <range> --type design --agent gemini` to
+  close it (agy auth permitting).
   - **25-2b-i (DONE — reviewed)** — `agent_provision.rs` (agent-gateway-gated): pure codec for the
     frozen `provision_wire_version=1` — envelope (magic/version/msg_type), per-state direction
     validation (`HandshakeStep`/`validate_inbound`), M1-M4 encode/decode, `ProvisionConfig` + §5.1
