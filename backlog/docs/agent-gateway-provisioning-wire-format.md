@@ -206,7 +206,7 @@ The canonical bytes of a config_map for a representative config (`chain_id=11565
 ```
 A7                              # map(7) — major 5, additional 7
    01                             # key 1
-   19 2D 2D                      # uint 11565 (0x2D2D) — major 0, additional 26 (4-byte BE)
+   19 2D 2D                      # uint 11565 (0x2D2D) — major 0, additional 25 (2-byte BE)
    02                             # key 2
    65 "prod-0"                   # text(5) "prod-0"
    03                             # key 3
@@ -273,26 +273,35 @@ provisioner_cert = DER-encoded X.509 leaf certificate
   intermediate CA). This keeps the enclave-side verification to one Ed25519 verify of the
   cert signature + one SPKI extraction, avoiding a full PKI path-validation stack in-TEE.
   Intermediate CAs are a documented post-MVP extension (§11).
-- **Role constraint (25-2a-rev1 Med fix).** The cert MUST carry a provisioning-specific role
-  marker — a dedicated EKU OID (e.g. `2.25.x`-style private OID, frozen in 25-2b) OR a pinned
-  Subject string — so a leaf cert the operator CA issued for a DIFFERENT purpose (TLS client,
-  code-signing, log-signing) cannot be repurposed as a provisioner (confused-deputy defense).
-  The enclave rejects any cert lacking the role marker ⇒ `PROV_UNAUTHORIZED_PROVISIONER`.
-  Without this, any leaf under the operator CA is a valid provisioner — the operator CA's blast
-  radius is its whole issued-cert set.
-- **Validity / revocation (NO enclave wall-clock check — 25-2a-rev1 HIGH fix).** SNP reports
+- **Role constraint (25-2a-rev1 Med fix; narrowed 25-2a-rev2).** The cert MUST carry a
+  **dedicated EKU OID** (a `2.25.<random>` private OID, frozen concretely in 25-2b), AND that OID
+  is the sole role marker (no Subject-string alternative — narrowed from the rev1 "EKU OR Subject"
+  so the cert-issuance tooling and the in-TEE check agree on one mechanism; 25-2a-rev2 Low). A leaf
+  cert the operator CA issued for a DIFFERENT purpose (TLS client, code-signing, log-signing) lacks
+  the EKU ⇒ rejected `PROV_UNAUTHORIZED_PROVISIONER`. Without this, any leaf under the operator CA
+  is a valid provisioner — the operator CA's blast radius is its whole issued-cert set.
+- **Validity / revocation (NO enclave wall-clock check — 25-2a-rev2 HIGH fix).** SNP reports
   carry a TCB *version* (firmware/hardware SVNs), NOT a trusted wall-clock timestamp, and the SNP
   TEE has no secure RTC — so the enclave **cannot** evaluate X.509 `not_before`/`not_after` against
-  a trusted time, and MUST NOT fall back to host time (the host is the adversary during provisioning).
-  Revocation + validity is therefore enforced by **mechanisms the enclave CAN verify**:
-  (i) **TCB-version gating** — the operator's pinned measurement-allowlist entry (Q7) is paired with
-  a minimum TCB-version; the enclave rejects reports whose TCB is below the floor or above a
-  revoked ceiling; (ii) **operator-CA rotation** — a compromised provisioner cert is retired by
-  re-building the enclave binary with a new operator CA root (the old cert's chain no longer pins);
-  (iii) **cert serial denylist** (optional 25-2b) — a small compile-time list of revoked provisioner
-  cert serials, checked in-TEE without a clock. The X.509 `not_before`/`not_after` fields are parsed
-  for audit logging only, NOT enforced (documented as residual: short-term compromise of an
-  operator CA before rotation is the window — accepted, MVP quorum = 1).
+  a trusted time, and MUST NOT fall back to host time (the host is the adversary during
+  provisioning). NB a further direction subtlety (25-2a-rev2 HIGH): in THIS handshake the enclave
+  **emits** the SNP report (M2) and the provisioner verifies it; the enclave does NOT receive or
+  verify a report from the provisioner, so **TCB-version gating is a property of the ENCLAVE side
+  (the provisioner's M2-verify path rejects stale-TCB enclaves), NOT a provisioner-cert revocation
+  mechanism**. Provisioner-cert lifecycle is therefore enforced ONLY by mechanisms the enclave can
+  verify without a clock AND without a report from the provisioner:
+  (i) **operator-CA root rotation** — a compromised provisioner cert is retired by re-building the
+  enclave binary with a NEW operator CA root pinned; the old cert's chain no longer verifies against
+  the new pin, so it cannot provision (this is the primary revocation path; an enclave binary's
+  pinned CA root is its clock-free "current epoch");
+  (ii) **compile-time cert-serial denylist** (optional 25-2b) — a small list of revoked provisioner
+  cert serials compiled into the enclave binary, checked in-TEE (no clock needed).
+  The X.509 `not_before`/`not_after` fields are parsed for audit logging only, NOT enforced.
+  **Residual (accepted, MVP quorum = 1):** between a provisioner-cert compromise and the next
+  enclave-binary release with a rotated CA root, the compromised cert remains usable — this is the
+  cost of having no enclave-side clock; mitigation is operational (rapid CA-root rotation on
+  compromise). An authenticated in-TEE time protocol (e.g. Roughtime bound to the anchor) is a
+  documented post-MVP extension that would close this window without a host clock.
 
 **Why X.509 DER (not a custom min-format).** Operator tooling signs/provisions using
 standard libraries (openssl / cloud KMS); DER X.509 is universally interoperable and
@@ -332,6 +341,13 @@ The 25-2b impl MUST include negative tests proving the decoder fails closed on e
 - Wrong magic (`b"2DAGxxx\0"` ≠ `b"2DAGPRV\0"`) → `PROV_BAD_MAGIC`.
 - `version ≠ 1` (incl. `0`, `2`, `0xFF`) → `PROV_UNSUPPORTED_VERSION`.
 - `msg_type ∉ {1,2,3,4}` → `PROV_MALFORMED`.
+- **`msg_type` in the wrong role/state** (25-2a-rev2 Med): enclave receiving M2/M4, or M3
+  before M1; provisioner receiving M1/M3, or M4 before M2 → `PROV_MALFORMED`.
+- **`PROV_TOO_LARGE` per field** (25-2a-rev2 Med): overall M1/M3 payload >
+  `MAX_PROV_PAYLOAD_LEN` (8192); `config_map` > `MAX_CONFIG_MAP_LEN` (4096);
+  `provisioner_cert` > `MAX_PROV_CERT_LEN` (2048); M2 `report` ≠ `SNP_REPORT_LEN` (1184) —
+  each fails closed `PROV_TOO_LARGE` (the report length is a fixed-equality check, but the
+  failure is reported under the same too-large family).
 - Non-canonical CBOR (descending keys, duplicate keys, indefinite-length, non-shortest
   int encoding, map header count ≠ actual pairs) → `PROV_MALFORMED`.
 - `config_map` with a key `8` (a host attempting to inject `enclave_scope_id`) →
@@ -348,6 +364,9 @@ The 25-2b impl MUST include negative tests proving the decoder fails closed on e
 - `Sig_PROV` not verifying under the provisioner cert's key → `PROV_BAD_SIGNATURE`.
 - **Channel-binding regression**: a captured M3 replayed against a DIFFERENT enclave
   session (different `N_e`) → `PROV_TRANSCRIPT_MISMATCH` (the load-bearing HIGH#1 test).
+- **Provisioner-cert role constraint** (25-2a-rev2 Med): a `provisioner_cert` that chains to
+  the operator CA root but lacks the provisioning role marker (EKU OID / pinned Subject) →
+  `PROV_UNAUTHORIZED_PROVISIONER` (confused-deputy defense).
 
 ## §10 Frozen golden vectors (byte-exact)
 
@@ -374,8 +393,10 @@ envelope:  0x32 44 41 47 50 52 56 00  01  01           # magic ‖ version=1 ‖
 payload:   0xA1 01 58 20  <32 × 0x11>                 # canonical-CBOR({1: N_p}) = map(1) {1: bytes(32)}
 ```
 
-Full M1 = `envelope ‖ payload` = `8 + 1 + 1 + 2 + 32` = 44 bytes. The payload head is `0xA1`
-(map(1)), `0x01` (key 1), `0x58 0x20` (bytes(32)), then 32 payload bytes — a single-key map
+Full M1 = `envelope ‖ payload` = `8 + 1 + 1 + 4 + 32` = **46 bytes**. The payload head is
+four bytes — `0xA1` (map(1)), `0x01` (key 1), `0x58 0x20` (bytes(32)) — then 32 nonce bytes (25-2a-rev2
+HIGH fix: the prior `2 + 32` form silently dropped the `0xA1 01` wrapper this same edit added).
+a single-key map
 wrapping the nonce, NOT a bare bytes value (25-2a-rev1 fix: the prior `0x58 20 …` form omitted
 the required `{1: N_p}` CBOR map wrapper).
 
@@ -460,3 +481,18 @@ golden M3 and that the verifier reaches the mint+seal step; the 25-2b negatives 
   a non-existent message; if persistence confirmation is ever needed it's version 2). Low fixes:
   handshake_domain 34→35 bytes; per-state msg_type direction validation; verify-order rationale
   corrected (only step 1 is pre-crypto; step 5 is post-sig by design). grok clean.
+- 2026-06-20 — 25-2a-rev2 after the second Full Matrix (compact job 8922, 2 HIGH + 1 Med + 2 Low).
+  HIGH#1 fix (claude-code/gemini/grok independent): the rev1 M1-golden fix added 0xA1 01 but left
+  the length formula 8+1+1+2+32=44 (should be 8+1+1+4+32=46) — a fresh self-contradiction of the
+  same class as the rev1 HIGH; corrected. HIGH#2 fix (claude-code+gemini): the rev1 revocation
+  story claimed "TCB-version gating" rejects provisioner certs, but in THIS handshake the enclave
+  EMITS the report (M2) and the provisioner verifies it — the enclave does not receive/verify a
+  report from the provisioner, so TCB-gating is an ENCLAVE-side property (the provisioner's M2-
+  verify), not a provisioner-cert mechanism. Provisioner-cert lifecycle is now enforced ONLY by
+  operator-CA root rotation (re-build the enclave binary with a new pinned root; the enclave's
+  pinned root is its clock-free "current epoch") + optional compile-time cert-serial denylist.
+  Residual (compromise-before-next-rotation window) accepted, MVP quorum=1; Roughtime-bound-to-
+  anchor is the documented post-MVP closer. Med: §9 negatives added for msg_type wrong-role and
+  PROV_TOO_LARGE per field. Low: chain_id annotation additional 26→25 (0x19 = additional 25,
+  2-byte BE); role marker narrowed to a single EKU OID (no Subject alternative); 25-2b pre-split
+  into sub-slices in TASK-25 notes.
