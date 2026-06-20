@@ -49,16 +49,19 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   `agent-*-preview` features enabled until each is un-gated by its own slice. Reproducible
   (nix/aya). The `enclave.nix` `buildFeatures` surface this task owns does not yet exist.
 - [ ] #2 **Attested keystore-install channel (explicit SNP state machine).** The provisioning flow is:
-  (a) the enclave mints a fresh `enclave_scope_id` via in-TEE `getrandom` AND an ephemeral install
-  handshake key (AC#3); (b) the enclave emits a signed SNP attestation report binding its
-  measurement + the ephemeral install key + a fresh nonce; (c) the **provisioner** (NOT the host
-  being trusted blindly) verifies VCEK/ASK/ARK chain + TCB/revocation (TASK-1.2) + a measurement
-  allowlist + the nonce freshness, thereby authenticating THAT enclave; (d) only then does the
-  provisioner send the authenticated `fleet_scope_id` (AC#7) + any config the enclave cannot derive,
-  which the enclave seals itself. The direction is: **attestation proves the enclave to the
-  provisioner** (standard SNP); a host that cannot present a report the provisioner accepts cannot
-  install a keystore. Acceptance test MUST include the NEGATIVE case (a non-attesting / wrong-
-  measurement / stale-nonce host ⇒ install refused).
+  (a) M1: the provisioner sends a challenge nonce `N_p`; the enclave mints `N_e` and emits M2 — a
+  signed SNP attestation report whose 64-byte `REPORT_DATA = SHA3-512("2d-hsm-agent-provision-
+  handshake-v1" ‖ N_p ‖ N_e)` (binding the enclave's measurement + TCB + the challenge, via the VCEK
+  signature); (b) the **provisioner** (NOT the host) verifies the VCEK/ASK/ARK chain + TCB/revocation
+  (TASK-1.2) + a measurement allowlist + that `REPORT_DATA == SHA3-512(domain ‖ N_p ‖ N_e)` (nonce
+  freshness), thereby authenticating THAT enclave; (c) M3: only then does the provisioner send the
+  authenticated `fleet_scope_id` (AC#7) + config + a `Sig_PROV` over the transcript `(config_map,
+  N_p, N_e, report_hash)` signed by its operator-CA-certified Ed25519 key; (d) the enclave runs the
+  §6 verify order, mints `enclave_scope_id` at SEAL time (AC#3 — NOT in M2/transcript; host-
+  uncontrollable by structural absence from the wire), and seals its own keystore. **Direction:**
+  attestation proves the enclave to the provisioner (standard SNP); a host that cannot present a report
+  the provisioner accepts cannot install a keystore. Acceptance test MUST include the NEGATIVE case
+  (a non-attesting / wrong-measurement / stale-nonce host ⇒ install refused).
 - [ ] #3 (HIGH carry-in #1, HARD BLOCKER) **`enclave_scope_id` provenance is host-uncontrollable.**
   AC#1's whole adversary is a host that clones an enclave. The `enclave_scope_id` MUST be drawn
   INSIDE the TEE — minted via `getrandom` in-enclave at provisioning (or attested-unique by
@@ -158,7 +161,7 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
     Malformed branches — + 5 Lows) → compact 9048; all 6 findings addressed in the fix commit (sig-
     alg checks, raw-TBS-bytes, x509-cert optional gating, malformed-branch tests, EKU-narrative
     reword, this per-slice-gate clarification). 10 cert tests; 531 total pass.
-  - **25-2b-iii (DONE — reviewed)** — §6 verify-order integration: `compute_report_data`
+  - **25-2b-iii (DONE — impl ⚠ review PARTIAL)** — §6 verify-order integration: `compute_report_data`
     (SHA3-512 REPORT_DATA commitment) / `compute_report_hash` (SHA3-256), `transcript_canonical` +
     `sig_prov_signed_bytes` (PROVISION_DOMAIN ‖ canonical-CBOR), `verify_m3_transcript_and_sig`
     (steps 3+4: transcript byte-compare → TranscriptMismatch; Sig_PROV verify_strict → BadSignature),
@@ -172,7 +175,7 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
     coverage held via Reduced security + one design-max cell, and the design lens is multi-covered
     (claude-code + codex×2) — the missing gemini-design-2×3 view is the documented gap. 53 tests;
     544 total pass.
-  - **25-2b-iv (DONE — reviewed)** — mint+seal + `ProvisionSession`: `mint_enclave_scope_id`
+  - **25-2b-iv (DONE — impl ⚠ review PARTIAL)** — mint+seal + `ProvisionSession`: `mint_enclave_scope_id`
     (getrandom, AC#3/#4; `validate_minted_scope_id` rejects zero + [0xe1]/[0xf1] sentinels),
     `build_provisioned_keystore_body` (basket A/B/C mapping, genesis-zero faucet), `seal_provisioned_keystore`
     (→ M4 blob), `ProvisionSession` (pure transport-free: on_m1 mints N_e + report_data; on_m3 runs
@@ -187,9 +190,14 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
     `seal_root` + `measurement` passed to `ProvisionSession::new` MUST be the SAME measurement proven
     in the M2 SNP report (derive both from one source — never seal under a measurement the provisioner
     did not attest); (2) one-shot failure — a Failed session ⇒ tear down the bootstrap listener (the
-    host must re-connect + re-M1 for any retry; Q5 already makes the listener one-connection); (3) wrap
-    `on_m3`'s sealed blob in `encode_m4` + the envelope before emitting; (4) the operator-CA-root pin
-    + measurement allowlist are compiled into the bin (25-1 Q7).
+    host must re-connect + re-M1 for any retry; Q5 already makes the listener one-connection); (3) the
+    `report` passed to `on_m3` MUST be the EXACT M2 report bytes the enclave emitted (the bytes whose
+    `report_data == compute_report_data(N_p, N_e)` — never a re-fetched/cached/host-provided report;
+    `on_m3` recomputes `report_hash` from it, binding the transcript to precisely that report); (4) wrap
+    `on_m3`'s sealed blob in `encode_m4` + the envelope before emitting; (5) the operator-CA-root pin is
+    compiled into the bin (25-1 Q7). NB the measurement-allowlist + VCEK/report verification is
+    PROVISIONER-side per AC#2 (the enclave EMITS the M2 report; the provisioner verifies it) — NOT the
+    enclave bin's job; that provisioner-side slice is a separate 25-x item.
 - **25-3..25-6** — per 25-1 §7 (enclave_scope_id in-TEE mint; production nix profile; restore identity
   hard gate on TASK-24; operator runbook).
 
