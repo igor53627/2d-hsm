@@ -498,12 +498,13 @@ const ED25519_PUBKEY_LEN: usize = 32;
 ///
 /// **Arc value choice:** the spec's `2.25.<random>` is a private unregistered OID. `const-oid` (both
 /// 0.9 and 0.10, used transitively by `x509-cert`) types its arc as `u32` AND caps each arc at
-/// `ARC_MAX_BYTES = size_of::<u32> = 4` base-128 bytes (max value 268435455), so a 128-bit
-/// UUID-derived `2.25` value is unrepresentable. The frozen value is the low 28 bits of the candidate
-/// UUID `6d847b22-9b6e-4c2f-8aa1-5f3e0c7b9d44`'s node id (`0x0C7B9D44` = 209175620) — traceable to
-/// that UUID while fitting the 4-byte-arc limit (round-trip-verified). Collision resistance is a
-/// non-issue: the operator CA is the SOLE assigner, so the value space is far more than enough for
-/// one frozen role marker.
+/// `ARC_MAX_BYTES = size_of::<u32> = 4` base-128 bytes (max value 268435455), so a full 128-bit
+/// UUID-derived `2.25` value is unrepresentable. The frozen value is therefore an **arbitrary frozen
+/// private OID under `2.25`**, seeded by the low 28 bits of candidate UUID
+/// `6d847b22-9b6e-4c2f-8aa1-5f3e0c7b9d44`'s node id (`0x0C7B9D44` = 209175620), fitting the 4-byte-arc
+/// limit (round-trip-verified). It is NOT the OID-encoding of that UUID (a `2.25` arc encodes the
+/// integer itself; this is just a seed for an arbitrary value). Collision resistance is a non-issue:
+/// the operator CA is the SOLE assigner, so the value space is far more than enough for one role marker.
 pub(crate) const PROVISIONER_EKU_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("2.25.209175620");
 
@@ -511,39 +512,79 @@ pub(crate) const PROVISIONER_EKU_OID: ObjectIdentifier =
 /// MUST use this algorithm with ABSENT parameters.
 const ED25519_ALG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
 
+/// Read a DER tag+length head from `b`, returning `(header_len, content_len)`. A MINIMAL length
+/// reader (short form + 1-4 byte long form) used ONLY to extract a sub-element's exact byte range
+/// from an already-parsed cert — `x509-cert`/`der` do the structural parse + crypto. Rejects
+/// indefinite length (minor 31), lengths >4 bytes, and truncation. Returns `Err(())` on any malformation.
+fn der_head(b: &[u8]) -> Result<(usize, usize), ()> {
+    let n = *b.get(1).ok_or(())?;
+    let (hdr, content) = if n < 0x80 {
+        (2, n as usize)
+    } else {
+        let k = (n & 0x7f) as usize;
+        if k == 0 || k > 4 || b.len() < 2 + k {
+            return Err(());
+        }
+        let mut len = 0usize;
+        for i in 0..k {
+            len = (len << 8) | b[2 + i] as usize;
+        }
+        (2 + k, len)
+    };
+    Ok((hdr, content))
+}
+
+/// Extract the EXACT `TBSCertificate` byte slice from a Certificate's DER (the first element of the
+/// outer `SEQUENCE`). Used to verify the CA signature over the **original signed bytes** — NOT a
+/// re-encoded TBS — so a cert whose TBS re-serializes differently under `x509-cert` still verifies iff
+/// the CA actually signed those bytes (closes the re-encode availability hole: a legitimate non-canonical
+/// cert is no longer falsely rejected). `cert_der` MUST already have been accepted by
+/// `Certificate::from_der` (this fn is a byte-range slice, not a parser).
+fn cert_tbs_bytes(cert_der: &[u8]) -> Result<&[u8], ()> {
+    let (outer_hdr, _) = der_head(cert_der)?;
+    let (tbs_hdr, tbs_len) = der_head(&cert_der[outer_hdr..])?;
+    let end = outer_hdr
+        .checked_add(tbs_hdr)
+        .and_then(|s| s.checked_add(tbs_len))
+        .ok_or(())?;
+    if end > cert_der.len() {
+        return Err(());
+    }
+    Ok(&cert_der[outer_hdr..end])
+}
+
 /// Verify the M3 `provisioner_cert` (§7) against the **pinned operator CA root** + the role EKU.
 /// Returns the provisioner's Ed25519 verifying key (for slice iii's `Sig_PROV` verify).
 ///
 /// **Single-level chain (MVP):** the leaf is signed DIRECTLY by the pinned root — no intermediate
-/// CA, no path validation. This fn performs exactly four checks: (1) DER parse (strict — x509-cert/
-/// der reject non-canonical input); (2) v3 + Ed25519 SPKI extraction; (3) one Ed25519 `verify_strict`
-/// of the cert signature over the TBS bytes against `operator_ca_root`; (4) the EKU extension MUST
-/// carry [`PROVISIONER_EKU_OID`].
+/// CA, no path validation. This fn performs exactly five checks: (1) DER parse (strict — x509-cert/
+/// der reject non-canonical input); (2) v3 + Ed25519 SPKI extraction (RFC 8410); (3) BOTH signature
+/// `AlgorithmIdentifier`s (`tbs.signature` AND `cert.signature_algorithm`) MUST be Ed25519 with absent
+/// params — algorithm agility is intentionally absent, the verifier fixes Ed25519; (4) one Ed25519
+/// `verify_strict` of the cert signature over the **original TBS bytes** ([`cert_tbs_bytes`]) against
+/// `operator_ca_root`; (5) the EKU extension MUST carry [`PROVISIONER_EKU_OID`].
 ///
 /// **`operator_ca_root`** is the pinned root verifying key — compiled into the enclave binary at
 /// build (the same binary-pinning discipline as the Q7 measurement allowlist); passed as a parameter
 /// so the verify path is pure + testable, with the production pin wired by slice iv's install path.
 /// Rotation = re-build with a new pin (the in-enclave clock-free epoch marker; §7 revocation).
 ///
-/// **Signature is verified BEFORE the EKU check** (step 3 ≺ step 4): the EKU is only meaningful on an
+/// **Signature is verified BEFORE the EKU check** (step 4 ≺ step 5): the EKU is only meaningful on an
 /// AUTHENTICATED cert — a forgable cert's EKU is worthless, so authenticity is established first.
 ///
-/// **Error taxonomy (§9):** malformed DER / non-v3 / non-Ed25519 key / bad signature encoding ⇒
-/// [`ProvisionError::Malformed`]; signature not verifying under the pinned root OR the role EKU
-/// missing/wrong ⇒ [`ProvisionError::UnauthorizedProvisioner`]. No wall-clock / `not_before`/
-/// `not_after` check (§7 — the SNP TEE has no trusted clock; provisioner-cert lifecycle is CA-root
-/// rotation + optional cert-serial denylist, NOT validity-window enforcement).
-///
-/// **TBS bytes:** `tbs.to_der()` re-encodes the parsed TBS canonically; for canonical certs
-/// (openssl / cloud-KMS output) this is byte-identical to the CA-signed bytes. A non-canonical cert
-/// would fail the verify (fail-closed-safe — such certs do not occur from standard tooling).
+/// **Error taxonomy (§9):** malformed DER / non-v3 / non-Ed25519 SPKI OR signature algorithm / bad
+/// signature encoding / non-canonical structure ⇒ [`ProvisionError::Malformed`]; signature not
+/// verifying under the pinned root OR the role EKU missing/wrong ⇒
+/// [`ProvisionError::UnauthorizedProvisioner`]. No wall-clock / `not_before`/`not_after` check (§7 —
+/// the SNP TEE has no trusted clock; provisioner-cert lifecycle is CA-root rotation + optional
+/// cert-serial denylist, NOT validity-window enforcement).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn verify_provisioner_cert(
     cert_der: &[u8],
     operator_ca_root: &ed25519_dalek::VerifyingKey,
 ) -> Result<ed25519_dalek::VerifyingKey, ProvisionError> {
     use ed25519_dalek::{Signature, VerifyingKey};
-    use x509_cert::der::{Decode, Encode};
+    use x509_cert::der::Decode;
     use x509_cert::ext::pkix::ExtendedKeyUsage;
     use x509_cert::Certificate;
 
@@ -574,15 +615,27 @@ pub(crate) fn verify_provisioner_cert(
     )
     .map_err(|_| ProvisionError::Malformed)?;
 
-    // 3. Cert signature over the TBS bytes, verified against the pinned operator CA root.
-    let tbs_der = tbs.to_der().map_err(|_| ProvisionError::Malformed)?;
+    // 3. BOTH signature AlgorithmIdentifiers (RFC 5280 inner==outer) MUST be Ed25519 with absent
+    //    parameters — algorithm agility is intentionally absent (the verifier fixes Ed25519), so a
+    //    cert that advertises a different sig alg (even if its signature bits happen to verify) is
+    //    rejected as Malformed before the crypto.
+    let sig_alg_ok = |a: &x509_cert::spki::AlgorithmIdentifierOwned| {
+        a.oid == ED25519_ALG_OID && a.parameters.is_none()
+    };
+    if !sig_alg_ok(&cert.signature_algorithm) || !sig_alg_ok(&tbs.signature) {
+        return Err(ProvisionError::Malformed);
+    }
+
+    // 4. Cert signature over the ORIGINAL TBS bytes (not a re-encode), verified against the pinned
+    //    operator CA root.
+    let tbs_bytes = cert_tbs_bytes(cert_der).map_err(|_| ProvisionError::Malformed)?;
     let sig_bytes = cert.signature.as_bytes().ok_or(ProvisionError::Malformed)?;
     let sig = Signature::from_slice(sig_bytes).map_err(|_| ProvisionError::Malformed)?;
     operator_ca_root
-        .verify_strict(&tbs_der, &sig)
+        .verify_strict(tbs_bytes, &sig)
         .map_err(|_| ProvisionError::UnauthorizedProvisioner)?;
 
-    // 4. Role constraint: the dedicated EKU OID MUST be present (the sole role marker).
+    // 5. Role constraint: the dedicated EKU OID MUST be present (the sole role marker).
     let has_role = tbs
         .get::<ExtendedKeyUsage>()
         .map_err(|_| ProvisionError::Malformed)?
@@ -1026,10 +1079,31 @@ mod tests {
         ca_sk: &SigningKey,
         ekus: Option<&[x509_cert::der::asn1::ObjectIdentifier]>,
     ) -> Vec<u8> {
+        mint_cert_malform(provisioner_pub, ca_sk, ekus, None)
+    }
+
+    /// A cert malformation for the [`mint_cert_malform`] negative fixtures (each exercises one
+    /// `Malformed` branch of [`verify_provisioner_cert`]).
+    enum Malform {
+        V1,               // version 1 (no extensions) — exercises the v3 gate
+        WrongSpkiAlg,     // SPKI algorithm = Ed448, not Ed25519
+        SpkiParamsPresent, // SPKI algorithm carries NULL params (RFC 8410 forbids them)
+        WrongPubkeyLen,   // SPKI subjectPublicKey = 31 bytes (not 32)
+        WrongSigAlg,      // signature AlgorithmIdentifiers = Ed448 (SPKI stays Ed25519)
+    }
+
+    /// `mint_cert` + an optional single [`Malform`]. Each malformation is applied independently and
+    /// produces a structurally-valid DER cert (so it parses) that fails exactly one verify branch.
+    fn mint_cert_malform(
+        provisioner_pub: &VerifyingKey,
+        ca_sk: &SigningKey,
+        ekus: Option<&[x509_cert::der::asn1::ObjectIdentifier]>,
+        malform: Option<Malform>,
+    ) -> Vec<u8> {
         use std::str::FromStr;
         use std::time::Duration;
-        use x509_cert::der::asn1::{BitString, OctetString};
-        use x509_cert::der::Encode;
+        use x509_cert::der::asn1::{Any, BitString, OctetString};
+        use x509_cert::der::{Encode, Tag};
         use x509_cert::ext::Extension;
         use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
@@ -1039,27 +1113,61 @@ mod tests {
         use x509_cert::{Certificate, TbsCertificate, Version};
         use ed25519_dalek::Signer;
 
-        let alg = AlgorithmIdentifierOwned {
+        let ed448 = || ObjectIdentifier::new_unwrap("1.3.101.113");
+        let ed25519 = || AlgorithmIdentifierOwned {
             oid: ED25519_ALG_OID.clone(),
             parameters: None,
         };
+        let spki_alg = match malform {
+            Some(Malform::WrongSpkiAlg) => AlgorithmIdentifierOwned {
+                oid: ed448(),
+                parameters: None,
+            },
+            Some(Malform::SpkiParamsPresent) => AlgorithmIdentifierOwned {
+                oid: ED25519_ALG_OID.clone(),
+                parameters: Some(Any::new(Tag::Null, Vec::<u8>::new()).unwrap()),
+            },
+            _ => ed25519(),
+        };
+        let sig_alg = match malform {
+            Some(Malform::WrongSigAlg) => AlgorithmIdentifierOwned {
+                oid: ed448(),
+                parameters: None,
+            },
+            _ => ed25519(),
+        };
+        let version = match malform {
+            Some(Malform::V1) => Version::V1,
+            _ => Version::V3,
+        };
+        let full_pub = provisioner_pub.to_bytes();
+        let pubkey_bytes: &[u8] = match malform {
+            Some(Malform::WrongPubkeyLen) => &full_pub[..31],
+            _ => &full_pub,
+        };
+
         let spki = SubjectPublicKeyInfoOwned {
-            algorithm: alg.clone(),
-            subject_public_key: BitString::from_bytes(&provisioner_pub.to_bytes()).unwrap(),
+            algorithm: spki_alg,
+            subject_public_key: BitString::from_bytes(pubkey_bytes).unwrap(),
         };
         let validity = Validity::from_now(Duration::from_secs(86400)).unwrap();
-        let extensions = ekus.map(|oids| {
-            let eku_der = ExtendedKeyUsage(oids.to_vec()).to_der().unwrap();
-            vec![Extension {
-                extn_id: x509_cert::der::asn1::ObjectIdentifier::new_unwrap("2.5.29.37"),
-                critical: false,
-                extn_value: OctetString::new(eku_der).unwrap(),
-            }]
-        });
+        // v1 certs cannot carry extensions; force None there so the DER stays valid.
+        let extensions = if version == Version::V1 {
+            None
+        } else {
+            ekus.map(|oids| {
+                let eku_der = ExtendedKeyUsage(oids.to_vec()).to_der().unwrap();
+                vec![Extension {
+                    extn_id: x509_cert::der::asn1::ObjectIdentifier::new_unwrap("2.5.29.37"),
+                    critical: false,
+                    extn_value: OctetString::new(eku_der).unwrap(),
+                }]
+            })
+        };
         let tbs = TbsCertificate {
-            version: Version::V3,
+            version,
             serial_number: SerialNumber::from(1u32),
-            signature: alg.clone(),
+            signature: sig_alg.clone(),
             issuer: Name::from_str("CN=test-operator-ca").unwrap(),
             validity,
             subject: Name::from_str("CN=test-provisioner").unwrap(),
@@ -1072,7 +1180,7 @@ mod tests {
         let sig = ca_sk.sign(&tbs_der);
         let cert = Certificate {
             tbs_certificate: tbs,
-            signature_algorithm: alg,
+            signature_algorithm: sig_alg,
             signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
         };
         cert.to_der().unwrap()
@@ -1143,6 +1251,90 @@ mod tests {
         );
         assert_eq!(
             verify_provisioner_cert(&[0xDE, 0xAD, 0xBE, 0xEF], &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    // ── Medium finding: each Malformed branch must be exercised (not just garbage-DER) ─────
+
+    #[test]
+    fn cert_non_v3_is_malformed() {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::V1),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cert_wrong_spki_alg_is_malformed() {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::WrongSpkiAlg),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cert_spki_params_present_is_malformed() {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::SpkiParamsPresent),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cert_wrong_pubkey_len_is_malformed() {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::WrongPubkeyLen),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cert_wrong_sig_alg_is_malformed() {
+        // SPKI stays Ed25519, but the signature AlgorithmIdentifiers advertise Ed448 — the
+        // inner==outer alg check (RFC 5280) rejects it as Malformed before the crypto.
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::WrongSigAlg),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
             Err(ProvisionError::Malformed)
         );
     }

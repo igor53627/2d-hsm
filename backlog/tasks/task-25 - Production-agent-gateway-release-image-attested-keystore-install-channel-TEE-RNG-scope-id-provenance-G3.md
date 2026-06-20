@@ -113,8 +113,13 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
 - **25-2b (in progress)** — Rust impl of 25-2a, **pre-declared sub-slices for incremental review**
   (25-2a-rev2 Low): (i) pure codec + DoS caps + §9 structural negatives; (ii) provisioner-cert
   chain validation + role-constraint check; (iii) verify-order integration (transcript + Sig_PROV);
-  (iv) mint+seal wiring; (v) golden-vector regen test. Each sub-slice is Full Matrix (the cert-
-  validation surface + the handshake state machine are concurrency-sensitive security logic).
+  (iv) mint+seal wiring; (v) golden-vector regen test. **Per-slice review gate (clarified
+  2026-06-20, compact 9048):** slices i + ii are PURE functions (codec / cert-verify — no state,
+  no concurrency) → **Reduced Matrix** suffices; slice iii integrates the transcript+Sig_PROV verify
+  into the **handshake state machine** (the concurrency/ordering-sensitive surface — ARM vs SIGN vs
+  GET_STATUS ordering) → **Full Matrix** incl. the 2×3 concurrency floor (`pse-review-2x3.sh`).
+  (The original "each sub-slice is Full Matrix" was written for 25-2b-as-a-whole; the per-slice
+  split lets the pure slices land on Reduced, the state-machine slice on Full.)
   - **25-2b-i (DONE — reviewed)** — `agent_provision.rs` (agent-gateway-gated): pure codec for the
     frozen `provision_wire_version=1` — envelope (magic/version/msg_type), per-state direction
     validation (`HandshakeStep`/`validate_inbound`), M1-M4 encode/decode, `ProvisionConfig` + §5.1
@@ -125,6 +130,16 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
     claude-code/design 1 Med + 4 Low) → 3 compact rounds settled clean (job 9028). 29 tests; 521
     total pass. Commits `1b99523` + fixes `08e31fb`/`871cdf9`. One doc rev (25-2a-rev6: §5.2
     `text(5)`→`text(6)` typo).
+  - **25-2b-ii (DONE — reviewed)** — `verify_provisioner_cert`: single-level X.509 leaf verify
+    via `x509-cert` 0.2.5 (optional dep, gated under `agent-gateway`). Five checks: DER parse → v3 +
+    Ed25519 SPKI (RFC 8410) → BOTH signature AlgorithmIdentifiers == Ed25519 (inner==outer; alg
+    agility intentionally absent) → `verify_strict` over the ORIGINAL TBS bytes (exact byte-range
+    slice, not a re-encode) against the pinned operator CA root → role EKU (`2.25.209175620`).
+    `operator_ca_root` passed as a param (pure/testable; production pin wired by slice iv). No
+    wall-clock check. Reduced Matrix (codex/gemini/grok clean, claude-code/design 1 Med — untested
+    Malformed branches — + 5 Lows) → compact 9048; all 6 findings addressed in the fix commit (sig-
+    alg checks, raw-TBS-bytes, x509-cert optional gating, malformed-branch tests, EKU-narrative
+    reword, this per-slice-gate clarification). 10 cert tests; 531 total pass.
 - **25-3..25-6** — per 25-1 §7 (enclave_scope_id in-TEE mint; production nix profile; restore identity
   hard gate on TASK-24; operator runbook).
 
