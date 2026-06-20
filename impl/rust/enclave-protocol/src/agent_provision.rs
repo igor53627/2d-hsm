@@ -486,6 +486,11 @@ pub(crate) fn decode_config_map(bytes: &[u8]) -> Result<ProvisionConfig, Provisi
         .ok_or(ProvisionError::Malformed)?;
     let fleet_scope_id = as_bytes32(map_get(&map, 7).ok_or(ProvisionError::Malformed)?)
         .ok_or(ProvisionError::Malformed)?;
+    // AC#7 provenance: fleet_scope_id must be a real fleet identity, not the zero id (which would
+    // collapse fleet-scoped caps + misclassify as a SealFailed downstream via KeystoreBody::validate).
+    if fleet_scope_id == [0u8; DIGEST_LEN] {
+        return Err(ProvisionError::Malformed);
+    }
     Ok(ProvisionConfig {
         twod_chain_id,
         environment_identifier,
@@ -831,10 +836,20 @@ use crate::agent_keystore::{seal_body, AuditRing, FaucetState, KeystoreBody, Key
 pub(crate) fn mint_enclave_scope_id() -> Result<[u8; DIGEST_LEN], ProvisionError> {
     let mut id = [0u8; DIGEST_LEN];
     getrandom::getrandom(&mut id).map_err(|_| ProvisionError::Csprng)?;
-    if id == [0u8; DIGEST_LEN] {
+    validate_minted_scope_id(&id)?;
+    Ok(id)
+}
+
+/// Pure provenance guard on a drawn `enclave_scope_id` (AC#4): reject the degenerate / known-fixture
+/// ids a clone could reproduce to defeat the 18-2 byte-compare — all-zero, and the `[0xe1;32]`/
+/// `[0xf1;32]` test sentinels. A sound CSPRNG never returns these (2^-256 each); separated from the
+/// `getrandom` draw so the rejection is deterministically testable. NB a faulty/faulted RNG that DID
+/// draw one is caught here (not silently sealed) — defense-in-depth, not a substitute for a sound CSPRNG.
+pub(crate) fn validate_minted_scope_id(id: &[u8; DIGEST_LEN]) -> Result<(), ProvisionError> {
+    if id == &[0u8; DIGEST_LEN] || id == &[0xe1u8; 32] || id == &[0xf1u8; 32] {
         return Err(ProvisionError::Csprng);
     }
-    Ok(id)
+    Ok(())
 }
 
 /// Construct the production **provisioned** `KeystoreBody` (genesis-equivalent initial state) from the
@@ -929,6 +944,11 @@ pub(crate) enum SessionState {
     AwaitingM3,
     /// M3 verified + keystore minted+sealed (M4 emitted). Terminal — the bootstrap listener tears down.
     Done,
+    /// A verify/mint/seal error during `on_m3` — the session is CONSUMED (terminal). Any M3 attempt
+    /// burns the session nonces, so the untrusted host cannot retry forged M3s against a fixed `N_e`
+    /// (static-target / fault-injection / oracle defense — the host must restart from M1 = fresh N_e +
+    /// fresh provisioner signature). One-shot failure semantics.
+    Failed,
 }
 
 impl ProvisionSession {
@@ -976,7 +996,6 @@ impl ProvisionSession {
     /// success. Terminal on success (state → `Done`); a second `on_m3` ⇒ [`ProvisionError::Malformed`].
     /// Errors propagate the failing §6 step (e.g. [`TranscriptMismatch`](ProvisionError::TranscriptMismatch)
     /// if the M3 was replayed against this session, [`BadSignature`](ProvisionError::BadSignature),
-    /// [`UnauthorizedProvisioner`](ProvisionError::UnauthorizedProvisioner)).
     pub(crate) fn on_m3(
         &mut self,
         m3_message: &[u8],
@@ -988,12 +1007,20 @@ impl ProvisionSession {
         let n_p = self.n_p.expect("AwaitingM3 ⇒ n_p set");
         let n_e = self.n_e.expect("AwaitingM3 ⇒ n_e set");
         let report_hash = compute_report_hash(report);
-        let (config, _prov_pub) =
-            verify_m3_in_order(m3_message, &self.pinned_root, &n_p, &n_e, &report_hash)?;
-        let scope_id = mint_enclave_scope_id()?;
-        let sealed = seal_provisioned_keystore(&config, scope_id, &self.seal_root, &self.measurement)?;
-        self.state = SessionState::Done;
-        Ok((config, sealed))
+        // One-shot failure semantics: ANY error (verify / mint / seal) CONSUMES the session —
+        // transition to `Failed` regardless of outcome, so the untrusted host cannot retry forged M3s
+        // against the same `N_e` (static-target / fault-injection / oracle defense; the host must
+        // restart from M1 = a fresh N_e + fresh provisioner signature).
+        let outcome = (|| {
+            let (config, _prov_pub) =
+                verify_m3_in_order(m3_message, &self.pinned_root, &n_p, &n_e, &report_hash)?;
+            let scope_id = mint_enclave_scope_id()?;
+            let sealed =
+                seal_provisioned_keystore(&config, scope_id, &self.seal_root, &self.measurement)?;
+            Ok((config, sealed))
+        })();
+        self.state = if outcome.is_ok() { SessionState::Done } else { SessionState::Failed };
+        outcome
     }
 
     /// Current session state (for the driver / tests).
@@ -2070,8 +2097,14 @@ mod tests {
             session.on_m3(&replay_m3, &report),
             Err(ProvisionError::TranscriptMismatch)
         );
-        // The session is NOT consumed by a failed verify (state stays AwaitingM3).
-        assert_eq!(session.state(), SessionState::AwaitingM3);
+        // One-shot failure semantics: the session is CONSUMED (→ Failed), so the host cannot retry
+        // forged M3s against the same N_e (static-target/fault-injection defense).
+        assert_eq!(session.state(), SessionState::Failed);
+        // Failed is terminal — a subsequent on_m3 ⇒ Malformed (must restart from on_m1).
+        assert_eq!(
+            session.on_m3(&replay_m3, &report),
+            Err(ProvisionError::Malformed)
+        );
     }
 
     #[test]
@@ -2100,6 +2133,25 @@ mod tests {
         let _ = session.on_m3(&m3, &report).unwrap(); // → Done
         // A second on_m3 (re-provision attempt) ⇒ Malformed (terminal state).
         assert_eq!(session.on_m3(&m3, &report), Err(ProvisionError::Malformed));
+    }
+
+    #[test]
+    fn validate_minted_scope_id_rejects_degenerate_and_sentinels() {
+        // AC#4: the known reproducible ids a clone could use to defeat the 18-2 byte-compare.
+        assert_eq!(validate_minted_scope_id(&[0u8; 32]), Err(ProvisionError::Csprng));
+        assert_eq!(validate_minted_scope_id(&[0xe1u8; 32]), Err(ProvisionError::Csprng));
+        assert_eq!(validate_minted_scope_id(&[0xf1u8; 32]), Err(ProvisionError::Csprng));
+        // A genuine random id passes.
+        assert_eq!(validate_minted_scope_id(&[0x5cu8; 32]), Ok(()));
+    }
+
+    #[test]
+    fn config_map_zero_fleet_scope_id_is_malformed() {
+        // AC#7: fleet_scope_id must be a real fleet identity, not zero (which would collapse
+        // fleet-scoped caps and misclassify as SealFailed downstream via KeystoreBody::validate).
+        let mut cfg = sample_config();
+        cfg.fleet_scope_id = [0u8; 32];
+        assert_eq!(decode_config_map(&encode_config_map(&cfg)), Err(ProvisionError::Malformed));
     }
 
 }
