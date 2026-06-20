@@ -24,6 +24,8 @@ pub const VMADDR_CID_HOST: u32 = 2;
 /// above [`DEFAULT_VSOCK_PORT`] as an operator-ergonomics default (see [`validate_relay_port`] for why
 /// the two are already distinct endpoints regardless of the number).
 pub const DEFAULT_ANCHOR_RELAY_PORT: u32 = 5001;
+/// Default provisioning bootstrap vsock port (TASK-25 Q5). Distinct from serve (5000) + relay (5001).
+pub const DEFAULT_PROVISIONING_VSOCK_PORT: u32 = 5002;
 
 fn env_u32_twod(primary: &str, legacy: &str, default: u32) -> Result<u32, String> {
     match var_twod(primary, legacy) {
@@ -93,6 +95,37 @@ pub fn anchor_relay_port_from_env() -> Result<u32, String> {
         DEFAULT_ANCHOR_RELAY_PORT,
     )?;
     validate_relay_port(port, serve_vsock_port_from_env()?)
+}
+
+/// Resolve the provisioning bootstrap vsock port (TASK-25 Q5): `TWOD_HSM_PROVISIONING_VSOCK_PORT`
+/// (legacy `2D_HSM_PROVISIONING_VSOCK_PORT`) or [`DEFAULT_PROVISIONING_VSOCK_PORT`] (5002), validated
+/// against BOTH the serve port and the relay port (three distinct ports — Q5 structural invariant).
+pub fn provisioning_vsock_port_from_env() -> Result<u32, String> {
+    use crate::env_config::{
+        LEGACY_HSM_PROVISIONING_VSOCK_PORT, TWOD_HSM_PROVISIONING_VSOCK_PORT,
+    };
+    let port = env_u32_twod(
+        TWOD_HSM_PROVISIONING_VSOCK_PORT,
+        LEGACY_HSM_PROVISIONING_VSOCK_PORT,
+        DEFAULT_PROVISIONING_VSOCK_PORT,
+    )?;
+    let serve = serve_vsock_port_from_env()?;
+    if port == serve {
+        return Err(format!(
+            "provisioning vsock port ({port}) must be distinct from the serve port ({serve})"
+        ));
+    }
+    let relay = env_u32_twod(
+        TWOD_HSM_ANCHOR_RELAY_PORT,
+        LEGACY_HSM_ANCHOR_RELAY_PORT,
+        DEFAULT_ANCHOR_RELAY_PORT,
+    )?;
+    if port == relay {
+        return Err(format!(
+            "provisioning vsock port ({port}) must be distinct from the anchor relay port ({relay})"
+        ));
+    }
+    Ok(port)
 }
 
 /// Resolve the UNTRUSTED host relay's upstream anchor endpoint (TASK-7.7 5b-2b-ii(b)) from

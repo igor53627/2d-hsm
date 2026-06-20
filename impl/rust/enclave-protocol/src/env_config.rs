@@ -56,6 +56,19 @@ pub const LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE: &str = "2D_HSM_ENCLAVE_MEASUREMEN
 pub const TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE: &str = "TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE";
 pub const LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE: &str = "2D_HSM_AGENT_SEALED_KEYSTORE_FILE";
 
+// TASK-25 AC#2: the one-shot provisioning bootstrap vsock port (Q5 — SEPARATE from the serve port
+// 5000 + the relay port 5001). The bootstrap listener accepts ONE connection, runs M1→M2→M3→M4,
+// then tears down. Default 5002.
+pub const TWOD_HSM_PROVISIONING_VSOCK_PORT: &str = "TWOD_HSM_PROVISIONING_VSOCK_PORT";
+pub const LEGACY_HSM_PROVISIONING_VSOCK_PORT: &str = "2D_HSM_PROVISIONING_VSOCK_PORT";
+
+// TASK-25 §7/AC#2: the pinned operator CA root Ed25519 public key (hex-encoded, 64 hex chars → 32
+// bytes). LAB/DEV: read from this env var. PRODUCTION: compiled into the binary at build (the same
+// binary-pinning discipline as the Q7 measurement allowlist). The provisioner cert chain verifies
+// against this root.
+pub const TWOD_HSM_OPERATOR_CA_ROOT_HEX: &str = "TWOD_HSM_OPERATOR_CA_ROOT_HEX";
+pub const LEGACY_HSM_OPERATOR_CA_ROOT_HEX: &str = "2D_HSM_OPERATOR_CA_ROOT_HEX";
+
 /// When `1`, allow boot without platform PQ root (transport-only smoke; NOT mainnet).
 pub const TWOD_HSM_TRANSPORT_ONLY_MODE: &str = "TWOD_HSM_TRANSPORT_ONLY_MODE";
 pub const LEGACY_HSM_TRANSPORT_ONLY_MODE: &str = "2D_HSM_TRANSPORT_ONLY_MODE";

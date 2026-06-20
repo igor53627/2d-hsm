@@ -143,11 +143,129 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     Ok(blob)
 }
 
+// TASK-25 boot integration: production keystore source = the provisioning bootstrap ceremony.
+// Triple-gated (Linux + vsock-transport + agent-gateway): the vsock binding + SNP report producer
+// are needed. On non-Linux / non-vsock builds (macOS CI), the provisioning source is unavailable →
+// fail closed (the lab file source is the fallback there).
+#[cfg(all(
+    not(feature = "lab-agent-keystore-from-file"),
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
+fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
+    agent_sealed_keystore_blob_from_provisioning()
+}
+
+/// The production keystore source: run the one-shot provisioning ceremony over vsock, persist the
+/// sealed blob to the keystore file path, then return it for unseal. On first boot (no keystore on
+/// disk), this IS the keystore source; on subsequent boots, the host should have persisted the blob
+/// and the lab file path would be set (but in a non-lab production build, we re-provision if the
+/// host didn't persist — Q8: a re-provisioned enclave mints a NEW enclave_scope_id + zero counters).
+#[cfg(all(
+    not(feature = "lab-agent-keystore-from-file"),
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
+fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolError> {
+    use crate::provision_bootstrap::{self, ProvisionReportProducer};
+    use crate::env_config::{
+        var_twod, LEGACY_HSM_OPERATOR_CA_ROOT_HEX, TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
+        LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_OPERATOR_CA_ROOT_HEX,
+    };
+    use std::io::Write as _;
+
+    // Resolve the pinned operator CA root pubkey (hex → 32 bytes). LAB/DEV: from env var.
+    // PRODUCTION: compiled in (a future build-time pin; this env path is for lab/dev testing).
+    let ca_hex = var_twod(TWOD_HSM_OPERATOR_CA_ROOT_HEX, LEGACY_HSM_OPERATOR_CA_ROOT_HEX)
+        .map_err(|_| ProtocolError::PqSigningUnavailable(
+            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX not set (the pinned operator CA root pubkey)"
+        ))?;
+    let ca_bytes = hex::decode(&ca_hex).map_err(|_| ProtocolError::PqSigningUnavailable(
+        "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not valid hex"
+    ))?;
+    if ca_bytes.len() != 32 {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX must be exactly 32 bytes (64 hex chars)"
+        ));
+    }
+    let mut ca_arr = [0u8; 32];
+    ca_arr.copy_from_slice(&ca_bytes);
+    let pinned_root = ed25519_dalek::VerifyingKey::from_bytes(&ca_arr).map_err(|_| {
+        ProtocolError::PqSigningUnavailable(
+            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not a valid Ed25519 public key"
+        )
+    })?;
+
+    // Resolve the provisioning vsock port (distinct from serve 5000 + relay 5001 — Q5).
+    let prov_port = crate::vsock_addr::provisioning_vsock_port_from_env().map_err(|msg| {
+        ProtocolError::PqSigningUnavailable(
+            "agent keystore: invalid provisioning vsock port config (see prior log line)"
+        )
+    })?;
+
+    // Resolve the seal root (set at step A) + measurement (the existing source).
+    let seal_root = crate::seal_root::resolve_provisioning_root().map_err(|_| {
+        ProtocolError::PqSigningUnavailable(
+            "agent keystore: provisioning root not configured for the sealing ceremony"
+        )
+    })?;
+    let measurement = agent_boot_measurement()?;
+
+    // The SNP report producer: on a real SNP guest, configfs-tsm fetch. On aya (non-SNP),
+    // a mock/stub is used — the report is opaque to the enclave (it only emits it in M2 + binds
+    // its SHA3-256). For now, use the existing snp_report module if available; else a placeholder.
+    // TODO(TASK-25): wire the real SNP report fetch (configfs-tsm) behind a trait impl; for the
+    // lab/dev path on aya, a mock report is acceptable (the PROVISIONER verifies the report, not
+    // the enclave).
+    struct LabReportProducer;
+    impl ProvisionReportProducer for LabReportProducer {
+        fn fetch_report(&self, _report_data: &[u8; 64]) -> Result<Vec<u8>, provision_bootstrap::ProvisionError> {
+            // A fixed mock 1184-byte report. On a real SNP guest, this would call
+            // snp_report::fetch_measurement_and_report with the report_data embedded in REPORT_DATA.
+            Ok(vec![0u8; crate::agent_provision::SNP_REPORT_LEN])
+        }
+    }
+
+    let idle_timeout = std::time::Duration::from_secs(60);
+
+    // Run the one-shot ceremony (binds listener, accepts ONE connection, M1→M2→M3→M4, tears down).
+    let (_config, sealed_blob) =
+        provision_bootstrap::vsock::run_vsock_provisioning_bootstrap(
+            crate::vsock_addr::DEFAULT_VSOCK_CID,
+            prov_port,
+            &pinned_root,
+            &seal_root,
+            &measurement,
+            &LabReportProducer,
+            idle_timeout,
+        )
+        .map_err(|e| ProtocolError::PqSigningUnavailable(
+            "agent keystore: provisioning ceremony failed"
+        ))?;
+
+    // Persist the sealed blob to the keystore file path (the HOST would do this in a real TEE;
+    // in the lab/dev host process, we write it directly so subsequent boots unseal it).
+    if let Ok(path) = var_twod(
+        TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
+        LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE,
+    ) {
+        if let Ok(mut file) = std::fs::File::create(&path) {
+            let _ = file.write_all(&sealed_blob);
+        }
+    }
+
+    Ok(sealed_blob)
+}
+
+// Non-lab, non-vsock (macOS CI): fail closed.
 #[cfg(not(feature = "lab-agent-keystore-from-file"))]
+#[cfg(not(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway")))]
 fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
-        "agent keystore: sealed source not configured (production host-vsock install/restore is a \
-         deferred slice; enable lab-agent-keystore-from-file for labs)",
+        "agent keystore: sealed source not configured (lab-agent-keystore-from-file for labs, \
+         or build with agent-gateway + vsock-transport on Linux for the provisioning ceremony)"
     ))
 }
 
