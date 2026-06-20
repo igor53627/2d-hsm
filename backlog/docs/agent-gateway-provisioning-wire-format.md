@@ -303,11 +303,18 @@ provisioner_cert = DER-encoded X.509 leaf certificate
   (ii) **compile-time cert-serial denylist** (optional 25-2b) — a small list of revoked provisioner
   cert serials compiled into the enclave binary, checked in-TEE (no clock needed).
   The X.509 `not_before`/`not_after` fields are parsed for audit logging only, NOT enforced.
-  **Residual (accepted, MVP quorum = 1):** between a provisioner-cert compromise and the next
-  enclave-binary release with a rotated CA root, the compromised cert remains usable — this is the
-  cost of having no enclave-side clock; mitigation is operational (rapid CA-root rotation on
-  compromise). An authenticated in-TEE time protocol (e.g. Roughtime bound to the anchor) is a
-  documented post-MVP extension that would close this window without a host clock.
+  **Residual (accepted, MVP quorum = 1; consolidated 25-2a-rev4 Med):** TWO windows remain open.
+  (a) **Pre-rotation:** between a provisioner-cert compromise and the next enclave-binary release
+  with a rotated CA root, the compromised cert remains usable against the CURRENT pinned root.
+  (b) **Post-rotation, older-binary:** even AFTER rotation, a hostile host can launch an OLDER
+  enclave binary that pins the old CA root and provision it with the compromised cert — closing
+  THAT requires external measurement/release admission control (the anchor service + deployment
+  pipeline refuse revoked measurements; on-chain MeasurementRegistry (TASK-1.4) long-term), not
+  anything in this protocol. Mitigation is operational: rapid CA-root rotation on compromise (for
+  (a)) + retire-and-revoke the compromised enclave measurement from the operator's deploy + anchor
+  admission (for (b)). An authenticated in-TEE time protocol (e.g. Roughtime bound to the anchor)
+  is a documented post-MVP extension that would close window (a) without a host clock; window (b)
+  is fundamentally an external-admission-control problem the time protocol does not solve.
 
 **Why X.509 DER (not a custom min-format).** Operator tooling signs/provisions using
 standard libraries (openssl / cloud KMS); DER X.509 is universally interoperable and
