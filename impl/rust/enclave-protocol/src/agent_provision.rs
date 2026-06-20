@@ -1089,7 +1089,9 @@ mod tests {
         WrongSpkiAlg,     // SPKI algorithm = Ed448, not Ed25519
         SpkiParamsPresent, // SPKI algorithm carries NULL params (RFC 8410 forbids them)
         WrongPubkeyLen,   // SPKI subjectPublicKey = 31 bytes (not 32)
-        WrongSigAlg,      // signature AlgorithmIdentifiers = Ed448 (SPKI stays Ed25519)
+        WrongSigAlg,      // BOTH signature AlgorithmIdentifiers = Ed448 (SPKI stays Ed25519)
+        WrongSigAlgInner, // only tbs.signature (inner) = Ed448; outer stays Ed25519
+        WrongSigAlgOuter, // only cert.signature_algorithm (outer) = Ed448; inner stays Ed25519
     }
 
     /// `mint_cert` + an optional single [`Malform`]. Each malformation is applied independently and
@@ -1129,11 +1131,18 @@ mod tests {
             },
             _ => ed25519(),
         };
-        let sig_alg = match malform {
-            Some(Malform::WrongSigAlg) => AlgorithmIdentifierOwned {
-                oid: ed448(),
-                parameters: None,
-            },
+        // Inner (tbs.signature) and outer (cert.signature_algorithm) are set INDEPENDENTLY so the
+        // wrong-inner-only / wrong-outer-only malforms pin that verify checks EACH (not just one).
+        let ed448_alg = || AlgorithmIdentifierOwned {
+            oid: ed448(),
+            parameters: None,
+        };
+        let tbs_sig_alg = match malform {
+            Some(Malform::WrongSigAlg) | Some(Malform::WrongSigAlgInner) => ed448_alg(),
+            _ => ed25519(),
+        };
+        let cert_sig_alg = match malform {
+            Some(Malform::WrongSigAlg) | Some(Malform::WrongSigAlgOuter) => ed448_alg(),
             _ => ed25519(),
         };
         let version = match malform {
@@ -1167,7 +1176,7 @@ mod tests {
         let tbs = TbsCertificate {
             version,
             serial_number: SerialNumber::from(1u32),
-            signature: sig_alg.clone(),
+            signature: tbs_sig_alg.clone(),
             issuer: Name::from_str("CN=test-operator-ca").unwrap(),
             validity,
             subject: Name::from_str("CN=test-provisioner").unwrap(),
@@ -1180,7 +1189,7 @@ mod tests {
         let sig = ca_sk.sign(&tbs_der);
         let cert = Certificate {
             tbs_certificate: tbs,
-            signature_algorithm: sig_alg,
+            signature_algorithm: cert_sig_alg,
             signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
         };
         cert.to_der().unwrap()
@@ -1332,6 +1341,42 @@ mod tests {
             &ca,
             Some(&[eku_oid()]),
             Some(Malform::WrongSigAlg),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cert_wrong_sig_alg_inner_only_is_malformed() {
+        // Only the INNER tbs.signature advertises Ed448 (outer stays Ed25519) — pins that verify
+        // checks the inner alg, not just the outer (compact 9051 residual).
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::WrongSigAlgInner),
+        );
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cert_wrong_sig_alg_outer_only_is_malformed() {
+        // Only the OUTER cert.signature_algorithm advertises Ed448 (inner stays Ed25519) — pins that
+        // verify checks the outer alg independently of the inner.
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert_malform(
+            &prov.verifying_key(),
+            &ca,
+            Some(&[eku_oid()]),
+            Some(Malform::WrongSigAlgOuter),
         );
         assert_eq!(
             verify_provisioner_cert(&cert, &ca.verifying_key()),
