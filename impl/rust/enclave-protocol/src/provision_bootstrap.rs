@@ -41,6 +41,15 @@ pub trait ProvisionReportProducer {
     fn fetch_report(&self, report_data: &[u8; 64]) -> Result<Vec<u8>, ProvisionError>;
 }
 
+/// Prepend a u32 BE length to a provision envelope, then write via `write_framed_message` (the
+/// standard length-prefixed framing wrapping the provision protocol's own envelope bytes).
+fn write_provision_envelope<W: Write>(writer: &mut W, envelope: &[u8]) -> Result<(), ProvisionError> {
+    let mut frame = Vec::with_capacity(4 + envelope.len());
+    frame.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
+    frame.extend_from_slice(envelope);
+    write_framed_message(writer, &frame).map_err(|_| ProvisionError::Malformed)
+}
+
 /// Run the provisioning ceremony (M1→M2→M3→M4) over a connected stream. The stream is the AF_VSOCK
 /// connection (or any `Read`+`Write` for testing). Messages are length-prefixed (the standard
 /// `read_framed_message`/`write_framed_message` wrapping the provision envelope bytes).
@@ -50,16 +59,9 @@ pub trait ProvisionReportProducer {
 /// report — the driver contract, slice iv). **`report_producer`** = the SNP report fetch seam.
 ///
 /// **`idle_timeout`** = the per-read deadline (slowloris defense; the bootstrap is one-shot, so a
-/// generous timeout is fine). Returns `(ProvisionConfig, sealed_blob)` on success.
-/// Prepend a u32 BE length to a provision envelope + write via `write_framed_message` (the standard
-/// length-prefixed framing wrapping the provision protocol's own envelope).
-fn write_provision_envelope<W: Write>(writer: &mut W, envelope: &[u8]) -> Result<(), ProvisionError> {
-    let mut frame = Vec::with_capacity(4 + envelope.len());
-    frame.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
-    frame.extend_from_slice(envelope);
-    write_framed_message(writer, &frame).map_err(|_| ProvisionError::Malformed)
-}
-
+/// generous timeout is fine). Returns `(ProvisionConfig, sealed_blob)` on success. NB writes use
+/// blocking `write_all`; the vsock binding MUST configure `SO_SNDTIMEO` on the accepted stream to
+/// bound the write side (a peer that accepts the connection but doesn't read).
 pub fn run_provisioning_ceremony<S: Read + Write>(
     stream: &mut S,
     pinned_root: &VerifyingKey,
