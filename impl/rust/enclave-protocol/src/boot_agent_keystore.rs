@@ -275,13 +275,15 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
     Ok(sealed_blob)
 }
 
-// Non-lab, non-vsock (macOS CI): fail closed.
+// Non-lab: fail closed. Covers BOTH non-vsock (macOS CI) AND vsock-but-no-lab (production is not
+// ready — needs real SNP report + compiled-in CA root, both TODO). The provisioning ceremony is
+// lab-gated; production wiring is a future TASK-25 slice.
 #[cfg(not(feature = "lab-agent-keystore-from-file"))]
-#[cfg(not(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway")))]
 fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
-        "agent keystore: sealed source not configured (lab-agent-keystore-from-file for labs, \
-         or build with agent-gateway + vsock-transport on Linux for the provisioning ceremony)"
+        "agent keystore: sealed source not configured. LAB: set TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE \
+         or enable lab-agent-keystore-from-file + vsock-transport for the provisioning ceremony. \
+         PRODUCTION: the attested host-vsock install channel + SNP report fetch are not yet wired."
     ))
 }
 
