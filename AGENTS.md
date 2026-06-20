@@ -39,10 +39,10 @@ For every high-risk change:
 ### Current Matrix (as of 2026-06)
 - Agents: codex, gemini, claude-code, grok (vendor diversity across lineages).
 - **gemini cell runs via the Antigravity `agy` CLI** (Google deprecated gemini-cli's free tier → `IneligibleTierError`; roborev issue #730 made `agy` the preferred gemini binary). The working invocation is **`roborev review --agent gemini` with NO `--model`** — roborev resolves `agy` and uses its built-in gemini model. Passing `--model gemini-3.1-pro-preview` (as older docs/CI did) forces roborev's gemini agent to fall back to the legacy gemini-cli (gemini.go `WithModel` escape hatch, because `agy` cannot take `--model`) and the cell fails closed with `IneligibleTierError`. The shared scripts (`pse-review-reduced.sh` / `pse-review-2x3.sh`) were updated 2026-06-19 to drop the gemini `--model`. NB: `roborev check-agents` still reports gemini `FAIL` — that is a known cosmetic bug (roborev #854, fixed post-v0.58.0, not yet in our release) in the *diagnostic* command, NOT the review cell — verify the cell via job status (`done`) instead of trusting `check-agents`.
-- **grok cell runs via the native `grok` CLI** (`~/pse/roborev/grok-cell.sh`, NOT the roborev `opencode` agent — opencode isn't installed on this host and routes to codex; `XAI_API_KEY` in the daemon env is irrelevant for the native CLI, which self-authenticates). Its findings print to stdout / a saved file and are **OUTSIDE the roborev DB**, so `roborev compact` does NOT consolidate grok — read the printed `===== grok/security =====` block directly.
+- **grok cell — DEFAULT via roborev pi+xai (lands in the DB), FALLBACK native grok CLI.** As of 2026-06-20 the working path is `roborev review --agent pi --provider xai --model grok-code-fast-1` — pi reads the xAI API key from `~/.pi/agent/auth.json` and the cell's findings land in the **roborev DB so `roborev compact` consolidates it** (verified end-to-end; previously grok was OUTSIDE the DB). The native `grok` CLI (`~/pse/roborev/grok-cell.sh`, free Antigravity OAuth) remains as a FALLBACK (GROK_VIA_PI=0 in `pse-review-reduced.sh`, or auto-fallback if `xai` is missing from auth.json) — findings print to the `===== grok/security =====` block and are NOT consolidated by compact. NB the xAI key is a **paid** api.x.ai credential (NOT the free Antigravity subscription the native `grok` CLI uses); treat it as a secret — it lives only in `~/.pi/agent/auth.json` (0600), never in git / scripts / env files.
 - Lenses: `security` + `design` (roborev CLI); **concurrency-sensitive** work adds `design` with `--reasoning maximum` (see `~/pse/roborev/pse-review-2x3.sh`)
 - Config lives in `.roborev.toml` at repo root; shared scripts in `~/pse/roborev/`
-- **gemini/grok cell precondition (verify, don't assume):** neither cell fails loudly when misconfigured. For gemini: if a `--model` slips back in, roborev silently falls back to gemini-cli → `failed` (compact drops it); a quota exhaustion surfaces as `skipped` (compact also drops it) — confirm the gemini cell reached **`done`**. For grok: if the native CLI isn't authed, `grok-cell.sh` emits `[grok-cell failed; see <file>]` into its block (the script never aborts the matrix). In BOTH cases treat any non-`done` / failed / skipped cell as a **gap, never as compacted-clean** — the Reduced Matrix needs all 4 cells live (or an explicitly noted degradation) before a high-risk change is "reviewed".
+- **gemini/grok cell precondition (verify, don't assume):** neither cell fails loudly when misconfigured. For gemini: if a `--model` slips back in, roborev silently falls back to gemini-cli → `failed` (compact drops it); a quota exhaustion surfaces as `skipped` (compact also drops it) — confirm the gemini cell reached **`done`**. For grok (pi+xai path): a missing/invalid xAI key surfaces as `failed` (compact drops it); the native-CLI fallback emits `[grok-cell failed; see <file>]` into its block. In ALL cases treat any non-`done` / failed / skipped cell as a **gap, never as compacted-clean** — the Reduced Matrix needs all 4 cells live (or an explicitly noted degradation) before a high-risk change is "reviewed".
 
 ### Reduced vs Full Matrix — Decision Rules
 
@@ -52,7 +52,7 @@ For high-risk work we distinguish two levels of review:
 - security + codex
 - security + gemini  (via agy — NO `--model`)
 - design + claude-code
-- security + grok  (native grok CLI via `grok-cell.sh`)
+- security + grok  (DEFAULT: roborev pi+xai → DB; FALLBACK: native grok CLI via `grok-cell.sh`)
 
 This is the normal operating mode for incremental work inside an already-reviewed direction.
 
@@ -83,12 +83,14 @@ See the "Reduced vs Full Matrix" section above for when to use which level.
 
 **Typical Reduced Matrix (most common):**
 ```bash
-~/pse/roborev/pse-review-reduced.sh --dirty   # 4 cells: codex+gemini security, claude-code design, grok security (via grok-cell.sh)
+~/pse/roborev/pse-review-reduced.sh --dirty   # 4 cells: codex+gemini security, claude-code design, grok security (pi+xai → DB by default; native CLI fallback)
 # …or run the cells by hand:
 roborev review --dirty --type security --agent codex --model gpt-5.5
 roborev review --dirty --type security --agent gemini             # NO --model: roborev resolves agy (Antigravity CLI); passing --model forces legacy gemini-cli and fails
 roborev review --dirty --type design   --agent claude-code --model opus
-# grok cell (native grok CLI via grok-cell.sh — findings OUTSIDE the roborev DB):
+# grok cell — DEFAULT (in DB, compact-consolidated):
+roborev review --dirty --type security --agent pi --provider xai --model grok-code-fast-1
+# grok cell — FALLBACK (native grok CLI, OUTSIDE the DB; read the printed block):
 ~/pse/roborev/grok-cell.sh --dirty
 ```
 
