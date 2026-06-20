@@ -183,7 +183,7 @@ config_map = canonical-CBOR({
     4: recovery_authority_pk,            # bytes[32], Ed25519 public key (raw)
     5: backup_recovery_wrapping_pubkey,  # bytes[1568], ML-KEM-1024 encapsulation key (raw)
     6: anchor_root,                      # bytes[32], Ed25519 public key (raw) — the TASK-7.7 anchor identity
-    7: fleet_scope_id,                   # bytes[32], the shared fleet scope id
+    7: fleet_scope_id,                   # bytes[32], the shared fleet scope id (≠ [0;32], ≠ the [0xf1;32] fixture — AC#7)
 })
 ```
 
@@ -369,6 +369,9 @@ The 25-2b impl MUST include negative tests proving the decoder fails closed on e
 - `config_map` field-type/length violation (e.g., `admin_authority_pk` ≠ 32 bytes,
   `backup_recovery_wrapping_pubkey` ≠ 1568, `environment_identifier` failing the sealed-
   config charset rule) → `PROV_MALFORMED`.
+- `fleet_scope_id` ∈ {[0;32], [0xf1;32]} (the all-zero id, or the keystore test fixture) →
+  `PROV_MALFORMED` (AC#7 anti-hardcoding — a production path that hardcodes the fixture instead
+  of taking the fleet id from the authenticated provisioner is caught at decode). 25-2a-rev7.
 - `report_data` mismatch (`SHA3-512(domain ‖ N_p ‖ N_e) ≠ report.report_data`) →
   `PROV_ATTEST_MISMATCH` (the report is not for this challenge).
 - `transcript` mismatch (M3 keys 2/3/4 not byte-equal to the session's `N_p`/`N_e`/
@@ -526,10 +529,10 @@ golden M3 and that the verifier reaches the mint+seal step; the 25-2b negatives 
   literal to the slice-v regen test, and the 25-2b-i encoder already emits the correct `0x66`); this
   fixes the illustrative shape so an independent implementer copying §5.2 does not emit non-canonical
   wrong-length CBOR. No §9 / message-structure change.
-- 2026-06-20 — 25-2a-rev7 (golden input; surfaced by the 25-2b-iv Full Matrix, compact job 9118 Med).
+- 2026-06-20 — 25-2a-rev7 (golden input + §5.1/§9 doc; surfaced by the 25-2b-iv Full Matrix, compact 9118).
   §5.2/§10.3 representative config `fleet_scope_id` changed from `[0xf1;32]` (the keystore test
-  fixture) to `[0xf5;32]`. `decode_config_map` now rejects `[0xf1;32]` per AC#7 anti-hardcoding (a
-  production path hardcoding the fixture instead of taking the fleet id from the authenticated
+  fixture) to `[0xf5;32]`: `decode_config_map` now rejects `[0xf1;32]` per AC#7 anti-hardcoding (a
+  production path that hardcodes the fixture instead of taking the fleet id from the authenticated
   provisioner is caught at decode), so the frozen golden uses a non-fixture value to stay decodable.
-  Wire-format-neutral (the byte SHAPE is unchanged — `07 58 20 <32 bytes>`; only the sentinel value).
-  No §9 / message-structure change.
+  §5.1 + §9 now document the `fleet_scope_id` value exclusions ([0;32], [0xf1;32]). Wire-format-neutral
+  (the MESSAGE byte shape is unchanged — `07 58 20 <32 bytes>`; only the sentinel value + doc).
