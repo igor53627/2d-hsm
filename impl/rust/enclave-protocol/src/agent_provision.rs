@@ -2184,4 +2184,21 @@ mod tests {
         assert_eq!(decode_config_map(&encode_config_map(&cfg)), Err(ProvisionError::Malformed));
     }
 
+    #[test]
+    fn seal_rejects_degenerate_and_fixture_scope_ids() {
+        // The seal boundary enforces validate_minted_scope_id (defense-in-depth: a caller that
+        // bypasses mint_enclave_scope_id cannot seal [0]/[0xe1]/[0xf1]).
+        let cfg = sample_config();
+        let root = [0x42u8; 32];
+        let meas = b"test-measurement";
+        for bad in [[0u8; 32], [0xe1u8; 32], [0xf1u8; 32]] {
+            assert_eq!(
+                seal_provisioned_keystore(&cfg, bad, &root, meas),
+                Err(ProvisionError::Csprng),
+                "scope_id {:02x?} must be rejected at the seal boundary",
+                bad
+            );
+        }
+    }
+
 }

@@ -49,10 +49,11 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   `agent-*-preview` features enabled until each is un-gated by its own slice. Reproducible
   (nix/aya). The `enclave.nix` `buildFeatures` surface this task owns does not yet exist.
 - [ ] #2 **Attested keystore-install channel (explicit SNP state machine).** The provisioning flow is:
-  (a) M1: the provisioner sends a challenge nonce `N_p`; the enclave mints `N_e` and emits M2 — a
-  signed SNP attestation report whose 64-byte `REPORT_DATA = SHA3-512("2d-hsm-agent-provision-
-  handshake-v1" ‖ N_p ‖ N_e)` (binding the enclave's measurement + TCB + the challenge, via the VCEK
-  signature); (b) the **provisioner** (NOT the host) verifies the VCEK/ASK/ARK chain + TCB/revocation
+  (a) M1: the provisioner sends a challenge nonce `N_p`; the enclave mints `N_e` and emits M2 — a signed
+  SNP report whose 64-byte `REPORT_DATA` =
+  `SHA3-512("2d-hsm-agent-provision-handshake-v1" ‖ N_p ‖ N_e)` (binding the enclave's measurement +
+  TCB + the challenge, via the VCEK signature);
+  (b) the **provisioner** (NOT the host) verifies the VCEK/ASK/ARK chain + TCB/revocation
   (TASK-1.2) + a measurement allowlist + that `REPORT_DATA == SHA3-512(domain ‖ N_p ‖ N_e)` (nonce
   freshness), thereby authenticating THAT enclave; (c) M3: only then does the provisioner send the
   authenticated `fleet_scope_id` (AC#7) + config + a `Sig_PROV` over the transcript `(config_map,
@@ -128,7 +129,10 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   (25-2a-rev2 Low): (i) pure codec + DoS caps + §9 structural negatives; (ii) provisioner-cert
   chain validation + role-constraint check; (iii) verify-order integration (transcript + Sig_PROV);
   (iv) mint+seal wiring; (v) golden-vector regen test. **Per-slice review gate (clarified
-  2026-06-20, compact 9048 + 9109):** slices i + ii are PURE functions (codec / cert-verify — no
+  2026-06-20, compact 9048 + 9109):** slices i + ii are PURE functions (codec / cert-verify — no state,
+  no concurrency) → **Reduced Matrix** suffices; slices iii (verify-order) AND iv (`ProvisionSession`
+  stateful: AwaitingM1→AwaitingM3→Done/Failed) are the state-machine / ordering-sensitive surfaces →
+  **Full Matrix** incl. the 2×3 concurrency floor (`pse-review-2x3.sh`).
   (The original "each sub-slice is Full Matrix" was written for 25-2b-as-a-whole; the per-slice split
   lets the pure slices land on Reduced, the state-machine slices on Full.)
   **⚠ Full Matrix PARTIAL for iii + iv:** gemini 2×3 runs intermittently (agy OAuth flake — fails
