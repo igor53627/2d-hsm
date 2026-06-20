@@ -1596,6 +1596,58 @@ mod tests {
         };
         cert.to_der().unwrap()
     }
+    /// The golden provisioner leaf cert — a FIXED-VALIDITY cert (2025-01-01 → 2035-01-01) signed by
+    /// `ca_sk`, so its DER is byte-deterministic (unlike `mint_cert`'s `Validity::from_now`). The
+    /// §10.4 byte-exact cert golden is frozen from this (its SHA3-256 hash).
+    fn golden_provisioner_cert(ca_sk: &SigningKey, prov_pub: &VerifyingKey) -> Vec<u8> {
+        use std::str::FromStr;
+        use ed25519_dalek::Signer;
+        use x509_cert::der::asn1::{BitString, OctetString, UtcTime};
+        use x509_cert::der::{DateTime, Encode};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::ext::Extension;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+        use x509_cert::time::Validity;
+        use x509_cert::{Certificate, TbsCertificate, Version};
+
+        let alg = AlgorithmIdentifierOwned {
+            oid: ED25519_ALG_OID.clone(),
+            parameters: None,
+        };
+        let spki = SubjectPublicKeyInfoOwned {
+            algorithm: alg.clone(),
+            subject_public_key: BitString::from_bytes(&prov_pub.to_bytes()).unwrap(),
+        };
+        let nb = UtcTime::from_date_time(DateTime::new(2025, 1, 1, 0, 0, 0).unwrap()).unwrap();
+        let na = UtcTime::from_date_time(DateTime::new(2035, 1, 1, 0, 0, 0).unwrap()).unwrap();
+        let eku_der = ExtendedKeyUsage(vec![PROVISIONER_EKU_OID]).to_der().unwrap();
+        let tbs = TbsCertificate {
+            version: Version::V3,
+            serial_number: SerialNumber::from(1u32),
+            signature: alg.clone(),
+            issuer: Name::from_str("CN=test-operator-ca").unwrap(),
+            validity: Validity { not_before: nb.into(), not_after: na.into() },
+            subject: Name::from_str("CN=test-provisioner").unwrap(),
+            subject_public_key_info: spki,
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: Some(vec![Extension {
+                extn_id: x509_cert::der::asn1::ObjectIdentifier::new_unwrap("2.5.29.37"),
+                critical: false,
+                extn_value: OctetString::new(eku_der).unwrap(),
+            }]),
+        };
+        let tbs_der = tbs.to_der().unwrap();
+        let sig = ca_sk.sign(&tbs_der);
+        let cert = Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: alg,
+            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+        };
+        cert.to_der().unwrap()
+    }
 
     /// Operator CA root keypair (deterministic test key).
     fn test_ca() -> SigningKey {
@@ -2224,6 +2276,11 @@ mod tests {
     const GOLDEN_N_E: [u8; 32] = [0x22; 32];
     const GOLDEN_REPORT_HASH: [u8; 32] = [0x33; 32];
 
+    /// SHA3-256 of the golden provisioner cert (fixed-validity 2025-01-01 → 2035-01-01, signed by
+    /// the golden CA key, with the golden EKU). Byte-deterministic; catches cert-construction drift.
+    const GOLDEN_CERT_HASH: &str =
+        "e3336669634962614aa49a26a92dcde84379bad28652aee5c171deefb14cba9d";
+
     /// Regenerate the §10 golden vectors + assert they match the frozen literals. A drift in the
     /// encoder (config_map), the transcript construction, or the provisioner key breaks this test.
     #[test]
@@ -2249,6 +2306,15 @@ mod tests {
             GOLDEN_SIG_PROV,
             "golden Sig_PROV drifted — the transcript, PROVISION_DOMAIN, or provisioner key changed"
         );
+
+        // §10.4 golden provisioner cert (fixed-validity → byte-deterministic).
+        let cert = golden_provisioner_cert(&test_ca(), &prov.verifying_key());
+        let cert_hash: [u8; 32] = Sha3_256::digest(&cert).into();
+        assert_eq!(
+            hex::encode(cert_hash),
+            GOLDEN_CERT_HASH,
+            "golden provisioner cert SHA3-256 drifted — cert construction or CA key changed"
+        );
     }
 
     /// §10.4: the golden M3 is ACCEPTED by the full verify pipeline + the verifier reaches mint+seal.
@@ -2258,7 +2324,7 @@ mod tests {
     fn golden_m3_accepted_by_verify_pipeline() {
         let ca = test_ca();
         let prov = SigningKey::from_bytes(&[0x70; 32]);
-        let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[eku_oid()]));
+        let cert = golden_provisioner_cert(&ca, &prov.verifying_key());
         let cfg = encode_config_map(&sample_config());
         let sig = hex::decode(GOLDEN_SIG_PROV).unwrap();
         let sig: [u8; SIG_PROV_LEN] = sig.try_into().unwrap();
