@@ -62,9 +62,30 @@ magic[8] ‖ version[1] ‖ msg_type[1] ‖ deterministic-CBOR(payload)
 | `msg_type` | 1 | `0x01` M1, `0x02` M2, `0x03` M3, `0x04` M4. Direction-ambiguous framing: `msg_type` disambiguates (this is a handshake, not RPC request/response). |
 | payload | var | `deterministic-CBOR(msg_type-specific-payload)`, defined per-message in §3-§6. |
 
+**Per-state direction validation (25-2a-rev1 Low fix).** A known `msg_type` received in the wrong
+role/state is `PROV_MALFORMED`: the **enclave** bootstrap listener accepts only M1 (initial state)
+→ then M3 (after emitting M2); the **provisioner** accepts only M2 (after sending M1) → then M4
+(after sending M3). Any other msg_type in either role ⇒ `PROV_MALFORMED` (a §9 negative test pins
+this).
+
 Decoders fail closed on: wrong magic (`PROV_BAD_MAGIC`), unsupported version
 (`PROV_UNSUPPORTED_VERSION`), unknown msg_type (`PROV_MALFORMED`), payload that does not
 round-trip canonical-CBOR (`PROV_MALFORMED`).
+
+**DoS caps (25-2a-rev1 Med fix).** All variable-length fields from the untrusted side are
+bounded; a decoder MUST fail closed `PROV_TOO_LARGE` (dedicated code, distinguishable from
+`PROV_MALFORMED`) on:
+
+| field | cap | rationale |
+|---|---|---|
+| overall M1/M3 payload | `MAX_PROV_PAYLOAD_LEN = 8192` | the largest legitimate M3 is ~1.8 KB (config ~1.7 KB + sig 64 + cert ~300 + framing); 8 KB is a 4× headroom. |
+| `config_map` (M3 key 1, bytes) | `MAX_CONFIG_MAP_LEN = 4096` | 7 fields, the 1568-byte ML-KEM pubkey dominates; 4 KB is 2× headroom. |
+| `provisioner_cert` (M3 key 6, bytes) | `MAX_PROV_CERT_LEN = 2048` | a single-level DER X.509 Ed25519 leaf is ~300-500 B; 2 KB rejects pathological / multi-cert bundles. |
+| `report` (M2 key 2, bytes) | `SNP_REPORT_LEN = 1184` (fixed) | the SNP attestation report is a fixed-size structure; pin the exact length, reject any other. |
+
+These mirror the existing `read_boot_file_capped` discipline (`boot_input.rs`) for the keystore
+unseal path — untrusted variable-length inputs are capped before the (more expensive) DER / CBOR
+parse. §9 includes a `PROV_TOO_LARGE` negative per field.
 
 ## §3 Message M1 — PROV_CHALLENGE (provisioner → enclave)
 
@@ -185,7 +206,7 @@ The canonical bytes of a config_map for a representative config (`chain_id=11565
 ```
 A7                              # map(7) — major 5, additional 7
    01                             # key 1
-   19 2D 0D                      # uint 11565 (0x2D0D) — major 0, additional 26 (4-byte BE)
+   19 2D 2D                      # uint 11565 (0x2D2D) — major 0, additional 26 (4-byte BE)
    02                             # key 2
    65 "prod-0"                   # text(5) "prod-0"
    03                             # key 3
@@ -229,10 +250,14 @@ The enclave verifies, in this exact order (fail-closed at each step):
    canonical-CBOR, keys exactly `{1..=7}`, field-type + length validation. Else
    `PROV_MALFORMED`.
 
-Only after all five pass does the enclave proceed to mint + seal (§6.3 of 25-1). This
-ordering puts the cheap structural checks (1, 5) and the channel-binding check (3) before
-the cryptographic heavy lifts where applicable, and ensures a malformed/replay/MITM input
-is rejected before any state mutation.
+Only after all five pass does the enclave proceed to mint + seal (§6.3 of 25-1). **Ordering
+rationale (25-2a-rev1 Low fix):** only step 1 (envelope) is a pre-crypto cheap check; the
+cryptographic heavy lifts (2 = cert-chain verify, 4 = `Sig_PROV` verify) intentionally precede
+step 5 (config re-decode), because step 5 operates on signature-VERIFIED bytes (the config was
+bound by `Sig_PROV`, so decoding it after the sig passes guarantees the bytes the host sent are
+the bytes the provisioner signed — a pre-sig decode could be mutated between decode and verify).
+DoS ordering is handled by the §2 DoS caps (a malformed oversized payload is rejected at step 1
+before any crypto).
 
 ## §7 provisioner_cert — DER X.509 leaf (single-level chain, MVP)
 
@@ -248,10 +273,26 @@ provisioner_cert = DER-encoded X.509 leaf certificate
   intermediate CA). This keeps the enclave-side verification to one Ed25519 verify of the
   cert signature + one SPKI extraction, avoiding a full PKI path-validation stack in-TEE.
   Intermediate CAs are a documented post-MVP extension (§11).
-- **Validity / revocation**: the enclave checks `not_before ≤ current_time ≤ not_after`
-  using the SNP-report-derived TCB time (host wall-clock is untrusted); revocation is via
-  TCB-version gating (the provisioner cert's `not_after` + the operator's measurement-allowlist
-  rotation, not an in-TEE CRL). Frozen concretely in 25-2b.
+- **Role constraint (25-2a-rev1 Med fix).** The cert MUST carry a provisioning-specific role
+  marker — a dedicated EKU OID (e.g. `2.25.x`-style private OID, frozen in 25-2b) OR a pinned
+  Subject string — so a leaf cert the operator CA issued for a DIFFERENT purpose (TLS client,
+  code-signing, log-signing) cannot be repurposed as a provisioner (confused-deputy defense).
+  The enclave rejects any cert lacking the role marker ⇒ `PROV_UNAUTHORIZED_PROVISIONER`.
+  Without this, any leaf under the operator CA is a valid provisioner — the operator CA's blast
+  radius is its whole issued-cert set.
+- **Validity / revocation (NO enclave wall-clock check — 25-2a-rev1 HIGH fix).** SNP reports
+  carry a TCB *version* (firmware/hardware SVNs), NOT a trusted wall-clock timestamp, and the SNP
+  TEE has no secure RTC — so the enclave **cannot** evaluate X.509 `not_before`/`not_after` against
+  a trusted time, and MUST NOT fall back to host time (the host is the adversary during provisioning).
+  Revocation + validity is therefore enforced by **mechanisms the enclave CAN verify**:
+  (i) **TCB-version gating** — the operator's pinned measurement-allowlist entry (Q7) is paired with
+  a minimum TCB-version; the enclave rejects reports whose TCB is below the floor or above a
+  revoked ceiling; (ii) **operator-CA rotation** — a compromised provisioner cert is retired by
+  re-building the enclave binary with a new operator CA root (the old cert's chain no longer pins);
+  (iii) **cert serial denylist** (optional 25-2b) — a small compile-time list of revoked provisioner
+  cert serials, checked in-TEE without a clock. The X.509 `not_before`/`not_after` fields are parsed
+  for audit logging only, NOT enforced (documented as residual: short-term compromise of an
+  operator CA before rotation is the window — accepted, MVP quorum = 1).
 
 **Why X.509 DER (not a custom min-format).** Operator tooling signs/provisions using
 standard libraries (openssl / cloud KMS); DER X.509 is universally interoperable and
@@ -272,12 +313,17 @@ The enclave returns the freshly-minted + sealed keystore blob (the output of `se
 over the freshly-constructed `KeystoreBody`). The host persists it to the keystore path on
 disk; subsequent boots unseal via the existing `unseal_agent_keystore_at_boot` path.
 
-**Atomicity (25-1 §2 step 6):** the seal is committed in volatile enclave session memory
-before M4 is emitted. A vsock send failure leaves the blob un-emitted and volatile (no TEE
-NVRAM); on reboot the enclave re-runs the ceremony with a FRESH `enclave_scope_id`
-(harmless — counters are zero, the anchor has seen nothing). A ceremony is **successful iff
-the host has persisted M4's blob**; the one-shot listener slot is consumed only on a
-completed handoff (send + ack).
+**Atomicity (25-1 §2 step 6; 25-2a-rev1 Med fix — no M5 ack message).** The seal is committed
+in volatile enclave session memory before M4 is emitted; the enclave **tears down the bootstrap
+listener and starts the runtime serve loop immediately after sending M4** (§1 — fire-and-forget;
+there is NO M5 persistence-ack in this format). The host-side persist is observed host-side; the
+enclave cannot confirm it (it is gone before persistence). A vsock send failure of M4 leaves the
+blob un-emitted and volatile (no TEE NVRAM); on reboot the enclave re-runs the ceremony with a
+FRESH `enclave_scope_id` (harmless — counters zero, anchor has seen nothing). A ceremony is
+**successful iff the host persisted M4's blob** (host-observable); the one-shot listener slot is
+consumed on M4 send (the only in-enclave signal available). This is the volatile fire-and-forget
+model; if a future revision needs in-enclave persistence confirmation it MUST add an explicit M5
+message and bump `provision_wire_version`.
 
 ## §9 Negative test requirements (decoder strictness)
 
@@ -312,11 +358,11 @@ regen test; the values here are the spec authority.
 ### 10.1 Domains + magic
 
 ```
-magic              = 0x32 44 41 47 50 52 56 00              # "2DAGPRV\0"
+magic              = 0x32 44 41 47 50 52 56 00              # "2DAGPRV\0" (8 bytes)
 PROVISION_DOMAIN   = 0x32 64 2D 68 73 6D 2F 61 67 65 6E 74 2D 70 72 6F 76 69 73 69 6F 6E 2F 76 31 00
                      # "2d-hsm/agent-provision/v1\0" (26 bytes incl. NUL)
 handshake_domain   = 0x32 64 2D 68 73 6D 2D 61 67 65 6E 74 2D 70 72 6F 76 69 73 69 6F 6E 2D 68 61 6E 64 73 68 61 6B 65 2D 76 31
-                     # "2d-hsm-agent-provision-handshake-v1" (34 bytes, NO NUL)
+                     # "2d-hsm-agent-provision-handshake-v1" (35 bytes, NO NUL)
 ```
 
 ### 10.2 M1 PROV_CHALLENGE golden
@@ -325,11 +371,13 @@ Inputs: `N_p = [0x11; 32]`.
 
 ```
 envelope:  0x32 44 41 47 50 52 56 00  01  01           # magic ‖ version=1 ‖ msg_type=1 (M1)
-payload:   0x58 20  <32 × 0x11>                       # canonical-CBOR({1: N_p}) = bytes(32) [0x11;32]
+payload:   0xA1 01 58 20  <32 × 0x11>                 # canonical-CBOR({1: N_p}) = map(1) {1: bytes(32)}
 ```
 
-Full M1 = `envelope ‖ payload` = `8 + 1 + 1 + 34` = 44 bytes (the bytes(32) CBOR head is
-`0x58 0x20`, then 32 payload bytes).
+Full M1 = `envelope ‖ payload` = `8 + 1 + 1 + 2 + 32` = 44 bytes. The payload head is `0xA1`
+(map(1)), `0x01` (key 1), `0x58 0x20` (bytes(32)), then 32 payload bytes — a single-key map
+wrapping the nonce, NOT a bare bytes value (25-2a-rev1 fix: the prior `0x58 20 …` form omitted
+the required `{1: N_p}` CBOR map wrapper).
 
 ### 10.3 config_map golden (basket B)
 
@@ -398,3 +446,17 @@ golden M3 and that the verifier reaches the mint+seal step; the 25-2b negatives 
   §10 (domains/magics frozen literally; config_map + M3 byte-exact values regenerated by
   the 25-2b regen test, shape in §5.2). Input to the Full Matrix on the wire format before
   25-2b (impl skeleton).
+- 2026-06-20 — 25-2a-rev1 after the first Full Matrix (compact job, 2 HIGH + 3 Med + 2 Low).
+  HIGH#1 fix: golden-shape chain_id encoding was `19 2D 0D` (11533), corrected to `19 2D 2D`
+  (11565) — a byte-exact spec contradicting its own named input; the M1 golden also regained
+  its `0xA1 01` map wrapper. HIGH#2 fix (claude-code + gemini independently): the §7
+  enclave-side X.509 `not_before/not_after` check assumed a trusted time, but SNP reports carry
+  a TCB version, NOT a wall-clock; removed the enclave wall-clock check, replaced with TCB-
+  version gating + operator-CA rotation + optional cert-serial denylist (the only mechanisms the
+  enclave can verify without a clock). Med fixes: cert role constraint (EKU/pinned Subject —
+  confused-deputy defense); DoS caps on all untrusted variable-length fields
+  (MAX_PROV_PAYLOAD_LEN / MAX_CONFIG_MAP_LEN / MAX_PROV_CERT_LEN / fixed SNP_REPORT_LEN); §8
+  atomicity clarified to volatile fire-and-forget (NO M5 ack — the prior "send + ack" referenced
+  a non-existent message; if persistence confirmation is ever needed it's version 2). Low fixes:
+  handshake_domain 34→35 bytes; per-state msg_type direction validation; verify-order rationale
+  corrected (only step 1 is pre-crypto; step 5 is post-sig by design). grok clean.
