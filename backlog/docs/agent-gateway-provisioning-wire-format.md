@@ -290,10 +290,16 @@ provisioner_cert = DER-encoded X.509 leaf certificate
   (the provisioner's M2-verify path rejects stale-TCB enclaves), NOT a provisioner-cert revocation
   mechanism**. Provisioner-cert lifecycle is therefore enforced ONLY by mechanisms the enclave can
   verify without a clock AND without a report from the provisioner:
-  (i) **operator-CA root rotation** — a compromised provisioner cert is retired by re-building the
-  enclave binary with a NEW operator CA root pinned; the old cert's chain no longer verifies against
-  the new pin, so it cannot provision (this is the primary revocation path; an enclave binary's
-  pinned CA root is its clock-free "current epoch");
+  (i) **operator-CA root rotation** — a compromised provisioner cert is retired by re-building
+  the enclave binary with a NEW operator CA root pinned; the old cert's chain no longer verifies
+  against the new pin. **NB (25-2a-rev3 HIGH fix):** this rotation is effective ONLY against newly
+  deployed enclave binaries — a hostile host can still launch an OLDER enclave binary that pins the
+  old CA root and provision it with the compromised cert. Closing THAT requires measurement /
+  release admission control OUTSIDE this protocol: the operator's external infrastructure (the
+  anchor service + the deployment pipeline) MUST refuse to run / refuse to handshake a revoked
+  enclave measurement, and the on-chain MeasurementRegistry (TASK-1.4) is the long-term
+  enforcement. CA-root rotation is the in-enclave clock-free epoch marker, but it is NOT by itself
+  a complete revocation mechanism against an adversary who controls which binary boots;
   (ii) **compile-time cert-serial denylist** (optional 25-2b) — a small list of revoked provisioner
   cert serials compiled into the enclave binary, checked in-TEE (no clock needed).
   The X.509 `not_before`/`not_after` fields are parsed for audit logging only, NOT enforced.
@@ -365,8 +371,9 @@ The 25-2b impl MUST include negative tests proving the decoder fails closed on e
 - **Channel-binding regression**: a captured M3 replayed against a DIFFERENT enclave
   session (different `N_e`) → `PROV_TRANSCRIPT_MISMATCH` (the load-bearing HIGH#1 test).
 - **Provisioner-cert role constraint** (25-2a-rev2 Med): a `provisioner_cert` that chains to
-  the operator CA root but lacks the provisioning role marker (EKU OID / pinned Subject) →
-  `PROV_UNAUTHORIZED_PROVISIONER` (confused-deputy defense).
+  the operator CA root but lacks the provisioning role marker (the dedicated EKU OID — §7, the
+  sole valid marker) → `PROV_UNAUTHORIZED_PROVISIONER` (confused-deputy defense). Includes a
+  Subject-only cert (no EKU) being rejected.
 
 ## §10 Frozen golden vectors (byte-exact)
 
@@ -394,11 +401,9 @@ payload:   0xA1 01 58 20  <32 × 0x11>                 # canonical-CBOR({1: N_p}
 ```
 
 Full M1 = `envelope ‖ payload` = `8 + 1 + 1 + 4 + 32` = **46 bytes**. The payload head is
-four bytes — `0xA1` (map(1)), `0x01` (key 1), `0x58 0x20` (bytes(32)) — then 32 nonce bytes (25-2a-rev2
-HIGH fix: the prior `2 + 32` form silently dropped the `0xA1 01` wrapper this same edit added).
-a single-key map
-wrapping the nonce, NOT a bare bytes value (25-2a-rev1 fix: the prior `0x58 20 …` form omitted
-the required `{1: N_p}` CBOR map wrapper).
+four bytes — `0xA1` (map(1)), `0x01` (key 1), `0x58 0x20` (bytes(32)) — then 32 nonce bytes: a
+single-key map `{1: N_p}` wrapping the nonce, NOT a bare bytes value (25-2a-rev2 HIGH fix: the
+prior `2 + 32` length form silently dropped the `0xA1 01` wrapper this same edit added).
 
 ### 10.3 config_map golden (basket B)
 
@@ -496,3 +501,14 @@ golden M3 and that the verifier reaches the mint+seal step; the 25-2b negatives 
   PROV_TOO_LARGE per field. Low: chain_id annotation additional 26→25 (0x19 = additional 25,
   2-byte BE); role marker narrowed to a single EKU OID (no Subject alternative); 25-2b pre-split
   into sub-slices in TASK-25 notes.
+
+- 2026-06-20 — 25-2a-rev3 after the third Full Matrix (compact job 8934, 1 HIGH + 1 Med + 1 Low).
+  HIGH fix: CA-root rotation overclaim — the rev2 text implied rotation retires a compromised
+  provisioner cert, but that only protects newly-built binaries; a hostile host can launch an
+  OLDER enclave binary that pins the old CA root. Narrowed: rotation is the in-enclave clock-free
+  epoch marker, NOT a complete revocation against an adversary who controls which binary boots;
+  closing that needs measurement/release admission control outside this protocol (anchor service +
+  deployment pipeline + TASK-1.4 MeasurementRegistry long-term). Med: §9 role-marker negative
+  de-duplicated with §7 (EKU OID only; the prior "EKU OID / pinned Subject" contradicted the
+  rev2 narrowing). Low: dangling sentence fragment in the M1 golden merged into one sentence.
+  codex/gemini/grok clean; claude-code Fail on the §7↔§9 EKU/Subject contradiction (the Med above).
