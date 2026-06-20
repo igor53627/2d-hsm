@@ -128,9 +128,17 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
         Ok(path) => {
             // Check existence FIRST: read_boot_file_capped maps File::open errors to
             // PqSigningUnavailable (not Io), so a missing file wouldn't be distinguishable from
-            // a read error. Path::exists cleanly separates first-boot (missing) from I/O error.
-            if !std::path::Path::new(&path).exists() {
-                return agent_sealed_keystore_blob_from_provisioning_or_fail();
+            // a read error. try_exists distinguishes Ok(false) = missing (first boot) from Err =
+            // inaccessible (fail closed). Path::exists returns false on BOTH → would mis-route an
+            // inaccessible path to provisioning.
+            match std::path::Path::new(&path).try_exists() {
+                Ok(false) => return agent_sealed_keystore_blob_from_provisioning_or_fail(),
+                Ok(true) => {} // file exists → fall through to read
+                Err(_) => {
+                    return Err(ProtocolError::PqSigningUnavailable(
+                        "agent keystore: cannot access TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE path",
+                    ));
+                }
             }
             // File exists → capped read.
             let blob = crate::boot_input::read_boot_file_capped(
