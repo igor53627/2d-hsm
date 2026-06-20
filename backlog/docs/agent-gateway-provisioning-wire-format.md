@@ -311,8 +311,9 @@ provisioner_cert = DER-encoded X.509 leaf certificate
   THAT requires external measurement/release admission control (the anchor service + deployment
   pipeline refuse revoked measurements; on-chain MeasurementRegistry (TASK-1.4) long-term), not
   anything in this protocol. Mitigation is operational: rapid CA-root rotation on compromise (for
-  (a)) + retire-and-revoke the compromised enclave measurement from the operator's deploy + anchor
-  admission (for (b)). An authenticated in-TEE time protocol (e.g. Roughtime bound to the anchor)
+  (a)) + retire-and-revoke EVERY still-deployable or anchor-admitted enclave measurement/release
+  that pins the old CA root (not just the single compromised one — the operator's deploy + anchor
+  admission MUST reject all such measurements; 25-2a-rev5 Med). An authenticated in-TEE time protocol (e.g. Roughtime bound to the anchor)
   is a documented post-MVP extension that would close window (a) without a host clock; window (b)
   is fundamentally an external-admission-control problem the time protocol does not solve.
 
