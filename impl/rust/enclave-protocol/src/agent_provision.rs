@@ -24,7 +24,9 @@ use crate::agent_cbor::{
     strict_decode_map_capped,
 };
 use crate::agent_capability::{put_bytes, put_text, put_uint};
-use crate::agent_keystore::{is_valid_environment_identifier, ML_KEM_1024_ENCAPS_KEY_LEN};
+use crate::agent_keystore::{
+    is_valid_environment_identifier, MAX_KEYSTORE_BLOB_SIZE, ML_KEM_1024_ENCAPS_KEY_LEN,
+};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // Frozen constants (25-2a §10.1)
@@ -250,9 +252,13 @@ pub(crate) fn encode_m2(n_e: &[u8; NONCE_LEN], report: &[u8]) -> Vec<u8> {
 
 /// Decode the M2 payload. The `report` MUST be exactly [`SNP_REPORT_LEN`] (a fixed VCEK-signed
 /// structure); any other length ⇒ [`ProvisionError::TooLarge`] (the §9 fixed-equality check, reported
-/// under the too-large family per §2).
+/// under the too-large family per §2). Parsed with a raised bstr cap ([`strict_decode_map_capped`])
+/// so an over-length `report` reaches the explicit length check as `TooLarge` rather than being
+/// rejected by the shared decoder's 4096 cap as `Malformed` (M2 is enclave-emitted and carries no §2
+/// overall-payload cap; the transport frame bounds the whole message).
 pub(crate) fn decode_m2(payload: &[u8]) -> Result<M2Attest, ProvisionError> {
-    let map = strict_decode_map(payload).map_err(|_| ProvisionError::Malformed)?;
+    let map = strict_decode_map_capped(payload, MAX_PROV_PAYLOAD_LEN as u64)
+        .map_err(|_| ProvisionError::Malformed)?;
     if !check_strict_keys(&map, |k| matches!(k, 1 | 2)) {
         return Err(ProvisionError::Malformed);
     }
@@ -360,14 +366,26 @@ pub(crate) fn encode_m4(sealed_blob: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode the M4 payload.
+/// Decode the M4 payload. The `sealed_blob` is capped at [`MAX_KEYSTORE_BLOB_SIZE`] — the SAME budget
+/// `seal_body` enforces, so a blob that seals is always re-installable; a larger blob ⇒
+/// [`ProvisionError::TooLarge`]. Parsed with the transport-bound bstr cap ([`crate::MAX_MESSAGE_SIZE`],
+/// STRICTLY WIDER than the [`MAX_KEYSTORE_BLOB_SIZE`] field cap) so an over-keystore-cap blob reaches
+/// the explicit `TooLarge` check rather than tripping the decode cap itself (which would collapse
+/// into `Malformed`) — the same decode-cap > field-cap discipline as M3. The raised cap also lets a
+/// realistic sealed keystore (the reference fixture is already ~4.2 KiB, above the shared decoder's
+/// 4096 cap) through. This honors the keystore spec's "install/restore encoder MUST honor
+/// `MAX_KEYSTORE_BLOB_SIZE`" obligation.
 pub(crate) fn decode_m4(payload: &[u8]) -> Result<M4Sealed, ProvisionError> {
-    let map = strict_decode_map(payload).map_err(|_| ProvisionError::Malformed)?;
+    let map = strict_decode_map_capped(payload, crate::MAX_MESSAGE_SIZE as u64)
+        .map_err(|_| ProvisionError::Malformed)?;
     if !check_strict_keys(&map, |k| k == 1) {
         return Err(ProvisionError::Malformed);
     }
     let sealed_blob = as_bytes(map_get(&map, 1).ok_or(ProvisionError::Malformed)?)
         .ok_or(ProvisionError::Malformed)?;
+    if sealed_blob.len() > MAX_KEYSTORE_BLOB_SIZE {
+        return Err(ProvisionError::TooLarge);
+    }
     Ok(M4Sealed {
         sealed_blob: sealed_blob.to_vec(),
     })
@@ -699,12 +717,57 @@ mod tests {
     }
 
     #[test]
-    fn config_map_non_canonical_rejected() {
-        // duplicate key 1 (canonical ordering already rejects; build via raw bytes)
+    fn config_map_header_count_mismatch_rejected() {
+        // map(8) header but only 7 pairs follow ⇒ strict_decode_map rejects the head/count mismatch
+        // (trailing bytes / under-filled map).
         let mut bytes = encode_config_map(&sample_config());
-        bytes[0] = 0xA8; // map(8) claim, but only 7 pairs follow ⇒ trailing/structural break
-        // (strict_decode_map will reject the head/count mismatch)
+        bytes[0] = 0xA8; // map(8) claim over 7 pairs
         assert_eq!(decode_config_map(&bytes), Err(ProvisionError::Malformed));
+    }
+
+    #[test]
+    fn config_map_duplicate_key_rejected() {
+        // A literal duplicate of key 1: build a valid config_map, then splice in a second `01 <val>`
+        // pair right after the first. strict_decode_map's canonical-ordering check (keys strictly
+        // ascending by encoded bytes) rejects the equal-key repeat ⇒ Malformed.
+        let cfg = sample_config();
+        let mut first_val = Vec::new();
+        put_uint(&mut first_val, 0, cfg.twod_chain_id); // the key-1 value (uint)
+        let mut bytes = encode_config_map(&cfg);
+        let insert_at = 1 + first_val.len() + 1; // after `A7 01 <uint>`
+        let mut dup = Vec::with_capacity(bytes.len() + 1 + first_val.len());
+        dup.extend_from_slice(&bytes[..insert_at]);
+        dup.push(0x01); // duplicate key 1
+        dup.extend_from_slice(&first_val);
+        dup.extend_from_slice(&bytes[insert_at..]);
+        dup[0] = 0xA8; // map(8) to keep the count consistent (7 + 1 dup = 8 pairs)
+        assert_eq!(decode_config_map(&dup), Err(ProvisionError::Malformed));
+    }
+
+    #[test]
+    fn config_map_out_of_order_keys_rejected() {
+        // Keys in non-ascending order: swap key 6 and key 7's BYTE positions is hard (fixed widths
+        // differ only by the key byte). Easier: emit key 7's pair BEFORE key 6's. Build by encoding
+        // key 7 then key 6 — strict_decode_map rejects descending order ⇒ Malformed.
+        let cfg = sample_config();
+        let mut out = Vec::new();
+        put_uint(&mut out, 5, 7); // map(7) claim
+        put_uint(&mut out, 0, 1);
+        put_uint(&mut out, 0, cfg.twod_chain_id);
+        put_uint(&mut out, 0, 2);
+        put_text(&mut out, &cfg.environment_identifier);
+        put_uint(&mut out, 0, 3);
+        put_bytes(&mut out, &cfg.admin_authority_pk);
+        put_uint(&mut out, 0, 4);
+        put_bytes(&mut out, &cfg.recovery_authority_pk);
+        put_uint(&mut out, 0, 5);
+        put_bytes(&mut out, &cfg.backup_recovery_wrapping_pubkey);
+        // OUT-OF-ORDER: key 7 before key 6
+        put_uint(&mut out, 0, 7);
+        put_bytes(&mut out, &cfg.fleet_scope_id);
+        put_uint(&mut out, 0, 6);
+        put_bytes(&mut out, &cfg.anchor_root);
+        assert_eq!(decode_config_map(&out), Err(ProvisionError::Malformed));
     }
 
     // ── §9 M2 negatives ─────────────────────────────────────────────────────────
@@ -722,6 +785,10 @@ mod tests {
         let bad = encode_m2(&n_e, &vec![0x77; SNP_REPORT_LEN - 1]);
         assert_eq!(decode_m2(&bad), Err(ProvisionError::TooLarge));
         let bad = encode_m2(&n_e, &vec![0x77; SNP_REPORT_LEN + 1]);
+        assert_eq!(decode_m2(&bad), Err(ProvisionError::TooLarge));
+        // report ABOVE the shared decoder's 4096 cap must STILL surface as TooLarge (not Malformed)
+        // — the raised-cap (strict_decode_map_capped) fix.
+        let bad = encode_m2(&n_e, &vec![0x77; 5000]);
         assert_eq!(decode_m2(&bad), Err(ProvisionError::TooLarge));
     }
 
@@ -797,6 +864,25 @@ mod tests {
         let payload = encode_m4(&blob);
         let dec = decode_m4(&payload).unwrap();
         assert_eq!(dec.sealed_blob, blob);
+    }
+
+    /// Regression for the Medium finding: a realistic sealed keystore is ABOVE the shared decoder's
+    /// 4096 cap (the reference fixture is ~4.2 KiB). Before the raised-cap fix, `decode_m4` rejected
+    /// such a blob as a structural `Malformed`. It MUST round-trip.
+    #[test]
+    fn m4_realistic_oversized_sealed_blob_round_trips() {
+        let blob = vec![0xABu8; 5000]; // > 4096, < MAX_KEYSTORE_BLOB_SIZE
+        let payload = encode_m4(&blob);
+        let dec = decode_m4(&payload).unwrap();
+        assert_eq!(dec.sealed_blob, blob);
+    }
+
+    #[test]
+    fn m4_sealed_blob_over_keystore_cap_is_too_large() {
+        // A blob above MAX_KEYSTORE_BLOB_SIZE (the seal_body budget) ⇒ TooLarge, not Malformed.
+        let blob = vec![0xABu8; MAX_KEYSTORE_BLOB_SIZE + 1];
+        let payload = encode_m4(&blob);
+        assert_eq!(decode_m4(&payload), Err(ProvisionError::TooLarge));
     }
 
     #[test]

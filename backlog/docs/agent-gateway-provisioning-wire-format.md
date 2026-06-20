@@ -208,7 +208,7 @@ A7                              # map(7) — major 5, additional 7
    01                             # key 1
    19 2D 2D                      # uint 11565 (0x2D2D) — major 0, additional 25 (2-byte BE)
    02                             # key 2
-   65 "prod-0"                   # text(5) "prod-0"
+   66 "prod-0"                   # text(6) "prod-0"  (6 bytes; 25-2a-rev6: was text(5) — typo, "prod-0" ≠ 5 bytes)
    03                             # key 3
    58 20  <32 bytes admin>       # bytes(32)
    04                             # key 4
@@ -520,3 +520,9 @@ golden M3 and that the verifier reaches the mint+seal step; the 25-2b negatives 
   de-duplicated with §7 (EKU OID only; the prior "EKU OID / pinned Subject" contradicted the
   rev2 narrowing). Low: dangling sentence fragment in the M1 golden merged into one sentence.
   codex/gemini/grok clean; claude-code Fail on the §7↔§9 EKU/Subject contradiction (the Med above).
+- 2026-06-20 — 25-2a-rev6 (doc typo; surfaced by the 25-2b-i Reduced Matrix, compact job 9019 Low).
+  §5.2 shape reference encoded `"prod-0"` as `65 "prod-0"` / `text(5)`, but `"prod-0"` is 6 bytes —
+  a correct canonical encoder emits `text(6)`=`0x66`. Wire-format-neutral (§10 defers the byte-exact
+  literal to the slice-v regen test, and the 25-2b-i encoder already emits the correct `0x66`); this
+  fixes the illustrative shape so an independent implementer copying §5.2 does not emit non-canonical
+  wrong-length CBOR. No §9 / message-structure change.
