@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), allow(dead_code))]
-// Slices 25-2b-i..iii landed: codec + cert verify + verify-order integration. The module-level
-// `allow(dead_code)` stays because the sole non-test caller — slice iv's stateful handshake driver
-// (holds the session, calls verify_m3_in_order, mints+seals the keystore) — is not wired yet. Mirrors
-// the staged-module convention (agent_boot / agent_boot_driver); drops once iv wires the inbound path.
+// Slices 25-2b-i..iv landed: codec + cert verify + verify-order + mint/seal + ProvisionSession. The
+// module-level `allow(dead_code)` stays because the sole non-test caller — the runtime handshake
+// DRIVER (the twod-hsm-agent-gateway bootstrap bin: AF_VSOCK listener + SNP fetch, calling
+// ProvisionSession) — is not wired yet. Mirrors the staged-module convention (agent_boot /
+// agent_boot_driver); drops once the driver wires the inbound path.
 
-//! Agent Gateway provisioning channel — wire format + M3 verify order (TASK-25, slices 25-2b-i..iii).
+//! Agent Gateway provisioning channel — wire format + verify order + mint/seal (TASK-25, slices
+//! 25-2b-i..iv).
 //!
 //! Implements the **frozen** `provision_wire_version = 1` format defined in
 //! `backlog/docs/agent-gateway-provisioning-wire-format.md` (25-2a):
@@ -16,10 +18,12 @@
 //!   ([`compute_report_data`]/[`compute_report_hash`]), transcript reconstruction + `Sig_PROV`
 //!   verify ([`verify_m3_transcript_and_sig`]) — binds the received M3 to THIS enclave session +
 //!   the authenticated provisioner before config re-decode.
+//! - **iv** — mint+seal + session ([`mint_enclave_scope_id`]/[`build_provisioned_keystore_body`]/
+//!   [`seal_provisioned_keystore`]/[`ProvisionSession`]): the in-TEE `enclave_scope_id` provenance
+//!   (AC#3/#4) + the sealed M4 blob + the transport-free stateful handshake (on_m1/on_m3).
 //!
-//! Still deferred: **iv** mint+seal wiring (the in-TEE `enclave_scope_id` mint + `seal_body` that
-//! produces M4) + the stateful handshake DRIVER that holds the session and calls
-//! [`verify_m3_in_order`]; **v** golden-vector regen.
+//! Still deferred: the runtime DRIVER (the `twod-hsm-agent-gateway` bootstrap bin — AF_VSOCK listener
+//! + SNP report fetch, calling [`ProvisionSession`]); **v** golden-vector regen.
 //!
 //! **Scope — untrusted provisioner→enclave wire input.** M1/M3 arrive over the AF_VSOCK bootstrap
 //! listener from a provisioner the enclave has not yet authenticated. Every field is length-capped
@@ -927,6 +931,10 @@ pub(crate) fn seal_provisioned_keystore(
     provisioning_root: &[u8; 32],
     enclave_measurement: &[u8],
 ) -> Result<Vec<u8>, ProvisionError> {
+    // Defense-in-depth: reject a degenerate/fixture scope_id at the seal boundary too, so a caller
+    // that bypasses mint_enclave_scope_id cannot seal [0;32]/[0xe1]/[0xf1] (KeystoreBody::validate
+    // only rejects zero/equal, not these production-forbidden fixtures).
+    validate_minted_scope_id(&enclave_scope_id)?;
     let body = build_provisioned_keystore_body(config, enclave_scope_id);
     seal_body(&body, provisioning_root, enclave_measurement).map_err(|e| match e {
         KeystoreError::Csprng => ProvisionError::Csprng,
