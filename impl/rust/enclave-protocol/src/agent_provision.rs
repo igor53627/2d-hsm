@@ -691,11 +691,13 @@ pub(crate) fn compute_report_hash(report: &[u8]) -> [u8; DIGEST_LEN] {
 /// (§5/§6). A flat 4-key map; key 1 is the SAME pre-encoded `config_map_bytes` bstr carried in M3 —
 /// the transcript binds the EXACT config bytes the host sent, not a re-encoding.
 ///
-/// **No provisioner-identity field:** the transcript deliberately excludes the provisioner cert/pubkey.
-/// Identity is bound indirectly — `Sig_PROV` is verified (step 4) under the pubkey authenticated by
-/// the cert (step 2), so a cert substitution fails step 4 (the signature won't verify under the
-/// pinned-root-authenticated key). Adding a pubkey field would be redundant; do NOT add one without
-/// re-deriving the binding.
+/// **Provisioner identity = the authenticated Ed25519 PUBKEY, not the cert.** The transcript excludes
+/// the cert by design: `Sig_PROV` (step 4) is verified under the pubkey step 2 authenticated FROM the
+/// cert, so the binding is to the KEY. NB a **same-pubkey** cert substitution — a second valid leaf
+/// under the pinned root + EKU, SAME key, different serial/subject — is NOT detected here (and is
+/// HARMLESS: the same authenticated key signed). The cert BYTES / serial / subject / validity are NOT
+/// cryptographically bound to M3; any future denylist / sealing / audit logic MUST key on the
+/// authenticated PUBKEY, not the cert object (the cert is not stable across re-issuance).
 pub(crate) fn transcript_canonical(
     config_map_bytes: &[u8],
     n_p: &[u8; NONCE_LEN],
@@ -1753,6 +1755,19 @@ mod tests {
         other_rh[0] ^= 0xFF;
         assert_eq!(
             verify_m3_in_order(&m3, &ca.verifying_key(), &n_p, &n_e, &other_rh),
+            Err(ProvisionError::TranscriptMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_m3_replay_n_p_only_mismatch_is_transcript_mismatch() {
+        // Isolate the N_p (challenge) binding: only N_p differs (N_e + report_hash match) ⇒
+        // TranscriptMismatch — completes the keys-2/3/4 coverage (compact/codex residual).
+        let (ca, _prov, m3, n_p, n_e, report_hash, _cert) = valid_m3_and_session();
+        let mut other_np = n_p;
+        other_np[0] ^= 0xFF;
+        assert_eq!(
+            verify_m3_in_order(&m3, &ca.verifying_key(), &other_np, &n_e, &report_hash),
             Err(ProvisionError::TranscriptMismatch)
         );
     }
