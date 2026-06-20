@@ -252,12 +252,13 @@ pub(crate) fn encode_m2(n_e: &[u8; NONCE_LEN], report: &[u8]) -> Vec<u8> {
 
 /// Decode the M2 payload. The `report` MUST be exactly [`SNP_REPORT_LEN`] (a fixed VCEK-signed
 /// structure); any other length ⇒ [`ProvisionError::TooLarge`] (the §9 fixed-equality check, reported
-/// under the too-large family per §2). Parsed with a raised bstr cap ([`strict_decode_map_capped`])
-/// so an over-length `report` reaches the explicit length check as `TooLarge` rather than being
-/// rejected by the shared decoder's 4096 cap as `Malformed` (M2 is enclave-emitted and carries no §2
-/// overall-payload cap; the transport frame bounds the whole message).
+/// under the too-large family per §2). Parsed with the transport-bound bstr cap
+/// ([`crate::MAX_MESSAGE_SIZE`], strictly wider than any field cap) so an over-length `report` of ANY
+/// size reaches the explicit `!= SNP_REPORT_LEN` check as `TooLarge` rather than tripping a narrower
+/// decode cap as `Malformed` — the same transport-bound-cap discipline as M4 (M2 is enclave-emitted and
+/// carries no §2 overall-payload cap; the transport frame bounds the whole message).
 pub(crate) fn decode_m2(payload: &[u8]) -> Result<M2Attest, ProvisionError> {
-    let map = strict_decode_map_capped(payload, MAX_PROV_PAYLOAD_LEN as u64)
+    let map = strict_decode_map_capped(payload, crate::MAX_MESSAGE_SIZE as u64)
         .map_err(|_| ProvisionError::Malformed)?;
     if !check_strict_keys(&map, |k| matches!(k, 1 | 2)) {
         return Err(ProvisionError::Malformed);
@@ -789,6 +790,10 @@ mod tests {
         // report ABOVE the shared decoder's 4096 cap must STILL surface as TooLarge (not Malformed)
         // — the raised-cap (strict_decode_map_capped) fix.
         let bad = encode_m2(&n_e, &vec![0x77; 5000]);
+        assert_eq!(decode_m2(&bad), Err(ProvisionError::TooLarge));
+        // report ABOVE the MAX_PROV_PAYLOAD_LEN (8192) transport-framing-level cap must STILL be
+        // TooLarge (the decode cap is MAX_MESSAGE_SIZE, not 8192) — compact job 9023 residual.
+        let bad = encode_m2(&n_e, &vec![0x77; 9000]);
         assert_eq!(decode_m2(&bad), Err(ProvisionError::TooLarge));
     }
 
