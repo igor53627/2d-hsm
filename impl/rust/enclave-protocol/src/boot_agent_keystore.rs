@@ -227,7 +227,7 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
     // the enclave).
     struct LabReportProducer;
     impl ProvisionReportProducer for LabReportProducer {
-        fn fetch_report(&self, _report_data: &[u8; 64]) -> Result<Vec<u8>, provision_bootstrap::ProvisionError> {
+        fn fetch_report(&self, _report_data: &[u8; 64]) -> Result<Vec<u8>, crate::agent_provision::ProvisionError> {
             // A fixed mock 1184-byte report. On a real SNP guest, this would call
             // snp_report::fetch_measurement_and_report with the report_data embedded in REPORT_DATA.
             Ok(vec![0u8; crate::agent_provision::SNP_REPORT_LEN])
@@ -238,7 +238,7 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
 
     // Run the one-shot ceremony (binds listener, accepts ONE connection, M1→M2→M3→M4, tears down).
     let (_config, sealed_blob) =
-        provision_bootstrap::vsock::run_vsock_provisioning_bootstrap(
+        crate::provision_bootstrap::vsock::run_vsock_provisioning_bootstrap(
             crate::vsock_addr::DEFAULT_VSOCK_CID,
             prov_port,
             &pinned_root,
