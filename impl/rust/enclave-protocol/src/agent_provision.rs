@@ -1,23 +1,31 @@
 #![cfg_attr(not(test), allow(dead_code))]
-// Slice 25-2b-i: the whole module is pure codec with no non-test caller yet (the cert-chain verify,
-// transcript+Sig_PROV verify, mint+seal, and golden-regen land in slices ii–v). Per-item annotations
-// would be noise across ~20 items; the module-level allow drops cleanly once slice iii/iv wires the
-// inbound M3 path. Mirrors the staged-module convention (agent_boot / agent_boot_driver).
+// Slices 25-2b-i..iii landed: codec + cert verify + verify-order integration. The module-level
+// `allow(dead_code)` stays because the sole non-test caller — slice iv's stateful handshake driver
+// (holds the session, calls verify_m3_in_order, mints+seals the keystore) — is not wired yet. Mirrors
+// the staged-module convention (agent_boot / agent_boot_driver); drops once iv wires the inbound path.
 
-//! Agent Gateway provisioning channel — wire-format codec (TASK-25, slice 25-2b-i).
+//! Agent Gateway provisioning channel — wire format + M3 verify order (TASK-25, slices 25-2b-i..iii).
 //!
-//! Pure encode/decode of the **frozen** `provision_wire_version = 1` format defined in
-//! `backlog/docs/agent-gateway-provisioning-wire-format.md` (25-2a). This slice implements ONLY the
-//! structural codec + §2 DoS caps + per-state direction validation: it does NOT verify the provisioner
-//! cert chain (slice ii), reconstruct/verify the transcript or `Sig_PROV` (slice iii), mint+seal
-//! (slice iv), or regenerate the golden `Sig_PROV`/cert literals (slice v). The crypto arms of
-//! [`ProvisionError`] are defined now so the error model is complete and stable for those slices.
+//! Implements the **frozen** `provision_wire_version = 1` format defined in
+//! `backlog/docs/agent-gateway-provisioning-wire-format.md` (25-2a):
+//! - **i** — structural codec: envelope (magic/version/msg_type), per-state direction validation,
+//!   M1-M4 encode/decode, §5.1 config_map, §2 DoS caps, the full §9 `ProvisionError` model.
+//! - **ii** — provisioner-cert verify ([`verify_provisioner_cert`]): single-level X.509 leaf ← pinned
+//!   operator CA root + the role EKU, via `x509-cert`.
+//! - **iii** — the §6 verify-order integration ([`verify_m3_in_order`]): SHA3 session binding
+//!   ([`compute_report_data`]/[`compute_report_hash`]), transcript reconstruction + `Sig_PROV`
+//!   verify ([`verify_m3_transcript_and_sig`]) — binds the received M3 to THIS enclave session +
+//!   the authenticated provisioner before config re-decode.
+//!
+//! Still deferred: **iv** mint+seal wiring (the in-TEE `enclave_scope_id` mint + `seal_body` that
+//! produces M4) + the stateful handshake DRIVER that holds the session and calls
+//! [`verify_m3_in_order`]; **v** golden-vector regen.
 //!
 //! **Scope — untrusted provisioner→enclave wire input.** M1/M3 arrive over the AF_VSOCK bootstrap
 //! listener from a provisioner the enclave has not yet authenticated. Every field is length-capped
 //! (§2 DoS caps) BEFORE any expensive parse, and every parse is strict-canonical-CBOR
 //! (RFC 8949 §4.2.1) via [`crate::agent_cbor`], so a non-canonical or oversized input fails closed
-//! with a distinguishable [`ProvisionError`] rather than reaching the (deferred) crypto.
+//! with a distinguishable [`ProvisionError`] rather than reaching the crypto.
 
 use crate::agent_cbor::{
     as_bytes, as_bytes32, as_bytes_n, as_u64, check_strict_keys, map_get, strict_decode_map,
@@ -656,6 +664,12 @@ pub(crate) fn verify_provisioner_cert(
 /// provisioner checks `SHA3-512(domain ‖ N_p ‖ N_e) == report.report_data` (mismatch ⇒
 /// [`ProvisionError::AttestMismatch`] — the report is not for this challenge). Fixed-width nonces ⇒
 /// no length-prefix needed (mirrors the anchor handshake).
+///
+/// **NB — provisioner-side check.** The ENCLAVE computes this to FILL the M2 `REPORT_DATA` (it does
+/// NOT verify it); the `AttestMismatch` comparison is run by the PROVISIONER (the M2 receiver).
+/// `verify_m3_in_order` (enclave side) binds the report only via `report_hash`
+/// ([`compute_report_hash`]) in the transcript — it trusts the `session_report_hash` the driver
+/// passes (slice iv guarantees that is SHA3-256 of the report THIS enclave emitted in M2).
 pub(crate) fn compute_report_data(n_p: &[u8; NONCE_LEN], n_e: &[u8; NONCE_LEN]) -> [u8; 64] {
     use sha3::{Digest, Sha3_512};
     let mut h = Sha3_512::new();
@@ -676,6 +690,12 @@ pub(crate) fn compute_report_hash(report: &[u8]) -> [u8; DIGEST_LEN] {
 /// `transcript_canonical = canonical-CBOR({1: config_map_bytes, 2: N_p, 3: N_e, 4: report_hash})`
 /// (§5/§6). A flat 4-key map; key 1 is the SAME pre-encoded `config_map_bytes` bstr carried in M3 —
 /// the transcript binds the EXACT config bytes the host sent, not a re-encoding.
+///
+/// **No provisioner-identity field:** the transcript deliberately excludes the provisioner cert/pubkey.
+/// Identity is bound indirectly — `Sig_PROV` is verified (step 4) under the pubkey authenticated by
+/// the cert (step 2), so a cert substitution fails step 4 (the signature won't verify under the
+/// pinned-root-authenticated key). Adding a pubkey field would be redundant; do NOT add one without
+/// re-deriving the binding.
 pub(crate) fn transcript_canonical(
     config_map_bytes: &[u8],
     n_p: &[u8; NONCE_LEN],
@@ -755,13 +775,15 @@ pub(crate) fn verify_m3_transcript_and_sig(
 /// The FULL §6 verify order for an M3 message (the integration point — slice 25-2b-iii). Given the
 /// raw M3 wire bytes (envelope + payload), the pinned operator CA root, and the live session's
 /// `(N_p, N_e, report_hash)` (the `N_p` received in M1, the `N_e` + report the enclave emitted in
-/// M2), run all five steps in order and return the decoded config + the authenticated provisioner
+/// M2), run all five §6 steps in order and return the decoded config + the authenticated provisioner
 /// pubkey (for slice iv's mint+seal).
 ///
-/// Order (fail-closed at each step): (1) envelope [`decode_envelope`]; (2) cert chain
-/// [`verify_provisioner_cert`]; (3) transcript reconstruction [`verify_m3_transcript_and_sig`];
-/// (4) `Sig_PROV` (inside `verify_m3_transcript_and_sig`); (5) config re-decode
-/// [`decode_config_map`]. Only after all five pass does the caller proceed to mint+seal.
+/// **§6 steps (mapped to code):** (1) envelope + structural M3 decode — [`decode_envelope`] +
+///   [`decode_m3`] (magic/version/msg_type=3, §2 DoS caps, canonical-CBOR payload; `decode_m3` is the
+///   payload-structure part of §6 step 1, NOT a separate crypto step); (2) cert chain
+///   [`verify_provisioner_cert`]; (3) transcript reconstruction (inside
+///   [`verify_m3_transcript_and_sig`]); (4) `Sig_PROV` (inside `verify_m3_transcript_and_sig`);
+///   (5) config re-decode [`decode_config_map`]. Only after all five pass does the caller mint+seal.
 pub(crate) fn verify_m3_in_order(
     m3_message: &[u8],
     pinned_root: &ed25519_dalek::VerifyingKey,
@@ -769,17 +791,18 @@ pub(crate) fn verify_m3_in_order(
     session_n_e: &[u8; NONCE_LEN],
     session_report_hash: &[u8; DIGEST_LEN],
 ) -> Result<(ProvisionConfig, ed25519_dalek::VerifyingKey), ProvisionError> {
-    // 1. Envelope.
+    // §6 step 1: envelope (magic/version/msg_type=3) + the structural M3 decode that extracts the
+    // cert/transcript/sig fields (§2 DoS caps + canonical-CBOR payload — NOT a separate crypto step).
     let (msg_type, payload) = decode_envelope(m3_message)?;
     if msg_type != MSG_M3_CONFIG {
         return Err(ProvisionError::Malformed);
     }
-    // 2. Structural M3 decode (§2 DoS caps + canonical-CBOR payload).
     let m3 = decode_m3(payload)?;
-    // 3 + 4. Cert chain (step 2 of §6), then transcript + Sig_PROV (steps 3+4).
+    // §6 step 2: cert chain (single-level leaf ← pinned root + role EKU).
     let prov_pub = verify_provisioner_cert(&m3.provisioner_cert, pinned_root)?;
+    // §6 steps 3+4: transcript reconstruction (byte-compare to the live session) + Sig_PROV verify.
     verify_m3_transcript_and_sig(&m3, &prov_pub, session_n_p, session_n_e, session_report_hash)?;
-    // 5. Config re-decode (post-signature: the config bytes are now Sig_PROV-bound).
+    // §6 step 5: config re-decode (post-signature: the config bytes are now Sig_PROV-bound).
     let config = decode_config_map(&m3.config_map_bytes)?;
     Ok((config, prov_pub))
 }
@@ -1669,6 +1692,68 @@ mod tests {
         assert_eq!(
             verify_m3_in_order(&bad, &ca.verifying_key(), &n_p, &n_e, &report_hash),
             Err(ProvisionError::BadMagic)
+        );
+    }
+
+    #[test]
+    fn verify_m3_wrong_msg_type_is_malformed() {
+        // A well-formed envelope carrying a NON-M3 msg_type (e.g. M2) is rejected by the type gate
+        // (exercises the `msg_type != MSG_M3_CONFIG` check, distinct from the magic-corruption case).
+        let (ca, _prov, m3, n_p, n_e, report_hash, _cert) = valid_m3_and_session();
+        // Rewrite the envelope's msg_type byte (offset 9) to M2.
+        let mut wrong_type = m3.clone();
+        wrong_type[9] = MSG_M2_ATTEST;
+        assert_eq!(
+            verify_m3_in_order(&wrong_type, &ca.verifying_key(), &n_p, &n_e, &report_hash),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn verify_m3_config_substitution_is_bad_signature() {
+        // HIGH#1 direct: the host cannot swap config in transit. Sign config A, then ship config B
+        // under config A's Sig_PROV (same session + cert) ⇒ BadSignature (the transcript binds the
+        // EXACT config_map_bytes; a different config makes the signed_bytes mismatch the signature).
+        let (ca, prov, _m3, n_p, n_e, report_hash, cert) = valid_m3_and_session();
+        use ed25519_dalek::Signer;
+        let cfg_a = encode_config_map(&sample_config());
+        // config B: a DIFFERENT but valid config (different chain_id).
+        let mut cfg_b = sample_config();
+        cfg_b.twod_chain_id = 99999;
+        let cfg_b = encode_config_map(&cfg_b);
+        // Sign over config A's transcript, but ship config B bytes.
+        let sig = prov
+            .sign(&sig_prov_signed_bytes(&cfg_a, &n_p, &n_e, &report_hash))
+            .to_bytes();
+        let swapped = build_m3_message(&cfg_b, &n_p, &n_e, &report_hash, &sig, &cert);
+        assert_eq!(
+            verify_m3_in_order(&swapped, &ca.verifying_key(), &n_p, &n_e, &report_hash),
+            Err(ProvisionError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn verify_m3_replay_n_e_only_mismatch_is_transcript_mismatch() {
+        // Isolate the N_e binding: only N_e differs (N_p + report_hash still match) ⇒
+        // TranscriptMismatch. Pins that the guard keys on N_e, not just report_hash.
+        let (ca, _prov, m3, n_p, n_e, report_hash, _cert) = valid_m3_and_session();
+        let mut other_n_e = n_e;
+        other_n_e[0] ^= 0xFF; // only N_e differs
+        assert_eq!(
+            verify_m3_in_order(&m3, &ca.verifying_key(), &n_p, &other_n_e, &report_hash),
+            Err(ProvisionError::TranscriptMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_m3_replay_report_hash_only_mismatch_is_transcript_mismatch() {
+        // Isolate the report_hash binding: only report_hash differs ⇒ TranscriptMismatch.
+        let (ca, _prov, m3, n_p, n_e, report_hash, _cert) = valid_m3_and_session();
+        let mut other_rh = report_hash;
+        other_rh[0] ^= 0xFF;
+        assert_eq!(
+            verify_m3_in_order(&m3, &ca.verifying_key(), &n_p, &n_e, &other_rh),
+            Err(ProvisionError::TranscriptMismatch)
         );
     }
 
