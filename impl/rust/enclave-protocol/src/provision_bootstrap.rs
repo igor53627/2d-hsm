@@ -51,6 +51,15 @@ pub trait ProvisionReportProducer {
 ///
 /// **`idle_timeout`** = the per-read deadline (slowloris defense; the bootstrap is one-shot, so a
 /// generous timeout is fine). Returns `(ProvisionConfig, sealed_blob)` on success.
+/// Prepend a u32 BE length to a provision envelope + write via `write_framed_message` (the standard
+/// length-prefixed framing wrapping the provision protocol's own envelope).
+fn write_provision_envelope<W: Write>(writer: &mut W, envelope: &[u8]) -> Result<(), ProvisionError> {
+    let mut frame = Vec::with_capacity(4 + envelope.len());
+    frame.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
+    frame.extend_from_slice(envelope);
+    write_framed_message(writer, &frame).map_err(|_| ProvisionError::Malformed)
+}
+
 pub fn run_provisioning_ceremony<S: Read + Write>(
     stream: &mut S,
     pinned_root: &VerifyingKey,
@@ -60,15 +69,6 @@ pub fn run_provisioning_ceremony<S: Read + Write>(
     idle_timeout: Duration,
 ) -> Result<(agent_provision::ProvisionConfig, Vec<u8>), ProvisionError> {
     let mut session = ProvisionSession::new(*pinned_root, *seal_root, measurement.to_vec());
-
-    // Helper: prepend a u32 BE length to the provision envelope (the standard framing wrapping
-    // the provision protocol — write_framed_message writes raw bytes, so we build [u32 len][env]).
-    let write_env = |env: &[u8]| -> Result<(), ProvisionError> {
-        let mut frame = Vec::with_capacity(4 + env.len());
-        frame.extend_from_slice(&(env.len() as u32).to_be_bytes());
-        frame.extend_from_slice(env);
-        write_framed_message(stream, &frame).map_err(|_| ProvisionError::Malformed)
-    };
 
     // ── M1: read PROV_CHALLENGE ───────────────────────────────────────────────
     let deadline = Some(std::time::Instant::now() + idle_timeout);
@@ -89,7 +89,7 @@ pub fn run_provisioning_ceremony<S: Read + Write>(
 
     // ── M2: emit PROV_ATTEST (N_e + report) ───────────────────────────────────
     let m2_env = encode_envelope(MSG_M2_ATTEST, &encode_m2(&n_e, &report));
-    write_env(&m2_env)?;
+    write_provision_envelope(stream, &m2_env)?;
 
     // ── M3: read PROV_CONFIG ──────────────────────────────────────────────────
     let deadline = Some(std::time::Instant::now() + idle_timeout);
@@ -100,7 +100,7 @@ pub fn run_provisioning_ceremony<S: Read + Write>(
 
     // ── M4: emit PROV_SEALED ──────────────────────────────────────────────────
     let m4_env = encode_envelope(MSG_M4_SEALED, &encode_m4(&sealed_blob));
-    write_env(&m4_env)?;
+    write_provision_envelope(stream, &m4_env)?;
 
     Ok((config, sealed_blob))
 }

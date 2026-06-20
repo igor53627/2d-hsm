@@ -2371,8 +2371,9 @@ mod tests {
 
         // Server thread: run the ceremony.
         let handle = std::thread::spawn(move || {
+            let mut sock = server_sock;
             crate::provision_bootstrap::run_provisioning_ceremony(
-                &mut server_sock,
+                &mut sock,
                 &pinned,
                 &seal_root,
                 &measurement,
