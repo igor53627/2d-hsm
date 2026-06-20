@@ -121,6 +121,12 @@ pub(crate) const MARKS_SCOPE_TARGET_MAX_LEN: usize = MAX_STR_LEN as usize;
 struct StrictParser<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Per-decode cap for major-2 (bytes) and major-3 (text) item lengths. [`strict_decode_map`] uses
+    /// [`MAX_STR_LEN`]; provision payloads (TASK-25 25-2b) pass a larger cap via
+    /// [`strict_decode_map_capped`] so an over-`MAX_CONFIG_MAP_LEN` bstr comes through for an explicit
+    /// `PROV_TOO_LARGE` instead of collapsing into the generic reject (the same reason
+    /// `strict_decode_marks_response` parameterizes its key-6 cap).
+    max_bstr: u64,
 }
 
 impl StrictParser<'_> {
@@ -198,13 +204,13 @@ impl StrictParser<'_> {
                 Ok(Value::Integer(n.try_into().map_err(|_| ())?))
             }
             2 => {
-                if arg > MAX_STR_LEN {
+                if arg > self.max_bstr {
                     return Err(());
                 }
                 Ok(Value::Bytes(self.take(arg as usize)?.to_vec()))
             }
             3 => {
-                if arg > MAX_STR_LEN {
+                if arg > self.max_bstr {
                     return Err(());
                 }
                 let s = core::str::from_utf8(self.take(arg as usize)?).map_err(|_| ())?;
@@ -262,7 +268,26 @@ impl StrictParser<'_> {
 /// over-deep nesting, oversize strings/collections, and trailing bytes. The top item MUST be a
 /// definite-length map. See the module doc: **wire input only — never the sealed keystore body.**
 pub(crate) fn strict_decode_map(bytes: &[u8]) -> Result<Vec<(Value, Value)>, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0 };
+    strict_decode_map_capped(bytes, MAX_STR_LEN)
+}
+
+/// Like [`strict_decode_map`] but with a caller-chosen cap on each bytes/text item length (instead of
+/// the shared [`MAX_STR_LEN`]). The canonicality discipline (shortest-form, no indefinite/tag/float, no
+/// dup/out-of-order keys, no trailing bytes) is unchanged; only the per-field length bound moves. Used by
+/// the TASK-25 25-2b provision M3 decoder: the `config_map` bstr may legitimately reach
+/// `MAX_CONFIG_MAP_LEN` (4096) — equal to [`MAX_STR_LEN`] — but the decoder must return a DISTINCT
+/// `PROV_TOO_LARGE` for an over-cap field rather than the generic `PROV_MALFORMED` that an internal cap
+/// reject would produce, so it parses with a larger cap and checks the field cap explicitly. `max_bstr`
+/// MUST be >= [`MAX_STR_LEN`] (the shared cap still bounds every OTHER field via [`strict_decode_map`]).
+pub(crate) fn strict_decode_map_capped(
+    bytes: &[u8],
+    max_bstr: u64,
+) -> Result<Vec<(Value, Value)>, ()> {
+    let mut p = StrictParser {
+        buf: bytes,
+        pos: 0,
+        max_bstr,
+    };
     let v = p.item(1)?;
     if p.pos != bytes.len() {
         return Err(()); // trailing bytes
@@ -371,7 +396,7 @@ pub(crate) fn strict_decode_marks_payload(
     bytes: &[u8],
     max_rows: usize,
 ) -> Result<DecodedMarks, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0 };
+    let mut p = StrictParser { buf: bytes, pos: 0, max_bstr: MAX_STR_LEN };
     // Top: map(4), keys 1..=4 in canonical ascending order.
     if p.typed_head(5)? != 4 {
         return Err(());
@@ -461,7 +486,7 @@ pub(crate) fn strict_decode_marks_response(
     bytes: &[u8],
     max_payload: usize,
 ) -> Result<MarksRespFields, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0 };
+    let mut p = StrictParser { buf: bytes, pos: 0, max_bstr: MAX_STR_LEN };
     if p.typed_head(5)? != 7 {
         return Err(()); // map(7): keys {1..=6, 13}
     }
@@ -528,7 +553,7 @@ pub(crate) fn strict_decode_commit_ack(
     bytes: &[u8],
     max_request_id: usize,
 ) -> Result<CommitAckFields, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0 };
+    let mut p = StrictParser { buf: bytes, pos: 0, max_bstr: MAX_STR_LEN };
     if p.typed_head(5)? != 9 {
         return Err(()); // map(9): keys {1..=8, 13}
     }

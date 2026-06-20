@@ -314,6 +314,12 @@ pub mod agent_anchor;
 // canonical decode). Crate-private; consumed by agent_capability/agent_dispatch/agent_anchor.
 #[cfg(feature = "agent-gateway")]
 mod agent_cbor;
+// Agent Gateway provisioning channel wire-format codec (TASK-25, slice 25-2b-i). Pure encode/decode
+// of the frozen `provision_wire_version = 1` format; cert-chain verify, transcript/Sig_PROV verify,
+// mint+seal, and golden-regen land in slices ii–v. Crate-private; `agent-gateway`-gated (mirrors
+// agent_cbor/agent_anchor — no crypto deps beyond the shared CBOR + keystore-validators).
+#[cfg(feature = "agent-gateway")]
+mod agent_provision;
 // Agent Gateway anti-rollback freshness-challenge (nonce) state machine (TASK-7.7). CSPRNG issue +
 // single-use lifecycle + handshake report_data binding. Crate-private; dead-code until boot wiring.
 #[cfg(feature = "agent-gateway")]
