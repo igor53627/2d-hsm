@@ -155,6 +155,8 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
 /// Try the vsock provisioning ceremony (Linux + vsock-transport + agent-gateway only); otherwise
 /// fail closed with a clear message.
 fn agent_sealed_keystore_blob_from_provisioning_or_fail() -> Result<Vec<u8>, ProtocolError> {
+    // Only the full lab + Linux + vsock + agent-gateway feature set has the provisioning ceremony.
+    // Everything else (macOS CI, non-vsock, non-lab production) fails closed.
     #[cfg(all(
         target_os = "linux",
         feature = "vsock-transport",
@@ -171,16 +173,9 @@ fn agent_sealed_keystore_blob_from_provisioning_or_fail() -> Result<Vec<u8>, Pro
         feature = "lab-agent-keystore-from-file"
     )))]
     {
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        feature = "vsock-transport",
-        feature = "agent-gateway"
-    )))]
-    {
         Err(ProtocolError::PqSigningUnavailable(
             "agent keystore: no sealed keystore file and vsock provisioning unavailable \
-             (needs Linux + vsock-transport)",
+             (needs Linux + vsock-transport + lab-agent-keystore-from-file)",
         ))
     }
 }
