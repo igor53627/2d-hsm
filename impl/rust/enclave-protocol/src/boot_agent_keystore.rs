@@ -122,48 +122,58 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     use crate::env_config::{
         var_twod, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
     };
-    let path = var_twod(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE)
-        .map_err(|_| {
-            ProtocolError::PqSigningUnavailable(
-                "agent keystore: TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE not set",
-            )
-        })?;
-    // CAPPED read (read_boot_file_capped returns at most MAX+1): a never-ending special file (/dev/zero) or
-    // an oversize file can't OOM the boot path before this length check — the +1 makes "too large" exact.
-    let blob = crate::boot_input::read_boot_file_capped(
-        path.as_ref(),
-        crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE,
-        "agent keystore: failed to read TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE",
-    )?;
-    if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
-        return Err(ProtocolError::PqSigningUnavailable(
-            "agent keystore: sealed blob exceeds MAX_KEYSTORE_BLOB_SIZE (would not be re-installable)",
-        ));
+    // Try the file path FIRST; if not found (first boot), fall back to the provisioning ceremony
+    // (only available on Linux + vsock-transport + agent-gateway — otherwise fail closed).
+    match var_twod(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE) {
+        Ok(path) => {
+            // CAPPED read: a never-ending special file or oversize blob can't OOM the boot path.
+            let blob = crate::boot_input::read_boot_file_capped(
+                path.as_ref(),
+                crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE,
+                "agent keystore: failed to read TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE",
+            )?;
+            if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
+                return Err(ProtocolError::PqSigningUnavailable(
+                    "agent keystore: sealed blob exceeds MAX_KEYSTORE_BLOB_SIZE",
+                ));
+            }
+            Ok(blob)
+        }
+        Err(_) => {
+            // File env not set → first boot → try provisioning (vsock ceremony). On non-Linux/non-vsock,
+            // the provisioning fn doesn't compile → fall through to the file-not-set error.
+            #[cfg(all(
+                target_os = "linux",
+                feature = "vsock-transport",
+                feature = "agent-gateway"
+            ))]
+            {
+                return agent_sealed_keystore_blob_from_provisioning();
+            }
+            #[cfg(not(all(
+                target_os = "linux",
+                feature = "vsock-transport",
+                feature = "agent-gateway"
+            )))]
+            {
+                Err(ProtocolError::PqSigningUnavailable(
+                    "agent keystore: TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE not set and vsock provisioning \
+                     unavailable (needs Linux + vsock-transport)",
+                ))
+            }
+        }
     }
-    Ok(blob)
 }
 
-// TASK-25 boot integration: production keystore source = the provisioning bootstrap ceremony.
-// Triple-gated (Linux + vsock-transport + agent-gateway): the vsock binding + SNP report producer
-// are needed. On non-Linux / non-vsock builds (macOS CI), the provisioning source is unavailable →
-// fail closed (the lab file source is the fallback there).
+// TASK-25 boot integration: the provisioning ceremony as the keystore source. LAB-GATED (the
+// LabReportProducer returns a mock all-zero report — production needs the real configfs-tsm fetch,
+// which is a TODO tracked in the function body). This means: on a LAB build (lab-agent-keystore-from-file
+// + linux + vsock-transport + agent-gateway), the lab file path is tried FIRST; if not found, the
+// provisioning ceremony runs. On a non-lab production build: the provisioning path does NOT compile
+// (the non-lab `agent_sealed_keystore_blob` fails closed — production needs the real SNP report +
+// compiled-in CA root, neither of which is wired yet).
 #[cfg(all(
-    not(feature = "lab-agent-keystore-from-file"),
-    target_os = "linux",
-    feature = "vsock-transport",
-    feature = "agent-gateway"
-))]
-fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
-    agent_sealed_keystore_blob_from_provisioning()
-}
-
-/// The production keystore source: run the one-shot provisioning ceremony over vsock, persist the
-/// sealed blob to the keystore file path, then return it for unseal. On first boot (no keystore on
-/// disk), this IS the keystore source; on subsequent boots, the host should have persisted the blob
-/// and the lab file path would be set (but in a non-lab production build, we re-provision if the
-/// host didn't persist — Q8: a re-provisioned enclave mints a NEW enclave_scope_id + zero counters).
-#[cfg(all(
-    not(feature = "lab-agent-keystore-from-file"),
+    feature = "lab-agent-keystore-from-file",
     target_os = "linux",
     feature = "vsock-transport",
     feature = "agent-gateway"
@@ -291,15 +301,10 @@ fn agent_boot_measurement() -> Result<Vec<u8>, ProtocolError> {
         LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
     ) {
         Ok(path) => {
-            let bytes = crate::boot_input::read_boot_file_trim_trailing_newlines(
+            crate::boot_input::read_boot_file_trim_trailing_newlines(
                 path.as_ref(),
-                AGENT_MEASUREMENT_FILE_MAX_BYTES,
                 "agent keystore: failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE",
-            )?;
-            while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-                bytes.pop();
-            }
-            bytes
+            )?
         }
         Err(_) => AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT.to_vec(),
     };
