@@ -140,6 +140,20 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
     Malformed branches — + 5 Lows) → compact 9048; all 6 findings addressed in the fix commit (sig-
     alg checks, raw-TBS-bytes, x509-cert optional gating, malformed-branch tests, EKU-narrative
     reword, this per-slice-gate clarification). 10 cert tests; 531 total pass.
+  - **25-2b-iii (DONE — reviewed)** — §6 verify-order integration: `compute_report_data`
+    (SHA3-512 REPORT_DATA commitment) / `compute_report_hash` (SHA3-256), `transcript_canonical` +
+    `sig_prov_signed_bytes` (PROVISION_DOMAIN ‖ canonical-CBOR), `verify_m3_transcript_and_sig`
+    (steps 3+4: transcript byte-compare → TranscriptMismatch; Sig_PROV verify_strict → BadSignature),
+    and `verify_m3_in_order` (full §6 order 1→5: envelope+decode → cert → transcript+sig → config,
+    returns ProvisionConfig + provisioner pubkey for slice iv). **Full Matrix** (first state-machine
+    slice): Reduced (codex/gemini/grok clean, claude-code/design Lows) + 2×3 (codex security/design
+    clean, design-max Fail → fixed). Findings (config-sub test gap, stale module docs, §6 step-
+    numbering, wrong-msg_type + isolated-field replay tests, precise identity-binding note) addressed
+    in `4cf2e88` + `6d0081e`; 3 compact rounds → clean (job 9088). **DEGRADATION (noted):** 2 of 3
+    gemini 2×3 cells failed agy re-auth (non-interactive session; AGENTS.md known scenario); gemini
+    coverage held via Reduced security + one design-max cell, and the design lens is multi-covered
+    (claude-code + codex×2) — the missing gemini-design-2×3 view is the documented gap. 53 tests;
+    544 total pass.
 - **25-3..25-6** — per 25-1 §7 (enclave_scope_id in-TEE mint; production nix profile; restore identity
   hard gate on TASK-24; operator runbook).
 
