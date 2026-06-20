@@ -126,37 +126,27 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     // (only available on Linux + vsock-transport + agent-gateway — otherwise fail closed).
     match var_twod(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE) {
         Ok(path) => {
-            // Try reading the file; NotFound = first boot (the path is configured but the file doesn't
-            // exist yet → fall through to provisioning). Any OTHER read error = fail closed.
-            match crate::boot_input::read_boot_file_capped(
+            // Check existence FIRST: read_boot_file_capped maps File::open errors to
+            // PqSigningUnavailable (not Io), so a missing file wouldn't be distinguishable from
+            // a read error. Path::exists cleanly separates first-boot (missing) from I/O error.
+            if !std::path::Path::new(&path).exists() {
+                return agent_sealed_keystore_blob_from_provisioning_or_fail();
+            }
+            // File exists → capped read.
+            let blob = crate::boot_input::read_boot_file_capped(
                 path.as_ref(),
                 crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE,
                 "agent keystore: failed to read TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE",
-            ) {
-                Ok(blob) => {
-                    if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
-                        return Err(ProtocolError::PqSigningUnavailable(
-                            "agent keystore: sealed blob exceeds MAX_KEYSTORE_BLOB_SIZE",
-                        ));
-                    }
-                    Ok(blob)
-                }
-                Err(e) => {
-                    // NotFound on a CONFIGURED path → first boot → fall through to provisioning.
-                    // Any other I/O error → fail closed (not a first-boot case).
-                    let is_not_found = matches!(
-                        e,
-                        ProtocolError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
-                    );
-                    if !is_not_found {
-                        return Err(e);
-                    }
-                    agent_sealed_keystore_blob_from_provisioning_or_fail()
-                }
+            )?;
+            if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
+                return Err(ProtocolError::PqSigningUnavailable(
+                    "agent keystore: sealed blob exceeds MAX_KEYSTORE_BLOB_SIZE",
+                ));
             }
+            Ok(blob)
         }
         Err(_) => {
-            // Env var not set at all → first boot → try provisioning (or fail closed).
+            // Env var not set → first boot → provisioning (or fail closed).
             agent_sealed_keystore_blob_from_provisioning_or_fail()
         }
     }
@@ -168,10 +158,19 @@ fn agent_sealed_keystore_blob_from_provisioning_or_fail() -> Result<Vec<u8>, Pro
     #[cfg(all(
         target_os = "linux",
         feature = "vsock-transport",
-        feature = "agent-gateway"
+        feature = "agent-gateway",
+        feature = "lab-agent-keystore-from-file"
     ))]
     {
         agent_sealed_keystore_blob_from_provisioning()
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        feature = "vsock-transport",
+        feature = "agent-gateway",
+        feature = "lab-agent-keystore-from-file"
+    )))]
+    {
     }
     #[cfg(not(all(
         target_os = "linux",
