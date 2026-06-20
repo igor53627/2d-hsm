@@ -66,6 +66,17 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   with `enclave_scope_id == A`'s defeats the 18-2 byte-compare (guard passes ⇒ security theater).
   Document the in-TEE RNG path and the attested-channel binding that prevents the host from selecting
   or replaying the id.
+  > **Implementation reconciliation (25-2b-iv, compact 9113):** the frozen `provision_wire_version=1`
+  > wire format (25-2a) simplified AC#2's "ephemeral install handshake key" + "mint before M2" design
+  > concepts — the frozen M3 transcript binds only `(config_map, N_p, N_e, report_hash)` and carries NO
+  > `enclave_scope_id`. The id is minted at **seal time** (inside `on_m3`, after the §6 verify passes),
+  > and its host-uncontrollability is **structural** (§5.1 wire map has no field for it — I2; the host
+  > never supplies it), NOT a per-field attestation in M2/M3. AC#2's "attestation proves the enclave to
+  > the provisioner" still holds (the M2 SNP report); AC#3's "binding that prevents the host from
+  > selecting/replaying the id" = the structural absence + the one-shot session (a replayed M3 is
+  > caught by the transcript N_e compare, TranscriptMismatch). The "ephemeral install handshake key"
+  > was NOT carried into the frozen format (the provisioner's Ed25519 cert key serves the role); if a
+  > future revision wants a per-enclave attested install key, it is a `provision_wire_version=2` change.
 - [ ] #4 (provenance hygiene) **Mint a RANDOM per-enclave `enclave_scope_id` via `getrandom`.** Do
   NOT copy the genesis/reference `[0xe1;32]` sentinel — that fixed value is a TEST FIXTURE
   (`genesis_body()` + `reference_keystore_body()` in `agent_keystore.rs`, both feature-gated to
@@ -120,6 +131,13 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   sensitive surfaces → **Full Matrix** incl. the 2×3 concurrency floor (`pse-review-2x3.sh`).
   (The original "each sub-slice is Full Matrix" was written for 25-2b-as-a-whole; the per-slice split
   lets the pure slices land on Reduced, the state-machine slices on Full.)
+  **⚠ Full Matrix PARTIAL for iii + iv (compact 9113):** the gemini 2×3 cells (agy) failed on
+  non-interactive re-auth (AGENTS.md known scenario; cannot re-auth without an interactive terminal).
+  So iii + iv are reviewed under a PARTIAL Full Matrix: codex×3 (security/design/design-max) +
+  claude-code/design + gemini/security(Reduced) all completed; the gemini design + design-max 2×3
+  views are the OPEN gap. The design lens is multi-covered (claude-code + codex×2), so this is a
+  documented degradation, NOT a clean Full Matrix — re-run `pse-review-2x3.sh` interactively (after
+  `agy` re-login) to close it before the runtime driver wires.
   - **25-2b-i (DONE — reviewed)** — `agent_provision.rs` (agent-gateway-gated): pure codec for the
     frozen `provision_wire_version=1` — envelope (magic/version/msg_type), per-state direction
     validation (`HandshakeStep`/`validate_inbound`), M1-M4 encode/decode, `ProvisionConfig` + §5.1

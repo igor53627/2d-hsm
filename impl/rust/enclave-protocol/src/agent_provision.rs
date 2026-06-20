@@ -124,7 +124,9 @@ pub(crate) enum ProvisionError {
     BadSignature,
     // ── mint+seal arms (slice iv) ──
     /// The in-TEE CSPRNG (`getrandom`) failed — the `enclave_scope_id` mint or the seal nonce could
-    /// not draw randomness. Fail-closed (the AC#3/#4 host-uncontrollable provenance is unavailable).
+    /// not draw randomness — OR a successfully-drawn scope id was a rejected degenerate/fixture value
+    /// (see [`mint_enclave_scope_id`]/[`validate_minted_scope_id`]: all-zero / [0xe1]/[0xf1] sentinels).
+    /// Either way the AC#3/#4 host-uncontrollable provenance is unavailable; fail-closed.
     Csprng,
     /// `seal_body` rejected the freshly-constructed genesis body (a body this code just built should
     /// not fail `validate()`; a non-CSPRNG seal failure indicates an internal invariant break).
@@ -1051,7 +1053,7 @@ mod tests {
             recovery_authority_pk: [0xa2; 32],
             backup_recovery_wrapping_pubkey: vec![0xb0; ML_KEM_1024_ENCAPS_KEY_LEN],
             anchor_root: [0xa3; 32],
-            fleet_scope_id: [0xf1; 32],
+            fleet_scope_id: [0xf5; 32], // a provisioning-test fleet id, DISTINCT from the [0xf1;32] keystore test fixture (AC#7)
         }
     }
 
