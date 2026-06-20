@@ -862,7 +862,15 @@ pub(crate) fn validate_minted_scope_id(id: &[u8; DIGEST_LEN]) -> Result<(), Prov
 /// (`cumulative_signing_budget = [0;32]` ⇒ §2 fails closed until a CONFIGURE_TREASURY budget is sealed);
 /// `entries`/`counters` are empty (keys/caps are minted later by GENERATE_KEYS). Mirrors the genesis
 /// init of `boot_agent_keystore::genesis_body`, MINUS the test sentinels + with the basket-C version
-/// pinned to the spec's `1`.
+/// pinned to the spec's `1` (the lab `genesis_body` uses `monotonic_treasury_config_version = 0`; prod
+/// pins `1` per §5.1 — the divergence is intentional, §5.1 is authoritative for production).
+///
+/// **`enclave_scope_id` is NOT attested in M2 / the M3 transcript** — it is minted HERE (at seal time,
+/// inside `on_m3` after the §6 verify), host-uncontrollable by construction (the §5.1 wire map has NO
+/// field for it — I2; the host never sees it until it is sealed). AC#2's "mint before M2 / attested-
+/// channel binding" was the 25-1 design-doc concept; the FROZEN 25-2a format binds only
+/// `(config, N_p, N_e, report_hash)` and carries no scope id — so the id's provenance is STRUCTURAL
+/// (host cannot supply it), not a per-field attestation.
 pub(crate) fn build_provisioned_keystore_body(
     config: &ProvisionConfig,
     enclave_scope_id: [u8; DIGEST_LEN],

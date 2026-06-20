@@ -114,12 +114,12 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   (25-2a-rev2 Low): (i) pure codec + DoS caps + §9 structural negatives; (ii) provisioner-cert
   chain validation + role-constraint check; (iii) verify-order integration (transcript + Sig_PROV);
   (iv) mint+seal wiring; (v) golden-vector regen test. **Per-slice review gate (clarified
-  2026-06-20, compact 9048):** slices i + ii are PURE functions (codec / cert-verify — no state,
-  no concurrency) → **Reduced Matrix** suffices; slice iii integrates the transcript+Sig_PROV verify
-  into the **handshake state machine** (the concurrency/ordering-sensitive surface — ARM vs SIGN vs
-  GET_STATUS ordering) → **Full Matrix** incl. the 2×3 concurrency floor (`pse-review-2x3.sh`).
-  (The original "each sub-slice is Full Matrix" was written for 25-2b-as-a-whole; the per-slice
-  split lets the pure slices land on Reduced, the state-machine slice on Full.)
+  2026-06-20, compact 9048 + 9109):** slices i + ii are PURE functions (codec / cert-verify — no
+  state, no concurrency) → **Reduced Matrix** suffices; slices iii (verify-order) AND iv
+  (`ProvisionSession` stateful: AwaitingM1→AwaitingM3→Done/Failed) are the state-machine / ordering-
+  sensitive surfaces → **Full Matrix** incl. the 2×3 concurrency floor (`pse-review-2x3.sh`).
+  (The original "each sub-slice is Full Matrix" was written for 25-2b-as-a-whole; the per-slice split
+  lets the pure slices land on Reduced, the state-machine slices on Full.)
   - **25-2b-i (DONE — reviewed)** — `agent_provision.rs` (agent-gateway-gated): pure codec for the
     frozen `provision_wire_version=1` — envelope (magic/version/msg_type), per-state direction
     validation (`HandshakeStep`/`validate_inbound`), M1-M4 encode/decode, `ProvisionConfig` + §5.1
@@ -154,6 +154,24 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
     coverage held via Reduced security + one design-max cell, and the design lens is multi-covered
     (claude-code + codex×2) — the missing gemini-design-2×3 view is the documented gap. 53 tests;
     544 total pass.
+  - **25-2b-iv (DONE — reviewed)** — mint+seal + `ProvisionSession`: `mint_enclave_scope_id`
+    (getrandom, AC#3/#4; `validate_minted_scope_id` rejects zero + [0xe1]/[0xf1] sentinels),
+    `build_provisioned_keystore_body` (basket A/B/C mapping, genesis-zero faucet), `seal_provisioned_keystore`
+    (→ M4 blob), `ProvisionSession` (pure transport-free: on_m1 mints N_e + report_data; on_m3 runs
+    verify_m3_in_order → mint scope_id → seal). **One-shot failure semantics (Full Matrix HIGH fix):**
+    on_m3 CONSUMES the session on ANY error (→ Failed terminal) so the host cannot retry forged M3s
+    against a fixed N_e (static-target / fault-injection / oracle defense — must restart from M1).
+    **Full Matrix** (Reduced + 2×3): gemini + codex×2 convergent HIGH (session-not-consumed) + Mediums
+    (fleet_scope_id=0 → Malformed at decode; sentinel rejection; scope_id attestation-timing
+    reconciliation with AC#2; genesis-version divergence note) addressed in `82aac6e`. 62 tests; 554
+    total pass. **Same gemini 2×3 agy degradation** as iii (noted).
+  - **Driver contract (slice iv → the `twod-hsm-agent-gateway` bootstrap bin, deferred):** (1) the
+    `seal_root` + `measurement` passed to `ProvisionSession::new` MUST be the SAME measurement proven
+    in the M2 SNP report (derive both from one source — never seal under a measurement the provisioner
+    did not attest); (2) one-shot failure — a Failed session ⇒ tear down the bootstrap listener (the
+    host must re-connect + re-M1 for any retry; Q5 already makes the listener one-connection); (3) wrap
+    `on_m3`'s sealed blob in `encode_m4` + the envelope before emitting; (4) the operator-CA-root pin
+    + measurement allowlist are compiled into the bin (25-1 Q7).
 - **25-3..25-6** — per 25-1 §7 (enclave_scope_id in-TEE mint; production nix profile; restore identity
   hard gate on TASK-24; operator runbook).
 
