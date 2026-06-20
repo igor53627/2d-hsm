@@ -17,14 +17,20 @@ exclude_patterns = [
 ]
 
 # NOTE: the LOCAL Reduced Matrix is 4 cells — codex/security, gemini/security,
-# claude-code/design, and grok/security. The grok cell runs via the NATIVE grok
-# CLI (~/pse/roborev/grok-cell.sh), and the gemini cell runs via the Antigravity
+# claude-code/design, and grok/security. As of 2026-06-20 the grok cell DEFAULTS
+# to `roborev review --agent pi --provider xai --model grok-code-fast-1` (pi reads
+# the paid xAI key from ~/.pi/agent/auth.json) — findings land in the roborev DB
+# so `roborev compact` consolidates them. The NATIVE grok CLI
+# (~/pse/roborev/grok-cell.sh, free Antigravity OAuth) is the FALLBACK
+# (GROK_VIA_PI=0 in pse-review-reduced.sh, or auto-fallback if xai is missing
+# from auth.json) — its findings print to the `===== grok/security =====` block
+# and are NOT compact-consolidated. The gemini cell runs via the Antigravity
 # `agy` CLI with NO `--model` (Google deprecated gemini-cli's free tier →
-# IneligibleTierError; roborev #730). See AGENTS.md for both. The `[ci]` block
-# below is intentionally only the 3 native roborev-DB vendors (codex/gemini/
-# claude-code): the grok cell's findings are OUTSIDE the roborev DB (read its
-# printed block), so it runs only in the local matrix, not CI. This 3-agent CI
-# set is a deliberate scope, not a stale config.
+# IneligibleTierError; roborev #730 — passing --model forces the legacy
+# gemini-cli and fails closed). See AGENTS.md for both cells' preconditions
+# (verify `done`, don't assume). The `[ci]` block below is the 3 core vendors
+# (codex/gemini/claude-code); the grok cell runs in the LOCAL matrix (default
+# in-DB via pi+xai), not PR CI.
 
 [ci]
 # PR CI: three vendors × two lenses (6 cells). Per-agent models are not
