@@ -481,6 +481,119 @@ pub(crate) fn decode_config_map(bytes: &[u8]) -> Result<ProvisionConfig, Provisi
         fleet_scope_id,
     })
 }
+// ════════════════════════════════════════════════════════════════════════════════
+// provisioner_cert — DER X.509 leaf verify (single-level chain + role EKU)  (§7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+use x509_cert::der::asn1::ObjectIdentifier;
+
+/// Raw Ed25519 public-key / signature-key length (RFC 8032).
+const ED25519_PUBKEY_LEN: usize = 32;
+
+/// The dedicated **provisioner role EKU OID** (25-2b §7): `2.25.209175620`, under the private `2.25`
+/// arc. A leaf under the operator CA MUST carry this OID in its Extended Key Usage extension; it is
+/// the SOLE role marker (no Subject-string alternative — 25-2a-rev2 narrowing). A leaf issued for any
+/// OTHER purpose (TLS client, code-signing, log-signing) lacks it ⇒ [`ProvisionError::UnauthorizedProvisioner`]
+/// (confused-deputy defense — without it, ANY leaf under the operator CA is a valid provisioner).
+///
+/// **Arc value choice:** the spec's `2.25.<random>` is a private unregistered OID. `const-oid` (both
+/// 0.9 and 0.10, used transitively by `x509-cert`) types its arc as `u32` AND caps each arc at
+/// `ARC_MAX_BYTES = size_of::<u32> = 4` base-128 bytes (max value 268435455), so a 128-bit
+/// UUID-derived `2.25` value is unrepresentable. The frozen value is the low 28 bits of the candidate
+/// UUID `6d847b22-9b6e-4c2f-8aa1-5f3e0c7b9d44`'s node id (`0x0C7B9D44` = 209175620) — traceable to
+/// that UUID while fitting the 4-byte-arc limit (round-trip-verified). Collision resistance is a
+/// non-issue: the operator CA is the SOLE assigner, so the value space is far more than enough for
+/// one frozen role marker.
+pub(crate) const PROVISIONER_EKU_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.25.209175620");
+
+/// The Ed25519 algorithm OID (RFC 8410: `id-Ed25519 = 1.3.101.112`). The provisioner leaf's SPKI
+/// MUST use this algorithm with ABSENT parameters.
+const ED25519_ALG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
+
+/// Verify the M3 `provisioner_cert` (§7) against the **pinned operator CA root** + the role EKU.
+/// Returns the provisioner's Ed25519 verifying key (for slice iii's `Sig_PROV` verify).
+///
+/// **Single-level chain (MVP):** the leaf is signed DIRECTLY by the pinned root — no intermediate
+/// CA, no path validation. This fn performs exactly four checks: (1) DER parse (strict — x509-cert/
+/// der reject non-canonical input); (2) v3 + Ed25519 SPKI extraction; (3) one Ed25519 `verify_strict`
+/// of the cert signature over the TBS bytes against `operator_ca_root`; (4) the EKU extension MUST
+/// carry [`PROVISIONER_EKU_OID`].
+///
+/// **`operator_ca_root`** is the pinned root verifying key — compiled into the enclave binary at
+/// build (the same binary-pinning discipline as the Q7 measurement allowlist); passed as a parameter
+/// so the verify path is pure + testable, with the production pin wired by slice iv's install path.
+/// Rotation = re-build with a new pin (the in-enclave clock-free epoch marker; §7 revocation).
+///
+/// **Signature is verified BEFORE the EKU check** (step 3 ≺ step 4): the EKU is only meaningful on an
+/// AUTHENTICATED cert — a forgable cert's EKU is worthless, so authenticity is established first.
+///
+/// **Error taxonomy (§9):** malformed DER / non-v3 / non-Ed25519 key / bad signature encoding ⇒
+/// [`ProvisionError::Malformed`]; signature not verifying under the pinned root OR the role EKU
+/// missing/wrong ⇒ [`ProvisionError::UnauthorizedProvisioner`]. No wall-clock / `not_before`/
+/// `not_after` check (§7 — the SNP TEE has no trusted clock; provisioner-cert lifecycle is CA-root
+/// rotation + optional cert-serial denylist, NOT validity-window enforcement).
+///
+/// **TBS bytes:** `tbs.to_der()` re-encodes the parsed TBS canonically; for canonical certs
+/// (openssl / cloud-KMS output) this is byte-identical to the CA-signed bytes. A non-canonical cert
+/// would fail the verify (fail-closed-safe — such certs do not occur from standard tooling).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn verify_provisioner_cert(
+    cert_der: &[u8],
+    operator_ca_root: &ed25519_dalek::VerifyingKey,
+) -> Result<ed25519_dalek::VerifyingKey, ProvisionError> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    use x509_cert::der::{Decode, Encode};
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::Certificate;
+
+    // 1. DER parse.
+    let cert = Certificate::from_der(cert_der).map_err(|_| ProvisionError::Malformed)?;
+    let tbs = &cert.tbs_certificate;
+
+    // 2. v3 (extensions — incl. the role EKU — require v3); Ed25519 SPKI (RFC 8410: alg 1.3.101.112,
+    //    parameters absent).
+    if tbs.version != x509_cert::Version::V3 {
+        return Err(ProvisionError::Malformed);
+    }
+    let spki = &tbs.subject_public_key_info;
+    if spki.algorithm.oid != ED25519_ALG_OID || spki.algorithm.parameters.is_some() {
+        return Err(ProvisionError::Malformed);
+    }
+    let prov_pub_bytes = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or(ProvisionError::Malformed)?;
+    if prov_pub_bytes.len() != ED25519_PUBKEY_LEN {
+        return Err(ProvisionError::Malformed);
+    }
+    let prov_pub = VerifyingKey::from_bytes(
+        prov_pub_bytes
+            .try_into()
+            .map_err(|_| ProvisionError::Malformed)?,
+    )
+    .map_err(|_| ProvisionError::Malformed)?;
+
+    // 3. Cert signature over the TBS bytes, verified against the pinned operator CA root.
+    let tbs_der = tbs.to_der().map_err(|_| ProvisionError::Malformed)?;
+    let sig_bytes = cert.signature.as_bytes().ok_or(ProvisionError::Malformed)?;
+    let sig = Signature::from_slice(sig_bytes).map_err(|_| ProvisionError::Malformed)?;
+    operator_ca_root
+        .verify_strict(&tbs_der, &sig)
+        .map_err(|_| ProvisionError::UnauthorizedProvisioner)?;
+
+    // 4. Role constraint: the dedicated EKU OID MUST be present (the sole role marker).
+    let has_role = tbs
+        .get::<ExtendedKeyUsage>()
+        .map_err(|_| ProvisionError::Malformed)?
+        .map(|(_, ExtendedKeyUsage(oids))| oids.contains(&PROVISIONER_EKU_OID))
+        .unwrap_or(false);
+    if !has_role {
+        return Err(ProvisionError::UnauthorizedProvisioner);
+    }
+
+    Ok(prov_pub)
+}
 
 #[cfg(test)]
 mod tests {
@@ -896,4 +1009,142 @@ mod tests {
         bad[1] = 0x02; // key 2
         assert_eq!(decode_m4(&bad), Err(ProvisionError::Malformed));
     }
+    // ── §7 provisioner_cert verify (slice 25-2b-ii) ──────────────────────────────
+
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+
+    /// The frozen provisioner EKU OID (the const is `pub(crate)`; this re-exports it for test use).
+    fn eku_oid() -> ObjectIdentifier {
+        PROVISIONER_EKU_OID
+    }
+    /// Mint a v3 Ed25519 leaf cert signed by `ca_sk` (the operator CA root). `ekus` selects the
+    /// Extended Key Usage extension: `Some(&[eku_oid()])` ⇒ a valid provisioner cert; `Some(&[other])`
+    /// ⇒ wrong role; `None` ⇒ no EKU. TEST-ONLY scaffolding (direct `TbsCertificate` assembly — no
+    /// x509-cert builder/signature-feature dependency; signs with the crate's direct Ed25519 sign).
+    fn mint_cert(
+        provisioner_pub: &VerifyingKey,
+        ca_sk: &SigningKey,
+        ekus: Option<&[x509_cert::der::asn1::ObjectIdentifier]>,
+    ) -> Vec<u8> {
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::der::asn1::{BitString, OctetString};
+        use x509_cert::der::Encode;
+        use x509_cert::ext::Extension;
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+        use x509_cert::time::Validity;
+        use x509_cert::{Certificate, TbsCertificate, Version};
+        use ed25519_dalek::Signer;
+
+        let alg = AlgorithmIdentifierOwned {
+            oid: ED25519_ALG_OID.clone(),
+            parameters: None,
+        };
+        let spki = SubjectPublicKeyInfoOwned {
+            algorithm: alg.clone(),
+            subject_public_key: BitString::from_bytes(&provisioner_pub.to_bytes()).unwrap(),
+        };
+        let validity = Validity::from_now(Duration::from_secs(86400)).unwrap();
+        let extensions = ekus.map(|oids| {
+            let eku_der = ExtendedKeyUsage(oids.to_vec()).to_der().unwrap();
+            vec![Extension {
+                extn_id: x509_cert::der::asn1::ObjectIdentifier::new_unwrap("2.5.29.37"),
+                critical: false,
+                extn_value: OctetString::new(eku_der).unwrap(),
+            }]
+        });
+        let tbs = TbsCertificate {
+            version: Version::V3,
+            serial_number: SerialNumber::from(1u32),
+            signature: alg.clone(),
+            issuer: Name::from_str("CN=test-operator-ca").unwrap(),
+            validity,
+            subject: Name::from_str("CN=test-provisioner").unwrap(),
+            subject_public_key_info: spki,
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions,
+        };
+        let tbs_der = tbs.to_der().unwrap();
+        let sig = ca_sk.sign(&tbs_der);
+        let cert = Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: alg,
+            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+        };
+        cert.to_der().unwrap()
+    }
+
+    /// Operator CA root keypair (deterministic test key).
+    fn test_ca() -> SigningKey {
+        SigningKey::from_bytes(&[0xC1; 32])
+    }
+
+
+    #[test]
+    fn cert_valid_verifies_and_returns_provisioner_pubkey() {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let prov_vk = prov.verifying_key();
+        let cert = mint_cert(&prov_vk, &ca, Some(&[eku_oid()]));
+        // Verifies against the pinned CA root and returns the provisioner's pubkey.
+        assert_eq!(verify_provisioner_cert(&cert, &ca.verifying_key()), Ok(prov_vk));
+    }
+
+    #[test]
+    fn cert_signed_by_wrong_ca_is_unauthorized() {
+        // A leaf signed by a DIFFERENT CA key does not verify under the pinned root.
+        let rogue_ca = SigningKey::from_bytes(&[0xC2; 32]);
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert(&prov.verifying_key(), &rogue_ca, Some(&[eku_oid()]));
+        assert_eq!(
+            verify_provisioner_cert(&cert, &test_ca().verifying_key()),
+            Err(ProvisionError::UnauthorizedProvisioner)
+        );
+    }
+
+    #[test]
+    fn cert_missing_eku_is_unauthorized() {
+        // A leaf with NO Extended Key Usage at all — the role marker is absent.
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert(&prov.verifying_key(), &ca, None);
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::UnauthorizedProvisioner)
+        );
+    }
+
+    #[test]
+    fn cert_wrong_eku_is_unauthorized() {
+        // A leaf whose EKU is a DIFFERENT OID (e.g. a TLS-client-usage cert under the same CA) —
+        // it chains to the root but lacks the provisioning role marker.
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let other_oid =
+            x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2"); // id-kp-clientAuth
+        let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[other_oid]));
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Err(ProvisionError::UnauthorizedProvisioner)
+        );
+    }
+
+    #[test]
+    fn cert_malformed_der_is_malformed() {
+        let ca = test_ca();
+        // Truncated / garbage DER.
+        assert_eq!(
+            verify_provisioner_cert(&[0x30, 0x05], &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            verify_provisioner_cert(&[0xDE, 0xAD, 0xBE, 0xEF], &ca.verifying_key()),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
 }
