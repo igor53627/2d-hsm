@@ -134,6 +134,10 @@ pub mod vsock {
         let (mut stream, _peer_addr) = listener
             .accept()
             .map_err(|_| ProvisionError::Malformed)?;
+        // Bound read/write stalls (SO_RCVTIMEO/SO_SNDTIMEO) — a peer that connects but stops
+        // reading/writing cannot hang the one-shot bootstrap (compact 9177/9180 Medium).
+        vsock_listen::configure_vsock_session_timeouts(&mut stream)
+            .map_err(|_| ProvisionError::Malformed)?;
         run_provisioning_ceremony(
             &mut stream,
             pinned_root,
