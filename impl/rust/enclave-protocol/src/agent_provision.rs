@@ -488,9 +488,12 @@ pub(crate) fn decode_config_map(bytes: &[u8]) -> Result<ProvisionConfig, Provisi
         .ok_or(ProvisionError::Malformed)?;
     let fleet_scope_id = as_bytes32(map_get(&map, 7).ok_or(ProvisionError::Malformed)?)
         .ok_or(ProvisionError::Malformed)?;
-    // AC#7 provenance: fleet_scope_id must be a real fleet identity, not the zero id (which would
-    // collapse fleet-scoped caps + misclassify as a SealFailed downstream via KeystoreBody::validate).
-    if fleet_scope_id == [0u8; DIGEST_LEN] {
+    // AC#7 provenance: fleet_scope_id must be a real fleet identity, not the zero id NOR the
+    // [0xf1;32] keystore test fixture (a production path that hardcodes the fixture instead of taking
+    // it from the authenticated provisioner is caught here). Unlike enclave_scope_id (unique-per-
+    // enclave ⇒ a known value is a clone-replay vector), fleet_scope_id is shared-by-design — the
+    // rejection is anti-hardcoding defense, not a value-security property.
+    if fleet_scope_id == [0u8; DIGEST_LEN] || fleet_scope_id == [0xf1u8; 32] {
         return Err(ProvisionError::Malformed);
     }
     Ok(ProvisionConfig {
@@ -2161,6 +2164,15 @@ mod tests {
         // fleet-scoped caps and misclassify as SealFailed downstream via KeystoreBody::validate).
         let mut cfg = sample_config();
         cfg.fleet_scope_id = [0u8; 32];
+        assert_eq!(decode_config_map(&encode_config_map(&cfg)), Err(ProvisionError::Malformed));
+    }
+
+    #[test]
+    fn config_map_fleet_scope_id_fixture_is_malformed() {
+        // AC#7: the [0xf1;32] keystore test fixture is rejected — a production path that hardcodes
+        // it (instead of taking the fleet id from the authenticated provisioner) is caught at decode.
+        let mut cfg = sample_config();
+        cfg.fleet_scope_id = [0xf1u8; 32];
         assert_eq!(decode_config_map(&encode_config_map(&cfg)), Err(ProvisionError::Malformed));
     }
 
