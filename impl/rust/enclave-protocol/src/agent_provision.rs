@@ -2201,4 +2201,77 @@ mod tests {
         }
     }
 
+    // ── §10 golden-vector regen (slice 25-2b-v) ─────────────────────────────────
+    //
+    // The frozen golden test keys (committed alongside this test, per §10.4): operator CA root
+    // SigningKey = from_bytes(&[0xC1;32]) (== test_ca); provisioner SigningKey = from_bytes(&[0x70;32]).
+    // The golden inputs: sample_config (chain_id=11565, env="prod-0", admin=[0xa1;32], recovery=[0xa2;32],
+    // backup=[0xb0;1568], anchor=[0xa3;32], fleet=[0xf5;32]), N_p=[0x11;32], N_e=[0x22;32],
+    // report_hash=[0x33;32]. Sig_PROV is deterministic (Ed25519 — RFC 8032), so the golden reproduces.
+
+    /// SHA3-256 of the golden §5.1 config_map (a compact drift-catcher for the ~1.7 KiB config blob).
+    const GOLDEN_CONFIG_MAP_HASH: &str =
+        "a55d920d03d35e3c9cd3987e348e2bfce13033a2bfaa4ddc1022526b43c90a8f";
+
+    /// The golden `Sig_PROV` — Ed25519(golden_provisioner_sk, PROVISION_DOMAIN ‖ golden transcript).
+    /// Deterministic (RFC 8032); freezing it catches ANY drift in the transcript (config + N_p + N_e +
+    /// report_hash) OR the provisioner key (a change makes the regen produce a different signature).
+    const GOLDEN_SIG_PROV: &str =
+        "8abe9db998691b5728b50d33e01a45ad43826c57045b103238f234d7cc80a872bfb33e2f82a84ad9684f4d9b8905fcad8434e1317586041068522e0e1a9fd704";
+
+    /// The golden M3 session values (§10.4): N_p, N_e, report_hash.
+    const GOLDEN_N_P: [u8; 32] = [0x11; 32];
+    const GOLDEN_N_E: [u8; 32] = [0x22; 32];
+    const GOLDEN_REPORT_HASH: [u8; 32] = [0x33; 32];
+
+    /// Regenerate the §10 golden vectors + assert they match the frozen literals. A drift in the
+    /// encoder (config_map), the transcript construction, or the provisioner key breaks this test.
+    #[test]
+    fn golden_vectors_regen() {
+        use ed25519_dalek::Signer;
+        use sha3::{Digest, Sha3_256};
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+
+        // §10.3 config_map_hash.
+        let cfg = encode_config_map(&sample_config());
+        let cfg_hash: [u8; 32] = Sha3_256::digest(&cfg).into();
+        assert_eq!(
+            hex::encode(cfg_hash),
+            GOLDEN_CONFIG_MAP_HASH,
+            "golden config_map SHA3-256 drifted — encoder or sample_config changed"
+        );
+
+        // §10.4 Sig_PROV over PROVISION_DOMAIN ‖ transcript.
+        let signed = sig_prov_signed_bytes(&cfg, &GOLDEN_N_P, &GOLDEN_N_E, &GOLDEN_REPORT_HASH);
+        let sig = prov.sign(&signed).to_bytes();
+        assert_eq!(
+            hex::encode(sig),
+            GOLDEN_SIG_PROV,
+            "golden Sig_PROV drifted — the transcript, PROVISION_DOMAIN, or provisioner key changed"
+        );
+    }
+
+    /// §10.4: the golden M3 is ACCEPTED by the full verify pipeline + the verifier reaches mint+seal.
+    /// Builds the golden M3 (golden config + a golden provisioner cert + the golden Sig_PROV) and runs
+    /// the full §6 verify_m3_in_order against the golden session.
+    #[test]
+    fn golden_m3_accepted_by_verify_pipeline() {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[eku_oid()]));
+        let cfg = encode_config_map(&sample_config());
+        let sig = hex::decode(GOLDEN_SIG_PROV).unwrap();
+        let sig: [u8; SIG_PROV_LEN] = sig.try_into().unwrap();
+        let m3 = build_m3_message(&cfg, &GOLDEN_N_P, &GOLDEN_N_E, &GOLDEN_REPORT_HASH, &sig, &cert);
+        // The full §6 verify order accepts the golden M3 against the golden session + pinned CA root.
+        let (config, prov_pub) = verify_m3_in_order(&m3, &ca.verifying_key(), &GOLDEN_N_P, &GOLDEN_N_E, &GOLDEN_REPORT_HASH)
+            .expect("the golden M3 MUST pass the full §6 verify order");
+        assert_eq!(config, sample_config(), "the decoded golden config matches");
+        assert_eq!(prov_pub, prov.verifying_key(), "the authenticated provisioner pubkey matches");
+        // `verify_m3_in_order` returning Ok IS the §10.4 proof: the golden M3 passes the full §6 order
+        // (envelope → cert → transcript → Sig_PROV → config re-decode) and the verifier reaches the
+        // mint+seal precondition (the Ok config + pubkey are exactly what seal_provisioned_keystore +
+        // ProvisionSession::on_m3 consume). The mint+seal step itself is exercised by session_happy_path.
+    }
+
 }
