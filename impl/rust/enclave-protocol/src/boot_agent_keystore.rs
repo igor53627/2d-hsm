@@ -169,7 +169,7 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     feature = "agent-gateway"
 ))]
 fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolError> {
-    use crate::provision_bootstrap::{self, ProvisionReportProducer};
+    use crate::provision_bootstrap::ProvisionReportProducer;
     use crate::env_config::{
         var_twod, LEGACY_HSM_OPERATOR_CA_ROOT_HEX, TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
         LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_OPERATOR_CA_ROOT_HEX,
@@ -182,16 +182,22 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
         .map_err(|_| ProtocolError::PqSigningUnavailable(
             "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX not set (the pinned operator CA root pubkey)"
         ))?;
-    let ca_bytes = hex::decode(&ca_hex).map_err(|_| ProtocolError::PqSigningUnavailable(
-        "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not valid hex"
-    ))?;
-    if ca_bytes.len() != 32 {
+    // Decode hex → 32 bytes WITHOUT the `hex` crate (not pulled by agent-gateway in production).
+    let ca_hex_trimmed = ca_hex.trim();
+    if ca_hex_trimmed.len() != 64 {
         return Err(ProtocolError::PqSigningUnavailable(
-            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX must be exactly 32 bytes (64 hex chars)"
+            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX must be exactly 64 hex chars (32 bytes)"
         ));
     }
     let mut ca_arr = [0u8; 32];
-    ca_arr.copy_from_slice(&ca_bytes);
+    for (i, byte) in ca_arr.iter_mut().enumerate() {
+        let pair = &ca_hex_trimmed[i * 2..i * 2 + 2];
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| {
+            ProtocolError::PqSigningUnavailable(
+                "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not valid hex"
+            )
+        })?;
+    }
     let pinned_root = ed25519_dalek::VerifyingKey::from_bytes(&ca_arr).map_err(|_| {
         ProtocolError::PqSigningUnavailable(
             "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not a valid Ed25519 public key"
@@ -285,7 +291,7 @@ fn agent_boot_measurement() -> Result<Vec<u8>, ProtocolError> {
         LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
     ) {
         Ok(path) => {
-            let mut bytes = crate::boot_input::read_boot_file_capped(
+            let bytes = crate::boot_input::read_boot_file_trim_trailing_newlines(
                 path.as_ref(),
                 AGENT_MEASUREMENT_FILE_MAX_BYTES,
                 "agent keystore: failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE",
