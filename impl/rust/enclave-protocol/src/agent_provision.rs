@@ -122,6 +122,13 @@ pub(crate) enum ProvisionError {
     UnauthorizedProvisioner,
     /// `Sig_PROV` did not verify under the provisioner cert's key (§6/§9).
     BadSignature,
+    // ── mint+seal arms (slice iv) ──
+    /// The in-TEE CSPRNG (`getrandom`) failed — the `enclave_scope_id` mint or the seal nonce could
+    /// not draw randomness. Fail-closed (the AC#3/#4 host-uncontrollable provenance is unavailable).
+    Csprng,
+    /// `seal_body` rejected the freshly-constructed genesis body (a body this code just built should
+    /// not fail `validate()`; a non-CSPRNG seal failure indicates an internal invariant break).
+    SealFailed,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -807,6 +814,192 @@ pub(crate) fn verify_m3_in_order(
     // §6 step 5: config re-decode (post-signature: the config bytes are now Sig_PROV-bound).
     let config = decode_config_map(&m3.config_map_bytes)?;
     Ok((config, prov_pub))
+}
+// ════════════════════════════════════════════════════════════════════════════════
+// Mint + seal (slice 25-2b-iv) — the in-TEE enclave_scope_id provenance + the sealed M4 blob
+// ════════════════════════════════════════════════════════════════════════════════
+
+use crate::agent_keystore::{seal_body, AuditRing, FaucetState, KeystoreBody, KeystoreConfig, KeystoreError};
+
+/// Mint the per-enclave `enclave_scope_id` (AC#3/#4 — the load-bearing host-uncontrollable
+/// provenance): a RANDOM 32-byte id drawn from the platform CSPRNG (`getrandom`), in-TEE, exactly
+/// once at provisioning. This is the SOLE field the host cannot supply (the §5.1 wire map has NO key
+/// for it — I2). NEVER the `[0xe1;32]` / `[0xf1;32]` test sentinels (those are `#[cfg(test)]` /
+/// lab-gated fixtures; a clone reproducing a known id would defeat the 18-2 byte-compare). An all-zero
+/// id is rejected (a degenerate CSPRNG output / clone-replay vector; `KeystoreBody::validate` would
+/// also reject it downstream — checked here for a clear provenance error).
+pub(crate) fn mint_enclave_scope_id() -> Result<[u8; DIGEST_LEN], ProvisionError> {
+    let mut id = [0u8; DIGEST_LEN];
+    getrandom::getrandom(&mut id).map_err(|_| ProvisionError::Csprng)?;
+    if id == [0u8; DIGEST_LEN] {
+        return Err(ProvisionError::Csprng);
+    }
+    Ok(id)
+}
+
+/// Construct the production **provisioned** `KeystoreBody` (genesis-equivalent initial state) from the
+/// verified provisioner config + the freshly-minted `enclave_scope_id` (25-1 Q2: the enclave seals its
+/// OWN keystore — the provisioner sends only the public config; the plaintext never leaves the TEE).
+///
+/// **Basket mapping (25-1 Q4):** (A) enclave-minted → `enclave_scope_id` (the param); (B) provisioner-
+/// supplied (the 7 fields from [`ProvisionConfig`]); (C) enclave-init deterministic →
+/// `monotonic_treasury_config_version = 1`, `authority_epoch = 0` (§5.1). The faucet is genesis-ZERO
+/// (`cumulative_signing_budget = [0;32]` ⇒ §2 fails closed until a CONFIGURE_TREASURY budget is sealed);
+/// `entries`/`counters` are empty (keys/caps are minted later by GENERATE_KEYS). Mirrors the genesis
+/// init of `boot_agent_keystore::genesis_body`, MINUS the test sentinels + with the basket-C version
+/// pinned to the spec's `1`.
+pub(crate) fn build_provisioned_keystore_body(
+    config: &ProvisionConfig,
+    enclave_scope_id: [u8; DIGEST_LEN],
+) -> KeystoreBody {
+    KeystoreBody {
+        config: KeystoreConfig {
+            twod_chain_id: config.twod_chain_id,
+            environment_identifier: config.environment_identifier.clone(),
+            admin_authority_pk: config.admin_authority_pk,
+            recovery_authority_pk: config.recovery_authority_pk,
+            backup_recovery_wrapping_pubkey: config.backup_recovery_wrapping_pubkey.clone(),
+            monotonic_treasury_config_version: 1, // basket C init (§5.1)
+            authority_epoch: 0, // basket C init (§5.1)
+            anchor_root: config.anchor_root,
+            enclave_scope_id,
+            fleet_scope_id: config.fleet_scope_id,
+        },
+        entries: Vec::new(),
+        counters: Vec::new(),
+        faucet: FaucetState {
+            per_dispense_max_amount: [0; 32],
+            max_gas_limit: 0,
+            max_effective_gas_fee_rate: 0,
+            cumulative_native_spend: [0; 32],
+            lifetime_spend: [0; 32],
+            circuit_breaker_threshold: None,
+            cumulative_signing_budget: [0; 32], // §2: unconfigured ⇒ fails closed
+        },
+        audit: AuditRing {
+            records: Vec::new(),
+            capacity: 256,
+            last_exported_seq: 0,
+            next_seq: 1,
+        },
+        freshness_epoch: 1,
+        structural_version: 1,
+        strict_recovery_counter: 0,
+    }
+}
+
+/// Build the provisioned body + `seal_body` it under the measurement-derived provisioning root → the
+/// M4 `sealed_blob` (magic `2DAGTKS\0`). `provisioning_root` + `enclave_measurement` are runtime
+/// values (the driver derives them from the SNP launch measurement); passed as params so the seal path
+/// is pure/testable. A non-CSPRNG seal failure maps to [`ProvisionError::SealFailed`] (a body this code
+/// just built should not fail `validate()` — indicates an internal invariant break).
+pub(crate) fn seal_provisioned_keystore(
+    config: &ProvisionConfig,
+    enclave_scope_id: [u8; DIGEST_LEN],
+    provisioning_root: &[u8; 32],
+    enclave_measurement: &[u8],
+) -> Result<Vec<u8>, ProvisionError> {
+    let body = build_provisioned_keystore_body(config, enclave_scope_id);
+    seal_body(&body, provisioning_root, enclave_measurement).map_err(|e| match e {
+        KeystoreError::Csprng => ProvisionError::Csprng,
+        _ => ProvisionError::SealFailed,
+    })
+}
+
+/// The pure (transport-free) provisioning handshake session — the stateful caller of
+/// [`verify_m3_in_order`] + [`mint_enclave_scope_id`] + [`seal_provisioned_keystore`]. The runtime
+/// driver (the `twod-hsm-agent-gateway` bootstrap bin) owns the AF_VSOCK listener + the SNP report
+/// fetch and calls [`ProvisionSession::on_m1`] / [`ProvisionSession::on_m3`]; this struct holds ONLY
+/// the session state, so the handshake logic is CI-testable without SNP/transport.
+#[derive(Debug)]
+pub(crate) struct ProvisionSession {
+    pinned_root: ed25519_dalek::VerifyingKey,
+    seal_root: [u8; 32],
+    measurement: Vec<u8>,
+    n_p: Option<[u8; DIGEST_LEN]>,
+    n_e: Option<[u8; DIGEST_LEN]>,
+    state: SessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionState {
+    /// Awaiting M1 (the provisioner's challenge).
+    AwaitingM1,
+    /// M1 received, N_e minted, M2 emitted; awaiting M3 (the report is fetched between, by the driver).
+    AwaitingM3,
+    /// M3 verified + keystore minted+sealed (M4 emitted). Terminal — the bootstrap listener tears down.
+    Done,
+}
+
+impl ProvisionSession {
+    /// New session. `pinned_root` = the compiled-in operator CA root; `seal_root` + `measurement` =
+    /// the runtime measurement-derived keystore-seal inputs.
+    pub(crate) fn new(
+        pinned_root: ed25519_dalek::VerifyingKey,
+        seal_root: [u8; 32],
+        measurement: Vec<u8>,
+    ) -> Self {
+        Self {
+            pinned_root,
+            seal_root,
+            measurement,
+            n_p: None,
+            n_e: None,
+            state: SessionState::AwaitingM1,
+        }
+    }
+
+    /// M1 handling: record the provisioner's challenge nonce `N_p`, mint the enclave session nonce
+    /// `N_e`, and compute `report_data` (§4) — the value the driver embeds in the M2 SNP report's
+    /// `REPORT_DATA` field. Returns `(N_e, report_data)` so the driver can build + emit M2. The driver
+    /// then fetches the SNP report and passes it back to [`on_m3`](Self::on_m3). Calling out of order
+    /// (before M1, or after M3) ⇒ [`ProvisionError::Malformed`].
+    pub(crate) fn on_m1(
+        &mut self,
+        n_p: [u8; DIGEST_LEN],
+    ) -> Result<([u8; DIGEST_LEN], [u8; 64]), ProvisionError> {
+        if self.state != SessionState::AwaitingM1 {
+            return Err(ProvisionError::Malformed);
+        }
+        let mut n_e = [0u8; DIGEST_LEN];
+        getrandom::getrandom(&mut n_e).map_err(|_| ProvisionError::Csprng)?;
+        let report_data = compute_report_data(&n_p, &n_e);
+        self.n_p = Some(n_p);
+        self.n_e = Some(n_e);
+        self.state = SessionState::AwaitingM3;
+        Ok((n_e, report_data))
+    }
+
+    /// M3 handling: the full §6 verify order against THIS session, then mint `enclave_scope_id` +
+    /// seal the keystore. `report` = the M2 SNP report the driver fetched (its SHA3-256 is the
+    /// transcript's `report_hash`). Returns the decoded `ProvisionConfig` + the sealed M4 blob on
+    /// success. Terminal on success (state → `Done`); a second `on_m3` ⇒ [`ProvisionError::Malformed`].
+    /// Errors propagate the failing §6 step (e.g. [`TranscriptMismatch`](ProvisionError::TranscriptMismatch)
+    /// if the M3 was replayed against this session, [`BadSignature`](ProvisionError::BadSignature),
+    /// [`UnauthorizedProvisioner`](ProvisionError::UnauthorizedProvisioner)).
+    pub(crate) fn on_m3(
+        &mut self,
+        m3_message: &[u8],
+        report: &[u8],
+    ) -> Result<(ProvisionConfig, Vec<u8>), ProvisionError> {
+        if self.state != SessionState::AwaitingM3 {
+            return Err(ProvisionError::Malformed);
+        }
+        let n_p = self.n_p.expect("AwaitingM3 ⇒ n_p set");
+        let n_e = self.n_e.expect("AwaitingM3 ⇒ n_e set");
+        let report_hash = compute_report_hash(report);
+        let (config, _prov_pub) =
+            verify_m3_in_order(m3_message, &self.pinned_root, &n_p, &n_e, &report_hash)?;
+        let scope_id = mint_enclave_scope_id()?;
+        let sealed = seal_provisioned_keystore(&config, scope_id, &self.seal_root, &self.measurement)?;
+        self.state = SessionState::Done;
+        Ok((config, sealed))
+    }
+
+    /// Current session state (for the driver / tests).
+    pub(crate) fn state(&self) -> SessionState {
+        self.state
+    }
 }
 
 #[cfg(test)]
@@ -1770,6 +1963,143 @@ mod tests {
             verify_m3_in_order(&m3, &ca.verifying_key(), &other_np, &n_e, &report_hash),
             Err(ProvisionError::TranscriptMismatch)
         );
+    }
+
+    // ── mint + seal + session (slice 25-2b-iv) ─────────────────────────────────
+
+    #[test]
+    fn mint_enclave_scope_id_is_random_nonzero_distinct() {
+        let a = mint_enclave_scope_id().unwrap();
+        let b = mint_enclave_scope_id().unwrap();
+        assert_ne!(a, [0u8; 32], "minted scope id must not be all-zero");
+        assert_ne!(a, [0xe1u8; 32], "must NOT be the test sentinel");
+        assert_ne!(a, b, "two mints must differ (host-uncontrollable randomness)");
+    }
+
+    #[test]
+    fn build_provisioned_body_carries_config_and_genesis_state() {
+        let cfg = sample_config();
+        let scope_id = [0x5cu8; 32];
+        let body = build_provisioned_keystore_body(&cfg, scope_id);
+        // basket B (provisioner config) carried through.
+        assert_eq!(body.config.twod_chain_id, cfg.twod_chain_id);
+        assert_eq!(body.config.environment_identifier, cfg.environment_identifier);
+        assert_eq!(body.config.admin_authority_pk, cfg.admin_authority_pk);
+        assert_eq!(body.config.anchor_root, cfg.anchor_root);
+        assert_eq!(body.config.fleet_scope_id, cfg.fleet_scope_id);
+        // basket A (enclave-minted): the param, NOT a fixture.
+        assert_eq!(body.config.enclave_scope_id, scope_id);
+        assert_ne!(body.config.enclave_scope_id, [0xe1u8; 32]);
+        // basket C (enclave-init deterministic).
+        assert_eq!(body.config.monotonic_treasury_config_version, 1);
+        assert_eq!(body.config.authority_epoch, 0);
+        // genesis state: empty entries/counters, faucet unconfigured (§2 fails closed).
+        assert!(body.entries.is_empty());
+        assert!(body.counters.is_empty());
+        assert_eq!(body.faucet.cumulative_signing_budget, [0u8; 32]);
+        assert_eq!(body.structural_version, 1);
+        assert_eq!(body.freshness_epoch, 1);
+        // validate() accepts the production body (proves it is sealable).
+        body.validate().unwrap();
+    }
+
+    #[test]
+    fn seal_provisioned_keystore_round_trips() {
+        let cfg = sample_config();
+        let scope_id = mint_enclave_scope_id().unwrap();
+        let root = [0x42u8; 32];
+        let meas = b"test-measurement";
+        let blob = seal_provisioned_keystore(&cfg, scope_id, &root, meas).unwrap();
+        assert!(!blob.is_empty());
+        // unseal round-trips to a body carrying the SAME config + minted scope_id.
+        let body = crate::agent_keystore::unseal_body(&blob, &root, meas).unwrap();
+        assert_eq!(body.config.enclave_scope_id, scope_id);
+        assert_eq!(body.config.twod_chain_id, cfg.twod_chain_id);
+    }
+
+    /// Build a ProvisionSession driven against a minted-M3 happy path; returns (session, m3, report).
+    /// `on_m1` is called, so the session is in AwaitingM3 with N_e set; the M3 is signed over that N_e.
+    fn session_at_awaiting_m3(
+        seal_root: [u8; 32],
+        meas: &[u8],
+    ) -> (ProvisionSession, SigningKey, Vec<u8>, Vec<u8>, [u8; 32]) {
+        let ca = test_ca();
+        let prov = SigningKey::from_bytes(&[0x70; 32]);
+        let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[eku_oid()]));
+        let mut session = ProvisionSession::new(ca.verifying_key(), seal_root, meas.to_vec());
+        let n_p = [0x11u8; 32];
+        let (n_e, _report_data) = session.on_m1(n_p).unwrap();
+        assert_eq!(session.state(), SessionState::AwaitingM3);
+        let report = vec![0x77u8; SNP_REPORT_LEN];
+        let report_hash = compute_report_hash(&report);
+        let cfg = encode_config_map(&sample_config());
+        let m3 = mint_m3_message(&prov, &cert, &cfg, &n_p, &n_e, &report_hash);
+        (session, prov, m3, report, n_p)
+    }
+
+    #[test]
+    fn session_happy_path_mints_and_seals() {
+        let root = [0x42u8; 32];
+        let meas = b"test-measurement";
+        let (mut session, _prov, m3, report, _n_p) = session_at_awaiting_m3(root, meas);
+        let (config, sealed) = session.on_m3(&m3, &report).unwrap();
+        assert_eq!(session.state(), SessionState::Done);
+        assert_eq!(config, sample_config());
+        // The sealed blob unseals under the same root+measurement to a valid keystore whose
+        // enclave_scope_id is a freshly-minted RANDOM id (NOT a fixture).
+        let body = crate::agent_keystore::unseal_body(&sealed, &root, meas).unwrap();
+        assert_ne!(body.config.enclave_scope_id, [0u8; 32]);
+        assert_ne!(body.config.enclave_scope_id, [0xe1u8; 32]);
+        assert_eq!(body.config.twod_chain_id, sample_config().twod_chain_id);
+    }
+
+    #[test]
+    fn session_replay_different_n_e_is_transcript_mismatch() {
+        // on_m1 mints the session's N_e; an M3 signed over a DIFFERENT N_e (a captured M3 replayed
+        // against this session) ⇒ TranscriptMismatch at the §6 transcript step.
+        let root = [0x42u8; 32];
+        let meas = b"test-measurement";
+        let (mut session, prov, _m3, report, n_p) = session_at_awaiting_m3(root, meas);
+        // Build an M3 signed over a WRONG N_e (not the session's).
+        let wrong_n_e = [0x99u8; 32];
+        let report_hash = compute_report_hash(&report);
+        let cert = mint_cert(&prov.verifying_key(), &test_ca(), Some(&[eku_oid()]));
+        let cfg = encode_config_map(&sample_config());
+        let replay_m3 = mint_m3_message(&prov, &cert, &cfg, &n_p, &wrong_n_e, &report_hash);
+        assert_eq!(
+            session.on_m3(&replay_m3, &report),
+            Err(ProvisionError::TranscriptMismatch)
+        );
+        // The session is NOT consumed by a failed verify (state stays AwaitingM3).
+        assert_eq!(session.state(), SessionState::AwaitingM3);
+    }
+
+    #[test]
+    fn session_out_of_order_is_malformed() {
+        let root = [0x42u8; 32];
+        let meas = b"test-measurement";
+        let mut session = ProvisionSession::new(test_ca().verifying_key(), root, meas.to_vec());
+        // on_m3 BEFORE on_m1 ⇒ Malformed (no session nonces yet).
+        assert_eq!(
+            session.on_m3(&[0x30, 0x00], &[0x77; SNP_REPORT_LEN]),
+            Err(ProvisionError::Malformed)
+        );
+        // double on_m1 ⇒ Malformed.
+        let _ = session.on_m1([0x11; 32]).unwrap();
+        assert_eq!(
+            session.on_m1([0x12; 32]),
+            Err(ProvisionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn session_double_on_m3_is_malformed() {
+        let root = [0x42u8; 32];
+        let meas = b"test-measurement";
+        let (mut session, _prov, m3, report, _n_p) = session_at_awaiting_m3(root, meas);
+        let _ = session.on_m3(&m3, &report).unwrap(); // → Done
+        // A second on_m3 (re-provision attempt) ⇒ Malformed (terminal state).
+        assert_eq!(session.on_m3(&m3, &report), Err(ProvisionError::Malformed));
     }
 
 }
