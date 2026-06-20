@@ -123,15 +123,19 @@ select a malicious `admin_authority_pk` — that is operator-trust by design, §
    verifies a single operator-CA signature. This is documented but is NOT the frozen MVP wire format
    — 25-2a freezes the online-provisioner-key form.)
 
-5. **Enclave verifies + mints + seals (Q2 + Q3).** The enclave verifies `Sig` vs the pinned operator
-   CA, re-derives the transcript `(N_p, N_e, report_hash, measurement, TCB)` from its own session
-   state and checks the signed values match, then:
+5. **Enclave verifies + mints + seals (Q2 + Q3).** The enclave verifies the `provisioner_cert`
+   chain to the pinned operator CA, re-derives `(N_p, N_e, report_hash)` from its own session state,
+   and verifies `Sig_PROV` over `CANONICAL(config, N_p, N_e, report_hash)` (the MVP realization from
+   Q1; no `measurement`/`TCB` in the signed payload — they are VCEK-bound, not re-hashed), then:
    - mints `enclave_scope_id = getrandom(32)` in-TEE (basket A, the one host-uncontrollable field);
-   - constructs the `KeystoreBody` via the **canonical genesis constructor** (`agent_keygen.rs` /
-     `genesis_body`), NOT a literal reproduced here — the constructor's exact field set (incl.
-     `strict_recovery_counter`, audit cursors, `structural_version=1`, `freshness_epoch` init per the
-     constructor) is authoritative; this doc does not duplicate it to avoid drift (25-1 Medium fix).
-     Faucet policy fields (`per_dispense_max_amount`, `max_gas_limit`, …) are **intentionally inert /
+   - constructs the `KeystoreBody` via the **production genesis constructor** (the provisioned-body
+     initializer — see §3 I4: today only `#[cfg(test)]` helpers exist (`empty_body()` in
+     `agent_keygen.rs:166`, `genesis_body()` in `boot_agent_keystore.rs:294`); **25-3 MUST introduce
+     a non-test production constructor** and MUST NOT source the sentinel from a test helper). The
+     constructor's exact field set (incl. `strict_recovery_counter`, audit cursors,
+     `structural_version=1`, `freshness_epoch` init per the constructor) is authoritative; this doc
+     does not duplicate it to avoid drift. Faucet policy fields (`per_dispense_max_amount`,
+     `max_gas_limit`, …) are **intentionally inert /
      zero at genesis** and are set post-provisioning by CONFIGURE_TREASURY (the only op that may raise
      spend authority) — they are NOT in any basket (25-1 Medium fix);
    - calls the existing `seal_body()` under the measurement-derived provisioning root.
@@ -140,9 +144,13 @@ select a malicious `admin_authority_pk` — that is operator-trust by design, §
    the host writes it to the keystore path on disk. The enclave **shuts down the bootstrap listener**
    (Q5) and starts the runtime 0x40 serve loop on its dedicated port. **Atomicity / partial failure
    (25-1 Medium fix):** the enclave commits the seal before emitting the blob, so a vsock send
-   failure leaves the keystore persisted in-enclave but un-emitted; a host crash before persist ⇒
-   the enclave reboots into the no-keystore state and re-runs the ceremony (a FRESH `enclave_scope_id`
-   is minted — harmless, no double-budget because counters are zero and the anchor has seen nothing).
+   failure leaves the sealed keystore **in volatile enclave session memory, NOT persisted** (SEV-SNP
+   has no host-independent NVRAM — the same premise that anchors HIGH#2; 25-1-rev2 Med fix). On the
+   next boot the enclave reboots into the no-keystore state and re-runs the ceremony (a FRESH
+   `enclave_scope_id` is minted — harmless, no double-budget because counters are zero and the anchor
+   has seen nothing). A ceremony is **successful iff the host has persisted the emitted blob** — the
+   enclave-side one-shot listener slot is consumed only on a completed handoff (send + ack); a
+   failed/abandoned handoff releases the slot so the host may retry.
    The host obtains the sealed blob from the ceremony session that reached step 6; a stalled bootstrap
    connection is subject to a bootstrap-listener timeout (25-2 freezes the value). A timed-out / abandoned
    round-1 session MUST release the one-shot listener slot (not consume it) so a stalled attacker
@@ -274,9 +282,10 @@ follow-ons), per the AGENTS.md decision rules. The 18-x pattern: design → impl
   Full Matrix on the design (the input that catches inversions like the 18-2 "underspecified and
   partly inverted" finding before any code).
 - **25-2a — provisioning channel protocol spec (byte-exact wire format).** Frozen wire format
-  for the two-round-trip ceremony (Q1), the boot-authorization signature payload
-  `(config, N_p, N_e, report_hash, meas, TCB)`, and the config map (basket B, 8 fields, NO
-  `enclave_scope_id` field — I2) + golden vectors. **Reviewable INDEPENDENTLY of any code**
+  for the two-round-trip ceremony (Q1), the online-provisioner-key MVP: `provisioner_cert` (chains
+  to the offline operator CA) + `Sig_PROV` over `CANONICAL(config, N_p, N_e, report_hash)`, and the
+  config map (basket B = 7 operator-chosen public fields; basket C = enclave-init deterministic;
+  NO `enclave_scope_id` field — I2) + golden vectors. **Reviewable INDEPENDENTLY of any code**
   (25-1 Medium fix: split the frozen format from the impl skeleton so the wire contract can be
   matrix-reviewed on its own). Full Matrix (new wire format ⇒ cap-format-change-class risk).
 - **25-2b — provisioning channel impl skeleton.** The Rust impl of the 25-2a format: message
