@@ -2371,11 +2371,8 @@ mod tests {
 
         // Server thread: run the ceremony.
         let handle = std::thread::spawn(move || {
-            let mut reader = server_sock.try_clone().expect("clone");
-            let mut writer = server_sock;
             crate::provision_bootstrap::run_provisioning_ceremony(
-                &mut reader,
-                &mut writer,
+                &mut server_sock,
                 &pinned,
                 &seal_root,
                 &measurement,

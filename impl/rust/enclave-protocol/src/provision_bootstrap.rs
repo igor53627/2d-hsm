@@ -51,9 +51,8 @@ pub trait ProvisionReportProducer {
 ///
 /// **`idle_timeout`** = the per-read deadline (slowloris defense; the bootstrap is one-shot, so a
 /// generous timeout is fine). Returns `(ProvisionConfig, sealed_blob)` on success.
-pub fn run_provisioning_ceremony<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
+pub fn run_provisioning_ceremony<S: Read + Write>(
+    stream: &mut S,
     pinned_root: &VerifyingKey,
     seal_root: &[u8; 32],
     measurement: &[u8],
@@ -64,16 +63,16 @@ pub fn run_provisioning_ceremony<R: Read, W: Write>(
 
     // Helper: prepend a u32 BE length to the provision envelope (the standard framing wrapping
     // the provision protocol — write_framed_message writes raw bytes, so we build [u32 len][env]).
-    let write_env = |w: &mut W, env: &[u8]| -> Result<(), ProvisionError> {
+    let write_env = |env: &[u8]| -> Result<(), ProvisionError> {
         let mut frame = Vec::with_capacity(4 + env.len());
         frame.extend_from_slice(&(env.len() as u32).to_be_bytes());
         frame.extend_from_slice(env);
-        write_framed_message(w, &frame).map_err(|_| ProvisionError::Malformed)
+        write_framed_message(stream, &frame).map_err(|_| ProvisionError::Malformed)
     };
 
     // ── M1: read PROV_CHALLENGE ───────────────────────────────────────────────
     let deadline = Some(std::time::Instant::now() + idle_timeout);
-    let m1_frame = read_framed_message_with_idle_deadline(reader, deadline)
+    let m1_frame = read_framed_message_with_idle_deadline(stream, deadline)
         .map_err(|_| ProvisionError::Malformed)?;
     // read_framed_message returns [u32 len][body]; strip the 4-byte prefix for the envelope.
     let (msg_type, m1_payload) = decode_envelope(&m1_frame[4..])?;
@@ -90,18 +89,18 @@ pub fn run_provisioning_ceremony<R: Read, W: Write>(
 
     // ── M2: emit PROV_ATTEST (N_e + report) ───────────────────────────────────
     let m2_env = encode_envelope(MSG_M2_ATTEST, &encode_m2(&n_e, &report));
-    write_env(writer, &m2_env)?;
+    write_env(&m2_env)?;
 
     // ── M3: read PROV_CONFIG ──────────────────────────────────────────────────
     let deadline = Some(std::time::Instant::now() + idle_timeout);
-    let m3_frame = read_framed_message_with_idle_deadline(reader, deadline)
+    let m3_frame = read_framed_message_with_idle_deadline(stream, deadline)
         .map_err(|_| ProvisionError::Malformed)?;
     // Strip the u32 prefix; pass the provision envelope to on_m3 (→ verify_m3_in_order).
     let (config, sealed_blob) = session.on_m3(&m3_frame[4..], &report)?;
 
     // ── M4: emit PROV_SEALED ──────────────────────────────────────────────────
     let m4_env = encode_envelope(MSG_M4_SEALED, &encode_m4(&sealed_blob));
-    write_env(writer, &m4_env)?;
+    write_env(&m4_env)?;
 
     Ok((config, sealed_blob))
 }
@@ -134,7 +133,6 @@ pub mod vsock {
             .accept()
             .map_err(|_| ProvisionError::Malformed)?;
         run_provisioning_ceremony(
-            &mut stream,
             &mut stream,
             pinned_root,
             seal_root,
