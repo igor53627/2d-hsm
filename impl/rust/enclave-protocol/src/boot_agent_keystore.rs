@@ -126,42 +126,63 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     // (only available on Linux + vsock-transport + agent-gateway — otherwise fail closed).
     match var_twod(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE) {
         Ok(path) => {
-            // CAPPED read: a never-ending special file or oversize blob can't OOM the boot path.
-            let blob = crate::boot_input::read_boot_file_capped(
+            // Try reading the file; NotFound = first boot (the path is configured but the file doesn't
+            // exist yet → fall through to provisioning). Any OTHER read error = fail closed.
+            match crate::boot_input::read_boot_file_capped(
                 path.as_ref(),
                 crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE,
                 "agent keystore: failed to read TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE",
-            )?;
-            if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
-                return Err(ProtocolError::PqSigningUnavailable(
-                    "agent keystore: sealed blob exceeds MAX_KEYSTORE_BLOB_SIZE",
-                ));
+            ) {
+                Ok(blob) => {
+                    if blob.len() > crate::agent_keystore::MAX_KEYSTORE_BLOB_SIZE {
+                        return Err(ProtocolError::PqSigningUnavailable(
+                            "agent keystore: sealed blob exceeds MAX_KEYSTORE_BLOB_SIZE",
+                        ));
+                    }
+                    Ok(blob)
+                }
+                Err(e) => {
+                    // NotFound on a CONFIGURED path → first boot → fall through to provisioning.
+                    // Any other I/O error → fail closed (not a first-boot case).
+                    let is_not_found = matches!(
+                        e,
+                        ProtocolError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
+                    );
+                    if !is_not_found {
+                        return Err(e);
+                    }
+                    agent_sealed_keystore_blob_from_provisioning_or_fail()
+                }
             }
-            Ok(blob)
         }
         Err(_) => {
-            // File env not set → first boot → try provisioning (vsock ceremony). On non-Linux/non-vsock,
-            // the provisioning fn doesn't compile → fall through to the file-not-set error.
-            #[cfg(all(
-                target_os = "linux",
-                feature = "vsock-transport",
-                feature = "agent-gateway"
-            ))]
-            {
-                return agent_sealed_keystore_blob_from_provisioning();
-            }
-            #[cfg(not(all(
-                target_os = "linux",
-                feature = "vsock-transport",
-                feature = "agent-gateway"
-            )))]
-            {
-                Err(ProtocolError::PqSigningUnavailable(
-                    "agent keystore: TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE not set and vsock provisioning \
-                     unavailable (needs Linux + vsock-transport)",
-                ))
-            }
+            // Env var not set at all → first boot → try provisioning (or fail closed).
+            agent_sealed_keystore_blob_from_provisioning_or_fail()
         }
+    }
+}
+
+/// Try the vsock provisioning ceremony (Linux + vsock-transport + agent-gateway only); otherwise
+/// fail closed with a clear message.
+fn agent_sealed_keystore_blob_from_provisioning_or_fail() -> Result<Vec<u8>, ProtocolError> {
+    #[cfg(all(
+        target_os = "linux",
+        feature = "vsock-transport",
+        feature = "agent-gateway"
+    ))]
+    {
+        agent_sealed_keystore_blob_from_provisioning()
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        feature = "vsock-transport",
+        feature = "agent-gateway"
+    )))]
+    {
+        Err(ProtocolError::PqSigningUnavailable(
+            "agent keystore: no sealed keystore file and vsock provisioning unavailable \
+             (needs Linux + vsock-transport)",
+        ))
     }
 }
 
@@ -303,10 +324,22 @@ fn agent_boot_measurement() -> Result<Vec<u8>, ProtocolError> {
         LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
     ) {
         Ok(path) => {
-            crate::boot_input::read_boot_file_trim_trailing_newlines(
+            // CAPPED read (not read_boot_file_trim_trailing_newlines which uses uncapped std::fs::read):
+            // a /dev/zero or oversize measurement file can't OOM the boot path. Trim locally.
+            let mut bytes = crate::boot_input::read_boot_file_capped(
                 path.as_ref(),
+                AGENT_MEASUREMENT_FILE_MAX_BYTES,
                 "agent keystore: failed to read TWOD_HSM_ENCLAVE_MEASUREMENT_FILE",
-            )?
+            )?;
+            if bytes.len() > AGENT_MEASUREMENT_FILE_MAX_BYTES {
+                return Err(ProtocolError::PqSigningUnavailable(
+                    "agent keystore: enclave measurement file exceeds 4 KiB",
+                ));
+            }
+            while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                bytes.pop();
+            }
+            bytes
         }
         Err(_) => AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT.to_vec(),
     };
