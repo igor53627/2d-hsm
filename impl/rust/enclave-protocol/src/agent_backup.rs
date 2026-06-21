@@ -1261,7 +1261,7 @@ pub(crate) fn verify_ac6_high_water(
 /// restore request. A canonical-CBOR marks payload (the authoritative current counters/spend) + an
 /// Ed25519 signature by the recovery authority over `RECOVERY_HIGH_WATER_DOMAIN ‖ request_id ‖
 /// marks_payload`. Carried at RestoreRequest key 4.
-const RECOVERY_HIGH_WATER_DOMAIN: &[u8] = b"2d-hsm-restore-high-water-v1\0";
+pub(crate) const RECOVERY_HIGH_WATER_DOMAIN: &[u8] = b"2d-hsm-restore-high-water-v1\0";
 
 /// The recovery-authority-signed high-water attestation (AC#6 source (a), carried in the RestoreRequest).
 /// `marks_payload` is the canonical CBOR marks (the SAME encoding [`KeystoreBody::encode_marks_payload`]

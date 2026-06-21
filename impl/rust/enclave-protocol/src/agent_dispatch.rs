@@ -7086,6 +7086,171 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "agent-backup-export-preview")]
+    mod restore_backup {
+        use super::*;
+        use crate::agent_backup::{
+            build_key_refs_manifest, build_restore_ingress_payload, compute_manifest_hash,
+            compute_original_backup_digest, seal_restore_ingress_envelope_with_m,
+            RecoveryHighWater, RECOVERY_HIGH_WATER_DOMAIN,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const RSCOPE: &[u8] = b"restore_backup";
+        const DEST_MEAS: &[u8] = b"dest-tee-measurement-v1";
+        const DEST_SEED: [u8; 64] = [0x6c; 64];
+        const INGRESS_M: [u8; 32] = [0x43; 32];
+
+        fn recovery_key() -> SigningKey {
+            SigningKey::from_bytes(&[0xa2; 32])
+        }
+
+        /// A source body with `n` transfer keys (the backup origin) — its payload + marks get restored.
+        fn source_body(n: usize) -> KeystoreBody {
+            let mut body = base_body();
+            let creation = CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 0,
+                batch_id: 1,
+            };
+            generate_keys(&mut body, KeyPurpose::AgentTransferK1, n, creation).unwrap();
+            body
+        }
+
+        /// Sign the recovery-authority high-water over the source's marks_payload (the EXACT preimage
+        /// verify_recovery_high_water expects: domain ‖ request_id ‖ marks_payload).
+        fn signed_high_water(
+            recovery: &SigningKey,
+            request_id: &[u8],
+            marks_payload: &[u8],
+        ) -> RecoveryHighWater {
+            let mut preimage = Vec::with_capacity(
+                RECOVERY_HIGH_WATER_DOMAIN.len() + request_id.len() + marks_payload.len(),
+            );
+            preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+            preimage.extend_from_slice(request_id);
+            preimage.extend_from_slice(marks_payload);
+            RecoveryHighWater {
+                marks_payload: marks_payload.to_vec(),
+                signature: recovery.sign(&preimage).to_bytes(),
+            }
+        }
+
+        /// The full dispatch envelope for a RESTORE_BACKUP request: a recovery-tier cap (key 5) + the
+        /// key-7 restore-request map {1: ingress envelope, 2: original backup, 3: refs, 4: high-water}.
+        fn restore_env(
+            recovery: &SigningKey,
+            request_id: &[u8],
+            counter: u64,
+            n_keys: usize,
+        ) -> Vec<u8> {
+            // Publish the destination ephemeral (deterministic seed ⇒ the test knows the decaps key).
+            let dest_pub =
+                crate::agent_dispatch::install_restore_ephemeral_with_seed(&DEST_MEAS, &DEST_SEED)
+                    .unwrap();
+            // Source body → restore-ingress payload + manifest.
+            let src = source_body(n_keys);
+            let refs: Vec<[u8; 32]> = src.entries.iter().map(|e| e.key_ref).collect();
+            let payload = build_restore_ingress_payload(&src, &refs).unwrap().to_vec();
+            let manifest = build_key_refs_manifest(&refs).unwrap();
+            let manifest_hash = compute_manifest_hash(&manifest);
+            // Original backup blob + digest.
+            let original_backup = b"test-original-backup-blob".to_vec();
+            let backup_digest = compute_original_backup_digest(&original_backup);
+            // Seal the ingress envelope to the dest ephemeral (AAD' = measurement/chain/env/manifest/digest).
+            let envelope_blob = seal_restore_ingress_envelope_with_m(
+                &dest_pub.encaps_key,
+                DEST_MEAS,
+                11565,
+                "testnet",
+                &manifest_hash,
+                &backup_digest,
+                &payload,
+                &INGRESS_M,
+            )
+            .unwrap();
+            // Signed high-water over the source's marks_payload.
+            let hwm = signed_high_water(recovery, request_id, &src.encode_marks_payload());
+            // Key-7 restore-request map.
+            let req_map = vec![
+                (Value::Integer(1.into()), Value::Bytes(envelope_blob)),
+                (Value::Integer(2.into()), Value::Bytes(original_backup)),
+                (
+                    Value::Integer(3.into()),
+                    Value::Array(refs.iter().map(|r| Value::Bytes(r.to_vec())).collect()),
+                ),
+                (
+                    Value::Integer(4.into()),
+                    Value::Map(vec![
+                        (
+                            Value::Integer(1.into()),
+                            Value::Bytes(hwm.marks_payload.clone()),
+                        ),
+                        (
+                            Value::Integer(2.into()),
+                            Value::Bytes(hwm.signature.to_vec()),
+                        ),
+                    ]),
+                ),
+            ];
+            // Recovery-tier cap (opcode 8, is_recovery=true). payload_binding is a placeholder — the
+            // handler does not yet enforce it (a 2c refinement; the high-water signature binds the request).
+            let cap = crate::agent_capability::test_signed_capability(
+                recovery, 8, request_id, counter, true, 11565, "testnet", 0, RSCOPE, 1, [0xab; 32],
+                [0xe1; 32],
+            );
+            envelope_rid(
+                8,
+                request_id,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(req_map)),
+                ],
+            )
+        }
+
+        /// End-to-end: a recovery-tier RESTORE_BACKUP through dispatch_agent reconstitutes the source
+        /// keystore's entries into a fresh destination TEE + advances strict_recovery (AC#6) + structural
+        /// (local+1, AC#4). The full ceremony path — ephemeral decap, AAD' verify, signed-high-water
+        /// verify, AC#6 forward-only gate, wholesale-replace — runs inside the one dispatch call.
+        #[test]
+        fn restore_backup_restores_entries_end_to_end() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body(); // fresh TEE: empty entries
+                                        // The cap + high-water signatures both verify against the sealed recovery_authority_pk — set it
+                                        // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let env = restore_env(&recovery, &[0x11; 16], 1, 2);
+            let resp = dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).unwrap();
+            match resp {
+                AgentResponse::RestoreBackup { candidate, .. } => {
+                    assert_eq!(
+                        candidate.entries.len(),
+                        2,
+                        "the 2 source entries are restored"
+                    );
+                    assert_eq!(
+                        candidate.counters.len(),
+                        source_body(2).counters.len(),
+                        "counters match the source (base_body+generate_keys seeds none)"
+                    );
+                    assert_eq!(
+                        candidate.strict_recovery_counter, 1,
+                        "strict_recovery advanced (max(local 0, backup 0)+1)"
+                    );
+                    assert_eq!(candidate.structural_version, 2, "local+1 (1 → 2, AC#4)");
+                    assert_eq!(candidate.freshness_epoch, 2, "epoch advanced");
+                    assert_eq!(
+                        candidate.config.environment_identifier, "testnet",
+                        "config-identity restored from the payload"
+                    );
+                }
+                _ => panic!("expected RestoreBackup"),
+            }
+        }
+    }
+
     /// TASK-22 — byte-exact `0x40` REQUEST-ENVELOPE golden vectors (AC#1).
     ///
     /// Frozen wire bytes of the canonical int-keyed CBOR request envelope (keys 1..=7: agent_version,
