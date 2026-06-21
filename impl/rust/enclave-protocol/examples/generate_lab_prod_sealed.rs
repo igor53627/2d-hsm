@@ -12,10 +12,9 @@ fn main() {
     let sk = include_bytes!("../testvectors/mldsa65_reference_sk.bin");
     let pk = include_bytes!("../testvectors/mldsa65_reference_pk.bin");
     set_pq_seal_v1_provisioning_root(*root).expect("set root");
-    let blob =
-        seal_mldsa65_keypair_v1_with_root(sk, pk, LAB_PROD_MEASUREMENT, root).expect("seal");
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors/lab_prod_enclave.sealed");
+    let blob = seal_mldsa65_keypair_v1_with_root(sk, pk, LAB_PROD_MEASUREMENT, root).expect("seal");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testvectors/lab_prod_enclave.sealed");
     std::fs::write(&path, &blob).expect("write sealed");
     let digest = pq_seal_v1_measurement_digest(LAB_PROD_MEASUREMENT);
     println!(

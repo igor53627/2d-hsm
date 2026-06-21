@@ -144,7 +144,10 @@ impl AnchorDial for TcpAnchorDial {
                 // TimedOut so classify_close labels it "anchor-connect-timeout". (connect_timeout(0) itself
                 // errors — we must never call it with a zero Duration, hence the break.)
                 last.get_or_insert_with(|| {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "anchor connect budget exhausted")
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "anchor connect budget exhausted",
+                    )
                 });
                 break;
             }
@@ -279,7 +282,10 @@ impl std::fmt::Display for RelayEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Listening { port, anchor } => {
-                write!(f, "host-anchor-relay: listening on vsock relay port {port}, anchor {anchor}")
+                write!(
+                    f,
+                    "host-anchor-relay: listening on vsock relay port {port}, anchor {anchor}"
+                )
             }
             Self::AcceptError { kind } => {
                 write!(f, "host-anchor-relay: accept error ({kind:?}); skipping")
@@ -391,7 +397,9 @@ where
     //    the two — so a black-holing anchor (even multi-A / dual-stack) is wedged-bounded HERE to
     //    ≤ connect_budget(), never on the loop and never past PUMP_BUDGET.
     let connect_deadline = (std::time::Instant::now() + connect_budget()).min(deadline);
-    let mut anchor = dial.dial(connect_deadline).map_err(RelayFault::AnchorConnect)?;
+    let mut anchor = dial
+        .dial(connect_deadline)
+        .map_err(RelayFault::AnchorConnect)?;
 
     // 3. Arm SO_RCVTIMEO/SO_SNDTIMEO on the anchor leg (the enclave leg is armed at the concrete
     //    boundary in run_host_anchor_relay — design §3d). Arm failure folds into AnchorConnect (close).
@@ -413,8 +421,13 @@ where
     //    enclave stream received ZERO anchor-looking bytes (the never-synth behavioral invariant; tests
     //    2/5/6/9 + lapsed_deadline_pump_never_synth).
     let wire = frame_response_cap(&response, response_cap).map_err(RelayFault::Pump)?;
-    deadline_guarded_write(enclave, &wire, deadline, "anchor relay: deadline before enclave write")
-        .map_err(RelayFault::Pump)?;
+    deadline_guarded_write(
+        enclave,
+        &wire,
+        deadline,
+        "anchor relay: deadline before enclave write",
+    )
+    .map_err(RelayFault::Pump)?;
     Ok(())
 }
 
@@ -430,7 +443,9 @@ where
 {
     match relay_one_pump(enclave, dial) {
         Ok(()) => emit_log(&RelayEvent::PumpOk),
-        Err(fault) => emit_log(&RelayEvent::PumpFault { label: fault.triage_label() }),
+        Err(fault) => emit_log(&RelayEvent::PumpFault {
+            label: fault.triage_label(),
+        }),
     }
 }
 
@@ -649,12 +664,18 @@ mod tests {
 
     impl<'a> AnchorDial for &'a FakeAnchorDial {
         type Stream = RecordingAnchorStream<'a>;
-        fn dial(&self, _deadline: std::time::Instant) -> std::io::Result<RecordingAnchorStream<'a>> {
+        fn dial(
+            &self,
+            _deadline: std::time::Instant,
+        ) -> std::io::Result<RecordingAnchorStream<'a>> {
             self.dials.set(self.dials.get() + 1);
             self.last_forwarded.borrow_mut().clear();
             match self.acts.borrow_mut().pop_front() {
                 Some(DialAct::Ok(resp)) => Ok(RecordingAnchorStream {
-                    inner: FakeAnchorStream { reads: Cursor::new(resp), written: Vec::new() },
+                    inner: FakeAnchorStream {
+                        reads: Cursor::new(resp),
+                        written: Vec::new(),
+                    },
                     sink: &self.last_forwarded,
                 }),
                 Some(DialAct::Err(k)) => Err(std::io::Error::new(k, "fake dial error")),
@@ -701,7 +722,11 @@ mod tests {
         let dial = FakeAnchorDial::new(vec![DialAct::Ok(canned_framed_response())]);
         drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
         // Anchor received the request frame VERBATIM.
-        assert_eq!(*dial.last_forwarded.borrow(), req, "forwarded request must be byte-identical");
+        assert_eq!(
+            *dial.last_forwarded.borrow(),
+            req,
+            "forwarded request must be byte-identical"
+        );
         // Enclave reads back EXACTLY the framed canned response.
         let mut got = Vec::new();
         let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
@@ -711,7 +736,11 @@ mod tests {
         let n = u32::from_be_bytes(len_buf) as usize;
         got.resize(n, 0);
         peer.read_exact(&mut got).unwrap();
-        assert_eq!(got, opaque_anchor_response(), "write-back must be the verbatim response");
+        assert_eq!(
+            got,
+            opaque_anchor_response(),
+            "write-back must be the verbatim response"
+        );
         assert_eq!(dial.dials.get(), 1);
     }
 
@@ -745,7 +774,11 @@ mod tests {
         let dial = FakeAnchorDial::new(vec![DialAct::Ok(framed)]);
         drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
         // The 0x44 request reached the anchor byte-identically.
-        assert_eq!(*dial.last_forwarded.borrow(), req, "0x44 request forwarded verbatim");
+        assert_eq!(
+            *dial.last_forwarded.borrow(),
+            req,
+            "0x44 request forwarded verbatim"
+        );
         // The enclave reads back the FULL > 4096 body verbatim — the marks cap was applied on both legs.
         let mut len_buf = [0u8; 4];
         let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
@@ -753,7 +786,10 @@ mod tests {
         let n = u32::from_be_bytes(len_buf) as usize;
         let mut got = vec![0u8; n];
         peer.read_exact(&mut got).unwrap();
-        assert_eq!(got, big, "the full marks response (> freshness cap) is written back verbatim");
+        assert_eq!(
+            got, big,
+            "the full marks response (> freshness cap) is written back verbatim"
+        );
         assert_eq!(dial.dials.get(), 1);
     }
 
@@ -783,7 +819,11 @@ mod tests {
         let dial = FakeAnchorDial::new(vec![DialAct::Ok(framed)]);
         drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
         // The 0x45 request reached the anchor byte-identically.
-        assert_eq!(*dial.last_forwarded.borrow(), req, "0x45 commit request forwarded verbatim");
+        assert_eq!(
+            *dial.last_forwarded.borrow(),
+            req,
+            "0x45 commit request forwarded verbatim"
+        );
         // The enclave reads back the ACK verbatim.
         let mut len_buf = [0u8; 4];
         let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
@@ -808,12 +848,19 @@ mod tests {
         let dial = FakeAnchorDial::new(vec![DialAct::Ok(canned_framed_response())]);
         drive_relay_loop_finite(vec![Ok(relay_side)].into_iter(), &&dial);
         // dial was NEVER invoked (reject happened before the round-trip).
-        assert_eq!(dial.dials.get(), 0, "anchor must NOT be dialed for a malformed request");
+        assert_eq!(
+            dial.dials.get(),
+            0,
+            "anchor must NOT be dialed for a malformed request"
+        );
         // ZERO bytes written back to the enclave (never-synth).
         let mut got = Vec::new();
         let _ = peer.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = peer.read_to_end(&mut got);
-        assert!(got.is_empty(), "no bytes may be written back on a malformed request; got {got:?}");
+        assert!(
+            got.is_empty(),
+            "no bytes may be written back on a malformed request; got {got:?}"
+        );
     }
 
     // 3. anchor_connect_refused_closes_and_continues — Regression: serial close-and-continue.
@@ -878,7 +925,10 @@ mod tests {
         let mut got = Vec::new();
         let _ = p1.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = p1.read_to_end(&mut got);
-        assert!(got.is_empty(), "oversized anchor response: nothing written back; got {got:?}");
+        assert!(
+            got.is_empty(),
+            "oversized anchor response: nothing written back; got {got:?}"
+        );
     }
 
     // 6. garbled_anchor_response_closes — Regression: truncated/garbage anchor frame (EOF mid-body) →
@@ -896,7 +946,10 @@ mod tests {
         let mut got = Vec::new();
         let _ = p1.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = p1.read_to_end(&mut got);
-        assert!(got.is_empty(), "garbled anchor response: ZERO bytes reach the enclave; got {got:?}");
+        assert!(
+            got.is_empty(),
+            "garbled anchor response: ZERO bytes reach the enclave; got {got:?}"
+        );
     }
 
     // 7. never_die_under_N_bad_connections — Regression: close-and-continue resilience end to end.
@@ -904,7 +957,8 @@ mod tests {
     fn never_die_under_n_bad_connections() {
         let req = test_golden_request_frame();
         // malformed (typed-but-bad-CBOR), anchor-down, timeout, garbled, then one GOOD.
-        let bad_frame = crate::encode_message(crate::MessageType::AgentBootRelay, &[0xff, 0xff]).unwrap();
+        let bad_frame =
+            crate::encode_message(crate::MessageType::AgentBootRelay, &[0xff, 0xff]).unwrap();
         let (e_mal, _pm) = enclave_pair_with(&bad_frame);
         let (e_down, _pd) = enclave_pair_with(&req);
         let (e_to, _pt) = enclave_pair_with(&req);
@@ -931,9 +985,17 @@ mod tests {
         let n = u32::from_be_bytes(len_buf) as usize;
         let mut body = vec![0u8; n];
         p_good.read_exact(&mut body).unwrap();
-        assert_eq!(body, opaque_anchor_response(), "final good pump must succeed");
+        assert_eq!(
+            body,
+            opaque_anchor_response(),
+            "final good pump must succeed"
+        );
         // malformed did not dial; the other 4 each dialed exactly once.
-        assert_eq!(dial.dials.get(), 4, "malformed never dials; the other four do");
+        assert_eq!(
+            dial.dials.get(),
+            4,
+            "malformed never dials; the other four do"
+        );
     }
 
     // 8. classify_close_taxonomy_pin — Regression: the operator-triage taxonomy + core message-wording
@@ -943,11 +1005,17 @@ mod tests {
         use std::io::{Error, ErrorKind};
         // AnchorConnect: kind-driven.
         assert_eq!(
-            classify_close(&RelayFault::AnchorConnect(Error::new(ErrorKind::TimedOut, "x"))),
+            classify_close(&RelayFault::AnchorConnect(Error::new(
+                ErrorKind::TimedOut,
+                "x"
+            ))),
             "anchor-connect-timeout"
         );
         assert_eq!(
-            classify_close(&RelayFault::AnchorConnect(Error::new(ErrorKind::ConnectionRefused, "x"))),
+            classify_close(&RelayFault::AnchorConnect(Error::new(
+                ErrorKind::ConnectionRefused,
+                "x"
+            ))),
             "anchor-unavailable"
         );
         // Pump typed-first: MessageTooLarge → oversized-request-frame.
@@ -957,7 +1025,10 @@ mod tests {
         );
         // Pump Io kinds.
         assert_eq!(
-            classify_close(&RelayFault::Pump(ProtocolError::Io(Error::new(ErrorKind::TimedOut, "x")))),
+            classify_close(&RelayFault::Pump(ProtocolError::Io(Error::new(
+                ErrorKind::TimedOut,
+                "x"
+            )))),
             "socket-timeout"
         );
         assert_eq!(
@@ -969,7 +1040,9 @@ mod tests {
         );
         // WireProtocol-folded substring buckets — PINNED against the cores' actual messages.
         assert_eq!(
-            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol("anchor response too large"))),
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "anchor response too large"
+            ))),
             "oversized-anchor-response"
         );
         // The reads-as-malformed-but-is-timeout case: a deadline-guarded write returns a WireProtocol
@@ -992,7 +1065,9 @@ mod tests {
         );
         // A genuine malformed boot request → malformed-request (the cores prefix "boot request:").
         assert_eq!(
-            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol("boot request: bad CBOR"))),
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "boot request: bad CBOR"
+            ))),
             "malformed-request"
         );
         // 5b-2e: a malformed 0x44 marks request ALSO buckets as malformed-request (cores prefix
@@ -1020,7 +1095,9 @@ mod tests {
         );
         // Anything else → relay-error.
         assert_eq!(
-            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol("something else"))),
+            classify_close(&RelayFault::Pump(ProtocolError::WireProtocol(
+                "something else"
+            ))),
             "relay-error"
         );
     }
@@ -1040,7 +1117,10 @@ mod tests {
         let mut got = Vec::new();
         let _ = p1.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = p1.read_to_end(&mut got);
-        assert!(got.is_empty(), "empty/failed anchor response writes nothing back; got {got:?}");
+        assert!(
+            got.is_empty(),
+            "empty/failed anchor response writes nothing back; got {got:?}"
+        );
         assert_eq!(dial.dials.get(), 1);
     }
 
@@ -1062,7 +1142,10 @@ mod tests {
         let mut got = Vec::new();
         let _ = p1.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = p1.read_to_end(&mut got);
-        assert!(got.is_empty(), "lapsed-deadline pump writes nothing back (never-synth); got {got:?}");
+        assert!(
+            got.is_empty(),
+            "lapsed-deadline pump writes nothing back (never-synth); got {got:?}"
+        );
     }
 
     // 11. golden_vector_reuse — Regression: the daemon forwards the CANONICAL frozen production request
@@ -1086,7 +1169,10 @@ mod tests {
     fn connect_budget_is_floored_fraction_of_pump_budget() {
         let cb = connect_budget();
         assert!(cb >= CONNECT_BUDGET_MIN, "connect budget floored");
-        assert!(cb <= PUMP_BUDGET, "connect budget never exceeds the pump budget");
+        assert!(
+            cb <= PUMP_BUDGET,
+            "connect budget never exceeds the pump budget"
+        );
         assert_eq!(cb, PUMP_BUDGET / CONNECT_BUDGET_DIVISOR);
     }
 
@@ -1123,15 +1209,22 @@ mod tests {
         let stub = std::thread::spawn(move || {
             let (mut conn, _) = tcp.accept().expect("stub accept");
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            conn.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            conn.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let key = ed25519_dalek::SigningKey::from_bytes(
                 &crate::lab_agent_smoke::LAB_ANCHOR_TEST_SEED,
             );
             // slice 6-5: the pump now threads the anchor's durable commit ledger; this one-request
             // loopback test only needs a fresh (empty) ledger.
             let mut ledger = crate::lab_agent_smoke::LabCommitLedger::new();
-            crate::lab_agent_smoke::lab_anchor_pump_one(&mut conn, &stub_body, &key, deadline(), &mut ledger)
-                .expect("the real stub pump signs the relayed request");
+            crate::lab_agent_smoke::lab_anchor_pump_one(
+                &mut conn,
+                &stub_body,
+                &key,
+                deadline(),
+                &mut ledger,
+            )
+            .expect("the real stub pump signs the relayed request");
         });
 
         // 2. The relay leg: REAL CID_ANY bind (what production run_host_anchor_relay does) + the
@@ -1142,7 +1235,9 @@ mod tests {
             let (mut enclave, _addr) = listener.accept().expect("relay accept");
             configure_relay_session_timeouts(&mut enclave, PUMP_BUDGET)
                 .expect("arm enclave-leg timeouts");
-            let dial = TcpAnchorDial { addrs: vec![stub_addr] };
+            let dial = TcpAnchorDial {
+                addrs: vec![stub_addr],
+            };
             // RelayFault is LOG-ONLY (deliberately no Debug derive) — surface the triage label.
             if let Err(fault) = relay_one_pump(&mut enclave, &dial) {
                 panic!("relay pump failed: {}", fault.triage_label());
@@ -1152,8 +1247,11 @@ mod tests {
         // 3. The guest leg: the PRODUCTION channel, a stub-conformant smoke request.
         let nonce = [0x6b_u8; 32];
         let frame = crate::lab_agent_smoke::smoke_request_frame(nonce);
-        let mut ch = crate::agent_boot_relay::VsockBootRelayChannel::new(LOOPBACK_CID, RELAY_TEST_PORT);
-        let raw = ch.round_trip(&frame, deadline()).expect("guest round trip over real vsock");
+        let mut ch =
+            crate::agent_boot_relay::VsockBootRelayChannel::new(LOOPBACK_CID, RELAY_TEST_PORT);
+        let raw = ch
+            .round_trip(&frame, deadline())
+            .expect("guest round trip over real vsock");
 
         // 4. The stub's bytes pass the REAL guest verify path and reconcile Fresh.
         let state = crate::agent_anchor::verify_anchor_response_bytes(&raw, &nonce, &body.config)

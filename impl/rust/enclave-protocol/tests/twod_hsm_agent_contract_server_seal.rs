@@ -38,9 +38,14 @@ fn shipped_setup_generate_keys_seals_and_commits_without_cfg_test_fallback() {
     // reference config) and drive it through the shipped cross-platform 0x40 serve glue.
     let inner: &[u8] = include_bytes!("../testvectors/agent-gateway/req_generate_keys_v1.bin");
     let frame = ep::encode_message(ep::MessageType::AgentGateway, inner).expect("frame encodes");
-    let reply = ep::contract_server::serve_one_agent_frame(&frame).expect("serve replies with a 0x40 frame");
+    let reply = ep::contract_server::serve_one_agent_frame(&frame)
+        .expect("serve replies with a 0x40 frame");
     let decoded = ep::decode_message(&reply).expect("reply is a valid 0x40 frame");
-    assert_eq!(decoded.msg_type, ep::MessageType::AgentGateway, "reply is a 0x40 frame");
+    assert_eq!(
+        decoded.msg_type,
+        ep::MessageType::AgentGateway,
+        "reply is a 0x40 frame"
+    );
 
     // `decode_agent_error_code` is `#[cfg(test)]`, so inspect the body CBOR directly: the agent band uses
     // `{1: code(int)}` for an error and `{1: <minted key array>, 2: blob}` for a GENERATE_KEYS success, so

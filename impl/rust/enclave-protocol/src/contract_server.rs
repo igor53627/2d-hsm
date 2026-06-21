@@ -29,7 +29,9 @@
 //! a `SESSION_IDLE_TIMEOUT`, NO max-session-lifetime / max-frames cap — the same serial-slot starvation
 //! already tracked as a multi-tenant precondition for the SNP serve loop, intentionally out of scope.
 
-use crate::enclave_serve::{configure_unix_session_timeouts, serve_framed_pump, SESSION_IDLE_TIMEOUT};
+use crate::enclave_serve::{
+    configure_unix_session_timeouts, serve_framed_pump, SESSION_IDLE_TIMEOUT,
+};
 use crate::reference_keystore::install_reference_agent_keystore;
 use crate::ProtocolError;
 use std::path::Path;
@@ -43,7 +45,9 @@ use std::path::Path;
 pub fn serve_one_agent_frame(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let decoded = crate::decode_message(frame)?;
     if decoded.msg_type != crate::MessageType::AgentGateway {
-        return Err(ProtocolError::WireProtocol("contract server: non-0x40 frame on the agent listener"));
+        return Err(ProtocolError::WireProtocol(
+            "contract server: non-0x40 frame on the agent listener",
+        ));
     }
     let body = crate::agent_dispatch::handle_agent_gateway_frame(&decoded.payload);
     crate::encode_message(crate::MessageType::AgentGateway, &body)
@@ -56,7 +60,11 @@ pub fn serve_one_agent_frame(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
 /// ack wire shape through `agent_anchor::test_signed_commit_ack_bytes`. **No durability** — acks are
 /// in-memory; the host anchor is mocked. Test/contract-server only.
 #[cfg(all(
-    any(feature = "agent-keygen-exec-preview", feature = "agent-configure-treasury-preview", feature = "agent-sign-faucet-preview"),
+    any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ),
     any(test, feature = "agent-contract-server")
 ))]
 struct ReferenceCommitChannel {
@@ -71,7 +79,11 @@ struct ReferenceCommitChannel {
 }
 
 #[cfg(all(
-    any(feature = "agent-keygen-exec-preview", feature = "agent-configure-treasury-preview", feature = "agent-sign-faucet-preview"),
+    any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ),
     any(test, feature = "agent-contract-server")
 ))]
 impl ReferenceCommitChannel {
@@ -81,7 +93,9 @@ impl ReferenceCommitChannel {
             chain_id: body.config.twod_chain_id,
             // Partial move (not clone): `body` is owned and unused after this literal (gemini PR #91).
             environment_identifier: body.config.environment_identifier,
-            signing_key: ed25519_dalek::SigningKey::from_bytes(&crate::reference_keystore::REFERENCE_ANCHOR_SEED),
+            signing_key: ed25519_dalek::SigningKey::from_bytes(
+                &crate::reference_keystore::REFERENCE_ANCHOR_SEED,
+            ),
             ledger: std::collections::HashMap::new(),
         }
     }
@@ -90,7 +104,9 @@ impl ReferenceCommitChannel {
     /// mutates them), idempotency-ledger by request_id, and sign the ack with the anchor key.
     fn ack(&mut self, frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
         let req = crate::agent_boot_relay::decode_anchor_commit_request(frame)?;
-        if req.chain_id != self.chain_id || req.environment_identifier != self.environment_identifier {
+        if req.chain_id != self.chain_id
+            || req.environment_identifier != self.environment_identifier
+        {
             return Err(ProtocolError::WireProtocol(
                 "reference commit channel: commit scope != reference keystore",
             ));
@@ -121,18 +137,36 @@ impl ReferenceCommitChannel {
 }
 
 #[cfg(all(
-    any(feature = "agent-keygen-exec-preview", feature = "agent-configure-treasury-preview", feature = "agent-sign-faucet-preview"),
+    any(
+        feature = "agent-keygen-exec-preview",
+        feature = "agent-configure-treasury-preview",
+        feature = "agent-sign-faucet-preview"
+    ),
     any(test, feature = "agent-contract-server")
 ))]
 impl crate::agent_boot_relay::BootRelayChannel for ReferenceCommitChannel {
-    fn round_trip(&mut self, frame: &[u8], _deadline: std::time::Instant) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+    fn round_trip(
+        &mut self,
+        frame: &[u8],
+        _deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
         // Return the UNFRAMED signed ack; any local failure → coarse always-retryable transport error ⇒
         // the enclave fails the op CLOSED (never reaches swap/emit), matching the production contract.
-        self.ack(frame).map_err(|_| crate::agent_boot_driver::AnchorTransportError("reference commit channel: ack computation failed"))
+        self.ack(frame).map_err(|_| {
+            crate::agent_boot_driver::AnchorTransportError(
+                "reference commit channel: ack computation failed",
+            )
+        })
     }
-    fn marks_round_trip(&mut self, _frame: &[u8], _deadline: std::time::Instant) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
+    fn marks_round_trip(
+        &mut self,
+        _frame: &[u8],
+        _deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
         // The per-op commit path calls ONLY round_trip; an Err (not panic) keeps a misuse fail-closed.
-        Err(crate::agent_boot_driver::AnchorTransportError("reference commit channel: marks_round_trip not used on the per-op commit channel"))
+        Err(crate::agent_boot_driver::AnchorTransportError(
+            "reference commit channel: marks_round_trip not used on the per-op commit channel",
+        ))
     }
 }
 
@@ -140,19 +174,25 @@ impl crate::agent_boot_relay::BootRelayChannel for ReferenceCommitChannel {
 /// when no mutating preview is enabled (PUBLIC_IDENTITY / PROVE_IDENTITY / SIGN_TRANSFER need neither).
 fn install_mutating_op_support() {
     #[cfg(all(
-    any(feature = "agent-keygen-exec-preview", feature = "agent-configure-treasury-preview", feature = "agent-sign-faucet-preview"),
-    any(test, feature = "agent-contract-server")
-))]
+        any(
+            feature = "agent-keygen-exec-preview",
+            feature = "agent-configure-treasury-preview",
+            feature = "agent-sign-faucet-preview"
+        ),
+        any(test, feature = "agent-contract-server")
+    ))]
     {
         use std::io::Write as _;
         // Best-effort install-once: the reference body makes both succeed on a fresh process. A `false`
         // (each fn: "already installed") is SURFACED, not silently dropped — the mutating ops depend on
         // these globals, so a duplicate/misordered install that left one un-installed would otherwise show
         // only as an opaque 0x45/0x46 with no server-side signal (symmetry with the seal-root warn above).
-        if !crate::agent_dispatch::install_anti_rollback_binding(crate::agent_dispatch::AntiRollbackBinding {
-            epoch: 1,
-            active: true,
-        }) {
+        if !crate::agent_dispatch::install_anti_rollback_binding(
+            crate::agent_dispatch::AntiRollbackBinding {
+                epoch: 1,
+                active: true,
+            },
+        ) {
             let _ = writeln!(
                 std::io::stderr(),
                 "[warn] contract server: anti-rollback binding not installed (already set?); mutating ops may fail closed (0x45)"
@@ -189,7 +229,8 @@ pub fn prepare_contract_server() -> Result<(), ProtocolError> {
         feature = "agent-sign-faucet-preview"
     ))]
     {
-        let reference_root: [u8; 32] = *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
+        let reference_root: [u8; 32] =
+            *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
         // Best-effort install-once. Surface a failure (not a silent `let _ =`) so a deviceless misconfig is
         // observable at runtime: if NO provisioning root ends up configured, the mutating ops fail closed
         // 0x46 — a 2d engineer should be able to tell that from a real reject. (An "already configured"
@@ -229,7 +270,9 @@ pub fn run_contract_server(
     // it 0700); a real dedicated directory (the bin's fixed /tmp/twod-hsm-agent-contract) passes. A caller
     // passing a real SENSITIVE dir (e.g. /etc itself) is a blatant self-inflicted misuse out of scope —
     // "dedicated" is uncheckable; the bin uses a fixed dir and this fn is release-banned / test-only.
-    let is_symlink = std::fs::symlink_metadata(private_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    let is_symlink = std::fs::symlink_metadata(private_dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
     if private_dir.as_os_str().is_empty() || private_dir == Path::new("/") || is_symlink {
         return Err(ProtocolError::WireProtocol(
             "contract server: private_dir must be a dedicated real directory, not empty / the root \"/\" / a symlink",
@@ -239,7 +282,8 @@ pub fn run_contract_server(
     // reference keystore (so PUBLIC_IDENTITY answers a real identity, not the empty-store 0x41), and the
     // mutating-op support (anti-rollback binding + mock commit channel; a no-op without a mutating preview).
     prepare_contract_server()?;
-    let listener = crate::uds_listen::bind_unix_listener(socket_path, private_dir).map_err(ProtocolError::Io)?;
+    let listener = crate::uds_listen::bind_unix_listener(socket_path, private_dir)
+        .map_err(ProtocolError::Io)?;
     let _ = writeln!(
         std::io::stderr(),
         "[info] twod-hsm-agent-contract-server: serving deviceless 0x40 on {} (TEST/DEV ONLY — no SNP, no anti-rollback)",
@@ -251,15 +295,24 @@ pub fn run_contract_server(
                 // Arm per-connection timeouts; a setup fault skips this connection WITHOUT backoff (not
                 // fd pressure). serve_framed_pump runs the per-connection pump; any fault is contained.
                 if configure_unix_session_timeouts(&mut stream).is_ok() {
-                    if let Err(e) = serve_framed_pump(&mut stream, serve_one_agent_frame, SESSION_IDLE_TIMEOUT) {
-                        let _ = writeln!(std::io::stderr(), "[info] agent contract server: connection closed ({e})");
+                    if let Err(e) =
+                        serve_framed_pump(&mut stream, serve_one_agent_frame, SESSION_IDLE_TIMEOUT)
+                    {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "[info] agent contract server: connection closed ({e})"
+                        );
                     }
                 }
             }
             // accept(2) failed WITHOUT draining the backlog → bounded backoff (EMFILE/ENFILE anti-spin),
             // mirroring the SNP serial loop.
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "[warn] agent contract server: accept error ({}); skipping", e.kind());
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[warn] agent contract server: accept error ({}); skipping",
+                    e.kind()
+                );
                 std::thread::sleep(crate::enclave_serve::ACCEPT_ERROR_BACKOFF);
             }
         }
@@ -291,11 +344,23 @@ mod tests {
         let mut env = Vec::new();
         ciborium::ser::into_writer(
             &Value::Map(vec![
-                (k(1), Value::Integer((crate::agent_identity::AGENT_GATEWAY_VERSION as u64).into())),
+                (
+                    k(1),
+                    Value::Integer((crate::agent_identity::AGENT_GATEWAY_VERSION as u64).into()),
+                ),
                 (k(2), Value::Integer(2u64.into())),
-                (k(3), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
-                (k(4), Value::Bytes(b"contract-test:public-identity".to_vec())),
-                (k(6), Value::Bytes(crate::reference_keystore::REFERENCE_TRANSFER_KEY_REF.to_vec())),
+                (
+                    k(3),
+                    Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string()),
+                ),
+                (
+                    k(4),
+                    Value::Bytes(b"contract-test:public-identity".to_vec()),
+                ),
+                (
+                    k(6),
+                    Value::Bytes(crate::reference_keystore::REFERENCE_TRANSFER_KEY_REF.to_vec()),
+                ),
             ]),
             &mut env,
         )
@@ -305,15 +370,25 @@ mod tests {
         // Close the write half so the pump reads exactly one frame, replies, then sees EOF and returns.
         client.shutdown(std::net::Shutdown::Write).unwrap();
 
-        serve_framed_pump(&mut server, serve_one_agent_frame, SESSION_IDLE_TIMEOUT).expect("pump serves the frame then EOFs");
+        serve_framed_pump(&mut server, serve_one_agent_frame, SESSION_IDLE_TIMEOUT)
+            .expect("pump serves the frame then EOFs");
 
         // Read EXACTLY one length-prefixed reply frame (not read_to_end — `server` is still open, so
         // there is no EOF to wait for), decode it, and compare the body to the frozen golden.
         let reply = crate::read_framed_message(&mut client).expect("read one reply frame");
         let decoded = crate::decode_message(&reply).expect("reply is a valid 0x40 frame");
-        assert_eq!(decoded.msg_type, crate::MessageType::AgentGateway, "reply is a 0x40 frame");
-        let frozen: &[u8] = include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin");
-        assert_eq!(decoded.payload.as_slice(), frozen, "round-trip PUBLIC_IDENTITY body == frozen golden");
+        assert_eq!(
+            decoded.msg_type,
+            crate::MessageType::AgentGateway,
+            "reply is a 0x40 frame"
+        );
+        let frozen: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin");
+        assert_eq!(
+            decoded.payload.as_slice(),
+            frozen,
+            "round-trip PUBLIC_IDENTITY body == frozen golden"
+        );
 
         crate::agent_dispatch::reset_agent_keystore_for_tests();
     }
@@ -324,7 +399,10 @@ mod tests {
     fn non_0x40_frame_is_rejected() {
         // 0x01 = GetMeasurement (a producer type) framed; serve_one_agent_frame must reject it.
         let frame = crate::encode_message(crate::MessageType::GetMeasurement, b"x").unwrap();
-        assert!(matches!(serve_one_agent_frame(&frame), Err(ProtocolError::WireProtocol(_))));
+        assert!(matches!(
+            serve_one_agent_frame(&frame),
+            Err(ProtocolError::WireProtocol(_))
+        ));
     }
 
     /// The full deviceless MUTATING round-trip: install the reference keystore + the anti-rollback binding
@@ -358,8 +436,14 @@ mod tests {
             Value::Map(m) => m,
             _ => panic!("success body is a CBOR map"),
         };
-        assert!(matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Array(_))), "key 1 = minted key list");
-        assert!(matches!(crate::agent_cbor::map_get(&m, 2), Some(Value::Bytes(_))), "key 2 = sealed keystore blob");
+        assert!(
+            matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Array(_))),
+            "key 1 = minted key list"
+        );
+        assert!(
+            matches!(crate::agent_cbor::map_get(&m, 2), Some(Value::Bytes(_))),
+            "key 2 = sealed keystore blob"
+        );
 
         crate::agent_dispatch::reset_agent_keystore_for_tests();
         crate::agent_dispatch::reset_commit_channel_for_tests();
@@ -378,7 +462,8 @@ mod tests {
         assert!(install_reference_agent_keystore());
         install_mutating_op_support();
 
-        let env: &[u8] = include_bytes!("../testvectors/agent-gateway/req_configure_set_limits_v1.bin");
+        let env: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/req_configure_set_limits_v1.bin");
         let out = crate::agent_dispatch::handle_agent_gateway_frame(env);
 
         assert_eq!(
@@ -390,7 +475,10 @@ mod tests {
             Value::Map(m) => m,
             _ => panic!("success body is a CBOR map"),
         };
-        assert!(matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Bytes(_))), "key 1 = sealed keystore blob");
+        assert!(
+            matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Bytes(_))),
+            "key 1 = sealed keystore blob"
+        );
 
         crate::agent_dispatch::reset_agent_keystore_for_tests();
         crate::agent_dispatch::reset_commit_channel_for_tests();
@@ -456,9 +544,18 @@ mod tests {
             &Value::Map(vec![
                 (k(1), k(crate::agent_identity::AGENT_GATEWAY_VERSION as u64)),
                 (k(2), k(5)),
-                (k(3), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
-                (k(4), Value::Bytes(b"contract-test:faucet-dispense".to_vec())),
-                (k(6), Value::Bytes(crate::reference_keystore::REFERENCE_TREASURY_KEY_REF.to_vec())),
+                (
+                    k(3),
+                    Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string()),
+                ),
+                (
+                    k(4),
+                    Value::Bytes(b"contract-test:faucet-dispense".to_vec()),
+                ),
+                (
+                    k(6),
+                    Value::Bytes(crate::reference_keystore::REFERENCE_TREASURY_KEY_REF.to_vec()),
+                ),
                 (k(7), payload),
             ]),
             &mut env,
@@ -475,8 +572,14 @@ mod tests {
             Value::Map(m) => m,
             _ => panic!("success body is a CBOR map"),
         };
-        assert!(matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Bytes(_))), "key 1 = signed tx RLP");
-        assert!(matches!(crate::agent_cbor::map_get(&m, 8), Some(Value::Bytes(_))), "key 8 = sealed keystore blob");
+        assert!(
+            matches!(crate::agent_cbor::map_get(&m, 1), Some(Value::Bytes(_))),
+            "key 1 = signed tx RLP"
+        );
+        assert!(
+            matches!(crate::agent_cbor::map_get(&m, 8), Some(Value::Bytes(_))),
+            "key 8 = sealed keystore blob"
+        );
 
         crate::agent_dispatch::reset_agent_keystore_for_tests();
         crate::agent_dispatch::reset_commit_channel_for_tests();

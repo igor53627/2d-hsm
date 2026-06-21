@@ -9,8 +9,8 @@
 
 use crate::env_config::{
     var_twod, LEGACY_HSM_ANCHOR_ENDPOINT, LEGACY_HSM_ANCHOR_RELAY_PORT, LEGACY_HSM_VSOCK_CID,
-    LEGACY_HSM_VSOCK_PORT, TWOD_HSM_ANCHOR_ENDPOINT, TWOD_HSM_ANCHOR_RELAY_PORT, TWOD_HSM_VSOCK_CID,
-    TWOD_HSM_VSOCK_PORT,
+    LEGACY_HSM_VSOCK_PORT, TWOD_HSM_ANCHOR_ENDPOINT, TWOD_HSM_ANCHOR_RELAY_PORT,
+    TWOD_HSM_VSOCK_CID, TWOD_HSM_VSOCK_PORT,
 };
 use std::net::ToSocketAddrs;
 
@@ -64,7 +64,11 @@ pub fn vsock_listen_addr_from_env() -> Result<(u32, u32), String> {
 /// Resolve the serve vsock port from env — the single source shared by [`vsock_listen_addr_from_env`]
 /// and the relay-port collision check, so both decode it identically (one place to change).
 fn serve_vsock_port_from_env() -> Result<u32, String> {
-    env_u32_twod(TWOD_HSM_VSOCK_PORT, LEGACY_HSM_VSOCK_PORT, DEFAULT_VSOCK_PORT)
+    env_u32_twod(
+        TWOD_HSM_VSOCK_PORT,
+        LEGACY_HSM_VSOCK_PORT,
+        DEFAULT_VSOCK_PORT,
+    )
 }
 
 /// Pure validation of a resolved relay `port` against the `serve_port`: reject `0` (reserved) and a
@@ -101,9 +105,7 @@ pub fn anchor_relay_port_from_env() -> Result<u32, String> {
 /// (legacy `2D_HSM_PROVISIONING_VSOCK_PORT`) or [`DEFAULT_PROVISIONING_VSOCK_PORT`] (5002), validated
 /// against BOTH the serve port and the relay port (three distinct ports — Q5 structural invariant).
 pub fn provisioning_vsock_port_from_env() -> Result<u32, String> {
-    use crate::env_config::{
-        LEGACY_HSM_PROVISIONING_VSOCK_PORT, TWOD_HSM_PROVISIONING_VSOCK_PORT,
-    };
+    use crate::env_config::{LEGACY_HSM_PROVISIONING_VSOCK_PORT, TWOD_HSM_PROVISIONING_VSOCK_PORT};
     let port = env_u32_twod(
         TWOD_HSM_PROVISIONING_VSOCK_PORT,
         LEGACY_HSM_PROVISIONING_VSOCK_PORT,
@@ -140,14 +142,16 @@ pub fn anchor_endpoint_from_env() -> Result<Vec<std::net::SocketAddr>, String> {
         Ok(s) if !s.is_empty() => s,
         _ => {
             return Err(format!(
-                "{TWOD_HSM_ANCHOR_ENDPOINT} (or legacy {LEGACY_HSM_ANCHOR_ENDPOINT}) must be set to \
+            "{TWOD_HSM_ANCHOR_ENDPOINT} (or legacy {LEGACY_HSM_ANCHOR_ENDPOINT}) must be set to \
                  the external anchor host:port (no default — fail-closed)"
-            ))
+        ))
         }
     };
     let addrs = resolve_host_port_bounded(&raw, ANCHOR_RESOLVE_BUDGET)?;
     if addrs.is_empty() {
-        return Err(format!("{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) resolved to zero addresses"));
+        return Err(format!(
+            "{TWOD_HSM_ANCHOR_ENDPOINT} ({raw}) resolved to zero addresses"
+        ));
     }
     Ok(addrs)
 }
@@ -212,7 +216,10 @@ mod tests {
     #[test]
     fn validate_relay_port_accepts_distinct_rejects_zero_and_collision() {
         // The default vs serve default — accepted.
-        assert_eq!(validate_relay_port(DEFAULT_ANCHOR_RELAY_PORT, DEFAULT_VSOCK_PORT).unwrap(), 5001);
+        assert_eq!(
+            validate_relay_port(DEFAULT_ANCHOR_RELAY_PORT, DEFAULT_VSOCK_PORT).unwrap(),
+            5001
+        );
         // 0 is reserved.
         assert!(validate_relay_port(0, DEFAULT_VSOCK_PORT).is_err());
         // same as the serve port — rejected (deterministic, no env needed).
@@ -252,8 +259,14 @@ mod tests {
         with_anchor_env_cleared(|| {
             // UNSET → fail-closed Err naming the var (no default, no silent localhost).
             let err = anchor_endpoint_from_env().unwrap_err();
-            assert!(err.contains(TWOD_HSM_ANCHOR_ENDPOINT), "err must name the var: {err}");
-            assert!(err.contains("fail-closed"), "err must state fail-closed: {err}");
+            assert!(
+                err.contains(TWOD_HSM_ANCHOR_ENDPOINT),
+                "err must name the var: {err}"
+            );
+            assert!(
+                err.contains("fail-closed"),
+                "err must state fail-closed: {err}"
+            );
             // EMPTY is treated as unset (same fail-closed branch) — never a localhost guess.
             std::env::set_var(TWOD_HSM_ANCHOR_ENDPOINT, "");
             assert!(anchor_endpoint_from_env().is_err());
@@ -322,6 +335,9 @@ mod tests {
         // timeout, NOT a hang) naming the var. Distinguishes the resolve-error arm from the timeout arm.
         let err = resolve_host_port_bounded("not-a-host-port", std::time::Duration::from_secs(5))
             .unwrap_err();
-        assert!(err.contains(TWOD_HSM_ANCHOR_ENDPOINT), "err must name the var: {err}");
+        assert!(
+            err.contains(TWOD_HSM_ANCHOR_ENDPOINT),
+            "err must name the var: {err}"
+        );
     }
 }

@@ -58,7 +58,10 @@ fn deterministic_golden_loader_unseals_committed_blob() {
     assert_eq!(body.config.environment_identifier, "testnet");
     assert_eq!(body.config.backup_recovery_wrapping_pubkey.len(), 1568);
     assert_eq!(body.structural_version, 1, "genesis structural_version");
-    assert_eq!(body.strict_recovery_counter, 0, "genesis strict_recovery_counter");
+    assert_eq!(
+        body.strict_recovery_counter, 0,
+        "genesis strict_recovery_counter"
+    );
     assert_eq!(body.freshness_epoch, 1);
     assert!(body.entries.is_empty(), "genesis has no key entries");
     assert!(body.counters.is_empty(), "genesis has no counter rows");

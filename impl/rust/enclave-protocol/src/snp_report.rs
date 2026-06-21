@@ -51,7 +51,10 @@ pub(crate) const TSM_QUOTE_ENTRY_PREFIX: &str = "twod-hsm-q-";
 #[cfg(feature = "agent-gateway")]
 #[cfg_attr(not(test), allow(dead_code))] // consumer = the triple-gated quote_subprocess child mode
 pub(crate) fn quote_child_entry_path() -> String {
-    format!("{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}", std::process::id())
+    format!(
+        "{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}",
+        std::process::id()
+    )
 }
 
 /// CHILD-ONLY best-effort orphan GC (path-parameterized so tempdir tests can exercise it): remove every
@@ -189,15 +192,18 @@ impl TsmFs for RealTsmFs {
         let mut inblob = std::fs::OpenOptions::new()
             .write(true)
             .open(format!("{entry}/inblob"))
-            .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot open inblob"))?;
+            .map_err(|_| {
+                ProtocolError::PqSigningUnavailable("SNP attestation: cannot open inblob")
+            })?;
         inblob.write_all(data).map_err(|_| {
             ProtocolError::PqSigningUnavailable("SNP attestation: cannot write report_data")
         })
     }
     fn read_outblob(&self, entry: &str) -> Result<Vec<u8>, ProtocolError> {
         use std::io::Read;
-        let file = std::fs::File::open(format!("{entry}/outblob"))
-            .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot open outblob"))?;
+        let file = std::fs::File::open(format!("{entry}/outblob")).map_err(|_| {
+            ProtocolError::PqSigningUnavailable("SNP attestation: cannot open outblob")
+        })?;
         // Cap-before-alloc (configfs is in the TCB, but match the module's bounded-read discipline so a
         // buggy/wedged provider can't force an unbounded heap alloc in the memory-constrained TEE): read at
         // most MAX_OUTBLOB_LEN+1, so an over-large stream is DETECTED (errored) — not silently truncated
@@ -205,7 +211,9 @@ impl TsmFs for RealTsmFs {
         let mut buf = Vec::new();
         file.take((MAX_OUTBLOB_LEN + 1) as u64)
             .read_to_end(&mut buf)
-            .map_err(|_| ProtocolError::PqSigningUnavailable("SNP attestation: cannot read outblob"))?;
+            .map_err(|_| {
+                ProtocolError::PqSigningUnavailable("SNP attestation: cannot read outblob")
+            })?;
         if buf.len() > MAX_OUTBLOB_LEN {
             return Err(ProtocolError::PqSigningUnavailable(OUTBLOB_OVERSIZE_MSG));
         }
@@ -223,7 +231,10 @@ impl TsmFs for RealTsmFs {
             Err(_) => return Vec::new(),
         };
         let mut buf = Vec::new();
-        match file.take((MAX_CERT_CHAIN_LEN + 1) as u64).read_to_end(&mut buf) {
+        match file
+            .take((MAX_CERT_CHAIN_LEN + 1) as u64)
+            .read_to_end(&mut buf)
+        {
             Ok(_) if buf.len() <= MAX_CERT_CHAIN_LEN => buf,
             _ => Vec::new(),
         }
@@ -297,7 +308,9 @@ fn fetch_report_inner_with<F: TsmFs>(
 /// boot-relay quote path does NOT come through here: it is the killable-subprocess
 /// `HardBoundedQuoteProducer` (`quote_subprocess`) — the cooperative deadline-bounded variant
 /// (`fetch_report_deadline`) was deleted in (4a).
-pub fn fetch_report(report_data: &[u8; REPORT_DATA_LEN]) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+pub fn fetch_report(
+    report_data: &[u8; REPORT_DATA_LEN],
+) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
     fetch_report_with(&RealTsmFs, report_data)
 }
 
@@ -338,8 +351,7 @@ struct CachedAttestation {
 }
 
 /// One SNP report captured at enclave boot (bound to the installed PQ key).
-static SNP_ATTESTATION: std::sync::Mutex<Option<CachedAttestation>> =
-    std::sync::Mutex::new(None);
+static SNP_ATTESTATION: std::sync::Mutex<Option<CachedAttestation>> = std::sync::Mutex::new(None);
 
 /// Boot hook: fetch the SNP report bound to `pq_pubkey` once and cache
 /// `(measurement, report, cert_chain)`. Propagates the fetch error (e.g. interface absent) so the
@@ -490,7 +502,11 @@ mod tests {
                 Err(ProtocolError::PqSigningUnavailable("fake create fail"))
             }
         }
-        fn write_inblob(&self, _entry: &str, _data: &[u8; REPORT_DATA_LEN]) -> Result<(), ProtocolError> {
+        fn write_inblob(
+            &self,
+            _entry: &str,
+            _data: &[u8; REPORT_DATA_LEN],
+        ) -> Result<(), ProtocolError> {
             self.calls.borrow_mut().push("write");
             if self.write_err {
                 Err(ProtocolError::PqSigningUnavailable("fake write fail"))
@@ -552,7 +568,10 @@ mod tests {
         fs.write_err = true;
         let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]);
         assert_eq!(err_msg(r), "fake write fail");
-        assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "remove"]);
+        assert_eq!(
+            *fs.calls.borrow(),
+            vec!["remove", "create", "write", "remove"]
+        );
     }
 
     #[test]
@@ -560,7 +579,10 @@ mod tests {
         let mut fs = FakeTsmFs::ok();
         fs.outblob_err = true;
         assert!(fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]).is_err());
-        assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "outblob", "remove"]);
+        assert_eq!(
+            *fs.calls.borrow(),
+            vec!["remove", "create", "write", "outblob", "remove"]
+        );
     }
 
     #[test]
@@ -568,8 +590,14 @@ mod tests {
         let mut fs = FakeTsmFs::ok();
         fs.outblob = vec![0u8; MIN_REPORT_LEN - 1]; // one byte short of the ABI minimum
         let r = fetch_report_with(&fs, &[0u8; REPORT_DATA_LEN]);
-        assert_eq!(err_msg(r), "SNP attestation: outblob shorter than ABI minimum");
-        assert_eq!(*fs.calls.borrow(), vec!["remove", "create", "write", "outblob", "remove"]);
+        assert_eq!(
+            err_msg(r),
+            "SNP attestation: outblob shorter than ABI minimum"
+        );
+        assert_eq!(
+            *fs.calls.borrow(),
+            vec!["remove", "create", "write", "outblob", "remove"]
+        );
     }
 
     /// (d-ii) quote-child naming/GC tests live HERE (not in the triple-gated quote_subprocess) so the
@@ -598,7 +626,10 @@ mod tests {
             let path = quote_child_entry_path();
             assert_eq!(
                 path,
-                format!("{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}", std::process::id()),
+                format!(
+                    "{TSM_REPORT_DIR}/{TSM_QUOTE_ENTRY_PREFIX}{}",
+                    std::process::id()
+                ),
                 "self-named path = report dir + prefix + OWN pid"
             );
         }
@@ -608,14 +639,31 @@ mod tests {
             // Regression: GC nuking the fixed producer entry (GET_MEASUREMENT breakage) or unrelated
             // names. Spares the REAL const (not a transcribed literal).
             let dir = tempfile::tempdir().unwrap();
-            for name in ["twod-hsm-q-123", "twod-hsm-q-99999", TSM_ENTRY_NAME, "unrelated"] {
+            for name in [
+                "twod-hsm-q-123",
+                "twod-hsm-q-99999",
+                TSM_ENTRY_NAME,
+                "unrelated",
+            ] {
                 std::fs::create_dir(dir.path().join(name)).unwrap();
             }
             gc_quote_entries_best_effort(dir.path());
-            assert!(!dir.path().join("twod-hsm-q-123").exists(), "prefixed orphan removed");
-            assert!(!dir.path().join("twod-hsm-q-99999").exists(), "prefixed orphan removed");
-            assert!(dir.path().join(TSM_ENTRY_NAME).exists(), "the FIXED producer entry is spared");
-            assert!(dir.path().join("unrelated").exists(), "unrelated names spared");
+            assert!(
+                !dir.path().join("twod-hsm-q-123").exists(),
+                "prefixed orphan removed"
+            );
+            assert!(
+                !dir.path().join("twod-hsm-q-99999").exists(),
+                "prefixed orphan removed"
+            );
+            assert!(
+                dir.path().join(TSM_ENTRY_NAME).exists(),
+                "the FIXED producer entry is spared"
+            );
+            assert!(
+                dir.path().join("unrelated").exists(),
+                "unrelated names spared"
+            );
         }
 
         #[test]

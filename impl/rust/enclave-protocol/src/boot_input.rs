@@ -24,7 +24,8 @@ pub fn read_boot_file_capped(
     err_label: &'static str,
 ) -> Result<Vec<u8>, ProtocolError> {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|_| ProtocolError::PqSigningUnavailable(err_label))?;
+    let file =
+        std::fs::File::open(path).map_err(|_| ProtocolError::PqSigningUnavailable(err_label))?;
     let mut bytes = Vec::new();
     file.take(max_bytes as u64 + 1)
         .read_to_end(&mut bytes)
@@ -39,10 +40,7 @@ pub fn read_boot_file_trim_trailing_newlines(
     err_label: &'static str,
 ) -> Result<Vec<u8>, ProtocolError> {
     let mut bytes = read_boot_file(path, err_label)?;
-    while bytes
-        .last()
-        .is_some_and(|b| *b == b'\n' || *b == b'\r')
-    {
+    while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
         bytes.pop();
     }
     Ok(bytes)

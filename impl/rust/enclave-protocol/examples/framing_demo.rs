@@ -2,11 +2,11 @@
 //!
 //! Run with: cargo run --example framing_demo
 
-use enclave_protocol::{
-    encode_message, decode_message, MessageType, GetMeasurementRequest,
-    AuthorizationTicketPayload, prepare_ticket_for_signing,
-};
 use ciborium::ser::into_writer;
+use enclave_protocol::{
+    decode_message, encode_message, prepare_ticket_for_signing, AuthorizationTicketPayload,
+    GetMeasurementRequest, MessageType,
+};
 
 fn main() {
     println!("=== Framing roundtrip demo ===\n");
@@ -15,8 +15,7 @@ fn main() {
     let mut payload = Vec::new();
     into_writer(&req, &mut payload).expect("CBOR encode");
 
-    let framed = encode_message(MessageType::GetMeasurement, &payload)
-        .expect("framing failed");
+    let framed = encode_message(MessageType::GetMeasurement, &payload).expect("framing failed");
 
     println!("Framed GET_MEASUREMENT ({} bytes)", framed.len());
     let decoded = decode_message(&framed).expect("decode failed");
@@ -62,7 +61,7 @@ fn main() {
         activation_height: 1_600_000,
         new_measurement: b"bad".to_vec(),
         pq_pubkey: vec![0xDD; 48],
-        fork_spec_hash: None,           // missing!
+        fork_spec_hash: None, // missing!
         new_header_version: None,
     };
 

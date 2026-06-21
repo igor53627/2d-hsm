@@ -11,7 +11,11 @@
 //! NB: the relay's resolved port (`anchor_relay_port_from_env`) has a DEFAULT, so it does not fail the
 //! config gate; `anchor_endpoint_from_env` is the no-default gate this test exercises. The bin clears
 //! its env to make the unset-var assertion deterministic regardless of the CI host's environment.
-#![cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#![cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 
 use std::process::{Command, Stdio};
 

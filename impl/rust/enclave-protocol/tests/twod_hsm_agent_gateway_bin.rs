@@ -10,7 +10,11 @@
 //! Both arms are deterministic + deviceless (no vsock device / configfs needed): arm (a)'s child fails
 //! at env parse BEFORE any device I/O; the fail-closed arm fails at the agent provisioning root BEFORE
 //! any bind/connect.
-#![cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#![cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 
 use std::process::{Command, Stdio};
 
@@ -37,13 +41,20 @@ fn agent_bin() -> Command {
 /// THIS discharges the §8 5b-2c byte-exact-stdout acceptance item (re-targeted to the agent bin).
 #[test]
 fn agent_bin_dispatches_first_and_stdout_is_byte_exact_err1() {
-    let out = agent_bin().env(MARKER_ENV, "1").output().expect("spawn the agent bin");
+    let out = agent_bin()
+        .env(MARKER_ENV, "1")
+        .output()
+        .expect("spawn the agent bin");
     assert_eq!(
         out.stdout.as_slice(),
         ERR1_FRAME,
         "stdout must be EXACTLY the 2-byte ERR(1) frame (full-buffer equality, not the parser)"
     );
-    assert_eq!(out.status.code(), Some(1), "bad/missing report_data env exits 1");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "bad/missing report_data env exits 1"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("twod-hsm quote child: exit 1"),
@@ -59,13 +70,15 @@ fn agent_bin_dispatches_first_and_stdout_is_byte_exact_err1() {
 mod refusal_arms {
     use super::agent_bin;
     use enclave_protocol::env_config::{
-        TWOD_HSM_BOOT_MAX_ATTEMPTS, TWOD_HSM_BOOT_OVERALL_BUDGET_MS,
-        TWOD_HSM_BOOT_PER_LEG_TIMEOUT_MS, TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
+        TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_BOOT_MAX_ATTEMPTS,
+        TWOD_HSM_BOOT_OVERALL_BUDGET_MS, TWOD_HSM_BOOT_PER_LEG_TIMEOUT_MS,
         TWOD_HSM_PQ_SEAL_V1_ROOT_FILE,
     };
 
-    const ROOT_FILE: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/seal_v1_provisioning_root.bin");
+    const ROOT_FILE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testvectors/seal_v1_provisioning_root.bin"
+    );
     const SMOKE_BLOB: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/testvectors/agent-gateway/agent_keystore_smoke_v1.sealed.bin"
@@ -90,7 +103,11 @@ mod refusal_arms {
             .output()
             .expect("spawn the agent bin");
         assert_eq!(out.status.code(), Some(1), "validation refusal exits 1");
-        assert!(out.stdout.is_empty(), "stdout stays protocol-only; got {:?}", out.stdout);
+        assert!(
+            out.stdout.is_empty(),
+            "stdout stays protocol-only; got {:?}",
+            out.stdout
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("boot budget config (raw, pre-validate)"),
@@ -104,7 +121,10 @@ mod refusal_arms {
             !stderr.contains("boot budget validated"),
             "a refused budget must never emit the validated event; got: {stderr:?}"
         );
-        assert!(!stderr.contains("serving on vsock"), "must never reach serve");
+        assert!(
+            !stderr.contains("serving on vsock"),
+            "must never reach serve"
+        );
     }
 
     /// Arm (iii) — OUTCOME REFUSAL: a VALID budget (1 attempt, 200 ms per leg), then the handshake's
@@ -130,7 +150,11 @@ mod refusal_arms {
             .output()
             .expect("spawn the agent bin");
         assert_eq!(out.status.code(), Some(1), "outcome refusal exits 1");
-        assert!(out.stdout.is_empty(), "stdout stays protocol-only; got {:?}", out.stdout);
+        assert!(
+            out.stdout.is_empty(),
+            "stdout stays protocol-only; got {:?}",
+            out.stdout
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         let pos = |needle: &str| -> usize {
             stderr
@@ -146,7 +170,10 @@ mod refusal_arms {
             "the canonical order raw({raw}) < validated({validated}) < warn-outcome({outcome}) < \
              err-render({err_render}) must hold; got: {stderr:?}"
         );
-        assert!(!stderr.contains("serving on vsock"), "a refused outcome must never serve");
+        assert!(
+            !stderr.contains("serving on vsock"),
+            "a refused outcome must never serve"
+        );
     }
 }
 
@@ -157,12 +184,20 @@ mod refusal_arms {
 #[test]
 fn agent_bin_fails_closed_on_unconfigured_root() {
     let out = agent_bin().output().expect("spawn the agent bin");
-    assert_eq!(out.status.code(), Some(1), "an unconfigured-root boot exits 1 (fail-closed)");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unconfigured-root boot exits 1 (fail-closed)"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(
         stderr.contains("boot failed") && stderr.contains("root"),
         "stderr must render the fail-closed boot cause naming the provisioning root; got: {stderr:?}"
     );
     // PROTOCOL-ONLY stdout: a fail-closed boot writes NOTHING to stdout (the journald channel is stderr).
-    assert!(out.stdout.is_empty(), "fail-closed startup must not write to stdout; got {:?}", out.stdout);
+    assert!(
+        out.stdout.is_empty(),
+        "fail-closed startup must not write to stdout; got {:?}",
+        out.stdout
+    );
 }

@@ -5,7 +5,8 @@ fn main() {
     let vk = enclave_protocol::reference_test_attestation_trust()
         .attestation_verifying_key
         .to_bytes();
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors/reference_attestation_vk.bin");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testvectors/reference_attestation_vk.bin");
     std::fs::write(&path, vk).expect("write vk");
     println!("wrote {} ({} bytes)", path.display(), vk.len());
 }

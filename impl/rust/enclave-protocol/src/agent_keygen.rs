@@ -77,13 +77,18 @@ pub fn generate_keys(
 ) -> Result<Vec<GeneratedKey>, GenerateKeysError> {
     // 1. count rules per purpose.
     match purpose {
-        KeyPurpose::AgentFaucetTreasuryK1 if count != 1 => return Err(GenerateKeysError::InvalidCount),
+        KeyPurpose::AgentFaucetTreasuryK1 if count != 1 => {
+            return Err(GenerateKeysError::InvalidCount)
+        }
         KeyPurpose::AgentTransferK1 if count == 0 => return Err(GenerateKeysError::InvalidCount),
         _ => {}
     }
     // 2. treasury singleton — a second active treasury key fails closed.
     if purpose == KeyPurpose::AgentFaucetTreasuryK1
-        && body.entries.iter().any(|e| e.purpose == KeyPurpose::AgentFaucetTreasuryK1)
+        && body
+            .entries
+            .iter()
+            .any(|e| e.purpose == KeyPurpose::AgentFaucetTreasuryK1)
     {
         return Err(GenerateKeysError::TreasuryExists);
     }
@@ -158,7 +163,11 @@ mod tests {
     const MEAS: &[u8] = b"keygen-test-measurement";
 
     fn creation() -> CreationMetadata {
-        CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 }
+        CreationMetadata {
+            config_version: 1,
+            counter_snapshot: 0,
+            batch_id: 1,
+        }
     }
 
     /// A valid, sealable keystore body with no entries (1568-byte ML-KEM wrapping key so seal_body
@@ -188,7 +197,12 @@ mod tests {
                 circuit_breaker_threshold: None,
                 cumulative_signing_budget: [0; 32],
             },
-            audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
+            audit: AuditRing {
+                records: vec![],
+                capacity: 64,
+                last_exported_seq: 0,
+                next_seq: 1,
+            },
             freshness_epoch: 1,
             structural_version: 1,
             strict_recovery_counter: 0,
@@ -213,7 +227,9 @@ mod tests {
             // eth/tron returned match the entry's pubkey.
             assert_eq!(
                 g.eth_address.to_vec(),
-                crate::secp256k1::eth_address_from_uncompressed(&g.pubkey_uncompressed).unwrap().to_vec()
+                crate::secp256k1::eth_address_from_uncompressed(&g.pubkey_uncompressed)
+                    .unwrap()
+                    .to_vec()
             );
         }
         // The mutated body still seals + round-trips (secrets survive).
@@ -257,7 +273,12 @@ mod tests {
         let mut body = empty_body();
         // over per-batch limit
         assert_eq!(
-            generate_keys(&mut body, KeyPurpose::AgentTransferK1, MAX_BATCH_SIZE + 1, creation()),
+            generate_keys(
+                &mut body,
+                KeyPurpose::AgentTransferK1,
+                MAX_BATCH_SIZE + 1,
+                creation()
+            ),
             Err(GenerateKeysError::CapacityExceeded)
         );
         assert!(body.entries.is_empty(), "no mutation on capacity failure");
@@ -289,7 +310,11 @@ mod tests {
             generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation()),
             Err(GenerateKeysError::CapacityExceeded)
         );
-        assert_eq!(body.entries.len(), MAX_TOTAL_KEY_ENTRIES, "no mutation on total-capacity failure");
+        assert_eq!(
+            body.entries.len(),
+            MAX_TOTAL_KEY_ENTRIES,
+            "no mutation on total-capacity failure"
+        );
     }
 
     #[test]
@@ -302,6 +327,10 @@ mod tests {
             generate_keys(&mut body, KeyPurpose::AgentFaucetTreasuryK1, 3, creation()),
             Err(GenerateKeysError::InvalidCount)
         );
-        assert_eq!(body.entries.len(), before, "failed keygen leaves body unchanged");
+        assert_eq!(
+            body.entries.len(),
+            before,
+            "failed keygen leaves body unchanged"
+        );
     }
 }

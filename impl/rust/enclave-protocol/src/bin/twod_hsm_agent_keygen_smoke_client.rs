@@ -36,7 +36,10 @@ fn run() -> Result<bool, String> {
     // NotPresent → default; NotUnicode / parse failure → fail closed naming the var.
     let parse_u32 = |var: &str, default: u32| -> Result<u32, String> {
         match std::env::var(var) {
-            Ok(s) => s.trim().parse::<u32>().map_err(|_| format!("{var} must be a u32")),
+            Ok(s) => s
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("{var} must be a u32")),
             Err(std::env::VarError::NotPresent) => Ok(default),
             Err(std::env::VarError::NotUnicode(_)) => Err(format!("{var} is not valid UTF-8")),
         }
@@ -52,5 +55,8 @@ fn run() -> Result<bool, String> {
         stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
         Ok(stream)
     };
-    Ok(enclave_protocol::run_agent_keygen_smoke_client(connect, &mut std::io::stderr()))
+    Ok(enclave_protocol::run_agent_keygen_smoke_client(
+        connect,
+        &mut std::io::stderr(),
+    ))
 }

@@ -129,8 +129,17 @@ fn build_header(
     payload_nonce: &[u8; PAYLOAD_NONCE_LEN],
 ) -> Result<Vec<u8>, BackupError> {
     let mut h = Vec::with_capacity(
-        BACKUP_MAGIC.len() + 2 + 2 + recovery_key_id.len() + 8 + 2 + environment_identifier.len()
-            + kem_ct.len() + 4 + key_refs_manifest.len() + PAYLOAD_NONCE_LEN,
+        BACKUP_MAGIC.len()
+            + 2
+            + 2
+            + recovery_key_id.len()
+            + 8
+            + 2
+            + environment_identifier.len()
+            + kem_ct.len()
+            + 4
+            + key_refs_manifest.len()
+            + PAYLOAD_NONCE_LEN,
     );
     h.extend_from_slice(BACKUP_MAGIC);
     h.extend_from_slice(&BACKUP_FORMAT_VERSION.to_be_bytes());
@@ -156,9 +165,11 @@ fn encapsulate_to_recovery_key(
     if recovery_encaps_key.len() != ML_KEM_1024_ENCAPS_KEY_LEN {
         return Err(BackupError::InvalidEncapsKeyLen);
     }
-    let encoded: ml_kem::Key<EncapsulationKey<MlKem1024>> =
-        recovery_encaps_key.try_into().map_err(|_| BackupError::InvalidEncapsKeyLen)?;
-    let ek = EncapsulationKey::<MlKem1024>::new(&encoded).map_err(|_| BackupError::InvalidEncapsKey)?;
+    let encoded: ml_kem::Key<EncapsulationKey<MlKem1024>> = recovery_encaps_key
+        .try_into()
+        .map_err(|_| BackupError::InvalidEncapsKeyLen)?;
+    let ek =
+        EncapsulationKey::<MlKem1024>::new(&encoded).map_err(|_| BackupError::InvalidEncapsKey)?;
     let mut m_arr = ml_kem::B32::from(*m);
     let (kem_ct, mut ss) = ek.encapsulate_deterministic(&m_arr);
     let mut ss_buf = Zeroizing::new([0u8; 32]);
@@ -207,9 +218,16 @@ fn seal_backup_blob_with_m(
         &payload_nonce,
     )?;
 
-    let cipher = ChaCha20Poly1305::new_from_slice(&payload_key[..]).map_err(|_| BackupError::Encrypt)?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&payload_key[..]).map_err(|_| BackupError::Encrypt)?;
     let dem_ct = cipher
-        .encrypt(Nonce::from_slice(&payload_nonce), Payload { msg: payload, aad: &header })
+        .encrypt(
+            Nonce::from_slice(&payload_nonce),
+            Payload {
+                msg: payload,
+                aad: &header,
+            },
+        )
         .map_err(|_| BackupError::Encrypt)?;
 
     let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
@@ -305,7 +323,9 @@ impl<'a> Reader<'a> {
         let b = self.take(8)?;
         // Direct indexing (like take_u16/take_u32) — no `.expect()` panic surface on untrusted bytes, even
         // though take(8) already guarantees the length (defense for a TEE parser that must never panic).
-        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
     fn take_lp16(&mut self) -> Result<&'a [u8], BackupError> {
         let n = self.take_u16()? as usize;
@@ -493,7 +513,11 @@ pub(crate) fn build_restore_ingress_payload(
     ciborium::ser::into_writer(&data, &mut *out).map_err(|_| BackupError::Serialization)?;
     // Both passes must encode the same length; a mismatch means pass 2 exceeded the reserved capacity
     // (reallocated, leaking a copy) or encoding is non-deterministic — either way a bug.
-    debug_assert_eq!(out.len(), prefix_len + counter.0, "restore-ingress CBOR length mismatch between passes");
+    debug_assert_eq!(
+        out.len(),
+        prefix_len + counter.0,
+        "restore-ingress CBOR length mismatch between passes"
+    );
     // Self-check: the just-built payload must STRICTLY re-parse (magic+version+CBOR, no trailing).
     let _ = parse_restore_ingress(&out)?;
     Ok(out)
@@ -531,8 +555,10 @@ pub(crate) fn parse_restore_ingress(payload: &[u8]) -> Result<RestoreIngressData
 /// envelope AEAD, so the host cannot alter the exported set; the restore side matches it against the
 /// request selector. Built from the SAME `ordered_refs` as the payload, so the two cannot disagree.
 pub(crate) fn build_key_refs_manifest(ordered_refs: &[[u8; 32]]) -> Result<Vec<u8>, BackupError> {
-    let arr: Vec<ciborium::value::Value> =
-        ordered_refs.iter().map(|r| ciborium::value::Value::Bytes(r.to_vec())).collect();
+    let arr: Vec<ciborium::value::Value> = ordered_refs
+        .iter()
+        .map(|r| ciborium::value::Value::Bytes(r.to_vec()))
+        .collect();
     let mut out = Vec::new();
     ciborium::ser::into_writer(&ciborium::value::Value::Array(arr), &mut out)
         .map_err(|_| BackupError::Serialization)?;
@@ -745,10 +771,14 @@ fn strict_parse_ingress_envelope(blob: &[u8]) -> Result<ParsedIngressEnvelope<'_
     let dest_measurement = r.take_lp16()?;
     let chain_id = r.take_u64()?;
     let environment_identifier = r.take_lp16()?;
-    let manifest_hash: &[u8; SHA3_256_LEN] =
-        r.take(SHA3_256_LEN)?.try_into().map_err(|_| BackupError::Truncated)?;
-    let original_backup_digest: &[u8; SHA3_256_LEN] =
-        r.take(SHA3_256_LEN)?.try_into().map_err(|_| BackupError::Truncated)?;
+    let manifest_hash: &[u8; SHA3_256_LEN] = r
+        .take(SHA3_256_LEN)?
+        .try_into()
+        .map_err(|_| BackupError::Truncated)?;
+    let original_backup_digest: &[u8; SHA3_256_LEN] = r
+        .take(SHA3_256_LEN)?
+        .try_into()
+        .map_err(|_| BackupError::Truncated)?;
     let ingress_kem_ct = r.take(ML_KEM_1024_CIPHERTEXT_LEN)?;
     let ingress_nonce = r.take(INGRESS_NONCE_LEN)?;
     let header_end = r.pos;
@@ -821,11 +851,20 @@ pub(crate) fn open_restore_ingress_envelope(
     // past the derive. Symmetric with `encapsulate_to_recovery_key`'s `ss.zeroize()` on the seal side
     // (claude-code/compact Medium: the decap path zeroizes too, not just the encaps path).
     ss_prime.zeroize();
-    let nonce: [u8; INGRESS_NONCE_LEN] =
-        parsed.ingress_nonce.try_into().map_err(|_| BackupError::Truncated)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Decrypt)?;
+    let nonce: [u8; INGRESS_NONCE_LEN] = parsed
+        .ingress_nonce
+        .try_into()
+        .map_err(|_| BackupError::Truncated)?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Decrypt)?;
     let payload_bytes = cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: parsed.dem_ct, aad: parsed.header })
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: parsed.dem_ct,
+                aad: parsed.header,
+            },
+        )
         .map_err(|_| BackupError::Decrypt)?;
     Ok(OpenedRestoreIngress {
         payload: Zeroizing::new(payload_bytes),
@@ -860,18 +899,29 @@ mod tests {
         blob: &[u8],
     ) -> Result<Vec<u8>, BackupError> {
         let parsed = strict_parse(blob)?;
-        let ct_arr: ml_kem::Ciphertext<MlKem1024> =
-            parsed.kem_ct.try_into().map_err(|_| BackupError::Truncated)?;
+        let ct_arr: ml_kem::Ciphertext<MlKem1024> = parsed
+            .kem_ct
+            .try_into()
+            .map_err(|_| BackupError::Truncated)?;
         // ML-KEM decapsulation is infallible by design (implicit rejection yields a pseudo-random ss on a
         // bad ct rather than erroring); a wrong key / mutated ct therefore surfaces as an AEAD tag failure
         // below, never as a silent success.
         let ss = dk.decapsulate(&ct_arr);
         let payload_key = derive_payload_key(ss.as_slice());
-        let nonce: [u8; PAYLOAD_NONCE_LEN] =
-            parsed.payload_nonce.try_into().map_err(|_| BackupError::Truncated)?;
-        let cipher = ChaCha20Poly1305::new_from_slice(&payload_key[..]).map_err(|_| BackupError::Decrypt)?;
+        let nonce: [u8; PAYLOAD_NONCE_LEN] = parsed
+            .payload_nonce
+            .try_into()
+            .map_err(|_| BackupError::Truncated)?;
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&payload_key[..]).map_err(|_| BackupError::Decrypt)?;
         cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: parsed.dem_ct, aad: parsed.header })
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: parsed.dem_ct,
+                    aad: parsed.header,
+                },
+            )
             .map_err(|_| BackupError::Decrypt)
     }
 
@@ -906,7 +956,10 @@ mod tests {
     /// AND it genuinely IS in the cleartext payload (so the test is non-vacuous).
     #[test]
     fn no_plaintext_secret_in_blob() {
-        assert!(payload().windows(SECRET.len()).any(|w| w == SECRET), "test payload must contain the secret");
+        assert!(
+            payload().windows(SECRET.len()).any(|w| w == SECRET),
+            "test payload must contain the secret"
+        );
         let (blob, _dk) = seal_fixed();
         assert!(
             !blob.windows(SECRET.len()).any(|w| w == SECRET),
@@ -921,7 +974,10 @@ mod tests {
     fn blob_not_openable_with_wrong_recovery_key() {
         let (blob, _dk1) = seal_fixed();
         let (_ek2, dk2) = recovery_keypair(&[0x11; 64]);
-        assert_eq!(open_backup_blob_offline(&dk2, &blob), Err(BackupError::Decrypt));
+        assert_eq!(
+            open_backup_blob_offline(&dk2, &blob),
+            Err(BackupError::Decrypt)
+        );
     }
 
     /// (d) Wrong-magic + unknown-version reject BEFORE any decrypt.
@@ -930,10 +986,19 @@ mod tests {
         let (mut blob, _dk) = seal_fixed();
         let mut wrong_magic = blob.clone();
         wrong_magic[0] = b'X';
-        assert_eq!(reject_unparseable_header(&wrong_magic), Err(BackupError::BadMagic));
+        assert_eq!(
+            reject_unparseable_header(&wrong_magic),
+            Err(BackupError::BadMagic)
+        );
         blob[BACKUP_MAGIC.len() + 1] = 0xFF;
-        assert_eq!(reject_unparseable_header(&blob), Err(BackupError::UnsupportedVersion));
-        assert_eq!(reject_unparseable_header(&blob[..4]), Err(BackupError::Truncated));
+        assert_eq!(
+            reject_unparseable_header(&blob),
+            Err(BackupError::UnsupportedVersion)
+        );
+        assert_eq!(
+            reject_unparseable_header(&blob[..4]),
+            Err(BackupError::Truncated)
+        );
     }
 
     /// Helper: an offline open of a tampered blob must NOT succeed (it either fails strict-parse or the
@@ -966,7 +1031,10 @@ mod tests {
         ] {
             let mut tampered = blob.clone();
             tampered[off] ^= 0x01;
-            assert!(open_is_err(&dk, &tampered), "tampering {label} (offset {off}) must break the open");
+            assert!(
+                open_is_err(&dk, &tampered),
+                "tampering {label} (offset {off}) must break the open"
+            );
         }
     }
 
@@ -986,9 +1054,15 @@ mod tests {
         // lp16(recovery_key_id) prefix is at bytes [10,11] (after magic(8)+ver(2)); bump its low byte +1.
         let new_len = (RID.len() as u16) + 1;
         t[10..12].copy_from_slice(&new_len.to_be_bytes());
-        assert!(open_is_err(&dk, &t), "re-partitioning via the length prefix must not open successfully");
+        assert!(
+            open_is_err(&dk, &t),
+            "re-partitioning via the length prefix must not open successfully"
+        );
         // And it is specifically the strict parse that catches THIS re-partition (the framing misaligns):
-        assert!(strict_parse(&t).is_err(), "re-partition misaligns the fixed-width framing ⇒ strict_parse rejects");
+        assert!(
+            strict_parse(&t).is_err(),
+            "re-partition misaligns the fixed-width framing ⇒ strict_parse rejects"
+        );
     }
 
     /// (f) Wrong-length encaps key fails closed (no panic, no partial work).
@@ -1025,7 +1099,11 @@ mod tests {
         let (mut blob, _dk) = seal_fixed();
         assert!(strict_parse(&blob).is_ok(), "the minted blob strict-parses");
         blob.push(0x00);
-        assert_eq!(strict_parse(&blob).err(), Some(BackupError::Truncated), "trailing byte ⇒ reject");
+        assert_eq!(
+            strict_parse(&blob).err(),
+            Some(BackupError::Truncated),
+            "trailing byte ⇒ reject"
+        );
     }
 
     /// (i') Corrupted AEAD tag (framing preserved) fails specifically with `Decrypt` — the AC#3
@@ -1036,8 +1114,14 @@ mod tests {
         let (mut blob, dk) = seal_fixed();
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
-        assert!(strict_parse(&blob).is_ok(), "flipping a tag byte preserves the framing");
-        assert_eq!(open_backup_blob_offline(&dk, &blob), Err(BackupError::Decrypt));
+        assert!(
+            strict_parse(&blob).is_ok(),
+            "flipping a tag byte preserves the framing"
+        );
+        assert_eq!(
+            open_backup_blob_offline(&dk, &blob),
+            Err(BackupError::Decrypt)
+        );
     }
 
     /// (i) A truncated blob (chopped mid-ciphertext) fails strict-parse, never panics.
@@ -1045,7 +1129,10 @@ mod tests {
     fn truncated_blob_fails_closed() {
         let (blob, _dk) = seal_fixed();
         for cut in [0usize, 5, 9, 11, blob.len() - 1] {
-            assert!(strict_parse(&blob[..cut]).is_err(), "truncation at {cut} must fail closed");
+            assert!(
+                strict_parse(&blob[..cut]).is_err(),
+                "truncation at {cut} must fail closed"
+            );
         }
     }
 
@@ -1067,8 +1154,14 @@ mod tests {
         assert!(put_lp16(&mut out, &ok).is_ok(), "exactly u16::MAX fits");
         let too_long = vec![0u8; u16::MAX as usize + 1];
         let mut out2 = Vec::new();
-        assert_eq!(put_lp16(&mut out2, &too_long), Err(BackupError::FieldTooLong));
-        assert!(out2.is_empty(), "a refused field writes NOTHING (no truncated prefix)");
+        assert_eq!(
+            put_lp16(&mut out2, &too_long),
+            Err(BackupError::FieldTooLong)
+        );
+        assert!(
+            out2.is_empty(),
+            "a refused field writes NOTHING (no truncated prefix)"
+        );
     }
 
     // ─── Slice 3: frozen pq-agent-backup-v1 golden vector + ML-KEM recovery-keypair fixture ───
@@ -1101,9 +1194,17 @@ mod tests {
             "backup golden drifted; if intentional, regen via `regen_agent_backup_golden_vector -- --ignored` \
              and re-mint the .json sidecar in the same commit",
         );
-        assert_eq!(&committed[8..10], &[0x00, 0x01], "backup_format_version 1 (literal BE u16)");
+        assert_eq!(
+            &committed[8..10],
+            &[0x00, 0x01],
+            "backup_format_version 1 (literal BE u16)"
+        );
         let (_ek, dk) = recovery_keypair(&SEED);
-        assert_eq!(open_backup_blob_offline(&dk, committed).unwrap(), payload(), "committed blob opens");
+        assert_eq!(
+            open_backup_blob_offline(&dk, committed).unwrap(),
+            payload(),
+            "committed blob opens"
+        );
     }
 
     #[test]
@@ -1111,15 +1212,30 @@ mod tests {
         // The committed recovery keypair: `decaps.bin` = the 64-byte ML-KEM keypair seed (the OFFLINE
         // secret — TEST ONLY), `encaps.bin` = the 1568-byte encapsulation (public) key. Couple both to the
         // in-source `SEED` and pin decaps→encaps consistency (`from_seed(seed).encapsulation_key()`).
-        let committed_encaps: &[u8] =
-            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin");
-        let committed_decaps: &[u8] =
-            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.decaps.bin");
-        assert_eq!(committed_decaps, SEED, "decaps fixture is the recovery keypair seed");
-        assert_eq!(committed_encaps.len(), ML_KEM_1024_ENCAPS_KEY_LEN, "encaps key is 1568 bytes");
+        let committed_encaps: &[u8] = include_bytes!(
+            "../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin"
+        );
+        let committed_decaps: &[u8] = include_bytes!(
+            "../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.decaps.bin"
+        );
+        assert_eq!(
+            committed_decaps, SEED,
+            "decaps fixture is the recovery keypair seed"
+        );
+        assert_eq!(
+            committed_encaps.len(),
+            ML_KEM_1024_ENCAPS_KEY_LEN,
+            "encaps key is 1568 bytes"
+        );
         let (encaps, _dk) = recovery_keypair(&SEED);
-        assert_eq!(committed_encaps, encaps.as_slice(), "encaps fixture == keypair-from-seed encaps key");
-        let seed: [u8; 64] = committed_decaps.try_into().expect("decaps fixture is 64 bytes");
+        assert_eq!(
+            committed_encaps,
+            encaps.as_slice(),
+            "encaps fixture == keypair-from-seed encaps key"
+        );
+        let seed: [u8; 64] = committed_decaps
+            .try_into()
+            .expect("decaps fixture is 64 bytes");
         let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(seed));
         assert_eq!(
             dk.encapsulation_key().to_bytes().as_slice(),
@@ -1135,25 +1251,74 @@ mod tests {
         // fails CI here.
         use sha2::{Digest, Sha256};
         let blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
-        let encaps: &[u8] =
-            include_bytes!("../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin");
+        let encaps: &[u8] = include_bytes!(
+            "../testvectors/agent-gateway/agent_backup_recovery_keypair_v1.encaps.bin"
+        );
         let sidecar = include_str!("../testvectors/agent-gateway/agent_backup_v1.json");
         let v: serde_json::Value =
             serde_json::from_str(sidecar).expect("backup sidecar must be valid JSON");
-        assert_eq!(v["blob_sha256"].as_str(), Some(hex(&Sha256::digest(blob)).as_str()), "sidecar blob_sha256 drift");
-        assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
-        assert_eq!(v["backup_format_version"].as_u64(), Some(u64::from(BACKUP_FORMAT_VERSION)), "sidecar version drift");
-        assert_eq!(v["magic"].as_str().map(str::as_bytes), Some(BACKUP_MAGIC.as_slice()), "sidecar magic drift");
-        assert_eq!(v["chain_id"].as_u64(), Some(CHAIN), "sidecar chain_id drift");
-        assert_eq!(v["environment_identifier"].as_str(), Some(ENV), "sidecar env drift");
-        assert_eq!(v["recovery_key_id_hex"].as_str(), Some(hex(RID).as_str()), "sidecar recovery_key_id drift");
-        assert_eq!(v["key_refs_manifest_hex"].as_str(), Some(hex(MANIFEST).as_str()), "sidecar manifest drift");
-        assert_eq!(v["payload_nonce_hex"].as_str(), Some(hex(&[0u8; PAYLOAD_NONCE_LEN]).as_str()), "sidecar nonce drift");
-        assert_eq!(v["recovery_keypair_seed_hex"].as_str(), Some(hex(&SEED).as_str()), "sidecar keypair seed drift");
-        assert_eq!(v["kem_encaps_message_m_hex"].as_str(), Some(hex(&M).as_str()), "sidecar encaps-message m drift");
+        assert_eq!(
+            v["blob_sha256"].as_str(),
+            Some(hex(&Sha256::digest(blob)).as_str()),
+            "sidecar blob_sha256 drift"
+        );
+        assert_eq!(
+            v["blob_len_bytes"].as_u64(),
+            Some(blob.len() as u64),
+            "sidecar blob_len_bytes drift"
+        );
+        assert_eq!(
+            v["backup_format_version"].as_u64(),
+            Some(u64::from(BACKUP_FORMAT_VERSION)),
+            "sidecar version drift"
+        );
+        assert_eq!(
+            v["magic"].as_str().map(str::as_bytes),
+            Some(BACKUP_MAGIC.as_slice()),
+            "sidecar magic drift"
+        );
+        assert_eq!(
+            v["chain_id"].as_u64(),
+            Some(CHAIN),
+            "sidecar chain_id drift"
+        );
+        assert_eq!(
+            v["environment_identifier"].as_str(),
+            Some(ENV),
+            "sidecar env drift"
+        );
+        assert_eq!(
+            v["recovery_key_id_hex"].as_str(),
+            Some(hex(RID).as_str()),
+            "sidecar recovery_key_id drift"
+        );
+        assert_eq!(
+            v["key_refs_manifest_hex"].as_str(),
+            Some(hex(MANIFEST).as_str()),
+            "sidecar manifest drift"
+        );
+        assert_eq!(
+            v["payload_nonce_hex"].as_str(),
+            Some(hex(&[0u8; PAYLOAD_NONCE_LEN]).as_str()),
+            "sidecar nonce drift"
+        );
+        assert_eq!(
+            v["recovery_keypair_seed_hex"].as_str(),
+            Some(hex(&SEED).as_str()),
+            "sidecar keypair seed drift"
+        );
+        assert_eq!(
+            v["kem_encaps_message_m_hex"].as_str(),
+            Some(hex(&M).as_str()),
+            "sidecar encaps-message m drift"
+        );
         // recovery_encaps_key_{len,sha256} are the ONLY integrity witnesses for encaps.bin in the sidecar
         // (the encaps key is NOT embedded in the blob, so blob_sha256 does not cover it).
-        assert_eq!(v["recovery_encaps_key_len"].as_u64(), Some(encaps.len() as u64), "sidecar encaps_key_len drift");
+        assert_eq!(
+            v["recovery_encaps_key_len"].as_u64(),
+            Some(encaps.len() as u64),
+            "sidecar encaps_key_len drift"
+        );
         assert_eq!(
             v["recovery_encaps_key_sha256"].as_str(),
             Some(hex(&Sha256::digest(encaps)).as_str()),
@@ -1172,8 +1337,16 @@ mod tests {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
         let (encaps, _dk) = recovery_keypair(&SEED);
         let blob = golden_backup_blob();
-        std::fs::write(format!("{dir}agent_backup_recovery_keypair_v1.encaps.bin"), &encaps).unwrap();
-        std::fs::write(format!("{dir}agent_backup_recovery_keypair_v1.decaps.bin"), SEED).unwrap();
+        std::fs::write(
+            format!("{dir}agent_backup_recovery_keypair_v1.encaps.bin"),
+            &encaps,
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{dir}agent_backup_recovery_keypair_v1.decaps.bin"),
+            SEED,
+        )
+        .unwrap();
         std::fs::write(format!("{dir}agent_backup_v1.bin"), &blob).unwrap();
         let sidecar = serde_json::json!({
             "description": "TASK-13b pq-agent-backup-v1 DR-backup KEM-DEM golden vector (envelope wire format). \
@@ -1198,7 +1371,10 @@ mod tests {
             serde_json::to_string_pretty(&sidecar).unwrap() + "\n",
         )
         .unwrap();
-        eprintln!("wrote backup golden vector ({}-byte blob) + keypair fixtures + sidecar -> {dir}", blob.len());
+        eprintln!(
+            "wrote backup golden vector ({}-byte blob) + keypair fixtures + sidecar -> {dir}",
+            blob.len()
+        );
     }
 
     // ─── restore-ingress-v1 payload format (TASK-13b slice 4c-2a) ───
@@ -1218,7 +1394,11 @@ mod tests {
                 p
             },
             secret_scalar: Zeroizing::new(vec![scalar; 32]),
-            creation_metadata: CreationMetadata { config_version: 3, counter_snapshot: 0, batch_id: 1 },
+            creation_metadata: CreationMetadata {
+                config_version: 3,
+                counter_snapshot: 0,
+                batch_id: 1,
+            },
             backup_export_metadata: BackupExportMetadata::default(),
         };
         KeystoreBody {
@@ -1266,8 +1446,8 @@ mod tests {
                 last_exported_seq: 0, // EXCLUDED cursor
                 next_seq: 2,          // EXCLUDED cursor
             },
-            freshness_epoch: 9,     // EXCLUDED — enclave-relative anti-rollback
-            structural_version: 7,  // EXCLUDED — enclave-relative anti-rollback
+            freshness_epoch: 9,    // EXCLUDED — enclave-relative anti-rollback
+            structural_version: 7, // EXCLUDED — enclave-relative anti-rollback
             strict_recovery_counter: 4,
         }
     }
@@ -1295,11 +1475,17 @@ mod tests {
         .unwrap();
         let opened = open_backup_blob_offline(&dk, &blob).unwrap();
         let data = parse_restore_ingress(&opened).unwrap();
-        assert_eq!(data.entries, body.entries, "entries (incl. secret scalars) preserved");
+        assert_eq!(
+            data.entries, body.entries,
+            "entries (incl. secret scalars) preserved"
+        );
         assert_eq!(data.counters, body.counters);
         assert_eq!(data.faucet, body.faucet);
         assert_eq!(data.strict_recovery_counter, 4);
-        assert_eq!(data.audit_records, body.audit.records, "audit records (full provenance) preserved");
+        assert_eq!(
+            data.audit_records, body.audit.records,
+            "audit records (full provenance) preserved"
+        );
         assert_eq!(data.config.twod_chain_id, 11565);
         assert_eq!(data.config.admin_authority_pk, [0xa1; 32]);
         assert_eq!(data.config.recovery_authority_pk, [0xa2; 32]);
@@ -1334,11 +1520,27 @@ mod tests {
             }
         };
         let top = map_keys(&val);
-        assert_eq!(top.len(), 6, "exactly 6 top-level fields (no anti-rollback / ring-cursor extras)");
-        for excluded in ["freshness_epoch", "structural_version", "audit", "next_seq", "capacity"] {
-            assert!(!top.contains(&excluded.to_string()), "top-level excludes `{excluded}`");
+        assert_eq!(
+            top.len(),
+            6,
+            "exactly 6 top-level fields (no anti-rollback / ring-cursor extras)"
+        );
+        for excluded in [
+            "freshness_epoch",
+            "structural_version",
+            "audit",
+            "next_seq",
+            "capacity",
+        ] {
+            assert!(
+                !top.contains(&excluded.to_string()),
+                "top-level excludes `{excluded}`"
+            );
         }
-        assert!(top.contains(&"audit_records".to_string()), "audit RECORDS are included");
+        assert!(
+            top.contains(&"audit_records".to_string()),
+            "audit RECORDS are included"
+        );
         let config = match &val {
             ciborium::value::Value::Map(m) => m
                 .iter()
@@ -1349,10 +1551,16 @@ mod tests {
         };
         let cfg = map_keys(&config);
         assert_eq!(cfg.len(), 6, "exactly 6 config fields");
-        for excluded in
-            ["anchor_root", "backup_recovery_wrapping_pubkey", "enclave_scope_id", "fleet_scope_id"]
-        {
-            assert!(!cfg.contains(&excluded.to_string()), "config excludes `{excluded}`");
+        for excluded in [
+            "anchor_root",
+            "backup_recovery_wrapping_pubkey",
+            "enclave_scope_id",
+            "fleet_scope_id",
+        ] {
+            assert!(
+                !cfg.contains(&excluded.to_string()),
+                "config excludes `{excluded}`"
+            );
         }
         assert!(parse_restore_ingress(&payload).is_ok());
     }
@@ -1369,7 +1577,10 @@ mod tests {
         assert_eq!(data.entries.len(), 1, "only the selected key");
         assert_eq!(data.entries[0].key_ref, [0x22; 32]);
         assert_eq!(data.counters, body.counters, "global counters still full");
-        assert_eq!(data.audit_records, body.audit.records, "global audit still full");
+        assert_eq!(
+            data.audit_records, body.audit.records,
+            "global audit still full"
+        );
         assert_ne!(
             build_key_refs_manifest(&refs).unwrap(),
             build_key_refs_manifest(&[[0x11; 32], [0x22; 32]]).unwrap(),
@@ -1385,14 +1596,28 @@ mod tests {
         let good = build_restore_ingress_payload(&body, &refs).unwrap();
         let mut bad_magic = good.to_vec();
         bad_magic[0] ^= 0x01;
-        assert_eq!(parse_restore_ingress(&bad_magic), Err(BackupError::BadMagic));
+        assert_eq!(
+            parse_restore_ingress(&bad_magic),
+            Err(BackupError::BadMagic)
+        );
         let mut bad_ver = good.to_vec();
         bad_ver[9] = 0xff;
-        assert_eq!(parse_restore_ingress(&bad_ver), Err(BackupError::UnsupportedVersion));
+        assert_eq!(
+            parse_restore_ingress(&bad_ver),
+            Err(BackupError::UnsupportedVersion)
+        );
         let mut trailing = good.to_vec();
         trailing.push(0x00);
-        assert_eq!(parse_restore_ingress(&trailing), Err(BackupError::Truncated), "trailing byte rejected");
-        assert_eq!(parse_restore_ingress(&good[..5]), Err(BackupError::Truncated), "truncated header rejected");
+        assert_eq!(
+            parse_restore_ingress(&trailing),
+            Err(BackupError::Truncated),
+            "trailing byte rejected"
+        );
+        assert_eq!(
+            parse_restore_ingress(&good[..5]),
+            Err(BackupError::Truncated),
+            "truncated header rejected"
+        );
     }
 
     /// The recovery-key id is deterministic and bound to the encaps key (host cannot substitute it).
@@ -1400,8 +1625,16 @@ mod tests {
     fn recovery_key_id_is_deterministic_and_key_bound() {
         let (ek1, _) = recovery_keypair(&[0x42; 64]);
         let (ek2, _) = recovery_keypair(&[0x43; 64]);
-        assert_eq!(derive_recovery_key_id(&ek1), derive_recovery_key_id(&ek1), "deterministic");
-        assert_ne!(derive_recovery_key_id(&ek1), derive_recovery_key_id(&ek2), "bound to the key");
+        assert_eq!(
+            derive_recovery_key_id(&ek1),
+            derive_recovery_key_id(&ek1),
+            "deterministic"
+        );
+        assert_ne!(
+            derive_recovery_key_id(&ek1),
+            derive_recovery_key_id(&ek2),
+            "bound to the key"
+        );
         assert_eq!(derive_recovery_key_id(&ek1).len(), RECOVERY_KEY_ID_LEN);
     }
 
@@ -1415,34 +1648,60 @@ mod tests {
     fn golden_restore_ingress_payload() -> Vec<u8> {
         let body = body_with_two_keys();
         let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
-        build_restore_ingress_payload(&body, &refs).unwrap().to_vec()
+        build_restore_ingress_payload(&body, &refs)
+            .unwrap()
+            .to_vec()
     }
 
     #[test]
     fn restore_ingress_v1_golden_is_byte_exact() {
-        let committed: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        let committed: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
         assert_eq!(
             golden_restore_ingress_payload().as_slice(),
             committed,
             "restore-ingress golden drifted; if intentional, regen via \
              `regen_restore_ingress_golden_vector -- --ignored` and re-mint the .json in the same commit",
         );
-        assert_eq!(&committed[..8], RESTORE_INGRESS_MAGIC.as_slice(), "magic 2DRIGV1\\0");
-        assert_eq!(&committed[8..10], &[0x00, 0x01], "restore_ingress_format_version 1 (literal BE u16)");
+        assert_eq!(
+            &committed[..8],
+            RESTORE_INGRESS_MAGIC.as_slice(),
+            "magic 2DRIGV1\\0"
+        );
+        assert_eq!(
+            &committed[8..10],
+            &[0x00, 0x01],
+            "restore_ingress_format_version 1 (literal BE u16)"
+        );
         // Field-level check of the COMMITTED bytes against LITERAL expected values (not against a fresh
         // mint) — so a builder bug frozen into the .bin is caught here, not masked by mint==committed.
         let data = parse_restore_ingress(committed).expect("committed payload strictly parses");
         assert_eq!(data.entries.len(), 2, "2 keys");
         assert_eq!(data.entries[0].key_ref, [0x11; 32], "entry 0 ref");
-        assert_eq!(&data.entries[0].secret_scalar[..], &[0x77; 32], "entry 0 secret scalar preserved");
+        assert_eq!(
+            &data.entries[0].secret_scalar[..],
+            &[0x77; 32],
+            "entry 0 secret scalar preserved"
+        );
         assert_eq!(data.entries[1].key_ref, [0x22; 32], "entry 1 ref");
-        assert_eq!(&data.entries[1].secret_scalar[..], &[0x88; 32], "entry 1 secret scalar preserved");
+        assert_eq!(
+            &data.entries[1].secret_scalar[..],
+            &[0x88; 32],
+            "entry 1 secret scalar preserved"
+        );
         assert_eq!(data.config.twod_chain_id, 11565, "config chain_id");
-        assert_eq!(data.config.monotonic_treasury_config_version, 3, "config version");
+        assert_eq!(
+            data.config.monotonic_treasury_config_version, 3,
+            "config version"
+        );
         assert_eq!(data.config.admin_authority_pk, [0xa1; 32], "admin pk");
         assert_eq!(data.strict_recovery_counter, 4, "strict_recovery_counter");
         assert_eq!(data.audit_records.len(), 1, "1 audit record");
-        assert_eq!(data.audit_records[0].request_id, vec![0x11; 16], "audit record request_id");
+        assert_eq!(
+            data.audit_records[0].request_id,
+            vec![0x11; 16],
+            "audit record request_id"
+        );
     }
 
     #[test]
@@ -1452,14 +1711,26 @@ mod tests {
         let sidecar = include_str!("../testvectors/agent-gateway/restore_ingress_v1.json");
         let v: serde_json::Value =
             serde_json::from_str(sidecar).expect("restore-ingress sidecar must be valid JSON");
-        assert_eq!(v["payload_sha256"].as_str(), Some(hex(&Sha256::digest(payload)).as_str()), "sha256 drift");
-        assert_eq!(v["payload_len_bytes"].as_u64(), Some(payload.len() as u64), "len drift");
+        assert_eq!(
+            v["payload_sha256"].as_str(),
+            Some(hex(&Sha256::digest(payload)).as_str()),
+            "sha256 drift"
+        );
+        assert_eq!(
+            v["payload_len_bytes"].as_u64(),
+            Some(payload.len() as u64),
+            "len drift"
+        );
         assert_eq!(
             v["restore_ingress_format_version"].as_u64(),
             Some(u64::from(RESTORE_INGRESS_FORMAT_VERSION)),
             "version drift",
         );
-        assert_eq!(v["magic"].as_str().map(str::as_bytes), Some(RESTORE_INGRESS_MAGIC.as_slice()), "magic drift");
+        assert_eq!(
+            v["magic"].as_str().map(str::as_bytes),
+            Some(RESTORE_INGRESS_MAGIC.as_slice()),
+            "magic drift"
+        );
         // recovery_key_id over the shared fixed SEED encaps key (pins the derivation for downstream 2d).
         let (encaps, _dk) = recovery_keypair(&SEED);
         assert_eq!(
@@ -1504,7 +1775,10 @@ mod tests {
             serde_json::to_string_pretty(&sidecar).unwrap() + "\n",
         )
         .unwrap();
-        eprintln!("wrote restore-ingress golden ({}-byte payload) + sidecar -> {dir}", payload.len());
+        eprintln!(
+            "wrote restore-ingress golden ({}-byte payload) + sidecar -> {dir}",
+            payload.len()
+        );
     }
 
     // ─── TASK-24 / AC#1: restore-ingress ENVELOPE (the attested second KEM-DEM layer) ───
@@ -1556,7 +1830,13 @@ mod tests {
         let cipher =
             ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Encrypt)?;
         let dem_ct = cipher
-            .encrypt(Nonce::from_slice(&ingress_nonce), Payload { msg: payload, aad: &header })
+            .encrypt(
+                Nonce::from_slice(&ingress_nonce),
+                Payload {
+                    msg: payload,
+                    aad: &header,
+                },
+            )
             .map_err(|_| BackupError::Encrypt)?;
         let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
         blob.extend_from_slice(&header);
@@ -1615,12 +1895,29 @@ mod tests {
         )
         .unwrap();
         let opened = open_restore_ingress_envelope(&dest_dk, &envelope).unwrap();
-        assert_eq!(opened.payload.as_slice(), payload, "payload recovered byte-exact");
-        assert_eq!(opened.dest_measurement, DEST_MEASUREMENT, "measurement surfaced");
+        assert_eq!(
+            opened.payload.as_slice(),
+            payload,
+            "payload recovered byte-exact"
+        );
+        assert_eq!(
+            opened.dest_measurement, DEST_MEASUREMENT,
+            "measurement surfaced"
+        );
         assert_eq!(opened.chain_id, CHAIN, "chain_id surfaced");
-        assert_eq!(opened.environment_identifier, ENV.as_bytes(), "env surfaced");
-        assert_eq!(opened.manifest_hash, manifest_hash, "manifest hash surfaced");
-        assert_eq!(opened.original_backup_digest, backup_digest, "backup digest surfaced");
+        assert_eq!(
+            opened.environment_identifier,
+            ENV.as_bytes(),
+            "env surfaced"
+        );
+        assert_eq!(
+            opened.manifest_hash, manifest_hash,
+            "manifest hash surfaced"
+        );
+        assert_eq!(
+            opened.original_backup_digest, backup_digest,
+            "backup digest surfaced"
+        );
     }
 
     /// (b) AC#7 no-plaintext-leak at the ENVELOPE layer. The envelope wraps an OPAQUE payload, so this
@@ -1722,10 +2019,9 @@ mod tests {
         let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
         let manifest = build_key_refs_manifest(&refs).unwrap();
         let manifest_hash = compute_manifest_hash(&manifest);
-        let backup_digest =
-            compute_original_backup_digest(include_bytes!(
-                "../testvectors/agent-gateway/agent_backup_v1.bin"
-            ));
+        let backup_digest = compute_original_backup_digest(include_bytes!(
+            "../testvectors/agent-gateway/agent_backup_v1.bin"
+        ));
         let envelope = seal_restore_ingress_envelope_with_m(
             &dest_encaps,
             DEST_MEASUREMENT,
@@ -1822,7 +2118,11 @@ mod tests {
         let ingress_key = derive_ingress_key(&ss);
         let manifest_hash_of_ss = compute_manifest_hash(&ss);
         let backup_digest_of_ss = compute_original_backup_digest(&ss);
-        assert_ne!(backup_key.as_ref(), ingress_key.as_ref(), "ingress KDF ≠ backup DEM key");
+        assert_ne!(
+            backup_key.as_ref(),
+            ingress_key.as_ref(),
+            "ingress KDF ≠ backup DEM key"
+        );
         assert_ne!(
             ingress_key.as_ref(),
             &manifest_hash_of_ss[..],
@@ -1834,8 +2134,7 @@ mod tests {
             "ingress KDF domain ≠ backup-digest domain for the same bytes"
         );
         assert_ne!(
-            manifest_hash_of_ss,
-            backup_digest_of_ss,
+            manifest_hash_of_ss, backup_digest_of_ss,
             "manifest-hash domain ≠ backup-digest domain for the same bytes"
         );
         // CRAFTED-INPUT regression for the prefix-free separator (claude-code + compact-codex round-2
@@ -1903,7 +2202,8 @@ mod tests {
             "magic 2DAGRIE\\0"
         );
         assert_eq!(
-            &committed[RESTORE_INGRESS_ENVELOPE_MAGIC.len()..RESTORE_INGRESS_ENVELOPE_MAGIC.len() + 2],
+            &committed
+                [RESTORE_INGRESS_ENVELOPE_MAGIC.len()..RESTORE_INGRESS_ENVELOPE_MAGIC.len() + 2],
             &[0x00, 0x01],
             "restore_ingress_envelope_format_version 1 (literal BE u16)"
         );
@@ -1912,8 +2212,15 @@ mod tests {
         let (_dest_encaps, dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
         let opened = open_restore_ingress_envelope(&dest_dk, committed).unwrap();
         let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
-        assert_eq!(opened.payload.as_slice(), payload, "committed envelope opens to the committed payload");
-        assert_eq!(opened.dest_measurement, DEST_MEASUREMENT, "committed measurement");
+        assert_eq!(
+            opened.payload.as_slice(),
+            payload,
+            "committed envelope opens to the committed payload"
+        );
+        assert_eq!(
+            opened.dest_measurement, DEST_MEASUREMENT,
+            "committed measurement"
+        );
         assert_eq!(opened.chain_id, CHAIN, "committed chain_id");
     }
 
@@ -1929,11 +2236,24 @@ mod tests {
         let committed_decaps: &[u8] = include_bytes!(
             "../testvectors/agent-gateway/restore_ingress_dest_ephemeral_keypair_v1.decaps.bin"
         );
-        assert_eq!(committed_decaps, DEST_EPHEMERAL_SEED, "decaps fixture is the dest ephemeral seed");
-        assert_eq!(committed_encaps.len(), ML_KEM_1024_ENCAPS_KEY_LEN, "encaps key is 1568 bytes");
+        assert_eq!(
+            committed_decaps, DEST_EPHEMERAL_SEED,
+            "decaps fixture is the dest ephemeral seed"
+        );
+        assert_eq!(
+            committed_encaps.len(),
+            ML_KEM_1024_ENCAPS_KEY_LEN,
+            "encaps key is 1568 bytes"
+        );
         let (encaps, _dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
-        assert_eq!(committed_encaps, encaps.as_slice(), "encaps fixture == keypair-from-seed encaps key");
-        let seed: [u8; 64] = committed_decaps.try_into().expect("decaps fixture is 64 bytes");
+        assert_eq!(
+            committed_encaps,
+            encaps.as_slice(),
+            "encaps fixture == keypair-from-seed encaps key"
+        );
+        let seed: [u8; 64] = committed_decaps
+            .try_into()
+            .expect("decaps fixture is 64 bytes");
         let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(seed));
         assert_eq!(
             dk.encapsulation_key().to_bytes().as_slice(),
@@ -1951,8 +2271,7 @@ mod tests {
             "../testvectors/agent-gateway/restore_ingress_dest_ephemeral_keypair_v1.encaps.bin"
         );
         let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
-        let sidecar =
-            include_str!("../testvectors/agent-gateway/restore_ingress_envelope_v1.json");
+        let sidecar = include_str!("../testvectors/agent-gateway/restore_ingress_envelope_v1.json");
         let v: serde_json::Value =
             serde_json::from_str(sidecar).expect("ingress envelope sidecar must be valid JSON");
         assert_eq!(
@@ -1960,7 +2279,11 @@ mod tests {
             Some(hex(&Sha256::digest(envelope)).as_str()),
             "sidecar envelope_sha256 drift"
         );
-        assert_eq!(v["envelope_len_bytes"].as_u64(), Some(envelope.len() as u64), "sidecar len drift");
+        assert_eq!(
+            v["envelope_len_bytes"].as_u64(),
+            Some(envelope.len() as u64),
+            "sidecar len drift"
+        );
         assert_eq!(
             v["restore_ingress_envelope_format_version"].as_u64(),
             Some(u64::from(RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION)),
@@ -1971,8 +2294,16 @@ mod tests {
             Some(RESTORE_INGRESS_ENVELOPE_MAGIC.as_slice()),
             "sidecar magic drift"
         );
-        assert_eq!(v["chain_id"].as_u64(), Some(CHAIN), "sidecar chain_id drift");
-        assert_eq!(v["environment_identifier"].as_str(), Some(ENV), "sidecar env drift");
+        assert_eq!(
+            v["chain_id"].as_u64(),
+            Some(CHAIN),
+            "sidecar chain_id drift"
+        );
+        assert_eq!(
+            v["environment_identifier"].as_str(),
+            Some(ENV),
+            "sidecar env drift"
+        );
         assert_eq!(
             v["dest_measurement_hex"].as_str(),
             Some(hex(DEST_MEASUREMENT).as_str()),

@@ -43,7 +43,10 @@ pub trait ProvisionReportProducer {
 
 /// Prepend a u32 BE length to a provision envelope, then write via `write_framed_message` (the
 /// standard length-prefixed framing wrapping the provision protocol's own envelope bytes).
-fn write_provision_envelope<W: Write>(writer: &mut W, envelope: &[u8]) -> Result<(), ProvisionError> {
+fn write_provision_envelope<W: Write>(
+    writer: &mut W,
+    envelope: &[u8],
+) -> Result<(), ProvisionError> {
     let mut frame = Vec::with_capacity(4 + envelope.len());
     frame.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
     frame.extend_from_slice(envelope);
@@ -109,7 +112,11 @@ pub fn run_provisioning_ceremony<S: Read + Write>(
 
 // ── vsock binding (Linux + vsock-transport) ─────────────────────────────────────
 
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 pub mod vsock {
     use super::*;
     use crate::vsock_listen;
@@ -129,11 +136,9 @@ pub mod vsock {
         report_producer: &dyn ProvisionReportProducer,
         idle_timeout: Duration,
     ) -> Result<(agent_provision::ProvisionConfig, Vec<u8>), ProvisionError> {
-        let listener = vsock_listen::bind_vsock_listener(cid, port)
-            .map_err(|_| ProvisionError::Malformed)?;
-        let (mut stream, _peer_addr) = listener
-            .accept()
-            .map_err(|_| ProvisionError::Malformed)?;
+        let listener =
+            vsock_listen::bind_vsock_listener(cid, port).map_err(|_| ProvisionError::Malformed)?;
+        let (mut stream, _peer_addr) = listener.accept().map_err(|_| ProvisionError::Malformed)?;
         // Bound read/write stalls (SO_RCVTIMEO/SO_SNDTIMEO) — a peer that connects but stops
         // reading/writing cannot hang the one-shot bootstrap (compact 9177/9180 Medium).
         vsock_listen::configure_vsock_session_timeouts(&mut stream)

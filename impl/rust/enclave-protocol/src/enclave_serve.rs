@@ -51,7 +51,9 @@ impl SharedEnclaveRuntime {
     #[cfg(feature = "staging-host")]
     pub fn staging_with_reference_signer() -> Result<Arc<Self>, ProtocolError> {
         crate::install_reference_sealed_signer_staging()?;
-        Ok(Arc::new(Self::new(crate::reference_test_attestation_trust())))
+        Ok(Arc::new(Self::new(
+            crate::reference_test_attestation_trust(),
+        )))
     }
 }
 
@@ -71,8 +73,7 @@ pub fn run_incoming_accept_loop<I, S, F>(
     incoming: I,
     runtime: Arc<SharedEnclaveRuntime>,
     mut prepare_connection: F,
-)
-where
+) where
     I: Iterator<Item = Result<S, std::io::Error>>,
     S: Read + Write + Send + 'static,
     F: FnMut(&mut S) -> Result<(), ProtocolError>,
@@ -110,14 +111,19 @@ where
 
 /// Apply UDS session I/O timeouts (must be at least [`READ_TIMEOUT`] for idle framing).
 #[cfg(unix)]
-pub fn configure_unix_session_timeouts(stream: &mut std::os::unix::net::UnixStream) -> Result<(), ProtocolError> {
+pub fn configure_unix_session_timeouts(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Result<(), ProtocolError> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     Ok(())
 }
 
 /// Serve framed host requests on one connection until EOF, timeout, or I/O error.
-pub fn serve_framed_connection<S>(stream: &mut S, runtime: &SharedEnclaveRuntime) -> Result<(), ProtocolError>
+pub fn serve_framed_connection<S>(
+    stream: &mut S,
+    runtime: &SharedEnclaveRuntime,
+) -> Result<(), ProtocolError>
 where
     S: Read + Write,
 {
@@ -138,11 +144,8 @@ where
             Err(e) => return Err(e),
         };
         let mut state = lock_enclave_state(&runtime.state)?;
-        let response = process_framed_with_shared_state(
-            &frame,
-            &mut state,
-            runtime.attestation_trust,
-        )?;
+        let response =
+            process_framed_with_shared_state(&frame, &mut state, runtime.attestation_trust)?;
         drop(state);
         write_framed_message(stream, &response)?;
         // Wire-error responses are still "complete frames" but must not extend the idle budget

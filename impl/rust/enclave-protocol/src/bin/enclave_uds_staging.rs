@@ -27,7 +27,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use enclave_protocol::env_config::{
         var_twod, LEGACY_HSM_ENCLAVE_STAGING_SOCKET, TWOD_HSM_ENCLAVE_STAGING_SOCKET,
     };
-    let path = match var_twod(TWOD_HSM_ENCLAVE_STAGING_SOCKET, LEGACY_HSM_ENCLAVE_STAGING_SOCKET) {
+    let path = match var_twod(
+        TWOD_HSM_ENCLAVE_STAGING_SOCKET,
+        LEGACY_HSM_ENCLAVE_STAGING_SOCKET,
+    ) {
         Ok(p) => PathBuf::from(p),
         Err(std::env::VarError::NotPresent) => default_socket_path(),
         Err(e) => return Err(e.into()),
@@ -43,6 +46,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         pq_signing_ready()
     );
 
-    run_incoming_accept_loop(listener.incoming(), runtime, configure_unix_session_timeouts);
+    run_incoming_accept_loop(
+        listener.incoming(),
+        runtime,
+        configure_unix_session_timeouts,
+    );
     Ok(())
 }

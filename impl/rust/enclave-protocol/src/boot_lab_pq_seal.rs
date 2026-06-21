@@ -13,12 +13,15 @@ pub fn boot_install_lab_sealed_signer_from_file() -> Result<(), crate::ProtocolE
         TWOD_HSM_ENCLAVE_MEASUREMENT_FILE, TWOD_HSM_PQ_SEALED_SIGNER_FILE,
     };
     use crate::pq_signer::install_sealed_pq_signer;
-    let blob_path = var_twod(TWOD_HSM_PQ_SEALED_SIGNER_FILE, LEGACY_HSM_PQ_SEALED_SIGNER_FILE)
-        .map_err(|_| {
-            crate::ProtocolError::PqSigningUnavailable(
-                "TWOD_HSM_PQ_SEALED_SIGNER_FILE not set (lab prod guest)",
-            )
-        })?;
+    let blob_path = var_twod(
+        TWOD_HSM_PQ_SEALED_SIGNER_FILE,
+        LEGACY_HSM_PQ_SEALED_SIGNER_FILE,
+    )
+    .map_err(|_| {
+        crate::ProtocolError::PqSigningUnavailable(
+            "TWOD_HSM_PQ_SEALED_SIGNER_FILE not set (lab prod guest)",
+        )
+    })?;
     let blob = std::fs::read(blob_path).map_err(|_| {
         crate::ProtocolError::PqSigningUnavailable("failed to read TWOD_HSM_PQ_SEALED_SIGNER_FILE")
     })?;
@@ -39,4 +42,3 @@ pub fn boot_install_lab_sealed_signer_from_file() -> Result<(), crate::ProtocolE
     }
     install_sealed_pq_signer(&blob, measurement.as_ref())
 }
-

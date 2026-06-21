@@ -9,13 +9,14 @@
 //!
 //! Запуск: cargo run --example ticket_signing_demo
 
-use enclave_protocol::{
-    AuthorizationTicketPayload, AuthorizedProducerState, Command, EnclaveState, MessageType,
-    Response, build_signed_recent_chain_proof, dispatch_command_with_state, encode_message,
-    decode_message, reference_test_attestation_signing_key, reference_test_attestation_trust,
-};
-use ciborium::ser::into_writer;
 use ciborium::de::from_reader;
+use ciborium::ser::into_writer;
+use enclave_protocol::{
+    build_signed_recent_chain_proof, decode_message, dispatch_command_with_state, encode_message,
+    reference_test_attestation_signing_key, reference_test_attestation_trust,
+    AuthorizationTicketPayload, AuthorizedProducerState, Command, EnclaveState, MessageType,
+    Response,
+};
 
 fn main() {
     println!("=== Realistic Host ↔ Enclave Session Simulation (with state) ===\n");
@@ -83,7 +84,11 @@ fn main() {
         new_header_version: Some(3),
     };
 
-    simulate_signing_flow(&hardfork_payload, &mut enclave_state, "Hard-Fork after proper arming");
+    simulate_signing_flow(
+        &hardfork_payload,
+        &mut enclave_state,
+        "Hard-Fork after proper arming",
+    );
 
     if let Response::GetStatus(s) = dispatch_command_with_state(
         Command::GetStatus(enclave_protocol::GetStatusRequest { version: 1 }),
@@ -91,7 +96,10 @@ fn main() {
         trust,
     ) {
         println!("After hard-fork sign — GET_STATUS:");
-        println!("  pending_hard_fork_height: {:?}", s.pending_hard_fork_height);
+        println!(
+            "  pending_hard_fork_height: {:?}",
+            s.pending_hard_fork_height
+        );
         println!();
     }
 
@@ -176,27 +184,22 @@ fn simulate_signing_flow(
 ) {
     println!("--- {} ---", label);
 
-    let command = Command::SignAuthorizationTicket(
-        enclave_protocol::SignAuthorizationTicketRequest {
+    let command =
+        Command::SignAuthorizationTicket(enclave_protocol::SignAuthorizationTicketRequest {
             ticket: payload.clone(),
-        },
-    );
+        });
 
     let mut cmd_bytes = Vec::new();
     into_writer(&command, &mut cmd_bytes).unwrap();
 
-    let framed = encode_message(MessageType::SignAuthorizationTicket, &cmd_bytes)
-        .expect("encode failed");
+    let framed =
+        encode_message(MessageType::SignAuthorizationTicket, &cmd_bytes).expect("encode failed");
 
     let received = decode_message(&framed).expect("decode failed");
-    let received_command: Command =
-        from_reader(&received.payload[..]).expect("deserialize failed");
+    let received_command: Command = from_reader(&received.payload[..]).expect("deserialize failed");
 
-    let response = dispatch_command_with_state(
-        received_command,
-        state,
-        reference_test_attestation_trust(),
-    );
+    let response =
+        dispatch_command_with_state(received_command, state, reference_test_attestation_trust());
 
     match &response {
         Response::SignAuthorizationTicket(r) => {

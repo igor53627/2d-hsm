@@ -128,7 +128,11 @@ mod tests {
     fn from_minimal_be_right_aligns_and_caps_width() {
         assert_eq!(from_minimal_be(&[]), Some(be(0)), "empty = zero");
         assert_eq!(from_minimal_be(&[0x01]), Some(be(1)));
-        assert_eq!(from_minimal_be(&[0xde, 0xad]), Some(be(0xdead)), "right-aligned big-endian");
+        assert_eq!(
+            from_minimal_be(&[0xde, 0xad]),
+            Some(be(0xdead)),
+            "right-aligned big-endian"
+        );
         // agrees with from_u64 on a value's minimal encoding (256 = 0x01,0x00).
         assert_eq!(from_minimal_be(&[0x01, 0x00]), Some(from_u64(256)));
         // full 32-byte width is accepted verbatim.
@@ -148,7 +152,17 @@ mod tests {
     #[test]
     fn add_cross_checks_u128() {
         // For operands whose sum fits u128, the 256-bit add must match native u128 addition.
-        let vals = [0u128, 1, 7, 255, 256, 0xffff_ffff, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX / 3];
+        let vals = [
+            0u128,
+            1,
+            7,
+            255,
+            256,
+            0xffff_ffff,
+            u64::MAX as u128,
+            (u64::MAX as u128) + 1,
+            u128::MAX / 3,
+        ];
         for &a in &vals {
             for &b in &vals {
                 if let Some(s) = a.checked_add(b) {
@@ -160,7 +174,11 @@ mod tests {
 
     #[test]
     fn add_overflow_is_none() {
-        assert_eq!(checked_add(&MAX, &be(0)), Some(MAX), "boundary: +0 does not overflow");
+        assert_eq!(
+            checked_add(&MAX, &be(0)),
+            Some(MAX),
+            "boundary: +0 does not overflow"
+        );
         assert_eq!(checked_add(&MAX, &be(1)), None, "2^256-1 + 1 overflows");
         assert_eq!(checked_add(&MAX, &MAX), None);
         // 2^255 + 2^255 = 2^256 overflows
@@ -173,7 +191,10 @@ mod tests {
         assert_eq!(checked_mul_u64(&be(5), 0), Some(be(0)));
         assert_eq!(checked_mul_u64(&be(7), 1), Some(be(7)));
         assert_eq!(checked_mul_u64(&be(255), 256), Some(be(255 * 256)));
-        assert_eq!(checked_mul_u64(&be(1), u64::MAX), Some(be(u64::MAX as u128)));
+        assert_eq!(
+            checked_mul_u64(&be(1), u64::MAX),
+            Some(be(u64::MAX as u128))
+        );
     }
 
     #[test]
@@ -193,9 +214,17 @@ mod tests {
     #[test]
     fn mul_overflow_is_none() {
         assert_eq!(checked_mul_u64(&MAX, 0), Some(be(0)));
-        assert_eq!(checked_mul_u64(&MAX, 1), Some(MAX), "boundary: *1 does not overflow");
+        assert_eq!(
+            checked_mul_u64(&MAX, 1),
+            Some(MAX),
+            "boundary: *1 does not overflow"
+        );
         assert_eq!(checked_mul_u64(&MAX, 2), None, "(2^256-1)*2 overflows");
-        assert_eq!(checked_mul_u64(&two_pow_255(), 2), None, "2^255 * 2 = 2^256 overflows");
+        assert_eq!(
+            checked_mul_u64(&two_pow_255(), 2),
+            None,
+            "2^255 * 2 = 2^256 overflows"
+        );
         // 2^255 * 1 stays in range; * (just past the fit) overflows.
         assert_eq!(checked_mul_u64(&two_pow_255(), 1), Some(two_pow_255()));
     }
@@ -205,7 +234,15 @@ mod tests {
         // `hi(x)` = x*2^128 lives in bytes 0..16, so these cross-checks value-verify carry propagation
         // through the HIGH half — the range that distinguishes u256 from u128 (the low-half `be()`
         // cross-checks never touch bytes 0..15).
-        let vals = [0u128, 1, 255, 0xffff, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX / 4];
+        let vals = [
+            0u128,
+            1,
+            255,
+            0xffff,
+            u64::MAX as u128,
+            (u64::MAX as u128) + 1,
+            u128::MAX / 4,
+        ];
         for &a in &vals {
             for &b in &vals {
                 if let Some(s) = a.checked_add(b) {
@@ -219,9 +256,17 @@ mod tests {
         almost[0] = 0x00; // bytes 1..=31 = 0xff ⇒ 2^248 - 1
         let mut two_248 = [0u8; 32];
         two_248[0] = 0x01; // 2^248
-        assert_eq!(checked_add(&almost, &from_u64(1)), Some(two_248), "full-width carry chain");
+        assert_eq!(
+            checked_add(&almost, &from_u64(1)),
+            Some(two_248),
+            "full-width carry chain"
+        );
         // A high-half carry OUT of byte 0 overflows: (2^128-1 + 1)*2^128 = 2^256.
-        assert_eq!(checked_add(&hi(u128::MAX), &hi(1)), None, "carry out of byte 0 ⇒ overflow");
+        assert_eq!(
+            checked_add(&hi(u128::MAX), &hi(1)),
+            None,
+            "carry out of byte 0 ⇒ overflow"
+        );
     }
 
     #[test]
@@ -243,10 +288,18 @@ mod tests {
         two_240[1] = 0x01; // 2^240
         let mut two_248 = [0u8; 32];
         two_248[0] = 0x01; // 2^248
-        assert_eq!(checked_mul_u64(&two_240, 256), Some(two_248), "high-byte left-shift by one byte");
+        assert_eq!(
+            checked_mul_u64(&two_240, 256),
+            Some(two_248),
+            "high-byte left-shift by one byte"
+        );
         let mut two_248_in = [0u8; 32];
         two_248_in[0] = 0x01;
-        assert_eq!(checked_mul_u64(&two_248_in, 256), None, "2^248 * 256 = 2^256 overflows");
+        assert_eq!(
+            checked_mul_u64(&two_248_in, 256),
+            None,
+            "2^248 * 256 = 2^256 overflows"
+        );
     }
 
     #[test]
@@ -260,7 +313,13 @@ mod tests {
         let mut hi_byte0 = [0u8; 32];
         hi_byte0[0] = 1; // 2^248
         assert!(MAX > hi_byte0, "2^256-1 (byte0=0xff) > 2^248 (byte0=0x01)");
-        assert!(MAX > be(u128::MAX), "any 256-bit value with a high byte set exceeds a 128-bit value");
-        assert!(hi(1) > be(u128::MAX), "2^128 > 2^128-1 across the half boundary");
+        assert!(
+            MAX > be(u128::MAX),
+            "any 256-bit value with a high byte set exceeds a 128-bit value"
+        );
+        assert!(
+            hi(1) > be(u128::MAX),
+            "2^128 > 2^128-1 across the half boundary"
+        );
     }
 }

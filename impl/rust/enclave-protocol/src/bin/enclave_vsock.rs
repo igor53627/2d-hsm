@@ -19,13 +19,15 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn load_attestation_trust() -> Result<enclave_protocol::ProducerAttestationTrust, Box<dyn std::error::Error>> {
+fn load_attestation_trust(
+) -> Result<enclave_protocol::ProducerAttestationTrust, Box<dyn std::error::Error>> {
     use enclave_protocol::ProducerAttestationTrust;
     use std::env;
     use std::fs;
 
     use enclave_protocol::env_config::{
-        var_twod, LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE, TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
+        var_twod, LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
+        TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
     };
     let path = var_twod(
         TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE,
@@ -62,8 +64,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(all(not(feature = "lab-pq-seal-from-file"), release_build))]
     {
-        boot_configure_pq_seal_v1_platform_root()
-            .map_err(|e| format!("PQ platform provisioning root required in release builds: {e}"))?;
+        boot_configure_pq_seal_v1_platform_root().map_err(|e| {
+            format!("PQ platform provisioning root required in release builds: {e}")
+        })?;
         eprintln!("enclave-vsock: PQ seal v1 provisioning root configured");
     }
     #[cfg(all(not(feature = "lab-pq-seal-from-file"), not(release_build)))]

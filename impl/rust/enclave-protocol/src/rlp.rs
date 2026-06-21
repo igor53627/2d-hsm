@@ -45,7 +45,10 @@ pub(crate) fn encode_uint_minimal(be_bytes: &[u8]) -> Vec<u8> {
 }
 
 fn encode_uint_minimal_into(out: &mut Vec<u8>, be_bytes: &[u8]) {
-    let first_nonzero = be_bytes.iter().position(|&b| b != 0).unwrap_or(be_bytes.len());
+    let first_nonzero = be_bytes
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(be_bytes.len());
     encode_bytes_into(out, &be_bytes[first_nonzero..]);
 }
 
@@ -120,11 +123,20 @@ mod tests {
         assert_eq!(encode_uint_minimal(&[0x00, 0x00, 0x05]), vec![0x05]); // small int -> itself
         assert_eq!(encode_uint_minimal(&[0x00, 0x80]), vec![0x81, 0x80]);
         // gas_price 1e9 = 0x3b9aca00
-        assert_eq!(hexs(&encode_uint_minimal(&0x3b9aca00u64.to_be_bytes())), "843b9aca00");
+        assert_eq!(
+            hexs(&encode_uint_minimal(&0x3b9aca00u64.to_be_bytes())),
+            "843b9aca00"
+        );
         // gas_limit 21000 = 0x5208
-        assert_eq!(hexs(&encode_uint_minimal(&21000u64.to_be_bytes())), "825208");
+        assert_eq!(
+            hexs(&encode_uint_minimal(&21000u64.to_be_bytes())),
+            "825208"
+        );
         // chain_id 11565 = 0x2d2d
-        assert_eq!(hexs(&encode_uint_minimal(&11565u64.to_be_bytes())), "822d2d");
+        assert_eq!(
+            hexs(&encode_uint_minimal(&11565u64.to_be_bytes())),
+            "822d2d"
+        );
     }
 
     #[test]
@@ -151,15 +163,15 @@ mod tests {
     fn reproduces_ordinary_tx_v1_preimage() {
         let to = hex_to_vec("70997970c51812dc3a010c7d01b50e0d17dc79c8");
         let preimage = encode_list(&[
-            encode_uint_minimal(&0u64.to_be_bytes()),          // nonce 0
+            encode_uint_minimal(&0u64.to_be_bytes()), // nonce 0
             encode_uint_minimal(&1_000_000_000u64.to_be_bytes()), // gas_price 1e9
-            encode_uint_minimal(&21_000u64.to_be_bytes()),     // gas_limit
-            encode_bytes(&to),                                 // to (20B raw)
+            encode_uint_minimal(&21_000u64.to_be_bytes()), // gas_limit
+            encode_bytes(&to),                        // to (20B raw)
             encode_uint_minimal(&1_000_000_000_000_000_000u64.to_be_bytes()), // value 1e18
-            encode_bytes(&[]),                                 // data empty
-            encode_uint_minimal(&11565u64.to_be_bytes()),      // chain_id
-            encode_uint_minimal(&[]),                          // EIP-155 trailing r
-            encode_uint_minimal(&[]),                          // EIP-155 trailing s
+            encode_bytes(&[]),                        // data empty
+            encode_uint_minimal(&11565u64.to_be_bytes()), // chain_id
+            encode_uint_minimal(&[]),                 // EIP-155 trailing r
+            encode_uint_minimal(&[]),                 // EIP-155 trailing s
         ]);
         assert_eq!(
             hexs(&preimage),
@@ -168,6 +180,9 @@ mod tests {
     }
 
     fn hex_to_vec(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }

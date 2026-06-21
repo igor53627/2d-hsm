@@ -21,9 +21,9 @@ use crate::ProtocolError;
 // Field offsets snp_report does not expose (it reads report_data/measurement itself).
 const VERSION_OFFSET: usize = 0x00; // u32 LE
 const POLICY_OFFSET: usize = 0x08; // u64 LE guest policy
-// A SEV-SNP ATTESTATION_REPORT is a fixed 1184 bytes (ABI v2–v5). Require the whole structure: the
-// VCEK signature + other fields the caller's signature step needs live at the end, so a truncated
-// buffer must not pre-validate (security: reject short/forged reports up front).
+                                   // A SEV-SNP ATTESTATION_REPORT is a fixed 1184 bytes (ABI v2–v5). Require the whole structure: the
+                                   // VCEK signature + other fields the caller's signature step needs live at the end, so a truncated
+                                   // buffer must not pre-validate (security: reject short/forged reports up front).
 const EXPECTED_REPORT_LEN: usize = 1184;
 // GUEST_POLICY.DEBUG is bit 19 — a debuggable guest is never acceptable for production.
 const POLICY_DEBUG_BIT: u64 = 1 << 19;
@@ -63,7 +63,11 @@ pub fn prevalidate_report(
         ));
     }
 
-    let version = u32::from_le_bytes(report[VERSION_OFFSET..VERSION_OFFSET + 4].try_into().unwrap());
+    let version = u32::from_le_bytes(
+        report[VERSION_OFFSET..VERSION_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
     if version < MIN_REPORT_VERSION {
         return Err(ProtocolError::WireProtocol(
             "SNP report version older than the assumed ABI layout (need v2+)",
@@ -134,7 +138,12 @@ mod tests {
     #[test]
     fn rejects_short_report() {
         // One byte short of the fixed 1184-byte report must be rejected as truncated.
-        assert!(prevalidate_report(&GOLDEN[..EXPECTED_REPORT_LEN - 1], None, &[golden_measurement()]).is_err());
+        assert!(prevalidate_report(
+            &GOLDEN[..EXPECTED_REPORT_LEN - 1],
+            None,
+            &[golden_measurement()]
+        )
+        .is_err());
     }
 
     #[test]
@@ -146,7 +155,9 @@ mod tests {
         report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + rd.len()].copy_from_slice(&rd);
 
         assert!(prevalidate_report(&report, Some(pubkey), &[golden_measurement()]).is_ok());
-        assert!(prevalidate_report(&report, Some(b"a-different-key"), &[golden_measurement()]).is_err());
+        assert!(
+            prevalidate_report(&report, Some(b"a-different-key"), &[golden_measurement()]).is_err()
+        );
     }
 
     #[test]

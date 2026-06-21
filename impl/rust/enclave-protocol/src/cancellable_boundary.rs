@@ -159,7 +159,9 @@ mod tests {
         // checked_sub: a bare `Instant::now()` is itself "lapsed" under the MIN_BOUNDARY_BUDGET floor, so
         // the fallback keeps the helper's meaning even if the monotonic clock reads < 1s (freshly-booted
         // microVM running tests as near-init) — where the naked `-` operator would panic.
-        Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now)
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now)
     }
     fn future() -> Instant {
         Instant::now() + Duration::from_secs(30)
@@ -171,7 +173,10 @@ mod tests {
         assert!(remaining_or_lapsed(future()).is_ok());
         // sub-MIN_BOUNDARY_BUDGET (~0.5ms) folds to lapsed.
         let near = Instant::now() + Duration::from_micros(500);
-        assert!(remaining_or_lapsed(near).is_err(), "sub-1ms residual must be treated as lapsed");
+        assert!(
+            remaining_or_lapsed(near).is_err(),
+            "sub-1ms residual must be treated as lapsed"
+        );
     }
 
     #[test]
@@ -180,7 +185,10 @@ mod tests {
         let (a, mut b) = UnixStream::pair().unwrap();
         b.write_all(b"x").unwrap();
         let rv = poll_with_deadline(&a, PollFlags::POLLIN, future()).expect("readable");
-        assert!(rv.contains(PollFlags::POLLIN), "expected POLLIN, got {rv:?}");
+        assert!(
+            rv.contains(PollFlags::POLLIN),
+            "expected POLLIN, got {rv:?}"
+        );
     }
 
     #[test]
@@ -191,7 +199,10 @@ mod tests {
         let start = Instant::now();
         let r = poll_with_deadline(&a, PollFlags::POLLIN, start + Duration::from_millis(100));
         assert!(r.is_err(), "no data -> must time out, not return ready");
-        assert!(start.elapsed() < Duration::from_secs(2), "must return on its own deadline, not block");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return on its own deadline, not block"
+        );
     }
 
     #[test]
@@ -207,7 +218,10 @@ mod tests {
         // The (a') primary path: a fresh connected socket is immediately writable -> POLLOUT.
         let (a, _b) = UnixStream::pair().unwrap();
         let rv = poll_with_deadline(&a, PollFlags::POLLOUT, future()).expect("writable");
-        assert!(rv.contains(PollFlags::POLLOUT), "expected POLLOUT, got {rv:?}");
+        assert!(
+            rv.contains(PollFlags::POLLOUT),
+            "expected POLLOUT, got {rv:?}"
+        );
     }
 
     #[test]
@@ -231,16 +245,34 @@ mod tests {
     fn connect_poll_succeeded_requires_clean_pollout() {
         use PollFlags as P;
         // Primary use: a freshly-writable connect fd -> POLLOUT clean -> success.
-        assert!(connect_poll_succeeded(P::POLLOUT), "bare POLLOUT must be success");
+        assert!(
+            connect_poll_succeeded(P::POLLOUT),
+            "bare POLLOUT must be success"
+        );
         // POLLOUT present but ALSO an error condition -> false. On AF_VSOCK the real refused/timed-out
         // connect shape is POLLERR|POLLOUT (kernel sets sk_err then wakes the poller; no POLLHUP — vsock
         // gates EPOLLHUP on LOCAL shutdown); POLLHUP/POLLNVAL are pinned too so the veto set can't shrink.
-        assert!(!connect_poll_succeeded(P::POLLOUT | P::POLLERR), "POLLERR must veto (vsock refusal shape)");
-        assert!(!connect_poll_succeeded(P::POLLOUT | P::POLLHUP), "POLLHUP must veto");
-        assert!(!connect_poll_succeeded(P::POLLOUT | P::POLLNVAL), "POLLNVAL must veto");
+        assert!(
+            !connect_poll_succeeded(P::POLLOUT | P::POLLERR),
+            "POLLERR must veto (vsock refusal shape)"
+        );
+        assert!(
+            !connect_poll_succeeded(P::POLLOUT | P::POLLHUP),
+            "POLLHUP must veto"
+        );
+        assert!(
+            !connect_poll_succeeded(P::POLLOUT | P::POLLNVAL),
+            "POLLNVAL must veto"
+        );
         // POLLOUT absent -> false even on an otherwise-clean revents.
-        assert!(!connect_poll_succeeded(P::POLLIN), "readable-without-writable is not connect success");
-        assert!(!connect_poll_succeeded(P::empty()), "empty revents must not be success");
+        assert!(
+            !connect_poll_succeeded(P::POLLIN),
+            "readable-without-writable is not connect success"
+        );
+        assert!(
+            !connect_poll_succeeded(P::empty()),
+            "empty revents must not be success"
+        );
         // Why there is no `want` parameter: a pipe's EOF routinely arrives as POLLIN|POLLHUP (final data +
         // writer closed). A POLLHUP-vetoing predicate applied to a pipe read would reject that completed
         // read — the (d) quote pipe has its own EOF-aware check (quote_subprocess::
@@ -254,7 +286,10 @@ mod tests {
     #[test]
     fn pipe_revents_pollin_alone_proceeds() {
         // Regression: a predicate too strict refuses plain data.
-        assert_eq!(classify_pipe_revents(PollFlags::POLLIN), PipeReadiness::ReadNow);
+        assert_eq!(
+            classify_pipe_revents(PollFlags::POLLIN),
+            PipeReadiness::ReadNow
+        );
     }
 
     #[test]
@@ -272,15 +307,27 @@ mod tests {
     fn pipe_revents_pollhup_alone_proceeds() {
         // Regression: drained EOF read as a spurious failure (clean child-exit-after-write race) —
         // bare POLLHUP means "go read; expect 0".
-        assert_eq!(classify_pipe_revents(PollFlags::POLLHUP), PipeReadiness::ReadNow);
+        assert_eq!(
+            classify_pipe_revents(PollFlags::POLLHUP),
+            PipeReadiness::ReadNow
+        );
     }
 
     #[test]
     fn pipe_revents_pollerr_pollnval_without_pollin_broken() {
         // Regression: a broken fd misread as EOF-success or spun on forever.
-        assert_eq!(classify_pipe_revents(PollFlags::POLLERR), PipeReadiness::BrokenFd);
-        assert_eq!(classify_pipe_revents(PollFlags::POLLNVAL), PipeReadiness::BrokenFd);
-        assert_eq!(classify_pipe_revents(PollFlags::empty()), PipeReadiness::BrokenFd);
+        assert_eq!(
+            classify_pipe_revents(PollFlags::POLLERR),
+            PipeReadiness::BrokenFd
+        );
+        assert_eq!(
+            classify_pipe_revents(PollFlags::POLLNVAL),
+            PipeReadiness::BrokenFd
+        );
+        assert_eq!(
+            classify_pipe_revents(PollFlags::empty()),
+            PipeReadiness::BrokenFd
+        );
         // ...but error flags NEVER mask pending data.
         assert_eq!(
             classify_pipe_revents(PollFlags::POLLIN | PollFlags::POLLERR),
