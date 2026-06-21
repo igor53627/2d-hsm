@@ -98,47 +98,16 @@ compile_error!(
 // in-TEE enclave_scope_id RNG provenance via the attested provisioning channel) is DONE + verified.
 // The compile_error! release ban is REMOVED; the feature can be enabled in release builds.
 
-// Live AGENT_K1_SIGN_TRANSFER signing emits fund-moving transfer signatures. SIGN_TRANSFER itself is
-// NOT rollback-sensitive (it mutates no sealed state), so it carries no TASK-7.7 anti-rollback
-// obligation — the ban is the production fund-CUSTODY-readiness gate: it stays fail-closed until the
-// AC#5 production funding profile is provisioned and TASK-18 un-gates. Hard-ban it from release builds.
-#[cfg(all(release_build, feature = "agent-sign-transfer-preview"))]
-compile_error!(
-    "`agent-sign-transfer-preview` (live AGENT_K1_SIGN_TRANSFER signing) must not be enabled in \
-     release builds until the AC#5 production funding profile is armed and TASK-18 un-gates"
-);
+// Live AGENT_K1_SIGN_TRANSFER signing — UN-GATED (TASK-18 18-7). NOT rollback-sensitive (mutates no
+// sealed state); the AC#5 funding profile is a runtime provisioning concern (not a compile gate).
 
-// Live AGENT_K1_SIGN_FAUCET_DISPENSE signing emits fund-moving dispense signatures AND debits sealed
-// faucet spend counters (rollback-sensitive). The ban is the production fund-CUSTODY-readiness gate ON TOP
-// OF the runtime anti-rollback gate: it stays fail-closed until the AC#5 production funding profile is
-// provisioned and TASK-18 un-gates. Hard-ban it from release builds.
-#[cfg(all(release_build, feature = "agent-sign-faucet-preview"))]
-compile_error!(
-    "`agent-sign-faucet-preview` (live AGENT_K1_SIGN_FAUCET_DISPENSE signing) must not be enabled in \
-     release builds until the AC#5 production funding profile is armed and TASK-18 un-gates"
-);
+// Live AGENT_K1_SIGN_FAUCET_DISPENSE signing — UN-GATED (TASK-18 18-8). Rollback-sensitive (debits
+// sealed spend counters); anti-rollback (commit_before_emit) + scope_identity (18-2) + G3 (TASK-25) DONE.
 
-// Live AGENT_K1_CONFIGURE_TREASURY execution mutates sealed faucet config (limits / refillable budget /
-// lifetime circuit-breaker / lifetime-spend recovery) + advances the monotonic config_version
-// (rollback-sensitive). The ban is the production fund-CUSTODY-readiness gate ON TOP OF the runtime
-// anti-rollback gate: it stays fail-closed until the AC#5 production funding profile is armed, the
-// `scope_target`↔sealed-enclave-id binding lands (same clone-replay un-gate prereq as GENERATE_KEYS —
-// today the handler enforces scope_class==0 but does NOT bind scope_target to a sealed enclave id, so a
-// cap is not yet pinned to one enclave; preview-banned so non-reachable in production), the independent
-// recovery-counter rule + the AC#14 audit record land, and TASK-18 un-gates. Hard-ban it from release.
-#[cfg(all(release_build, feature = "agent-configure-treasury-preview"))]
-compile_error!(
-    "`agent-configure-treasury-preview` (live AGENT_K1_CONFIGURE_TREASURY config mutation) must not be \
-     enabled in release builds until the AC#5 production funding profile is armed, the \
-     scope_target-binding + the independent recovery-counter rule + the AC#14 audit record land, and \
-     TASK-18 un-gates"
-);
+// Live AGENT_K1_CONFIGURE_TREASURY execution — UN-GATED (TASK-18 18-7). Mutates sealed faucet config
+// (Structural). scope_identity binding (18-2) + recovery-counter + AC#14 audit + G3 provenance all DONE.
 
-// TASK-23: the deviceless UDS 0x40 contract-test server (`twod-hsm-agent-contract-server`) installs a
-// reference keystore with PUBLIC test keys and serves the agent protocol WITHOUT SNP attestation or
-// anti-rollback durability. It is a dev/CI cross-language contract harness, NEVER a production endpoint
-// — release-banned so a release build cannot compile it. The production path is the AF_VSOCK + SNP
-// `twod-hsm-agent-gateway` bin.
+// TASK-23: the deviceless UDS 0x40 contract-test server stays release-banned (PUBLIC keys, no SNP).
 #[cfg(all(release_build, feature = "agent-contract-server"))]
 compile_error!(
     "`agent-contract-server` (deviceless UDS 0x40 contract-test server) is test/dev-only and must never \
@@ -146,17 +115,8 @@ compile_error!(
      attestation, and has no anti-rollback durability"
 );
 
-// TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path (the pq-agent-backup-v1 ML-KEM-1024
-// KEM-DEM envelope). A live EXPORT will advance the sealed audit `last_exported_seq` high-water; its
-// anti-rollback coverage is now RESOLVED (slice 2 classed EXPORT Structural — a dropped seal ⇒
-// StructuralGap⇒restore, never a silent regress). Still pending before a live EXPORT can ship: the
-// audit-ring WRITE path + the EXPORT/RESTORE handlers (slice 4; today they verify the cap then fail closed).
-// Hard-ban it from release builds until those land and TASK-18 un-gates.
-#[cfg(all(release_build, feature = "agent-backup-export-preview"))]
-compile_error!(
-    "`agent-backup-export-preview` (EXPORT_BACKUP/RESTORE_BACKUP DR-backup KEM-DEM) must not be enabled in \
-     release builds until the audit-ring write path + the EXPORT/RESTORE handlers land and TASK-18 un-gates"
-);
+// TASK-13b/TASK-24: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) — UN-GATED (TASK-18 18-9). The EXPORT handler
+// + audit drain (TASK-13b), the RESTORE handler + AC#6 (TASK-24), + Structural anti-rollback all DONE.
 
 mod boot_input;
 pub mod boot_lab_pq_seal;
