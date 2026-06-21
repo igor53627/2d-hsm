@@ -91,14 +91,12 @@ compile_error!(
      release builds until the 2D EIP-2718 type-0x19 reservation merges (vsock spec §10.8)"
 );
 
-// Live AGENT_K1_GENERATE_KEYS execution mints keys + advances counters via a host-persisted re-seal
-// that an untrusted host can roll back and replay; hard-ban it from release builds until TASK-7.7
-// anti-rollback + scope_target-binding + the AC#14 audit record land.
-#[cfg(all(release_build, feature = "agent-keygen-exec-preview"))]
-compile_error!(
-    "`agent-keygen-exec-preview` (live AGENT_K1_GENERATE_KEYS mutation) must not be enabled in \
-     release builds until anti-rollback (TASK-7.7), scope_target-binding, and audit land"
-);
+// Live AGENT_K1_GENERATE_KEYS execution — UN-GATED (TASK-18 18-6, 2026-06-22). The three prerequisites
+// are ALL DONE + reviewed: (1) anti-rollback durable commit (TASK-7.7 commit_before_emit seal→anchor→swap);
+// (2) scope_target-binding (TASK-18 18-2 signed scope_identity byte-compare vs sealed enclave_scope_id);
+// (3) AC#14 audit record (record_audit in the GENERATE_KEYS handler). The G3 precondition (TASK-25 AC#1/#3:
+// in-TEE enclave_scope_id RNG provenance via the attested provisioning channel) is DONE + verified.
+// The compile_error! release ban is REMOVED; the feature can be enabled in release builds.
 
 // Live AGENT_K1_SIGN_TRANSFER signing emits fund-moving transfer signatures. SIGN_TRANSFER itself is
 // NOT rollback-sensitive (it mutates no sealed state), so it carries no TASK-7.7 anti-rollback
