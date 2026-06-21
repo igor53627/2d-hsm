@@ -1645,9 +1645,9 @@ fn handle_export_backup(
 fn restore_canonical_params(requested_refs: &[[u8; 32]], backup_digest: &[u8; 32]) -> Vec<u8> {
     use crate::agent_capability::{put_bytes, put_uint};
     let mut out = Vec::new();
-    put_uint(&mut out, 0xA0, 2); // map(2)
+    put_uint(&mut out, 5, 2); // map(2) — major type 5 (NOT the composed byte 0xA0; put_uint shifts major<<5)
     put_uint(&mut out, 0, 1); // key 1: requested_refs
-    put_uint(&mut out, 0x80, requested_refs.len() as u64); // array(n)
+    put_uint(&mut out, 4, requested_refs.len() as u64); // array(n) — major type 4 (NOT 0x80)
     for r in requested_refs {
         put_bytes(&mut out, r);
     }
@@ -1705,6 +1705,21 @@ fn handle_restore_backup(
         keystore.config.environment_identifier.as_bytes(),
     )
     .map_err(|_| AgentError::SealFailed)?;
+    // (5c) AC#10 wrapping-key separation (compact 9611 HIGH): the backup was sealed to the SAME recovery
+    //      wrapping key this enclave holds. The AAD' `original_backup_digest` check above only confirms the
+    //      operator re-wrapped the EXACT authorized backup; it does NOT confirm that backup was sealed to
+    //      this enclave's `backup_recovery_wrapping_pubkey`. A backup sealed to a different ML-KEM key
+    //      (e.g. authorized by the recovery authority but from a different fleet's wrapping key) would
+    //      otherwise decrypt to garbage here; enforcing the header's `recovery_key_id` == the sealed key's
+    //      derived id closes the AC#10 "distinct authority vs wrapping-key roles" invariant.
+    let sealed_rid = crate::agent_backup::derive_recovery_key_id(
+        &keystore.config.backup_recovery_wrapping_pubkey,
+    );
+    let backup_rid = crate::agent_backup::backup_recovery_key_id(&req.original_backup)
+        .map_err(|_| AgentError::Malformed)?;
+    if backup_rid != sealed_rid.as_slice() {
+        return Err(AgentError::SealFailed);
+    }
     // (5b) HIGH #1 (compact 9499): payload_binding — bind the cap to THIS restore's params (the key
     //      selector + the backup digest). A cap issued for one restore cannot authorize a different one.
     let canonical = restore_canonical_params(&req.requested_refs, &opened.original_backup_digest);
@@ -7150,15 +7165,27 @@ mod tests {
         use super::*;
         use crate::agent_backup::{
             build_key_refs_manifest, build_restore_ingress_payload, compute_manifest_hash,
-            compute_original_backup_digest, seal_restore_ingress_envelope_with_m,
-            RecoveryHighWater, RECOVERY_HIGH_WATER_DOMAIN,
+            compute_original_backup_digest, derive_recovery_key_id, seal_backup_blob,
+            seal_restore_ingress_envelope_with_m, RecoveryHighWater, RECOVERY_HIGH_WATER_DOMAIN,
         };
         use ed25519_dalek::{Signer, SigningKey};
+        use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
 
         const RSCOPE: &[u8] = b"restore_backup";
         const DEST_MEAS: &[u8] = b"dest-tee-measurement-v1";
         const DEST_SEED: [u8; 64] = [0x6c; 64];
+        const WRAP_SEED: [u8; 64] = [0xd7; 64]; // distinct from DEST_SEED (ceremony role separation)
         const INGRESS_M: [u8; 32] = [0x43; 32];
+
+        /// The recovery wrapping encapsulation pubkey for WRAP_SEED — the ML-KEM key the original
+        /// `pq-agent-backup-v1` is sealed to. AC#10: the destination enclave's sealed
+        /// `backup_recovery_wrapping_pubkey` MUST equal this (or restore fails closed at the
+        /// `recovery_key_id` binding). Returns ONLY the pubkey (the decaps key is the operator's
+        /// offline secret — never in the enclave).
+        fn wrapping_encaps_pubkey() -> Vec<u8> {
+            let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(WRAP_SEED));
+            dk.encapsulation_key().to_bytes().as_slice().to_vec()
+        }
 
         fn recovery_key() -> SigningKey {
             SigningKey::from_bytes(&[0xa2; 32])
@@ -7210,13 +7237,29 @@ mod tests {
                 crate::agent_dispatch::install_restore_ephemeral_with_seed(&DEST_MEAS, &DEST_SEED)
                     .unwrap();
             // Source body → restore-ingress payload + manifest.
-            let src = source_body(n_keys);
+            let mut src = source_body(n_keys);
             let refs: Vec<[u8; 32]> = src.entries.iter().map(|e| e.key_ref).collect();
             let payload = build_restore_ingress_payload(&src, &refs).unwrap().to_vec();
             let manifest = build_key_refs_manifest(&refs).unwrap();
             let manifest_hash = compute_manifest_hash(&manifest);
-            // Original backup blob + digest.
-            let original_backup = b"test-original-backup-blob".to_vec();
+            // Original backup blob (compact 9611 HIGH AC#10): a REAL `pq-agent-backup-v1` sealed to the
+            // recovery wrapping key (WRAP_SEED) — NOT a placeholder. The handler parses this header's
+            // `recovery_key_id` and binds it to the destination's sealed wrapping pubkey. The source
+            // body carries the matching wrapping pubkey so the success-path test can copy it onto dest.
+            let wrap_pub = wrapping_encaps_pubkey();
+            let wrap_rid = derive_recovery_key_id(&wrap_pub);
+            let original_backup = seal_backup_blob(
+                &wrap_pub,
+                &wrap_rid,
+                src.config.twod_chain_id,
+                &src.config.environment_identifier,
+                &manifest,
+                &payload,
+            )
+            .unwrap();
+            // The source body carries the wrapping pubkey the backup was sealed to (callers that reach
+            // the AC#10 check copy this onto the destination's sealed config).
+            src.config.backup_recovery_wrapping_pubkey = wrap_pub;
             let backup_digest = compute_original_backup_digest(&original_backup);
             // Seal the ingress envelope to the dest ephemeral (AAD' = measurement/chain/env/manifest/digest).
             let envelope_blob = seal_restore_ingress_envelope_with_m(
@@ -7289,6 +7332,35 @@ mod tests {
             )
         }
 
+        /// Compact 9611 MEDIUM (restore_canonical_params): pin the EXACT RFC 8949 bytes so a conformant
+        /// EXTERNAL cap issuer (computing the payload_binding preimage per the spec, not via this crate)
+        /// produces byte-identical bytes. Before this the map/array headers passed the composed byte
+        /// (0xA0/0x80) to put_uint, which expects a major-TYPE number (0-7) and shifts it `<<5`; the
+        /// result was malformed CBOR that only this crate's own (symmetric) issuer/verifier pair agreed on.
+        #[test]
+        fn restore_canonical_params_pins_rfc_8949_bytes() {
+            let refs = [[0xAA; 32], [0xBB; 32]];
+            let digest = [0xCC; 32];
+            let out = restore_canonical_params(&refs, &digest);
+            // map(2)=0xA2, key1=0x01, array(2)=0x82, bstr(32)=0x58 0x20 +32B, key2=0x02, bstr(32)=0x58 0x20 +32B.
+            let mut expect = vec![0xA2, 0x01, 0x82];
+            expect.push(0x58);
+            expect.push(0x20);
+            expect.extend_from_slice(&[0xAA; 32]);
+            expect.push(0x58);
+            expect.push(0x20);
+            expect.extend_from_slice(&[0xBB; 32]);
+            expect.push(0x02);
+            expect.push(0x58);
+            expect.push(0x20);
+            expect.extend_from_slice(&[0xCC; 32]);
+            assert_eq!(
+                out, expect,
+                "restore_canonical_params MUST emit RFC 8949 shortest-form CBOR so an external cap \
+                 issuer interoperates; a drift here silently rejects compliant externally-signed caps"
+            );
+        }
+
         /// End-to-end: a recovery-tier RESTORE_BACKUP through dispatch_agent reconstitutes the source
         /// keystore's entries into a fresh destination TEE + advances strict_recovery (AC#6) + structural
         /// (local+1, AC#4). The full ceremony path — ephemeral decap, AAD' verify, signed-high-water
@@ -7302,6 +7374,11 @@ mod tests {
                                         // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
             let (env, src) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
+            // AC#10: the destination's sealed wrapping pubkey MUST match the backup's (the handler's
+            // recovery_key_id binding, compact 9611 HIGH). restore_env sealed the backup to WRAP_SEED
+            // and set src's wrapping pubkey; copy it onto dest so the success path verifies.
+            dest.config.backup_recovery_wrapping_pubkey =
+                src.config.backup_recovery_wrapping_pubkey.clone();
             let resp = dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).unwrap();
             match resp {
                 AgentResponse::RestoreBackup { candidate, .. } => {
@@ -7374,6 +7451,29 @@ mod tests {
                 dispatch_agent(Profile::AgentGateway, &env, &dest, b"OTHER-tee-measurement").err(),
                 Some(AgentError::SealFailed),
                 "dest_measurement mismatch ⇒ fail closed (SealFailed)"
+            );
+        }
+
+        /// AC#10 fail-closed (compact 9611 HIGH): the backup was sealed to a recovery wrapping key
+        /// whose `recovery_key_id` != the destination's sealed `backup_recovery_wrapping_pubkey`'s
+        /// derived id. The handler parses the backup header + binds it to the sealed key; a mismatch
+        /// (authorized by the recovery authority but re-wrapped to a DIFFERENT ML-KEM key) ⇒
+        /// SealFailed. No partial import. Exercises the `backup_recovery_key_id` parse + compare.
+        #[test]
+        fn restore_backup_wrong_wrapping_key_fails_closed() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
+            // restore_env sealed the backup to WRAP_SEED; leave dest's wrapping key as base_body's
+            // placeholder (a DIFFERENT key) ⇒ recovery_key_id mismatch ⇒ fail closed at step 5c.
+            // (base_body's `vec![0xb0; 1568]` is intentionally not WRAP_SEED's key.)
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::SealFailed),
+                "backup sealed to a different wrapping key than the destination's sealed pubkey ⇒ \
+                 fail closed (SealFailed) — AC#10 wrapping-key separation"
             );
         }
 

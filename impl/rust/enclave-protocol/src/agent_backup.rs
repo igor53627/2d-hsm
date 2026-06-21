@@ -370,6 +370,15 @@ fn strict_parse(blob: &[u8]) -> Result<ParsedBackup<'_>, BackupError> {
     })
 }
 
+/// Extract the backup header's `recovery_key_id` — the ML-KEM wrapping key id the backup was sealed
+/// to — WITHOUT decapsulating. Used by the RESTORE handler (AC#10) to enforce wrapping-key
+/// separation: a backup sealed to a key whose id != `derive_recovery_key_id(this_enclave's sealed
+/// backup_recovery_wrapping_pubkey)` MUST fail (authorized by the recovery authority but re-wrapped
+/// to the wrong ML-KEM key). Pure framing parse; fails closed on any malformed blob.
+pub(crate) fn backup_recovery_key_id(blob: &[u8]) -> Result<&[u8], BackupError> {
+    Ok(strict_parse(blob)?.recovery_key_id)
+}
+
 // ===========================================================================================
 // restore-ingress-v1 — the EXPORT_BACKUP payload (TASK-13b slice 4c-2a). This is the OPAQUE
 // `payload` that [`seal_backup_blob`] wraps in the KEM-DEM envelope: the RESTORABLE agent state a
