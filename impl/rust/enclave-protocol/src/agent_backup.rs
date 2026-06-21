@@ -1217,6 +1217,63 @@ pub(crate) fn verify_ac6_high_water(
     Ok(())
 }
 
+/// The AC#6 authenticated high-water source (a): the recovery material the operator submits WITH the
+/// restore request. A canonical-CBOR marks payload (the authoritative current counters/spend) + an
+/// Ed25519 signature by the recovery authority over `RECOVERY_HIGH_WATER_DOMAIN ‖ request_id ‖
+/// marks_payload`. Carried at RestoreRequest key 4.
+const RECOVERY_HIGH_WATER_DOMAIN: &[u8] = b"2d-hsm-restore-high-water-v1\0";
+
+/// The recovery-authority-signed high-water attestation (AC#6 source (a), carried in the RestoreRequest).
+/// `marks_payload` is the canonical CBOR marks (the SAME encoding [`KeystoreBody::encode_marks_payload`]
+/// produces — counters + cumulative_native_spend + lifetime_spend + strict_recovery_counter); `signature`
+/// is the recovery authority's Ed25519 over the domain-prefixed, request_id-bound preimage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryHighWater {
+    pub marks_payload: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+/// Fail-closed errors for [`verify_recovery_high_water`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryHighWaterError {
+    /// The Ed25519 signature did not verify against the sealed `recovery_authority_pk` (wrong signer,
+    /// tampered payload, or a request_id mismatch — the binding ties this attestation to THIS ceremony).
+    SignatureInvalid,
+    /// The signed `marks_payload` failed strict-canonical decode (wrong shape / over-cap / non-canonical).
+    MalformedMarks,
+}
+
+/// Verify the recovery-authority-signed high-water (AC#6 source (a)): `verify_strict` the Ed25519
+/// signature over `RECOVERY_HIGH_WATER_DOMAIN ‖ request_id ‖ marks_payload` against the sealed
+/// `recovery_authority_pk`, then strict-decode the marks. The `request_id` binding ties this attestation
+/// to THIS restore ceremony (the cap's request_id) — anti-replay: the operator cannot reuse one
+/// high-water attestation across restores with different caps. Returns the authenticated [`DecodedMarks`]
+/// for [`verify_ac6_high_water`]. `verify_strict` rejects torsion/small-order keys (the same surface as
+/// every other Ed25519 verify in the crate). EVERY failure ⇒ a distinct error (fail closed).
+pub(crate) fn verify_recovery_high_water(
+    hwm: &RecoveryHighWater,
+    request_id: &[u8],
+    recovery_authority_pk: &[u8; 32],
+) -> Result<crate::agent_cbor::DecodedMarks, RecoveryHighWaterError> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let key = VerifyingKey::from_bytes(recovery_authority_pk)
+        .map_err(|_| RecoveryHighWaterError::SignatureInvalid)?;
+    let mut preimage = Vec::with_capacity(
+        RECOVERY_HIGH_WATER_DOMAIN.len() + request_id.len() + hwm.marks_payload.len(),
+    );
+    preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+    preimage.extend_from_slice(request_id);
+    preimage.extend_from_slice(&hwm.marks_payload);
+    let sig = Signature::from_bytes(&hwm.signature);
+    key.verify_strict(&preimage, &sig)
+        .map_err(|_| RecoveryHighWaterError::SignatureInvalid)?;
+    crate::agent_cbor::strict_decode_marks_payload(
+        &hwm.marks_payload,
+        crate::agent_keystore::MAX_COUNTER_ENTRIES,
+    )
+    .map_err(|_| RecoveryHighWaterError::MalformedMarks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3252,6 +3309,83 @@ mod tests {
             verify_ac6_high_water(&dest, &data, &lower),
             Err(Ac6Error::StaleBackup),
             "authenticated spend < backup spend ⇒ stale"
+        );
+    }
+
+    // ─── TASK-24 AC#6 source (a): verify_recovery_high_water ───
+
+    /// Build a recovery-authority-signed high-water attestation over body_with_two_keys' marks.
+    fn signed_high_water(
+        request_id: &[u8],
+        recovery: &ed25519_dalek::SigningKey,
+        marks_payload: Option<Vec<u8>>,
+    ) -> RecoveryHighWater {
+        use ed25519_dalek::Signer;
+        let marks_payload =
+            marks_payload.unwrap_or_else(|| body_with_two_keys().encode_marks_payload());
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+        preimage.extend_from_slice(request_id);
+        preimage.extend_from_slice(&marks_payload);
+        let signature = recovery.sign(&preimage).to_bytes();
+        RecoveryHighWater {
+            marks_payload,
+            signature,
+        }
+    }
+
+    #[test]
+    fn verify_recovery_high_water_accepts_valid_signature() {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        let hwm = signed_high_water(rid, &recovery, None);
+        let marks = verify_recovery_high_water(&hwm, rid, &pk).expect("valid signature verifies");
+        // The decoded marks match body_with_two_keys' counters (1 row, HAC=1).
+        assert_eq!(marks.rows.len(), 1);
+        assert_eq!(marks.rows[0].highest_accepted_counter, 1);
+    }
+
+    #[test]
+    fn verify_recovery_high_water_rejects_wrong_authority() {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]); // a different "authority"
+        let other_pk = other.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        let hwm = signed_high_water(rid, &recovery, None); // signed by [9;32]
+        assert_eq!(
+            verify_recovery_high_water(&hwm, rid, &other_pk),
+            Err(RecoveryHighWaterError::SignatureInvalid),
+            "a high-water signed by a different key than the sealed recovery_authority_pk is rejected"
+        );
+    }
+
+    #[test]
+    fn verify_recovery_high_water_request_id_binding() {
+        // The signature binds the request_id: verifying against a DIFFERENT request_id fails (anti-replay
+        // — one attestation cannot authorize a restore under a different cap/request_id).
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let hwm = signed_high_water(b"req-restore-1", &recovery, None);
+        assert_eq!(
+            verify_recovery_high_water(&hwm, b"req-DIFFERENT", &pk),
+            Err(RecoveryHighWaterError::SignatureInvalid),
+            "request_id mismatch ⇒ signature invalid (ceremony binding)"
+        );
+    }
+
+    #[test]
+    fn verify_recovery_high_water_rejects_malformed_marks() {
+        // A valid signature over a GARBAGE marks_payload: the signature verifies (it covers whatever
+        // bytes), but the strict-canonical decode of the garbage fails ⇒ MalformedMarks.
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        let hwm = signed_high_water(rid, &recovery, Some(vec![0xFF, 0xFF, 0xFF])); // garbage marks
+        assert_eq!(
+            verify_recovery_high_water(&hwm, rid, &pk),
+            Err(RecoveryHighWaterError::MalformedMarks),
+            "a valid signature over non-canonical marks ⇒ MalformedMarks"
         );
     }
 }
