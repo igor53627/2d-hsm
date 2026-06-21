@@ -1638,6 +1638,142 @@ pub fn reset_agent_keystore_for_tests() {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// TASK-24 Slice 2a-i: the destination TEE's ATTESTED EPHEMERAL ML-KEM-1024 keypair lifecycle — the
+// restore-ceremony key the operator re-wraps the backup to (the `dest_ephemeral_pubkey` of the
+// `2d-hsm-agent-restore-ingress-v1` envelope, Slice 1). Generated on demand by the GET_RESTORE_PUBKEY
+// opcode (Sub-slice 2a-ii); held in a process-global; SINGLE-USE (retired after one successful restore,
+// so a second ceremony needs a fresh key + fresh attestation — claude-code AC#1 review: forbid reusing
+// one attested ephemeral key across multiple restores). Gated by `agent-backup-export-preview` (pulls
+// ml-kem), same as the whole DR-backup path.
+// ---------------------------------------------------------------------------------------------------
+
+/// The destination's attested restore-ephemeral keypair, held in [`INSTALLED_RESTORE_EPHEMERAL`] between
+/// the GET_RESTORE_PUBKEY opcode (which generates + publishes the pubkey half) and the RESTORE_BACKUP
+/// handler (which decapsulates with the private half via [`crate::agent_backup::open_restore_ingress_
+/// envelope`]). The DECAPS key is stored as its 64-byte SEED (not the materialized `DecapsulationKey`) so
+/// the slot is `Send` without depending on ml-kem's `Send` impls, AND so the private key is only
+/// materialized briefly inside the restore decap (reconstructed via `DecapsulationKey::from_seed`, used,
+/// dropped) — minimizing the window the decaps key exists in memory. The seed is `Zeroizing` (scrubbed on
+/// drop / retire).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (held only by the fns below, wired in 2a-ii/2b)
+struct InstalledRestoreEphemeral {
+    /// The 1568-byte attested encapsulation (public) key the operator re-wraps to (the opcode returns it).
+    encaps_key: Vec<u8>,
+    /// The 64-byte ML-KEM keypair seed — reconstructs the decapsulation (private) key on demand. Sensitive
+    /// (with the measurement + attestation it IS the ceremony private key); `Zeroizing`.
+    decaps_seed: zeroize::Zeroizing<[u8; 64]>,
+    /// The attestation measurement this ephemeral key was published under — IS the `dest_measurement`
+    /// the RESTORE handler checks against the envelope's AAD' (`opened.dest_measurement == OWN`).
+    measurement: Vec<u8>,
+}
+
+/// Process-global slot for the destination restore-ephemeral keypair. Const-init `None` ⇒ no ephemeral
+/// published (GET_RESTORE_PUBKEY has not run this boot, or it was retired). Volatile — lost on restart, so
+/// a restart forces the operator to re-fetch a fresh ephemeral pubkey + re-wrap (the ceremony never
+/// trusts a persisted key).
+#[cfg(feature = "agent-backup-export-preview")]
+static INSTALLED_RESTORE_EPHEMERAL: Mutex<Option<InstalledRestoreEphemeral>> = Mutex::new(None);
+
+/// The GET_RESTORE_PUBKEY opcode response: the attested ephemeral public key + the measurement it was
+/// published under (the operator verifies the attestation binds the two out-of-band — AC#12 — then
+/// re-wraps the backup to the pubkey).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) struct RestoreEphemeralPub {
+    pub encaps_key: Vec<u8>,
+    pub measurement: Vec<u8>,
+}
+
+/// Generate + install a FRESH attested restore-ephemeral ML-KEM-1024 keypair (the GET_RESTORE_PUBKEY
+/// opcode's action). **Install-once**: returns `None` if an ephemeral is already installed (a second
+/// GET_RESTORE_PUBKEY this boot is a no-op — the operator re-uses the already-published key until it is
+/// retired by a successful restore). `measurement` is the enclave's own attestation measurement (from
+/// [`INSTALLED_KEYSTORE`]); returns `None` on an empty measurement or CSPRNG failure (fail-closed — the
+/// opcode returns an error, no half-installed state). The keypair is drawn from the TEE CSPRNG
+/// (`getrandom`), never host-supplied.
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEphemeralPub> {
+    use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+    // An empty measurement would make the AAD' `dest_measurement == OWN` check meaningless — reject up
+    // front (mirrors `install_agent_keystore`'s empty-measurement guard).
+    if measurement.is_empty() {
+        return None;
+    }
+    // A fresh 64-byte seed from the TEE CSPRNG — the ceremony private key's root. CSPRNG failure ⇒ None
+    // (fail-closed; no half-install).
+    let mut seed = zeroize::Zeroizing::new([0u8; 64]);
+    getrandom::getrandom(&mut seed[..]).ok()?;
+    let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*seed));
+    let encaps_key = dk.encapsulation_key().to_bytes().as_slice().to_vec();
+    let pub_info = RestoreEphemeralPub { encaps_key: encaps_key.clone(), measurement: measurement.to_vec() };
+    let mut guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    if guard.is_some() {
+        return None; // install-once: a second GET_RESTORE_PUBKEY does not overwrite the published key
+    }
+    *guard = Some(InstalledRestoreEphemeral { encaps_key, decaps_seed: seed, measurement: measurement.to_vec() });
+    Some(pub_info)
+}
+
+/// Whether a restore-ephemeral keypair is currently published (GET_RESTORE_PUBKEY ran, not yet retired).
+/// Poison-recovers (consistent with the other agent process-globals).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) fn is_restore_ephemeral_installed() -> bool {
+    INSTALLED_RESTORE_EPHEMERAL
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+/// The restore handler's read of the published ephemeral: a SNAPSHOT (decaps seed + the measurement)
+/// cloned out under a brief lock, so the handler does NOT hold the ephemeral slot lock across the restore
+/// (it already holds [`INSTALLED_KEYSTORE`). The handler reconstructs the `DecapsulationKey` from the seed
+/// via `DecapsulationKey::from_seed`, passes it to [`crate::agent_backup::open_restore_ingress_envelope`],
+/// and checks `snapshot.measurement == opened.dest_measurement` (the AAD' `== OWN` check). Returns `None`
+/// if no ephemeral is published (the opcode hasn't run / was retired) — the handler fails the restore
+/// closed. Does NOT consume the slot (a FAILED restore keeps the key for retry; only a SUCCESS retires it
+/// via [`retire_restore_ephemeral`]).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2b handler wires it)
+pub(crate) struct RestoreEphemeralSnapshot {
+    pub decaps_seed: zeroize::Zeroizing<[u8; 64]>,
+    pub measurement: Vec<u8>,
+}
+
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2b handler wires it)
+pub(crate) fn snapshot_restore_ephemeral() -> Option<RestoreEphemeralSnapshot> {
+    let guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    guard.as_ref().map(|e| RestoreEphemeralSnapshot {
+        decaps_seed: zeroize::Zeroizing::new(*e.decaps_seed),
+        measurement: e.measurement.clone(),
+    })
+}
+
+/// Retire the restore-ephemeral keypair — SINGLE-USE enforcement (claude-code AC#1 review). Called by the
+/// RESTORE handler ONLY after a successful restore commit (the operator-authorized ceremony consumed the
+/// key). A second restore this boot then finds no ephemeral (`is_restore_ephemeral_installed()` == false)
+/// and must re-fetch a fresh GET_RESTORE_PUBKEY + fresh attestation + fresh re-wrap — forbidding one
+/// attested ephemeral key from authenticating two distinct recoveries. The `Zeroizing` decaps seed is
+/// scrubbed on drop. No-op (idempotent) if already retired.
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode + 2b handler wire it)
+pub(crate) fn retire_restore_ephemeral() {
+    if let Ok(mut guard) = INSTALLED_RESTORE_EPHEMERAL.lock() {
+        *guard = None; // Zeroizing decaps_seed scrubbed on drop
+    }
+}
+
+#[cfg(all(test, feature = "agent-backup-export-preview"))]
+fn reset_restore_ephemeral_for_tests() {
+    if let Ok(mut guard) = INSTALLED_RESTORE_EPHEMERAL.lock() {
+        *guard = None;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
 // TASK-7.7 slice 6-4: the per-op anchor-commit channel + the seal-before-emit commit helper. The commit
 // CODE compiles always but only RUNS under `agent-keygen-exec-preview` (the only path that produces a
 // GENERATE_KEYS candidate; without the feature GENERATE_KEYS → NotConfigured, so the commit is never
@@ -1835,6 +1971,9 @@ pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'s
     reset_agent_keystore_for_tests();
     reset_anti_rollback_binding_for_tests();
     reset_commit_channel_for_tests(); // slice 6-4: frame-path tests install a mock commit channel
+    // TASK-24 Slice 2a-i: the restore-ephemeral slot (only under the backup-export preview — pulls ml-kem).
+    #[cfg(feature = "agent-backup-export-preview")]
+    reset_restore_ephemeral_for_tests();
     crate::agent_challenge::reset_outstanding_challenge_for_tests();
     // The quote-producer process-ledger claim ((d-ii)/2) — triple-gated like its module (the enclosing
     // module is already agent-gateway-gated; the inner cfg completes the gate so non-linux / non-vsock
@@ -3893,6 +4032,88 @@ mod tests {
         assert!(
             !is_anti_rollback_configured(),
             "const-init None ⇒ fail-closed default"
+        );
+    }
+
+    // ---- TASK-24 Slice 2a-i: restore-ephemeral keypair lifecycle ----
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_install_once_and_basic_access() {
+        let _g = lock_and_reset_agent_process_globals();
+        assert!(!is_restore_ephemeral_installed(), "const-init None ⇒ fail-closed default");
+        let pub1 = install_restore_ephemeral(b"dest-measurement-v1").expect("first install succeeds");
+        assert_eq!(pub1.measurement, b"dest-measurement-v1");
+        assert_eq!(
+            pub1.encaps_key.len(),
+            crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN,
+            "1568-byte ML-KEM-1024 encaps key"
+        );
+        assert!(is_restore_ephemeral_installed());
+        // Install-once: a second call returns None + does NOT overwrite the published key.
+        assert!(install_restore_ephemeral(b"other").is_none(), "install-once refuses overwrite");
+        let still = snapshot_restore_ephemeral().unwrap();
+        assert_eq!(still.measurement, b"dest-measurement-v1", "first key retained, not overwritten");
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_rejects_empty_measurement() {
+        let _g = lock_and_reset_agent_process_globals();
+        assert!(install_restore_ephemeral(b"").is_none(), "empty measurement rejected");
+        assert!(!is_restore_ephemeral_installed(), "no half-install on empty measurement");
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_snapshot_reconstructs_the_published_encaps_key() {
+        // The snapshot's decaps seed MUST reconstruct a DecapsulationKey whose encaps key == the one
+        // GET_RESTORE_PUBKEY published (the operator re-wrapped to that pubkey; the handler decapsulates
+        // with the matching private half). Pins the seed↔pubkey consistency the ceremony round-trip needs.
+        use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+        let _g = lock_and_reset_agent_process_globals();
+        let pub_info = install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        let snap = snapshot_restore_ephemeral().expect("snapshot after install");
+        assert_eq!(snap.measurement, b"dest-measurement-v1");
+        let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*snap.decaps_seed));
+        assert_eq!(
+            dk.encapsulation_key().to_bytes().as_slice(),
+            pub_info.encaps_key.as_slice(),
+            "snapshot seed reconstructs the published encaps key"
+        );
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_retire_is_single_use() {
+        // SINGLE-USE enforcement (claude-code AC#1 review): after retire, no ephemeral is published — a
+        // second restore must re-fetch GET_RESTORE_PUBKEY + fresh attestation + fresh re-wrap.
+        let _g = lock_and_reset_agent_process_globals();
+        install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        assert!(is_restore_ephemeral_installed());
+        retire_restore_ephemeral();
+        assert!(!is_restore_ephemeral_installed(), "retire clears (single-use)");
+        assert!(snapshot_restore_ephemeral().is_none(), "no snapshot after retire");
+        retire_restore_ephemeral(); // idempotent
+        // After retire a FRESH install is allowed (the next ceremony's key).
+        assert!(
+            install_restore_ephemeral(b"dest-measurement-v2").is_some(),
+            "fresh install allowed after retire"
+        );
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_snapshot_keeps_the_key_for_retry() {
+        // A snapshot (a FAILED restore attempt) does NOT retire — the operator can retry the ceremony
+        // with a corrected envelope to the SAME published key. Only a SUCCESSFUL restore retires.
+        let _g = lock_and_reset_agent_process_globals();
+        install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        let _snap = snapshot_restore_ephemeral().unwrap();
+        assert!(is_restore_ephemeral_installed(), "snapshot keeps the key for retry");
+        assert!(
+            snapshot_restore_ephemeral().is_some(),
+            "still snapshottable after a failed-attempt snapshot"
         );
     }
 
