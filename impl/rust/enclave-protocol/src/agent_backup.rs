@@ -3503,4 +3503,55 @@ mod tests {
             "a valid signature over non-canonical marks ⇒ MalformedMarks"
         );
     }
+
+    /// Medium (compact 9516): the PAYLOAD config chain/env cross-check (HIGH #2 fix) is independently
+    /// enforced — mutate ONLY data.config (keeping the envelope AAD' matching the destination) + assert
+    /// ChainMismatch / EnvironmentMismatch. Proves the check catches a host re-wrapping attacker-chosen
+    /// data with a different config-identity.
+    #[test]
+    fn verify_restore_ingress_rejects_payload_chain_mismatch_independently() {
+        let (opened, mut data, backup, refs, meas, _chain, env) = valid_restore_inputs();
+        // Mutate ONLY the payload's config chain — the envelope AAD' still matches own_chain (11565),
+        // but the payload's config.twod_chain_id is now 99999.
+        data.config.twod_chain_id = 99999;
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &refs, &meas, 11565, &env),
+            Err(RestoreVerifyError::ChainMismatch),
+            "payload config chain mismatch (independent of the AAD' chain check)"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_payload_env_mismatch_independently() {
+        let (opened, mut data, backup, refs, meas, chain, _env) = valid_restore_inputs();
+        // Mutate ONLY the payload's config env.
+        data.config.environment_identifier = "mainnet".to_string();
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &refs, &meas, chain, b"testnet"),
+            Err(RestoreVerifyError::EnvironmentMismatch),
+            "payload config env mismatch (independent of the AAD' env check)"
+        );
+    }
+
+    /// Medium (compact 9516): the scoped recovery high-water preimage includes chain_id + env — a
+    /// signature for one scope must be rejected under another.
+    #[test]
+    fn verify_recovery_high_water_cross_scope_rejected() {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        // Sign for (11565, "testnet") — verify with a DIFFERENT chain.
+        let hwm = signed_high_water(rid, &recovery, None);
+        assert_eq!(
+            verify_recovery_high_water(&hwm, 99999, "testnet", rid, &pk),
+            Err(RecoveryHighWaterError::SignatureInvalid),
+            "high-water signed for chain 11565 must not verify under chain 99999"
+        );
+        // Sign for (11565, "testnet") — verify with a DIFFERENT env.
+        assert_eq!(
+            verify_recovery_high_water(&hwm, 11565, "mainnet", rid, &pk),
+            Err(RecoveryHighWaterError::SignatureInvalid),
+            "high-water signed for env testnet must not verify under env mainnet"
+        );
+    }
 }
