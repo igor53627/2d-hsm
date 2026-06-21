@@ -876,6 +876,525 @@ pub(crate) fn open_restore_ingress_envelope(
     })
 }
 
+/// Fail-closed errors for [`apply_restore_to_body`] (never a partial/silent apply).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestoreApplyError {
+    /// AC#7: the RESTORE-time `audit_capacity` is smaller than the restored `audit_records.len()` —
+    /// refuse, NEVER truncate the restored reviewable history.
+    AuditCapacityOverflow,
+    /// AC#6: `strict_recovery_counter` forward-only advance (`max(local, backup) + 1`) overflows `u64`.
+    MonotonicOverflow,
+}
+
+/// TASK-24 AC#3/#7 (+ AC#6 strict_recovery): apply a decoded [`RestoreIngressData`] to a keystore body —
+/// wholesale-REPLACE the restorable state, reconstruct the EXCLUDED audit cursors enclave-locally, and
+/// advance `strict_recovery_counter` forward-only. Pure transform (no I/O, no validate — the handler
+/// validates + seals). EVERY error path returns `Err` with NO partial mutation (the capacity gate runs
+/// before any field write).
+///
+/// **Wholesale-replaces** (AC#3): the config-IDENTITY subset (`twod_chain_id`/`environment_identifier`/
+/// `admin_authority_pk`/`recovery_authority_pk`/`monotonic_treasury_config_version`/`authority_epoch`) +
+/// `entries` (incl. the secret scalars — the point of the backup) + `counters` + `faucet` + audit RECORDS
+/// + `strict_recovery_counter` (advanced, AC#6). **Never touches the EXCLUDED surfaces**: `anchor_root`,
+/// `backup_recovery_wrapping_pubkey`, `enclave_scope_id`, `fleet_scope_id` (enclave-local identity — the
+/// payload carries none), and `freshness_epoch`/`structural_version` (enclave-relative; the handler's
+/// `advance_commit_epoch(true)` bumps them — AC#4, the `local+1` strategy).
+///
+/// **Audit cursors** (AC#7): reconstructed enclave-locally — `next_seq = max(record.seq)+1` (or 1 if
+/// none), `last_exported_seq = next_seq-1` (the restored ring starts FULLY drained), `capacity` from the
+/// RESTORE-time policy arg (NOT the backup). `capacity < records.len()` ⇒ `AuditCapacityOverflow` (fail
+/// closed, never truncate — AC#14).
+///
+/// **AC#6 NOTE**: this installs the backup's `counters` + `faucet` as the AC#3 base. The handler's AC#6
+/// gate (the authenticated-high-water seeding via the 5b-2e raw-marks channel) OVERRIDES/VALIDATES the
+/// spend/counter high-water BEFORE commit — it never trusts the possibly-stale backup alone for those
+/// marks. `strict_recovery_counter` IS advanced forward-only here (the clear part of AC#6): the new value
+/// is strictly `> max(local, backup)` — a fresh TEE (local 0) restores to `backup+1`, a re-restore to
+/// `max(local, backup)+1`.
+pub(crate) fn apply_restore_to_body(
+    body: &mut crate::agent_keystore::KeystoreBody,
+    data: &RestoreIngressData,
+    audit_capacity: u32,
+) -> Result<(), RestoreApplyError> {
+    // AC#7: capacity gate FIRST (before any write) — fail closed, NEVER truncate restored records.
+    if (audit_capacity as usize) < data.audit_records.len() {
+        return Err(RestoreApplyError::AuditCapacityOverflow);
+    }
+    // AC#7: reconstruct the EXCLUDED cursors enclave-locally (the payload carries records, not cursors).
+    let next_seq = data
+        .audit_records
+        .iter()
+        .map(|r| r.seq)
+        .max()
+        .map(|m| m.saturating_add(1))
+        .unwrap_or(1);
+    let last_exported_seq = next_seq - 1; // restored ring starts fully drained (next_seq >= 1 ⇒ no underflow)
+
+    // AC#3: wholesale-replace the config-IDENTITY subset. The enclave-local identity fields
+    // (anchor_root / backup_recovery_wrapping_pubkey / enclave_scope_id / fleet_scope_id) are EXCLUDED —
+    // the payload carries none; they stay the restoring enclave's own.
+    body.config.twod_chain_id = data.config.twod_chain_id;
+    body.config.environment_identifier = data.config.environment_identifier.clone();
+    body.config.admin_authority_pk = data.config.admin_authority_pk;
+    body.config.recovery_authority_pk = data.config.recovery_authority_pk;
+    body.config.monotonic_treasury_config_version = data.config.monotonic_treasury_config_version;
+    body.config.authority_epoch = data.config.authority_epoch;
+
+    body.entries = data.entries.clone();
+    body.counters = data.counters.clone();
+    body.faucet = data.faucet.clone();
+    body.audit.records = data.audit_records.clone();
+    body.audit.capacity = audit_capacity;
+    body.audit.next_seq = next_seq;
+    body.audit.last_exported_seq = last_exported_seq;
+
+    // AC#6 (strict_recovery): forward-only advance — strictly > the current highest of (local, backup).
+    let highest = body
+        .strict_recovery_counter
+        .max(data.strict_recovery_counter);
+    body.strict_recovery_counter = highest
+        .checked_add(1)
+        .ok_or(RestoreApplyError::MonotonicOverflow)?;
+
+    Ok(())
+}
+
+/// Fail-closed errors for [`verify_restore_ingress`] (the AAD' semantic checks + AC#9 set-match). Each
+/// names a DISTINCT rejection cause so the handler can collapse them to the right §10.9 wire code.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestoreVerifyError {
+    /// AC#1(a): the envelope's `dest_measurement` != THIS enclave's own (a re-wrap for a different TEE).
+    MeasurementMismatch,
+    /// AC#1(b): the envelope's `chain_id` != the sealed config (cross-chain restore).
+    ChainMismatch,
+    /// AC#1(b): the envelope's `environment_identifier` != the sealed config (e.g. testnet→mainnet).
+    EnvironmentMismatch,
+    /// AC#1(c): the envelope's `original_backup_digest` != the digest of the submitted original backup.
+    BackupDigestMismatch,
+    /// AC#1(c): the authenticated `manifest_hash` != the manifest recomputed from the payload's entries
+    /// (the envelope was re-wrapped over a DIFFERENT payload than the one it now carries — tamper/forgery).
+    ManifestMismatch,
+    /// AC#9: the request's key_refs selector SET != the payload's entry-ref SET (order/multiplicity-
+    /// insensitive; a `[A,A]`/out-of-order selector matches `[A]`/body-order, but a selector naming a ref
+    /// the payload does not carry — or omitting one it does — is rejected).
+    SelectorSetMismatch,
+    /// The manifest CBOR encode failed (a malformed entry-ref shape — internal invariant break).
+    ManifestEncode,
+}
+
+/// TASK-24 AC#1 AAD' semantic checks + AC#9 set-match: verify an opened restore-ingress envelope against
+/// the restoring enclave's OWN state + the parsed payload + the request's key_refs selector. The envelope
+/// AEAD already authenticated the AAD' fields (they're in the header); this compares those authenticated
+/// values against the enclave's own identity + recomputes the manifest/digest over the submitted material.
+/// Pure (no I/O); EVERY mismatch ⇒ a distinct `RestoreVerifyError` (fail closed, no partial import).
+///
+/// **Order** (fail-fast on the cheapest checks): (a) `dest_measurement == OWN` (AC#1 — a re-wrap for a
+/// different TEE); (b) `chain_id` + `environment_identifier == sealed config` (AC#1 — cross-chain / cross-
+/// environment restore fails closed); (c) `original_backup_digest` matches the submitted original backup
+/// (AC#1 — the re-wrap is of the EXACT backup the recovery authority authorized); (d) `manifest_hash`
+/// matches the manifest recomputed from the PAYLOAD's entries in body order (AC#1 — manifest↔payload
+/// consistency, the authenticated manifest binds THIS payload); (e) the request's selector SET equals the
+/// payload's entry-ref SET (AC#9 — order/multiplicity-insensitive set-match).
+pub(crate) fn verify_restore_ingress(
+    opened: &OpenedRestoreIngress,
+    data: &RestoreIngressData,
+    original_backup_blob: &[u8],
+    requested_refs: &[[u8; 32]],
+    own_measurement: &[u8],
+    own_chain_id: u64,
+    own_env: &[u8],
+) -> Result<(), RestoreVerifyError> {
+    // (a) AC#1: the attestation/measurement in AAD' is THIS enclave's own (defense-in-depth — the PRIMARY
+    // anti-substitution control is the operator verifying the attestation binds the ephemeral key to the
+    // measurement out-of-band, AC#12; `== OWN` catches a re-wrap made for a DIFFERENT attested TEE).
+    if opened.dest_measurement != own_measurement {
+        return Err(RestoreVerifyError::MeasurementMismatch);
+    }
+    // (b) AC#1: chain_id + environment_identifier equal the sealed config (cross-environment restore fails
+    // closed — a testnet blob into a mainnet enclave is rejected here).
+    if opened.chain_id != own_chain_id {
+        return Err(RestoreVerifyError::ChainMismatch);
+    }
+    if opened.environment_identifier != own_env {
+        return Err(RestoreVerifyError::EnvironmentMismatch);
+    }
+    // (c) AC#1: the original-backup digest — the envelope was re-wrapped over the EXACT backup the recovery
+    // authority authorized; a re-wrap of a different backup fails here.
+    if opened.original_backup_digest != compute_original_backup_digest(original_backup_blob) {
+        return Err(RestoreVerifyError::BackupDigestMismatch);
+    }
+    // (d) AC#1: manifest↔payload consistency — the authenticated manifest hash must equal the manifest
+    // recomputed from the PAYLOAD's entries in body order. Binds the envelope to the payload it carries.
+    let payload_refs: Vec<[u8; 32]> = data.entries.iter().map(|e| e.key_ref).collect();
+    let manifest =
+        build_key_refs_manifest(&payload_refs).map_err(|_| RestoreVerifyError::ManifestEncode)?;
+    if opened.manifest_hash != compute_manifest_hash(&manifest) {
+        return Err(RestoreVerifyError::ManifestMismatch);
+    }
+    // (e) AC#9 set-match: the request's selector (order/multiplicity-INSENSITIVE) == the payload's entry
+    // refs as a SET. A `[A,A]` or non-body-order selector is the same export as `[A]`/body-order and MUST
+    // NOT be rejected; a selector naming a ref the payload lacks (or omitting one it carries) IS rejected.
+    let mut req_set: Vec<[u8; 32]> = requested_refs.to_vec();
+    req_set.sort_unstable();
+    req_set.dedup();
+    let mut pay_set = payload_refs;
+    pay_set.sort_unstable();
+    pay_set.dedup();
+    if req_set != pay_set {
+        return Err(RestoreVerifyError::SelectorSetMismatch);
+    }
+    Ok(())
+}
+
+/// The decoded RESTORE_BACKUP(8) request body (envelope key 7). Carries: the attested ingress envelope
+/// blob (the operator's re-wrap), the ORIGINAL `pq-agent-backup-v1` blob (so the handler can verify the
+/// AAD' `original_backup_digest`), the request's `key_refs` selector (AC#9 set-match), AND the
+/// recovery-authority-signed high-water (AC#6 source (a) — the authenticated high-water the operator
+/// attests is current; REQUIRED — a fresh TEE with no authenticated source is rejected). The ingress
+/// envelope + original backup + marks payload are OPAQUE byte strings here — the handler opens/decapsulates/
+/// hashes/verifies them; this struct only frames them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestoreRequest {
+    /// The `2d-hsm-agent-restore-ingress-v1` blob (magic `2DAGRIE\0`) — the attested re-wrap to dest.
+    pub ingress_envelope: Vec<u8>,
+    /// The full original `pq-agent-backup-v1` blob (magic `2DAGTBK\0`) the operator decapsulated offline.
+    pub original_backup: Vec<u8>,
+    /// The request's key_refs selector — a SET (AC#9 order/multiplicity-insensitive) the handler matches
+    /// against the payload's entry refs.
+    pub requested_refs: Vec<[u8; 32]>,
+    /// The AC#6 authenticated high-water source (a): the recovery-authority-signed marks (the current
+    /// authoritative counters/spend). REQUIRED — AC#6 rejects a restore with no authenticated source.
+    pub recovery_high_water: RecoveryHighWater,
+}
+
+/// Strict decode of the RESTORE_BACKUP(8) request body (envelope key 7). Exactly the canonical CBOR map
+/// `{1: ingress_envelope(bstr), 2: original_backup(bstr), 3: requested_refs(array<32B bstr>), 4:
+/// recovery_high_water({1: marks_payload(bstr), 2: signature(bstr(64))})}`, keys ascending, deny-unknown.
+/// EVERY deviation ⇒ `Err` (fail closed): wrong types, unknown keys, a ref not exactly 32 bytes, a
+/// signature not exactly 64 bytes, an empty selector, or a MISSING required field (incl. the high-water —
+/// AC#6 rejects a restore with no authenticated source). Mirrors [`parse_restore_ingress`]'s discipline.
+pub(crate) fn decode_restore_request(
+    payload: &[(ciborium::value::Value, ciborium::value::Value)],
+) -> Result<RestoreRequest, BackupError> {
+    // NB: takes the ALREADY-DECODED envelope key-7 map (the crate convention — `decode_envelope` parses
+    // key 7 into a Vec<(Value,Value)>; the export/transfer/generate handlers consume it the same way), NOT
+    // raw bytes — so the canonical-decode + trailing-bytes enforcement is the envelope decoder's job, and
+    // this fn validates only the field SET + shapes (deny unknown, exact ref/signature lengths, required).
+    let mut ingress_envelope = None;
+    let mut original_backup = None;
+    let mut requested_refs = None;
+    let mut recovery_high_water = None;
+    for (k, val) in payload.iter() {
+        match k {
+            ciborium::value::Value::Integer(i) if *i == 1.into() => {
+                ingress_envelope = Some(as_bytes(val)?);
+            }
+            ciborium::value::Value::Integer(i) if *i == 2.into() => {
+                original_backup = Some(as_bytes(val)?);
+            }
+            ciborium::value::Value::Integer(i) if *i == 3.into() => {
+                requested_refs = Some(as_ref_array(val)?);
+            }
+            ciborium::value::Value::Integer(i) if *i == 4.into() => {
+                recovery_high_water = Some(as_high_water(val)?);
+            }
+            _ => return Err(BackupError::Serialization), // deny unknown fields
+        }
+    }
+    let requested_refs = requested_refs.ok_or(BackupError::Serialization)?;
+    if requested_refs.is_empty() {
+        return Err(BackupError::Truncated); // a restore with no refs is malformed (no-op restore)
+    }
+    Ok(RestoreRequest {
+        ingress_envelope: ingress_envelope.ok_or(BackupError::Serialization)?,
+        original_backup: original_backup.ok_or(BackupError::Serialization)?,
+        requested_refs,
+        recovery_high_water: recovery_high_water.ok_or(BackupError::Serialization)?,
+    })
+}
+
+/// Extract a CBOR byte string (`Value::Bytes`) or fail closed.
+fn as_bytes(v: &ciborium::value::Value) -> Result<Vec<u8>, BackupError> {
+    match v {
+        ciborium::value::Value::Bytes(b) => Ok(b.clone()),
+        _ => Err(BackupError::Serialization),
+    }
+}
+
+/// Extract a CBOR array of EXACTLY-32-byte byte strings (`Vec<[u8; 32]>`) or fail closed.
+fn as_ref_array(v: &ciborium::value::Value) -> Result<Vec<[u8; 32]>, BackupError> {
+    let arr = match v {
+        ciborium::value::Value::Array(a) => a,
+        _ => return Err(BackupError::Serialization),
+    };
+    arr.iter()
+        .map(|e| match e {
+            ciborium::value::Value::Bytes(b) if b.len() == 32 => {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(b);
+                Ok(r)
+            }
+            _ => Err(BackupError::Serialization),
+        })
+        .collect()
+}
+
+/// Extract the `RecoveryHighWater` sub-map (key 4): `{1: marks_payload(bstr), 2: signature(bstr(64))}`,
+/// deny-unknown. Fail closed on a non-map, a missing field, or a signature not exactly 64 bytes.
+fn as_high_water(v: &ciborium::value::Value) -> Result<RecoveryHighWater, BackupError> {
+    let m = match v {
+        ciborium::value::Value::Map(m) => m,
+        _ => return Err(BackupError::Serialization),
+    };
+    let mut marks_payload = None;
+    let mut signature = None;
+    for (k, val) in m.iter() {
+        match k {
+            ciborium::value::Value::Integer(i) if *i == 1.into() => {
+                marks_payload = Some(as_bytes(val)?);
+            }
+            ciborium::value::Value::Integer(i) if *i == 2.into() => {
+                let sig_bytes = match val {
+                    ciborium::value::Value::Bytes(b) => b,
+                    _ => return Err(BackupError::Serialization),
+                };
+                if sig_bytes.len() != 64 {
+                    return Err(BackupError::Serialization);
+                }
+                let mut sig = [0u8; 64];
+                sig.copy_from_slice(sig_bytes);
+                signature = Some(sig);
+            }
+            _ => return Err(BackupError::Serialization), // deny unknown sub-fields
+        }
+    }
+    Ok(RecoveryHighWater {
+        marks_payload: marks_payload.ok_or(BackupError::Serialization)?,
+        signature: signature.ok_or(BackupError::Serialization)?,
+    })
+}
+
+/// Fail-closed errors for [`verify_ac6_high_water`] (the AC#6 forward-only gate).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Ac6Error {
+    /// The authenticated high-water does NOT dominate the backup (authenticated < backup for some counter
+    /// row or spend) — the recovery material does not vouch the backup as current; the backup is STALE.
+    StaleBackup,
+    /// The authenticated high-water does NOT dominate the destination's PRE-restore state — adopting it
+    /// would LOWER a high-water the destination already holds (AC#6: "restore that would lower a high-water
+    /// is rejected"). E.g. a re-restore of an older backup onto a destination that has since advanced.
+    WouldLower,
+}
+
+/// Whether the `high` (authenticated) high-water DOMINATES a target counter/spend set: every target
+/// counter row has a `high` match (by authority + scope_class + scope_target) with `>=` highest_accepted
+/// counter, AND `high`'s `cumulative_native_spend` + `lifetime_spend` are `>=` the target's. The spends
+/// are 32-byte big-endian magnitudes, so lexicographic `>=` (the `[u8;32]` `Ord` impl) IS numeric `>=`
+/// — the SAME comparison [`crate::agent_boot::marks_dominate_local`] uses. Pure, no allocation beyond the
+/// row scan.
+fn high_water_dominates(
+    high: &crate::agent_cbor::DecodedMarks,
+    target_counters: &[crate::agent_keystore::CounterEntry],
+    target_cumulative_native_spend: &[u8; 32],
+    target_lifetime_spend: &[u8; 32],
+) -> bool {
+    for tc in target_counters {
+        match high.rows.iter().find(|r| {
+            r.authority == tc.authority
+                && r.scope_class == tc.scope_class
+                && r.scope_target == tc.scope_target
+        }) {
+            Some(r) if r.highest_accepted_counter >= tc.highest_accepted_counter => {}
+            _ => return false, // `high` is missing the row, or its counter is LOWER
+        }
+    }
+    high.cumulative_native_spend >= *target_cumulative_native_spend
+        && high.lifetime_spend >= *target_lifetime_spend
+}
+
+/// TASK-24 AC#6 forward-only gate: verify an AUTHENTICATED high-water (a [`crate::agent_cbor::DecodedMarks`]
+/// the recovery authority attests is the CURRENT high-water) against the backup the restore carries + the
+/// destination's PRE-restore state. The candidate ADOPTS the authenticated (the current authoritative
+/// state, `>=` the stale backup); this gate ensures that adoption NEVER lowers a high-water + that the
+/// backup is not stale. Pure (no mutation); EVERY violation ⇒ a distinct [`Ac6Error`] (fail closed).
+///
+/// **(1) StaleBackup** — the authenticated must dominate the BACKUP (`>=` per counter row + both spends):
+/// the recovery material vouches the backup is current. A backup whose counters/spend exceed the
+/// authenticated is stale (the source advanced past the snapshot after export) ⇒ reject.
+///
+/// **(2) WouldLower** — the authenticated must dominate the DESTINATION's pre-restore state: adopting it
+/// never lowers a high-water the destination already holds. A re-restore of an older backup onto a
+/// destination that has since advanced fails here (AC#6: "restore that would lower a high-water is
+/// rejected"). On a FRESH TEE (empty pre-restore counters, zero spends) this is vacuously satisfied — the
+/// gate does NOT reject a fresh TEE that HAS an authenticated source (the "no authenticated source ⇒
+/// reject" rule is the HANDLER's `None`-source check, not this fn).
+///
+/// The fresh-TEE `strict_recovery_counter` advance (AC#6's other half) is handled by
+/// [`apply_restore_to_body`] (`max(local, backup) + 1`); this gate covers the COUNTERS/SPEND half.
+pub(crate) fn verify_ac6_high_water(
+    destination_pre_restore: &crate::agent_keystore::KeystoreBody,
+    data: &RestoreIngressData,
+    authenticated: &crate::agent_cbor::DecodedMarks,
+) -> Result<(), Ac6Error> {
+    // (1) authenticated >= backup (the recovery material vouches the backup is current, not stale).
+    if !high_water_dominates(
+        authenticated,
+        &data.counters,
+        &data.faucet.cumulative_native_spend,
+        &data.faucet.lifetime_spend,
+    ) {
+        return Err(Ac6Error::StaleBackup);
+    }
+    // (2) authenticated >= destination-pre-restore (adopting it never lowers a held high-water).
+    if !high_water_dominates(
+        authenticated,
+        &destination_pre_restore.counters,
+        &destination_pre_restore.faucet.cumulative_native_spend,
+        &destination_pre_restore.faucet.lifetime_spend,
+    ) {
+        return Err(Ac6Error::WouldLower);
+    }
+    Ok(())
+}
+
+/// The AC#6 authenticated high-water source (a): the recovery material the operator submits WITH the
+/// restore request. A canonical-CBOR marks payload (the authoritative current counters/spend) + an
+/// Ed25519 signature by the recovery authority over `RECOVERY_HIGH_WATER_DOMAIN ‖ request_id ‖
+/// marks_payload`. Carried at RestoreRequest key 4.
+pub(crate) const RECOVERY_HIGH_WATER_DOMAIN: &[u8] = b"2d-hsm-restore-high-water-v1\0";
+
+/// The recovery-authority-signed high-water attestation (AC#6 source (a), carried in the RestoreRequest).
+/// `marks_payload` is the canonical CBOR marks (the SAME encoding [`KeystoreBody::encode_marks_payload`]
+/// produces — counters + cumulative_native_spend + lifetime_spend + strict_recovery_counter); `signature`
+/// is the recovery authority's Ed25519 over the domain-prefixed, request_id-bound preimage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryHighWater {
+    pub marks_payload: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+/// Fail-closed errors for [`verify_recovery_high_water`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryHighWaterError {
+    /// The Ed25519 signature did not verify against the sealed `recovery_authority_pk` (wrong signer,
+    /// tampered payload, or a request_id mismatch — the binding ties this attestation to THIS ceremony).
+    SignatureInvalid,
+    /// The signed `marks_payload` failed strict-canonical decode (wrong shape / over-cap / non-canonical).
+    MalformedMarks,
+}
+
+/// Verify the recovery-authority-signed high-water (AC#6 source (a)): `verify_strict` the Ed25519
+/// signature over `RECOVERY_HIGH_WATER_DOMAIN ‖ request_id ‖ marks_payload` against the sealed
+/// `recovery_authority_pk`, then strict-decode the marks. The `request_id` binding ties this attestation
+/// to THIS restore ceremony (the cap's request_id) — anti-replay: the operator cannot reuse one
+/// high-water attestation across restores with different caps. Returns the authenticated [`DecodedMarks`]
+/// for [`verify_ac6_high_water`]. `verify_strict` rejects torsion/small-order keys (the same surface as
+/// every other Ed25519 verify in the crate). EVERY failure ⇒ a distinct error (fail closed).
+pub(crate) fn verify_recovery_high_water(
+    hwm: &RecoveryHighWater,
+    request_id: &[u8],
+    recovery_authority_pk: &[u8; 32],
+) -> Result<crate::agent_cbor::DecodedMarks, RecoveryHighWaterError> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let key = VerifyingKey::from_bytes(recovery_authority_pk)
+        .map_err(|_| RecoveryHighWaterError::SignatureInvalid)?;
+    let mut preimage = Vec::with_capacity(
+        RECOVERY_HIGH_WATER_DOMAIN.len() + request_id.len() + hwm.marks_payload.len(),
+    );
+    preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+    preimage.extend_from_slice(request_id);
+    preimage.extend_from_slice(&hwm.marks_payload);
+    let sig = Signature::from_bytes(&hwm.signature);
+    key.verify_strict(&preimage, &sig)
+        .map_err(|_| RecoveryHighWaterError::SignatureInvalid)?;
+    crate::agent_cbor::strict_decode_marks_payload(
+        &hwm.marks_payload,
+        crate::agent_keystore::MAX_COUNTER_ENTRIES,
+    )
+    .map_err(|_| RecoveryHighWaterError::MalformedMarks)
+}
+
+/// TASK-24 AC#6 adopt: overwrite the candidate's counters + both spends with the AUTHENTICATED
+/// high-water (the current authoritative state), raising `strict_recovery_counter` to the max of
+/// [`apply_restore_to_body`]'s advance + the authenticated. [`verify_ac6_high_water`] MUST have run
+/// first — it guarantees the authenticated DOMINATES the backup (so this overwrite never lowers the
+/// just-installed backup base) AND the destination's pre-restore state. The counters are rebuilt as
+/// `CounterEntry`s with the candidate's (just-restored) `environment_identifier` (env is folded out of
+/// the marks wire; [`KeystoreConfig::environment_identifier`] is the single source). `strict_recovery` is
+/// `max` (not overwrite) — [`apply_restore_to_body`] advanced it to `max(local, backup)+1` (the ceremony
+/// witness, strictly past both), and the authenticated may carry a higher recovery-counter still.
+pub(crate) fn adopt_ac6_high_water(
+    candidate: &mut crate::agent_keystore::KeystoreBody,
+    authenticated: &crate::agent_cbor::DecodedMarks,
+) {
+    let env = candidate.config.environment_identifier.clone();
+    candidate.counters = authenticated
+        .rows
+        .iter()
+        .map(|r| crate::agent_keystore::CounterEntry {
+            authority: r.authority,
+            environment_identifier: env.clone(),
+            scope_class: r.scope_class,
+            scope_target: r.scope_target.clone(),
+            highest_accepted_counter: r.highest_accepted_counter,
+        })
+        .collect();
+    candidate.faucet.cumulative_native_spend = authenticated.cumulative_native_spend;
+    candidate.faucet.lifetime_spend = authenticated.lifetime_spend;
+    candidate.strict_recovery_counter = candidate
+        .strict_recovery_counter
+        .max(authenticated.strict_recovery_counter);
+}
+
+/// TEST-ONLY deterministic seal of a `restore-ingress-v1` ENVELOPE to the destination ephemeral key
+/// (the operator's offline re-wrap, ceremony step (iii)). Mirrors [`seal_backup_blob_with_m`]:
+/// `(ingress_kem_ct, ss') = Encaps(dest_ephemeral_encaps_key, m')`, then ChaCha20Poly1305 with AAD' =
+/// the full header. Self-checks a strict re-parse. The encapsulation reuses [`encapsulate_to_recovery_key`]
+/// — it is the GENERIC ML-KEM Encaps-to-a-public-key (the "recovery" in the name is the backup role; the
+/// operation is key-independent), so a separate copy would be pure duplication. `pub(crate)` so the
+/// `agent_dispatch` end-to-end RESTORE_BACKUP test can build an envelope to a known ephemeral key.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_restore_ingress_envelope_with_m(
+    dest_ephemeral_encaps_key: &[u8],
+    dest_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &str,
+    manifest_hash: &[u8; SHA3_256_LEN],
+    original_backup_digest: &[u8; SHA3_256_LEN],
+    payload: &[u8],
+    m: &[u8; 32],
+) -> Result<Vec<u8>, BackupError> {
+    let (ingress_kem_ct, ss_prime) = encapsulate_to_recovery_key(dest_ephemeral_encaps_key, m)?;
+    let ingress_key = derive_ingress_key(&ss_prime[..]);
+    let ingress_nonce = [0u8; INGRESS_NONCE_LEN];
+    let header = build_ingress_header(
+        dest_measurement,
+        chain_id,
+        environment_identifier,
+        manifest_hash,
+        original_backup_digest,
+        &ingress_kem_ct,
+        &ingress_nonce,
+    )?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Encrypt)?;
+    let dem_ct = cipher
+        .encrypt(
+            Nonce::from_slice(&ingress_nonce),
+            Payload {
+                msg: payload,
+                aad: &header,
+            },
+        )
+        .map_err(|_| BackupError::Encrypt)?;
+    let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
+    blob.extend_from_slice(&header);
+    put_lp32(&mut blob, &dem_ct)?;
+    strict_parse_ingress_envelope(&blob)?; // self-check: strict re-parse before hand-back
+    Ok(blob)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,55 +2317,6 @@ mod tests {
     /// SNP launch measurement; non-empty + variable-length to exercise the lp16 framing).
     const DEST_MEASUREMENT: &[u8] = b"dest-tee-measurement-v1";
 
-    /// TEST-ONLY deterministic seal of a `restore-ingress-v1` ENVELOPE to the destination ephemeral key
-    /// (the operator's offline re-wrap, ceremony step (iii)). Mirrors [`seal_backup_blob_with_m`]:
-    /// `(ingress_kem_ct, ss') = Encaps(dest_ephemeral_encaps_key, m')`, then ChaCha20Poly1305 with AAD' =
-    /// the full header. Self-checks a strict re-parse. The encapsulation reuses [`encapsulate_to_recovery_key`]
-    /// — it is the GENERIC ML-KEM Encaps-to-a-public-key (the "recovery" in the name is the backup role;
-    /// the operation is key-independent), so a separate copy would be pure duplication.
-    #[allow(clippy::too_many_arguments)]
-    fn seal_restore_ingress_envelope_with_m(
-        dest_ephemeral_encaps_key: &[u8],
-        dest_measurement: &[u8],
-        chain_id: u64,
-        environment_identifier: &str,
-        manifest_hash: &[u8; SHA3_256_LEN],
-        original_backup_digest: &[u8; SHA3_256_LEN],
-        payload: &[u8],
-        m: &[u8; 32],
-    ) -> Result<Vec<u8>, BackupError> {
-        let (ingress_kem_ct, ss_prime) = encapsulate_to_recovery_key(dest_ephemeral_encaps_key, m)?;
-        let ingress_key = derive_ingress_key(&ss_prime[..]);
-        let ingress_nonce = [0u8; INGRESS_NONCE_LEN];
-        let header = build_ingress_header(
-            dest_measurement,
-            chain_id,
-            environment_identifier,
-            manifest_hash,
-            original_backup_digest,
-            &ingress_kem_ct,
-            &ingress_nonce,
-        )?;
-        let cipher =
-            ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Encrypt)?;
-        let dem_ct = cipher
-            .encrypt(
-                Nonce::from_slice(&ingress_nonce),
-                Payload {
-                    msg: payload,
-                    aad: &header,
-                },
-            )
-            .map_err(|_| BackupError::Encrypt)?;
-        let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
-        blob.extend_from_slice(&header);
-        put_lp32(&mut blob, &dem_ct)?;
-        // Self-check: the just-minted envelope must STRICTLY re-parse before hand-back (mirrors
-        // `seal_backup_blob_with_m`'s `strict_parse(&blob)?` self-check).
-        strict_parse_ingress_envelope(&blob)?;
-        Ok(blob)
-    }
-
     /// Build the golden ingress envelope: the frozen `restore_ingress_v1.bin` PAYLOAD re-wrapped to the
     /// fixed destination ephemeral key, with AAD' binding the frozen `agent_backup_v1.bin` digest + the
     /// payload's own manifest hash. Cross-references BOTH prior goldens (payload + backup envelope) so the
@@ -2404,6 +2874,598 @@ mod tests {
         eprintln!(
             "wrote restore-ingress ENVELOPE golden ({}-byte envelope) + dest-ephemeral keypair fixtures + sidecar -> {dir}",
             envelope.len()
+        );
+    }
+
+    // ─── TASK-24 AC#3/#7/#6: apply_restore_to_body (the wholesale-replace + cursor reconstruction) ───
+
+    /// A restore target body with DELIBERATELY distinct EXCLUDED sentinels (`anchor_root=[0xCC;32]`,
+    /// `enclave_scope_id=[0xce;32]`, `fleet_scope_id=[0xcf;32]`, `backup_recovery_wrapping_pubkey=[0xd0;…]`,
+    /// `freshness_epoch=100`, `structural_version=50`, `strict_recovery_counter=10`) so the exclusion +
+    /// forward-only + untouched-anchor-state assertions are non-vacuous.
+    fn restore_target_body() -> crate::agent_keystore::KeystoreBody {
+        use crate::agent_keystore::*;
+        let mut body = body_with_two_keys(); // baseline (will be wholesale-replaced)
+        body.config.anchor_root = [0xCC; 32]; // EXCLUDED — must survive the restore
+        body.config.enclave_scope_id = [0xCE; 32]; // EXCLUDED
+        body.config.fleet_scope_id = [0xCF; 32]; // EXCLUDED
+        body.config.backup_recovery_wrapping_pubkey = vec![0xD0; ML_KEM_1024_ENCAPS_KEY_LEN]; // EXCLUDED
+        body.freshness_epoch = 100; // EXCLUDED (handler's advance_commit_epoch bumps it)
+        body.structural_version = 50; // EXCLUDED (local+1 handler bump)
+        body.strict_recovery_counter = 10; // the LOCAL high-water (AC#6 forward-only gate)
+        body
+    }
+
+    /// A RestoreIngressData round-tripped through the frozen payload format (realistic — not hand-built).
+    fn sample_restore_data() -> RestoreIngressData {
+        let body = body_with_two_keys(); // source body (chain 11565, env "testnet", 2 keys, 1 audit rec)
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        let payload = build_restore_ingress_payload(&body, &refs).unwrap();
+        parse_restore_ingress(&payload).unwrap()
+    }
+
+    /// AC#3: wholesale-replace entries/config-identity/counters/faucet/audit-records; the EXCLUDED
+    /// enclave-local identity (anchor_root/scope_ids/wrapping pubkey) + freshness/structural are PRESERVED
+    /// (the restoring enclave's own — the payload carries none).
+    #[test]
+    fn apply_restore_wholesale_replaces_and_preserves_excluded() {
+        let mut target = restore_target_body();
+        let data = sample_restore_data();
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        // Replaced: config-identity subset + entries + counters + faucet.
+        assert_eq!(target.config.twod_chain_id, 11565);
+        assert_eq!(target.config.environment_identifier, "testnet");
+        assert_eq!(target.entries.len(), 2, "entries replaced");
+        assert_eq!(target.entries[0].key_ref, [0x11; 32]);
+        assert_eq!(
+            &target.entries[0].secret_scalar[..],
+            &[0x77; 32],
+            "secret scalar restored"
+        );
+        assert_eq!(target.counters, data.counters, "counters replaced");
+        assert_eq!(target.faucet, data.faucet, "faucet replaced");
+        assert_eq!(
+            target.audit.records, data.audit_records,
+            "audit records replaced"
+        );
+        // PRESERVED (excluded — the restoring enclave's own identity, never in the payload).
+        assert_eq!(
+            target.config.anchor_root, [0xCC; 32],
+            "anchor_root preserved (excluded)"
+        );
+        assert_eq!(
+            target.config.enclave_scope_id, [0xCE; 32],
+            "enclave_scope_id preserved"
+        );
+        assert_eq!(
+            target.config.fleet_scope_id, [0xCF; 32],
+            "fleet_scope_id preserved"
+        );
+        assert_eq!(
+            target.config.backup_recovery_wrapping_pubkey,
+            vec![0xD0; crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN],
+            "wrapping pubkey preserved"
+        );
+        assert_eq!(
+            target.freshness_epoch, 100,
+            "freshness_epoch untouched (handler bumps it)"
+        );
+        assert_eq!(
+            target.structural_version, 50,
+            "structural_version untouched (local+1 handler bump)"
+        );
+    }
+
+    /// AC#7: audit cursors reconstructed enclave-locally — next_seq=max(seq)+1, last_exported_seq=
+    /// next_seq-1 (fully drained), capacity from the RESTORE-time policy (NOT the backup).
+    #[test]
+    fn apply_restore_reconstructs_audit_cursors() {
+        let mut target = restore_target_body();
+        let data = sample_restore_data();
+        // body_with_two_keys has ONE audit record (seq=1) ⇒ next_seq=2, last_exported_seq=1.
+        apply_restore_to_body(&mut target, &data, 128).unwrap();
+        assert_eq!(
+            target.audit.capacity, 128,
+            "capacity from restore-time policy, not the backup"
+        );
+        let max_seq = data.audit_records.iter().map(|r| r.seq).max().unwrap();
+        assert_eq!(
+            target.audit.next_seq,
+            max_seq + 1,
+            "next_seq = max(record.seq)+1"
+        );
+        assert_eq!(
+            target.audit.last_exported_seq,
+            target.audit.next_seq - 1,
+            "fully drained"
+        );
+    }
+
+    /// AC#6 (strict_recovery): forward-only — new = max(local, backup)+1. Local high-water (10) vs the
+    /// backup's value ⇒ strictly past both.
+    #[test]
+    fn apply_restore_strict_recovery_advances_forward_only() {
+        let mut target = restore_target_body(); // local strict_recovery_counter = 10
+        let mut data = sample_restore_data();
+        // Case 1: backup (4) < local (10) ⇒ new = 11 (local + 1).
+        data.strict_recovery_counter = 4;
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        assert_eq!(
+            target.strict_recovery_counter, 11,
+            "local(10) > backup(4) ⇒ new = 11"
+        );
+        // Case 2: a re-restore where the backup now exceeds local — new = max(local, backup)+1.
+        target.strict_recovery_counter = 3;
+        data.strict_recovery_counter = 8;
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        assert_eq!(
+            target.strict_recovery_counter, 9,
+            "max(3,8)+1 = 9 (strictly past both)"
+        );
+    }
+
+    /// AC#7/#14: capacity < records.len() ⇒ AuditCapacityOverflow, fail closed, NO partial mutation.
+    #[test]
+    fn apply_restore_capacity_overflow_fails_closed_no_truncation() {
+        let mut target = restore_target_body();
+        let pre = target.clone();
+        let data = sample_restore_data(); // 1 audit record
+                                          // capacity 0 < 1 record ⇒ overflow.
+        assert_eq!(
+            apply_restore_to_body(&mut target, &data, 0),
+            Err(RestoreApplyError::AuditCapacityOverflow),
+            "capacity overflow ⇒ fail closed"
+        );
+        assert_eq!(
+            target, pre,
+            "NO partial mutation on the capacity-overflow path"
+        );
+    }
+
+    /// AC#7 edge: an empty audit-records backup ⇒ next_seq=1, last_exported_seq=0 (a fresh ring).
+    #[test]
+    fn apply_restore_empty_audit_records_yields_fresh_cursors() {
+        let mut target = restore_target_body();
+        let mut data = sample_restore_data();
+        data.audit_records.clear();
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        assert!(target.audit.records.is_empty());
+        assert_eq!(target.audit.next_seq, 1, "empty ⇒ next_seq=1");
+        assert_eq!(
+            target.audit.last_exported_seq, 0,
+            "empty ⇒ last_exported_seq=0"
+        );
+    }
+
+    // ─── TASK-24 AC#1 AAD' semantic checks + AC#9 set-match: verify_restore_ingress ───
+
+    /// Build a fully-valid (opened, data, original_backup, request_refs, own_measurement, own_chain,
+    /// own_env) tuple via the test-only seal+open+parse, so each negative test tweaks ONE field.
+    fn valid_restore_inputs() -> (
+        OpenedRestoreIngress,
+        RestoreIngressData,
+        Vec<u8>,
+        Vec<[u8; 32]>,
+        Vec<u8>,
+        u64,
+        Vec<u8>,
+    ) {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        let payload = build_restore_ingress_payload(&body, &refs)
+            .unwrap()
+            .to_vec();
+        let data = parse_restore_ingress(&payload).unwrap();
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let manifest_hash = compute_manifest_hash(&manifest);
+        let original_backup_blob = b"test-original-backup-blob-v1".to_vec();
+        let backup_digest = compute_original_backup_digest(&original_backup_blob);
+        let (dest_encaps, dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let envelope = seal_restore_ingress_envelope_with_m(
+            &dest_encaps,
+            DEST_MEASUREMENT,
+            CHAIN,
+            ENV,
+            &manifest_hash,
+            &backup_digest,
+            &payload,
+            &INGRESS_M,
+        )
+        .unwrap();
+        let opened = open_restore_ingress_envelope(&dest_dk, &envelope).unwrap();
+        (
+            opened,
+            data,
+            original_backup_blob,
+            refs,
+            DEST_MEASUREMENT.to_vec(),
+            CHAIN,
+            ENV.as_bytes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn verify_restore_ingress_accepts_valid() {
+        let (opened, data, backup, refs, meas, chain, env) = valid_restore_inputs();
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &refs, &meas, chain, &env),
+            Ok(()),
+            "a fully-consistent restore verifies"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_measurement_mismatch() {
+        let (opened, data, backup, refs, _meas, chain, env) = valid_restore_inputs();
+        assert_eq!(
+            verify_restore_ingress(
+                &opened,
+                &data,
+                &backup,
+                &refs,
+                b"OTHER-TEE-measurement",
+                chain,
+                &env
+            ),
+            Err(RestoreVerifyError::MeasurementMismatch),
+            "a re-wrap for a different TEE is rejected (AC#1a)"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_chain_and_environment_mismatch() {
+        let (opened, data, backup, refs, meas, _chain, _env) = valid_restore_inputs();
+        // cross-chain
+        assert_eq!(
+            verify_restore_ingress(
+                &opened,
+                &data,
+                &backup,
+                &refs,
+                &meas,
+                99999,
+                &ENV.as_bytes()
+            ),
+            Err(RestoreVerifyError::ChainMismatch),
+            "cross-chain restore fails closed (AC#1b)"
+        );
+        // cross-environment (testnet blob into a mainnet enclave)
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &refs, &meas, CHAIN, b"mainnet"),
+            Err(RestoreVerifyError::EnvironmentMismatch),
+            "cross-environment restore fails closed (AC#1b)"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_backup_digest_mismatch() {
+        let (opened, data, _backup, refs, meas, chain, env) = valid_restore_inputs();
+        assert_eq!(
+            verify_restore_ingress(
+                &opened,
+                &data,
+                b"a-DIFFERENT-backup-blob",
+                &refs,
+                &meas,
+                chain,
+                &env
+            ),
+            Err(RestoreVerifyError::BackupDigestMismatch),
+            "a re-wrap of a different backup than authorized is rejected (AC#1c)"
+        );
+    }
+
+    /// AC#9 set-match is ORDER/multiplicity-INSENSITIVE: a `[A,A]` or non-body-order selector is the same
+    /// export as `[A]`/body-order and MUST NOT be rejected. The full `[0x11,0x22]` set in reversed order
+    /// + with a duplicate verifies; a selector naming a ref the payload lacks is rejected.
+    #[test]
+    fn verify_restore_ingress_set_match_is_order_multiplicity_insensitive() {
+        let (opened, data, backup, _refs, meas, chain, env) = valid_restore_inputs();
+        // reversed order + a duplicate 0x11 ⇒ same SET as the body-order [0x11,0x22] payload.
+        let reordered = vec![[0x22; 32], [0x11; 32], [0x11; 32]];
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &reordered, &meas, chain, &env),
+            Ok(()),
+            "AC#9: [A,A]/non-body-order selector == [A]/body-order export"
+        );
+        // a selector naming a ref NOT in the payload ⇒ set mismatch.
+        let extra = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &extra, &meas, chain, &env),
+            Err(RestoreVerifyError::SelectorSetMismatch),
+            "a selector naming a ref the payload lacks is rejected (AC#9)"
+        );
+        // a selector OMITTING a ref the payload carries ⇒ set mismatch.
+        let partial = vec![[0x11; 32]];
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &partial, &meas, chain, &env),
+            Err(RestoreVerifyError::SelectorSetMismatch),
+            "a selector omitting a payload ref is rejected (AC#9)"
+        );
+    }
+
+    // ─── TASK-24: RESTORE_BACKUP request body decode (decode_restore_request) ───
+
+    /// A placeholder high-water for the decode-round-trip tests (decode frames bytes; it doesn't verify).
+    fn test_high_water() -> RecoveryHighWater {
+        RecoveryHighWater {
+            marks_payload: vec![0xAB; 8],
+            signature: [0xCD; 64],
+        }
+    }
+
+    use ciborium::value::Value as V;
+
+    /// Build the decoded key-7 map (the shape `decode_restore_request` consumes — the crate convention:
+    /// the envelope decoder yields key 7 as a Vec<(Value,Value)>, not raw bytes).
+    fn restore_request_map(req: &RestoreRequest) -> Vec<(V, V)> {
+        vec![
+            (V::Integer(1.into()), V::Bytes(req.ingress_envelope.clone())),
+            (V::Integer(2.into()), V::Bytes(req.original_backup.clone())),
+            (
+                V::Integer(3.into()),
+                V::Array(
+                    req.requested_refs
+                        .iter()
+                        .map(|r| V::Bytes(r.to_vec()))
+                        .collect(),
+                ),
+            ),
+            (
+                V::Integer(4.into()),
+                V::Map(vec![
+                    (
+                        V::Integer(1.into()),
+                        V::Bytes(req.recovery_high_water.marks_payload.clone()),
+                    ),
+                    (
+                        V::Integer(2.into()),
+                        V::Bytes(req.recovery_high_water.signature.to_vec()),
+                    ),
+                ]),
+            ),
+        ]
+    }
+
+    fn sample_req(refs: Vec<[u8; 32]>) -> RestoreRequest {
+        RestoreRequest {
+            ingress_envelope: vec![0xAB; 10],
+            original_backup: vec![0xCD; 20],
+            requested_refs: refs,
+            recovery_high_water: test_high_water(),
+        }
+    }
+
+    #[test]
+    fn decode_restore_request_round_trips() {
+        let req = sample_req(vec![[0x11; 32], [0x22; 32]]);
+        assert_eq!(
+            decode_restore_request(&restore_request_map(&req)).unwrap(),
+            req
+        );
+    }
+
+    #[test]
+    fn decode_restore_request_rejects_empty_selector() {
+        let req = sample_req(vec![]);
+        assert_eq!(
+            decode_restore_request(&restore_request_map(&req)),
+            Err(BackupError::Truncated),
+            "an empty selector (no-op restore) is malformed"
+        );
+    }
+
+    #[test]
+    fn decode_restore_request_rejects_wrong_ref_length_and_unknown_field() {
+        // wrong ref length (31 bytes, not 32)
+        let bad_ref_map = vec![(
+            V::Integer(3.into()),
+            V::Array(vec![V::Bytes(vec![0x11; 31])]),
+        )];
+        assert_eq!(
+            decode_restore_request(&bad_ref_map),
+            Err(BackupError::Serialization),
+            "wrong ref length"
+        );
+        // unknown field (key 5) ⇒ rejected (deny unknown)
+        let unknown = vec![(V::Integer(5.into()), V::Bytes(vec![0xFF]))];
+        assert_eq!(
+            decode_restore_request(&unknown),
+            Err(BackupError::Serialization),
+            "unknown field"
+        );
+    }
+
+    #[test]
+    fn decode_restore_request_rejects_missing_high_water() {
+        // AC#6: the recovery_high_water (key 4) is REQUIRED — a request without it (no authenticated
+        // source) is rejected at decode (a fresh TEE with no authenticated source is rejected, no zero-init).
+        let map = vec![
+            (V::Integer(1.into()), V::Bytes(vec![0xAB; 10])),
+            (V::Integer(2.into()), V::Bytes(vec![0xCD; 20])),
+            (
+                V::Integer(3.into()),
+                V::Array(vec![V::Bytes(vec![0x11; 32])]),
+            ),
+        ];
+        assert_eq!(
+            decode_restore_request(&map),
+            Err(BackupError::Serialization),
+            "a request with no recovery_high_water (key 4) is rejected — AC#6 no-source ⇒ reject"
+        );
+    }
+
+    // ─── TASK-24 AC#6 forward-only gate: verify_ac6_high_water ───
+
+    /// A DecodedMarks with ONE counter row (authority [0xa1;32], scope_class 0, scope_target
+    /// b"generate_transfer" — matching body_with_two_keys' counter) + uniform spend bytes. `hac` sets the
+    /// row's highest_accepted_counter; `spend_byte` sets both 32-byte spends.
+    fn ac6_marks(hac: u64, spend_byte: u8) -> crate::agent_cbor::DecodedMarks {
+        crate::agent_cbor::DecodedMarks {
+            rows: vec![crate::agent_cbor::DecodedRow {
+                authority: [0xa1; 32],
+                scope_class: 0,
+                scope_target: b"generate_transfer".to_vec(),
+                highest_accepted_counter: hac,
+            }],
+            cumulative_native_spend: [spend_byte; 32],
+            lifetime_spend: [spend_byte; 32],
+            strict_recovery_counter: 0,
+        }
+    }
+
+    /// A FRESH restore-target body: empty counters + zero spends (the common fresh-TEE case).
+    fn fresh_destination_body() -> crate::agent_keystore::KeystoreBody {
+        let mut b = restore_target_body();
+        b.counters.clear();
+        b.faucet.cumulative_native_spend = [0; 32];
+        b.faucet.lifetime_spend = [0; 32];
+        b
+    }
+
+    #[test]
+    fn verify_ac6_accepts_fresh_tee_with_authentic_source() {
+        // Fresh TEE (empty counters, zero spends) + an authenticated high-water that dominates the backup
+        // (the recovery material vouches the backup is current) ⇒ ACCEPT. This is the common fresh-TEE
+        // restore WITH an authenticated source (AC#6: the "no source ⇒ reject" rule is the handler's
+        // None-source check, not this fn).
+        let dest = fresh_destination_body();
+        let data = sample_restore_data(); // backup: counter HAC=1, zero spends
+        let authenticated = ac6_marks(1, 0x00); // >= backup (HAC 1 >= 1, spends 0 >= 0)
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &authenticated),
+            Ok(()),
+            "fresh TEE + authentic source ⇒ accept"
+        );
+    }
+
+    #[test]
+    fn verify_ac6_rejects_stale_backup() {
+        // The authenticated high-water's counter (HAC 0) < the backup's (HAC 1) ⇒ the recovery material
+        // does NOT vouch the backup as current ⇒ STALE BACKUP ⇒ reject.
+        let dest = fresh_destination_body();
+        let data = sample_restore_data(); // backup counter HAC=1
+        let stale = ac6_marks(0, 0x00); // HAC 0 < backup's 1
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &stale),
+            Err(Ac6Error::StaleBackup),
+            "authenticated < backup ⇒ stale backup ⇒ reject"
+        );
+    }
+
+    #[test]
+    fn verify_ac6_rejects_restore_that_would_lower() {
+        // A re-restore: the destination ALREADY holds a counter (HAC 5) higher than the authenticated
+        // (HAC 1) ⇒ adopting the authenticated would LOWER the destination's high-water ⇒ reject.
+        let mut dest = fresh_destination_body();
+        dest.counters.push(crate::agent_keystore::CounterEntry {
+            authority: [0xa1; 32],
+            environment_identifier: "testnet".to_string(),
+            scope_class: 0,
+            scope_target: b"generate_transfer".to_vec(),
+            highest_accepted_counter: 5, // the destination has already advanced past the backup
+        });
+        let data = sample_restore_data(); // backup counter HAC=1
+        let authenticated = ac6_marks(1, 0x00); // >= backup, but < destination's 5
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &authenticated),
+            Err(Ac6Error::WouldLower),
+            "authenticated < destination-pre-restore ⇒ would-lower ⇒ reject"
+        );
+    }
+
+    #[test]
+    fn verify_ac6_spend_dominance_is_numeric_big_endian() {
+        // The 32-byte spends are big-endian magnitudes ⇒ lexicographic >= is numeric >=. A higher spend
+        // byte dominates; the authenticated's higher cumulative spend accepts even with a matching HAC.
+        let dest = fresh_destination_body();
+        let mut data = sample_restore_data();
+        data.faucet.cumulative_native_spend = [0x10; 32]; // backup spend > the default zero
+        let authenticated = ac6_marks(1, 0x20); // spend 0x20 > backup's 0x10 ⇒ dominates
+        assert_eq!(verify_ac6_high_water(&dest, &data, &authenticated), Ok(()));
+        // authenticated spend < backup spend ⇒ stale.
+        let lower = ac6_marks(1, 0x00);
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &lower),
+            Err(Ac6Error::StaleBackup),
+            "authenticated spend < backup spend ⇒ stale"
+        );
+    }
+
+    // ─── TASK-24 AC#6 source (a): verify_recovery_high_water ───
+
+    /// Build a recovery-authority-signed high-water attestation over body_with_two_keys' marks.
+    fn signed_high_water(
+        request_id: &[u8],
+        recovery: &ed25519_dalek::SigningKey,
+        marks_payload: Option<Vec<u8>>,
+    ) -> RecoveryHighWater {
+        use ed25519_dalek::Signer;
+        let marks_payload =
+            marks_payload.unwrap_or_else(|| body_with_two_keys().encode_marks_payload());
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+        preimage.extend_from_slice(request_id);
+        preimage.extend_from_slice(&marks_payload);
+        let signature = recovery.sign(&preimage).to_bytes();
+        RecoveryHighWater {
+            marks_payload,
+            signature,
+        }
+    }
+
+    #[test]
+    fn verify_recovery_high_water_accepts_valid_signature() {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        let hwm = signed_high_water(rid, &recovery, None);
+        let marks = verify_recovery_high_water(&hwm, rid, &pk).expect("valid signature verifies");
+        // The decoded marks match body_with_two_keys' counters (1 row, HAC=1).
+        assert_eq!(marks.rows.len(), 1);
+        assert_eq!(marks.rows[0].highest_accepted_counter, 1);
+    }
+
+    #[test]
+    fn verify_recovery_high_water_rejects_wrong_authority() {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]); // a different "authority"
+        let other_pk = other.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        let hwm = signed_high_water(rid, &recovery, None); // signed by [9;32]
+        assert_eq!(
+            verify_recovery_high_water(&hwm, rid, &other_pk),
+            Err(RecoveryHighWaterError::SignatureInvalid),
+            "a high-water signed by a different key than the sealed recovery_authority_pk is rejected"
+        );
+    }
+
+    #[test]
+    fn verify_recovery_high_water_request_id_binding() {
+        // The signature binds the request_id: verifying against a DIFFERENT request_id fails (anti-replay
+        // — one attestation cannot authorize a restore under a different cap/request_id).
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let hwm = signed_high_water(b"req-restore-1", &recovery, None);
+        assert_eq!(
+            verify_recovery_high_water(&hwm, b"req-DIFFERENT", &pk),
+            Err(RecoveryHighWaterError::SignatureInvalid),
+            "request_id mismatch ⇒ signature invalid (ceremony binding)"
+        );
+    }
+
+    #[test]
+    fn verify_recovery_high_water_rejects_malformed_marks() {
+        // A valid signature over a GARBAGE marks_payload: the signature verifies (it covers whatever
+        // bytes), but the strict-canonical decode of the garbage fails ⇒ MalformedMarks.
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = recovery.verifying_key().to_bytes();
+        let rid = b"req-restore-1";
+        let hwm = signed_high_water(rid, &recovery, Some(vec![0xFF, 0xFF, 0xFF])); // garbage marks
+        assert_eq!(
+            verify_recovery_high_water(&hwm, rid, &pk),
+            Err(RecoveryHighWaterError::MalformedMarks),
+            "a valid signature over non-canonical marks ⇒ MalformedMarks"
         );
     }
 }

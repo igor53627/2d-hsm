@@ -87,6 +87,11 @@ pub enum AgentOpcode {
     ConfigureTreasury = 6,
     ExportBackup = 7,
     RestoreBackup = 8,
+    /// GET_RESTORE_PUBKEY (TASK-24 Slice 2a-ii): generate + publish the destination TEE's attested
+    /// ephemeral ML-KEM-1024 public key (the ceremony key the operator re-wraps the backup to). NOT
+    /// privileged (no capability — the pubkey is public + attested), NOT rollback-sensitive (generates
+    /// only a volatile process-global keypair, no sealed-state mutation), NotCommitted (no anchor commit).
+    GetRestorePubkey = 9,
 }
 
 impl AgentOpcode {
@@ -100,6 +105,7 @@ impl AgentOpcode {
             6 => Self::ConfigureTreasury,
             7 => Self::ExportBackup,
             8 => Self::RestoreBackup,
+            9 => Self::GetRestorePubkey,
             _ => return None,
         })
     }
@@ -130,8 +136,9 @@ impl AgentOpcode {
             // (no spend/cap/counter; bounded by key-purpose + canonical EIP-155 + sealed chain_id per
             // §5). If TASK-7.6.4 transfer signing ever gains sealed spend/counter state, move it to true.
             Self::SignTransfer => false,
-            // Read/attestation opcodes touch no rollback-sensitive state.
-            Self::PublicIdentity | Self::ProveIdentity => false,
+            // Read/attestation opcodes touch no rollback-sensitive state. GET_RESTORE_PUBKEY likewise —
+            // it generates only a volatile process-global ephemeral keypair (no sealed-state mutation).
+            Self::PublicIdentity | Self::ProveIdentity | Self::GetRestorePubkey => false,
         }
     }
 
@@ -216,9 +223,10 @@ impl AgentOpcode {
             // committed op touches a non-marks surface ⇒ Structural.
             Self::SignFaucetDispense => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
-            Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => {
-                CommitBumpClass::NotCommitted
-            }
+            Self::SignTransfer
+            | Self::PublicIdentity
+            | Self::ProveIdentity
+            | Self::GetRestorePubkey => CommitBumpClass::NotCommitted,
         }
     }
 }
@@ -336,6 +344,26 @@ pub enum AgentResponse {
         candidate: Box<KeystoreBody>,
         backup_blob: Vec<u8>,
         request_id: Vec<u8>,
+    },
+    /// RESTORE_BACKUP result (TASK-24): the wholesale-restored `candidate` keystore (entries/config-
+    /// identity/counters/faucet/audit-records from the backup, AC#6-authenticated high-water counters/spend,
+    /// reconstructed audit cursors, advanced strict_recovery_counter, + the enclave-local `local+1`
+    /// structural bump via advance_commit_epoch). Like the other mutating Structural ops the frame layer
+    /// SEALS the candidate, COMMITS the post-restore state to the anchor (seal-before-emit), SWAPS it into
+    /// the live slot, EMITS the sealed blob, AND retires the restore-ephemeral key (single-use). `request_id`
+    /// keys the anchor commit. The restore itself opens no key material in the response (the restored
+    /// entries live in the sealed blob).
+    RestoreBackup {
+        candidate: Box<KeystoreBody>,
+        request_id: Vec<u8>,
+    },
+    /// GET_RESTORE_PUBKEY result (TASK-24 Slice 2a-ii): the destination TEE's attested ephemeral ML-KEM-1024
+    /// public key (`encaps_key`, 1568 bytes) + the `measurement` it was published under. Non-mutating
+    /// (NotCommitted) — generates only a volatile process-global keypair, so it does NOT go through the
+    /// seal-before-emit seam; the frame layer encodes it directly (like PUBLIC_IDENTITY / SIGN_TRANSFER).
+    GetRestorePubkey {
+        encaps_key: Vec<u8>,
+        measurement: Vec<u8>,
     },
 }
 
@@ -463,6 +491,7 @@ pub(crate) fn dispatch_agent(
     profile: Profile,
     payload: &[u8],
     keystore: &KeystoreBody,
+    measurement: &[u8],
 ) -> Result<AgentResponse, AgentError> {
     // Role/profile gate (0x41) — a producer signer rejects the whole 0x40 family before anything.
     if profile != Profile::AgentGateway {
@@ -512,6 +541,10 @@ pub(crate) fn dispatch_agent(
             // Without the feature it falls through to the privileged default arm below (verify, fail closed).
             #[cfg(feature = "agent-backup-export-preview")]
             AgentOpcode::ExportBackup => handle_export_backup(&env, keystore, &verified),
+            #[cfg(feature = "agent-backup-export-preview")]
+            AgentOpcode::RestoreBackup => {
+                handle_restore_backup(&env, keystore, &verified, measurement)
+            }
             // CONFIGURE_TREASURY (without its preview) / EXPORT_BACKUP (without its preview) / RESTORE_BACKUP
             // (and GENERATE_KEYS without its preview) verify here but their execution lands in later slices /
             // is deferred ⇒ fail closed.
@@ -574,9 +607,47 @@ pub(crate) fn dispatch_agent(
                 Err(AgentError::NotConfigured)
             }
         }
+        // GET_RESTORE_PUBKEY (TASK-24 Slice 2a-ii): generate + publish the destination's attested
+        // ephemeral ML-KEM pubkey. NOT privileged (no cap — the pubkey is public+attested), NOT
+        // rollback-sensitive, NotCommitted — a ceremony-setup op. Enabled only under
+        // `agent-backup-export-preview` (the handler uses the ml-kem-pulling ephemeral lifecycle);
+        // otherwise fail closed (the opcode is known but the ceremony path is unconfigured).
+        AgentOpcode::GetRestorePubkey => {
+            #[cfg(feature = "agent-backup-export-preview")]
+            {
+                handle_get_restore_pubkey(&env, keystore, measurement)
+            }
+            #[cfg(not(feature = "agent-backup-export-preview"))]
+            {
+                let _ = (&env, keystore, measurement);
+                Err(AgentError::NotConfigured)
+            }
+        }
         // Privileged opcodes handled above; unreachable here.
         _ => Err(AgentError::Malformed),
     }
+}
+
+/// GET_RESTORE_PUBKEY(9) handler (TASK-24 Slice 2a-ii): publish the destination TEE's attested ephemeral
+/// ML-KEM-1024 public key (the ceremony key the operator re-wraps the backup to). IDEMPOTENT: if an
+/// ephemeral is already published this boot, returns it unchanged (the operator may re-query before
+/// re-wrapping — no key churn); else generates + installs a fresh one from the TEE CSPRNG. Single-use is
+/// preserved across ceremonies by [`retire_restore_ephemeral`] (called by the RESTORE handler on success)
+/// — a GET_RESTORE_PUBKEY after a completed restore finds nothing published + generates a NEW key. CSPRNG
+/// failure ⇒ `SealFailed` (no half-publish). NotCommitted — no anchor commit (volatile process-global).
+#[cfg(feature = "agent-backup-export-preview")]
+fn handle_get_restore_pubkey(
+    _env: &AgentEnvelope,
+    _keystore: &KeystoreBody,
+    measurement: &[u8],
+) -> Result<AgentResponse, AgentError> {
+    let pub_info = published_restore_ephemeral()
+        .or_else(|| install_restore_ephemeral(measurement))
+        .ok_or(AgentError::SealFailed)?;
+    Ok(AgentResponse::GetRestorePubkey {
+        encaps_key: pub_info.encaps_key,
+        measurement: pub_info.measurement,
+    })
 }
 
 /// PUBLIC_IDENTITY(2): look up the key by `key_ref` and return its unified-account identity.
@@ -1567,6 +1638,80 @@ fn handle_export_backup(
     })
 }
 
+/// RESTORE_BACKUP(8) handler (TASK-24): the recovery ceremony — reconstitute the agent keystore inside
+/// this enclave from an attested ingress envelope (the operator's re-wrap of a DR backup to this TEE's
+/// ephemeral key), gated by the AC#6 authenticated high-water. Pure COMPOSITION of the tested primitives
+/// (each AC is enforced at its step); EVERY error path ⇒ a §10.9 code with NO partial import + NO
+/// counter/anchor/ephemeral advance (the frame layer retires the ephemeral + commits ONLY on success).
+///
+/// `verified` is the RECOVERY-tier capability (verify_capability already checked `is_recovery` — an
+/// admin-signed restore is rejected at the tier check, AC#10). `measurement` is this enclave's own
+/// attested measurement (the AAD' `dest_measurement == OWN` check).
+#[cfg(feature = "agent-backup-export-preview")]
+fn handle_restore_backup(
+    env: &AgentEnvelope,
+    keystore: &KeystoreBody,
+    _verified: &VerifiedCapability,
+    measurement: &[u8],
+) -> Result<AgentResponse, AgentError> {
+    use crate::agent_backup::{
+        adopt_ac6_high_water, apply_restore_to_body, decode_restore_request,
+        open_restore_ingress_envelope, parse_restore_ingress, verify_ac6_high_water,
+        verify_recovery_high_water, verify_restore_ingress,
+    };
+    use ml_kem::{DecapsulationKey, MlKem1024};
+
+    // (1) Decode the request body: ingress envelope + original backup + key_refs selector + signed high-water.
+    let req = decode_restore_request(env.payload.as_deref().ok_or(AgentError::Malformed)?)
+        .map_err(|_| AgentError::Malformed)?;
+    // (2) Snapshot the published ephemeral + reconstruct the decaps key. No ephemeral published (GET_RESTORE_PUBKEY
+    //     not run / already retired) ⇒ the ceremony cannot proceed ⇒ fail closed (the operator must publish one first).
+    let snap = snapshot_restore_ephemeral().ok_or(AgentError::NotConfigured)?;
+    let dest_dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*snap.decaps_seed));
+    // (3) Open the attested ingress envelope (AC#1: decap with the ephemeral private key + AEAD-tag verify over AAD').
+    let opened = open_restore_ingress_envelope(&dest_dk, &req.ingress_envelope)
+        .map_err(|_| AgentError::SealFailed)?;
+    // (4) Parse the restore-ingress payload (AC#2: magic/version/strict-CBOR).
+    let data = parse_restore_ingress(&opened.payload).map_err(|_| AgentError::Malformed)?;
+    // (5) AAD' semantic checks + AC#9 set-match (AC#1: measurement==OWN, chain/env==sealed, manifest/backup-digest match).
+    verify_restore_ingress(
+        &opened,
+        &data,
+        &req.original_backup,
+        &req.requested_refs,
+        measurement,
+        keystore.config.twod_chain_id,
+        keystore.config.environment_identifier.as_bytes(),
+    )
+    .map_err(|_| AgentError::SealFailed)?;
+    // (6) Verify the recovery-authority-signed high-water (AC#6 source (a): signature vs recovery_authority_pk
+    //     + strict-decode the marks, bound to this ceremony's request_id).
+    let authenticated = verify_recovery_high_water(
+        &req.recovery_high_water,
+        &env.request_id,
+        &keystore.config.recovery_authority_pk,
+    )
+    .map_err(|_| AgentError::CapabilityRejected)?;
+    // (7) AC#6 forward-only gate: authenticated >= backup (not stale) + >= destination-pre-restore (never lowers).
+    verify_ac6_high_water(keystore, &data, &authenticated).map_err(|_| AgentError::SealFailed)?;
+    // (8) Wholesale-replace the restorable state + reconstruct audit cursors + advance strict_recovery (AC#3/#7/#6).
+    //     AC#7: capacity from the RESTORE-time policy (the destination's own `audit.capacity`, NOT the backup).
+    let mut candidate = keystore.clone();
+    apply_restore_to_body(&mut candidate, &data, keystore.audit.capacity)
+        .map_err(|_| AgentError::SealFailed)?;
+    // (9) AC#6 adopt: raise the candidate's counters/spend to the authenticated high-water (the current state).
+    adopt_ac6_high_water(&mut candidate, &authenticated);
+    // (10) Enclave-local structural_version = local+1 (AC#4, the `local+1` strategy; Structural commit class).
+    candidate
+        .advance_commit_epoch(true)
+        .map_err(|_| AgentError::SealFailed)?;
+    // (11) Return the candidate; the frame layer seals → commits → swaps → emits → retires the ephemeral.
+    Ok(AgentResponse::RestoreBackup {
+        candidate: Box::new(candidate),
+        request_id: env.request_id.clone(),
+    })
+}
+
 /// Map a keygen failure to the anti-oracle §10.9 band.
 fn map_keygen_error(e: GenerateKeysError) -> AgentError {
     match e {
@@ -1633,6 +1778,197 @@ pub fn is_agent_keystore_installed() -> bool {
 #[cfg(test)]
 pub fn reset_agent_keystore_for_tests() {
     if let Ok(mut guard) = INSTALLED_KEYSTORE.lock() {
+        *guard = None;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// TASK-24 Slice 2a-i: the destination TEE's ATTESTED EPHEMERAL ML-KEM-1024 keypair lifecycle — the
+// restore-ceremony key the operator re-wraps the backup to (the `dest_ephemeral_pubkey` of the
+// `2d-hsm-agent-restore-ingress-v1` envelope, Slice 1). Generated on demand by the GET_RESTORE_PUBKEY
+// opcode (Sub-slice 2a-ii); held in a process-global; SINGLE-USE (retired after one successful restore,
+// so a second ceremony needs a fresh key + fresh attestation — claude-code AC#1 review: forbid reusing
+// one attested ephemeral key across multiple restores). Gated by `agent-backup-export-preview` (pulls
+// ml-kem), same as the whole DR-backup path.
+// ---------------------------------------------------------------------------------------------------
+
+/// The destination's attested restore-ephemeral keypair, held in [`INSTALLED_RESTORE_EPHEMERAL`] between
+/// the GET_RESTORE_PUBKEY opcode (which generates + publishes the pubkey half) and the RESTORE_BACKUP
+/// handler (which decapsulates with the private half via [`crate::agent_backup::open_restore_ingress_
+/// envelope`]). The DECAPS key is stored as its 64-byte SEED (not the materialized `DecapsulationKey`) so
+/// the slot is `Send` without depending on ml-kem's `Send` impls, AND so the private key is only
+/// materialized briefly inside the restore decap (reconstructed via `DecapsulationKey::from_seed`, used,
+/// dropped) — minimizing the window the decaps key exists in memory. The seed is `Zeroizing` (scrubbed on
+/// drop / retire).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (held only by the fns below, wired in 2a-ii/2b)
+struct InstalledRestoreEphemeral {
+    /// The 1568-byte attested encapsulation (public) key the operator re-wraps to (the opcode returns it).
+    encaps_key: Vec<u8>,
+    /// The 64-byte ML-KEM keypair seed — reconstructs the decapsulation (private) key on demand. Sensitive
+    /// (with the measurement + attestation it IS the ceremony private key); `Zeroizing`.
+    decaps_seed: zeroize::Zeroizing<[u8; 64]>,
+    /// The attestation measurement this ephemeral key was published under — IS the `dest_measurement`
+    /// the RESTORE handler checks against the envelope's AAD' (`opened.dest_measurement == OWN`).
+    measurement: Vec<u8>,
+}
+
+/// Process-global slot for the destination restore-ephemeral keypair. Const-init `None` ⇒ no ephemeral
+/// published (GET_RESTORE_PUBKEY has not run this boot, or it was retired). Volatile — lost on restart, so
+/// a restart forces the operator to re-fetch a fresh ephemeral pubkey + re-wrap (the ceremony never
+/// trusts a persisted key).
+#[cfg(feature = "agent-backup-export-preview")]
+static INSTALLED_RESTORE_EPHEMERAL: Mutex<Option<InstalledRestoreEphemeral>> = Mutex::new(None);
+
+/// The GET_RESTORE_PUBKEY opcode response: the attested ephemeral public key + the measurement it was
+/// published under (the operator verifies the attestation binds the two out-of-band — AC#12 — then
+/// re-wraps the backup to the pubkey).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) struct RestoreEphemeralPub {
+    pub encaps_key: Vec<u8>,
+    pub measurement: Vec<u8>,
+}
+
+/// Generate + install a FRESH attested restore-ephemeral ML-KEM-1024 keypair (the GET_RESTORE_PUBKEY
+/// opcode's action). **Install-once**: returns `None` if an ephemeral is already installed (a second
+/// GET_RESTORE_PUBKEY this boot is a no-op — the operator re-uses the already-published key until it is
+/// retired by a successful restore). `measurement` is the enclave's own attestation measurement (from
+/// [`INSTALLED_KEYSTORE`]); returns `None` on an empty measurement or CSPRNG failure (fail-closed — the
+/// opcode returns an error, no half-installed state). The keypair is drawn from the TEE CSPRNG
+/// (`getrandom`), never host-supplied.
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEphemeralPub> {
+    use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+    // An empty measurement would make the AAD' `dest_measurement == OWN` check meaningless — reject up
+    // front (mirrors `install_agent_keystore`'s empty-measurement guard).
+    if measurement.is_empty() {
+        return None;
+    }
+    // A fresh 64-byte seed from the TEE CSPRNG — the ceremony private key's root. CSPRNG failure ⇒ None
+    // (fail-closed; no half-install).
+    let mut seed = zeroize::Zeroizing::new([0u8; 64]);
+    getrandom::getrandom(&mut seed[..]).ok()?;
+    let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*seed));
+    let encaps_key = dk.encapsulation_key().to_bytes().as_slice().to_vec();
+    let pub_info = RestoreEphemeralPub {
+        encaps_key: encaps_key.clone(),
+        measurement: measurement.to_vec(),
+    };
+    let mut guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    if guard.is_some() {
+        return None; // install-once: a second GET_RESTORE_PUBKEY does not overwrite the published key
+    }
+    *guard = Some(InstalledRestoreEphemeral {
+        encaps_key,
+        decaps_seed: seed,
+        measurement: measurement.to_vec(),
+    });
+    Some(pub_info)
+}
+
+/// Test-only: install a DETERMINISTIC restore-ephemeral keypair from an explicit 64-byte `seed` (the
+/// production [`install_restore_ephemeral`] draws from the CSPRNG). Enables the end-to-end RESTORE_BACKUP
+/// dispatch test to install the GOLDEN dest-ephemeral keypair (seed `[0x6c;64]`, matching the frozen
+/// `restore_ingress_envelope_v1.bin`) so the test's ingress envelope — sealed to that known pubkey —
+/// decapsulates inside the handler. Same install-once + empty-measurement-reject semantics.
+#[cfg(all(test, feature = "agent-backup-export-preview"))]
+#[allow(dead_code)] // forward enabler for the 2c end-to-end RESTORE_BACKUP dispatch test (lands next)
+pub(crate) fn install_restore_ephemeral_with_seed(
+    measurement: &[u8],
+    seed: &[u8; 64],
+) -> Option<RestoreEphemeralPub> {
+    use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+    if measurement.is_empty() {
+        return None;
+    }
+    let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*seed));
+    let encaps_key = dk.encapsulation_key().to_bytes().as_slice().to_vec();
+    let pub_info = RestoreEphemeralPub {
+        encaps_key: encaps_key.clone(),
+        measurement: measurement.to_vec(),
+    };
+    let mut guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    if guard.is_some() {
+        return None;
+    }
+    *guard = Some(InstalledRestoreEphemeral {
+        encaps_key,
+        decaps_seed: zeroize::Zeroizing::new(*seed),
+        measurement: measurement.to_vec(),
+    });
+    Some(pub_info)
+}
+
+/// Whether a restore-ephemeral keypair is currently published (GET_RESTORE_PUBKEY ran, not yet retired).
+/// Poison-recovers (consistent with the other agent process-globals).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) fn is_restore_ephemeral_installed() -> bool {
+    INSTALLED_RESTORE_EPHEMERAL
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+/// Idempotent read of the published ephemeral pubkey + measurement (the GET_RESTORE_PUBKEY handler's
+/// "already published" path): returns the published `RestoreEphemeralPub` if an ephemeral is installed,
+/// so a second GET_RESTORE_PUBKEY this boot returns the SAME key the operator already re-wrapped to
+/// (idempotent), rather than generating a new one. Single-use is preserved by [`retire_restore_ephemeral`]
+/// (after a successful restore) — a GET_RESTORE_PUBKEY post-retire finds None here + generates a FRESH key.
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
+pub(crate) fn published_restore_ephemeral() -> Option<RestoreEphemeralPub> {
+    let guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    guard.as_ref().map(|e| RestoreEphemeralPub {
+        encaps_key: e.encaps_key.clone(),
+        measurement: e.measurement.clone(),
+    })
+}
+
+/// The restore handler's read of the published ephemeral: a SNAPSHOT (decaps seed + the measurement)
+/// cloned out under a brief lock, so the handler does NOT hold the ephemeral slot lock across the restore
+/// (it already holds [`INSTALLED_KEYSTORE`). The handler reconstructs the `DecapsulationKey` from the seed
+/// via `DecapsulationKey::from_seed`, passes it to [`crate::agent_backup::open_restore_ingress_envelope`],
+/// and checks `snapshot.measurement == opened.dest_measurement` (the AAD' `== OWN` check). Returns `None`
+/// if no ephemeral is published (the opcode hasn't run / was retired) — the handler fails the restore
+/// closed. Does NOT consume the slot (a FAILED restore keeps the key for retry; only a SUCCESS retires it
+/// via [`retire_restore_ephemeral`]).
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2b handler wires it)
+pub(crate) struct RestoreEphemeralSnapshot {
+    pub decaps_seed: zeroize::Zeroizing<[u8; 64]>,
+    pub measurement: Vec<u8>,
+}
+
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2b handler wires it)
+pub(crate) fn snapshot_restore_ephemeral() -> Option<RestoreEphemeralSnapshot> {
+    let guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    guard.as_ref().map(|e| RestoreEphemeralSnapshot {
+        decaps_seed: zeroize::Zeroizing::new(*e.decaps_seed),
+        measurement: e.measurement.clone(),
+    })
+}
+
+/// Retire the restore-ephemeral keypair — SINGLE-USE enforcement (claude-code AC#1 review). Called by the
+/// RESTORE handler ONLY after a successful restore commit (the operator-authorized ceremony consumed the
+/// key). A second restore this boot then finds no ephemeral (`is_restore_ephemeral_installed()` == false)
+/// and must re-fetch a fresh GET_RESTORE_PUBKEY + fresh attestation + fresh re-wrap — forbidding one
+/// attested ephemeral key from authenticating two distinct recoveries. The `Zeroizing` decaps seed is
+/// scrubbed on drop. No-op (idempotent) if already retired.
+#[cfg(feature = "agent-backup-export-preview")]
+#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode + 2b handler wire it)
+pub(crate) fn retire_restore_ephemeral() {
+    if let Ok(mut guard) = INSTALLED_RESTORE_EPHEMERAL.lock() {
+        *guard = None; // Zeroizing decaps_seed scrubbed on drop
+    }
+}
+
+#[cfg(all(test, feature = "agent-backup-export-preview"))]
+fn reset_restore_ephemeral_for_tests() {
+    if let Ok(mut guard) = INSTALLED_RESTORE_EPHEMERAL.lock() {
         *guard = None;
     }
 }
@@ -1835,6 +2171,9 @@ pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'s
     reset_agent_keystore_for_tests();
     reset_anti_rollback_binding_for_tests();
     reset_commit_channel_for_tests(); // slice 6-4: frame-path tests install a mock commit channel
+                                      // TASK-24 Slice 2a-i: the restore-ephemeral slot (only under the backup-export preview — pulls ml-kem).
+    #[cfg(feature = "agent-backup-export-preview")]
+    reset_restore_ephemeral_for_tests();
     crate::agent_challenge::reset_outstanding_challenge_for_tests();
     // The quote-producer process-ledger claim ((d-ii)/2) — triple-gated like its module (the enclosing
     // module is already agent-gateway-gated; the inner cfg completes the gate so non-linux / non-vsock
@@ -1933,7 +2272,12 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
     let (outcome, measurement) = match guard.as_ref() {
         Some(installed) => {
             let measurement = installed.measurement.clone();
-            let outcome = dispatch_agent(Profile::AgentGateway, payload, &installed.body);
+            let outcome = dispatch_agent(
+                Profile::AgentGateway,
+                payload,
+                &installed.body,
+                &measurement,
+            );
             (outcome, measurement)
         }
         None => return encode_agent_error(AgentError::WrongProfile),
@@ -1997,6 +2341,29 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 &mut guard,
                 move |sealed| encode_export_backup_response(&backup_blob, sealed),
             )
+        }
+        Ok(AgentResponse::RestoreBackup {
+            candidate,
+            request_id,
+        }) => {
+            // RESTORE_BACKUP (rollback-sensitive; Structural — wholesale-replaced body + local+1 structural
+            // bump) goes through the SAME shared seal-before-emit seam. After the commit succeeds the
+            // restore-ephemeral key is RETIRED (single-use: a second restore must re-fetch GET_RESTORE_PUBKEY
+            // + fresh attestation + fresh re-wrap). NB: commit_before_emit returns an error BODY on a
+            // commit failure (not an Err) — the retire below is EAGER (per-attempt single-use): a failed
+            // commit still burns this ephemeral, forcing a fresh ceremony for the retry. That is the
+            // conservative single-use choice (the ephemeral is NEVER reused); the retry-cost (re-fetch +
+            // re-wrap) is the accepted tradeoff vs threading a success signal out of the seam.
+            #[cfg(feature = "agent-backup-export-preview")]
+            let body =
+                commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
+                    encode_restore_backup_response(sealed)
+                });
+            #[cfg(feature = "agent-backup-export-preview")]
+            retire_restore_ephemeral();
+            #[cfg(not(feature = "agent-backup-export-preview"))]
+            let body = encode_agent_error(AgentError::NotConfigured); // unreachable: dispatch gates the arm
+            body
         }
         Ok(resp) => encode_agent_response(&resp),
         Err(e) => encode_agent_error(e),
@@ -2094,6 +2461,17 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
             ),
             (Value::Integer(7.into()), Value::Bytes(t.from.to_vec())),
         ]),
+        // GET_RESTORE_PUBKEY response (TASK-24 Slice 2a-ii): the attested ephemeral pubkey + its
+        // measurement. Key 1 = encaps_key (BYTES, 1568), key 2 = measurement (BYTES). Non-mutating
+        // (NotCommitted) so it IS encoded here (unlike the mutating ops below that must go through the
+        // frame-layer seam).
+        AgentResponse::GetRestorePubkey {
+            encaps_key,
+            measurement,
+        } => encode_body(vec![
+            (Value::Integer(1.into()), Value::Bytes(encaps_key.clone())),
+            (Value::Integer(2.into()), Value::Bytes(measurement.clone())),
+        ]),
         // GENERATE_KEYS MUST be encoded by the frame layer WITH its sealed blob
         // (`encode_generate_keys_response`). Reaching the generic encoder means a mis-routed mutation;
         // fail closed to an error body rather than fabricate a persist-less success the host can't
@@ -2111,6 +2489,10 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
         // Reaching the generic encoder is a mis-routed mutation ⇒ fail closed — never emit a DR backup whose
         // drain/advance was not sealed/committed.
         AgentResponse::ExportBackup { .. } => encode_agent_error(AgentError::SealFailed),
+        // RESTORE_BACKUP is frame-layer-only (`encode_restore_backup_response` needs the sealed blob).
+        // Reaching the generic encoder is a mis-routed mutation ⇒ fail closed — never report a restore
+        // success whose state was not sealed/committed.
+        AgentResponse::RestoreBackup { .. } => encode_agent_error(AgentError::SealFailed),
     }
 }
 
@@ -2202,6 +2584,18 @@ fn encode_export_backup_response(backup_blob: &[u8], sealed_blob: &[u8]) -> Vec<
         (Value::Integer(1.into()), Value::Bytes(backup_blob.to_vec())),
         (Value::Integer(2.into()), Value::Bytes(sealed_blob.to_vec())),
     ])
+}
+
+/// Encode the RESTORE_BACKUP success body (TASK-24): `{1: sealed_keystore_blob}` — the restored
+/// keystore (the host persists it). Mirrors CONFIGURE_TREASURY's single-blob response (a restore emits
+/// no separate artifact — the restored entries live in the sealed blob). Invoked by the frame-layer seam
+/// ONLY after the anchor commit succeeds, so a restore success is reported iff the post-restore state is
+/// durably committed.
+fn encode_restore_backup_response(sealed_blob: &[u8]) -> Vec<u8> {
+    encode_body(vec![(
+        Value::Integer(1.into()),
+        Value::Bytes(sealed_blob.to_vec()),
+    )])
 }
 
 /// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
@@ -2461,7 +2855,7 @@ mod tests {
             vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
         );
         assert_eq!(
-            dispatch_agent(Profile::Producer, &payload, &body).err(),
+            dispatch_agent(Profile::Producer, &payload, &body, b"test-measurement").err(),
             Some(AgentError::WrongProfile)
         );
     }
@@ -2473,7 +2867,8 @@ mod tests {
             2,
             vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
         );
-        let resp = dispatch_agent(Profile::AgentGateway, &payload, &body).unwrap();
+        let resp =
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").unwrap();
         match resp {
             AgentResponse::PublicIdentity(id) => {
                 assert_eq!(id.key_ref, key_ref);
@@ -2493,7 +2888,7 @@ mod tests {
             vec![(Value::Integer(6.into()), Value::Bytes(vec![0xff; 32]))],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::KeyPurposeMismatch)
         );
     }
@@ -2516,7 +2911,8 @@ mod tests {
                 ),
             ],
         );
-        let resp = dispatch_agent(Profile::AgentGateway, &payload, &body).unwrap();
+        let resp =
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").unwrap();
         match resp {
             AgentResponse::ProveIdentity(proof) => {
                 let recovered = crate::secp256k1::recover_pubkey_uncompressed(
@@ -2556,7 +2952,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::NotConfigured)
         );
     }
@@ -2569,7 +2965,7 @@ mod tests {
         // the verifier now parses the cap and rejects missing required keys.
         let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(vec![]))]);
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
     }
@@ -2604,11 +3000,14 @@ mod tests {
         );
         let payload = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::NotConfigured)
         );
     }
 
+    // Under `agent-backup-export-preview` RESTORE_BACKUP is LIVE (handle_restore_backup) — this stub
+    // contract (verify cap → NotConfigured) holds only WITHOUT the preview (mirrors the EXPORT stub test).
+    #[cfg(not(feature = "agent-backup-export-preview"))]
     #[test]
     fn deferred_restore_backup_recovery_cap_reaches_not_configured() {
         use ed25519_dalek::SigningKey;
@@ -2638,7 +3037,7 @@ mod tests {
         );
         let payload = envelope(8, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::NotConfigured)
         );
     }
@@ -2672,7 +3071,7 @@ mod tests {
         cap.reverse();
         let payload = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
     }
@@ -2735,7 +3134,7 @@ mod tests {
                 (Value::Integer(7.into()), Value::Map(pay)),
             ],
         );
-        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+        match dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").unwrap() {
             AgentResponse::GenerateKeys {
                 keys, candidate, ..
             } => {
@@ -2775,7 +3174,7 @@ mod tests {
                 (Value::Integer(7.into()), Value::Map(pay)),
             ],
         );
-        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+        match dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").unwrap() {
             AgentResponse::GenerateKeys { candidate, .. } => {
                 // +1 per COMMITTED op, regardless of count (NOT +3).
                 assert_eq!(
@@ -2819,7 +3218,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::SealFailed)
         );
     }
@@ -2847,7 +3246,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::CapabilityRejected)
         );
     }
@@ -2894,7 +3293,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::KeyPurposeMismatch)
         );
     }
@@ -2917,7 +3316,7 @@ mod tests {
                 (Value::Integer(7.into()), Value::Map(pay)),
             ],
         );
-        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+        match dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").unwrap() {
             AgentResponse::GenerateKeys {
                 keys, candidate, ..
             } => {
@@ -2971,7 +3370,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::CapabilityRejected)
         );
     }
@@ -3027,7 +3426,7 @@ mod tests {
         );
         // Accepted (Success) — NOT CapabilityRejected. Transfer-pool keygen is the fleet-allowed case.
         assert!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).is_ok(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").is_ok(),
             "fleet-scoped transfer-pool keygen (purpose=1) MUST be accepted (§10.3 transfer pool: fleet allowed); \
              only faucet-treasury keygen (purpose=2) is enclave-only (AC#12)"
         );
@@ -3066,7 +3465,8 @@ mod tests {
             dispatch_agent(
                 Profile::AgentGateway,
                 &read_env(vec![0x41; MAX_REQUEST_ID_LEN + 1]),
-                &body
+                &body,
+                b"test-measurement"
             )
             .err(),
             Some(AgentError::Malformed),
@@ -3076,7 +3476,13 @@ mod tests {
         // key_ref ⇒ NOT Malformed). Confirms the bound admits exactly [0, 64], incl the empty id.
         for rid in [vec![0x41; MAX_REQUEST_ID_LEN], Vec::new()] {
             assert_ne!(
-                dispatch_agent(Profile::AgentGateway, &read_env(rid.clone()), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &read_env(rid.clone()),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::Malformed),
                 "a request_id of len {} must decode (admin-cap-bound; not a Malformed reject)",
                 rid.len()
@@ -3103,7 +3509,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::CapabilityRejected)
         );
     }
@@ -3133,7 +3539,7 @@ mod tests {
         );
         let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::CapabilityRejected)
         );
     }
@@ -3144,7 +3550,7 @@ mod tests {
         let (body, _) = body_with_key();
         let payload = envelope(1, vec![]); // no capability key 5
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::CapabilityRejected)
         );
     }
@@ -3160,7 +3566,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
     }
@@ -3168,9 +3574,15 @@ mod tests {
     #[test]
     fn unknown_opcode_and_version_and_domain_are_malformed() {
         let (body, _) = body_with_key();
-        // unknown opcode 9
+        // unknown opcode 10 (9 is now GET_RESTORE_PUBKEY, TASK-24 Slice 2a-ii)
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &envelope(9, vec![]), &body).err(),
+            dispatch_agent(
+                Profile::AgentGateway,
+                &envelope(10, vec![]),
+                &body,
+                b"test-measurement"
+            )
+            .err(),
             Some(AgentError::Malformed)
         );
         // wrong version
@@ -3184,7 +3596,7 @@ mod tests {
             (Value::Integer(4.into()), Value::Bytes(vec![0x11; 16])),
         ]));
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &bad_ver, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &bad_ver, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
         // wrong domain
@@ -3201,7 +3613,7 @@ mod tests {
             (Value::Integer(4.into()), Value::Bytes(vec![0x11; 16])),
         ]));
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &bad_dom, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &bad_dom, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
     }
@@ -3213,13 +3625,25 @@ mod tests {
         // SIGN_FAUCET_DISPENSE(5) is rollback-sensitive: the anti-rollback gate fail-closes it
         // (NotConfigured) when unconfigured — independent of any preview feature (until slice 15-3).
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &envelope(5, vec![]), &body).err(),
+            dispatch_agent(
+                Profile::AgentGateway,
+                &envelope(5, vec![]),
+                &body,
+                b"test-measurement"
+            )
+            .err(),
             Some(AgentError::NotConfigured)
         );
         // SIGN_TRANSFER(4): production fail-closed (NotConfigured) WITHOUT the preview feature; WITH it
         // the opcode is LIVE, so an empty payload reaches the handler and is rejected as Malformed (not
         // NotConfigured) — that distinction is exactly what proves the production gate opened.
-        let err4 = dispatch_agent(Profile::AgentGateway, &envelope(4, vec![]), &body).err();
+        let err4 = dispatch_agent(
+            Profile::AgentGateway,
+            &envelope(4, vec![]),
+            &body,
+            b"test-measurement",
+        )
+        .err();
         #[cfg(not(feature = "agent-sign-transfer-preview"))]
         assert_eq!(err4, Some(AgentError::NotConfigured));
         #[cfg(feature = "agent-sign-transfer-preview")]
@@ -3232,12 +3656,12 @@ mod tests {
         let mut p = envelope(2, vec![]);
         p.push(0xff); // trailing garbage
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &p, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &p, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
         let not_map = enc(Value::Integer(1.into()));
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &not_map, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &not_map, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
     }
@@ -3263,7 +3687,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
             Some(AgentError::Malformed)
         );
     }
@@ -3584,7 +4008,7 @@ mod tests {
                 (Value::Integer(7.into()), Value::Map(pay)),
             ],
         );
-        match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+        match dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").unwrap() {
             AgentResponse::GenerateKeys { candidate, .. } => {
                 assert_eq!(
                     candidate.audit.records.len(),
@@ -3771,7 +4195,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::SealFailed)
         );
     }
@@ -3796,7 +4220,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::NotConfigured)
         );
     }
@@ -3814,6 +4238,7 @@ mod tests {
             (AgentOpcode::ConfigureTreasury, true),
             (AgentOpcode::ExportBackup, true),
             (AgentOpcode::RestoreBackup, true),
+            (AgentOpcode::GetRestorePubkey, false), // volatile ephemeral keypair, no sealed-state mutation
         ] {
             assert_eq!(op.is_rollback_sensitive(), expected);
         }
@@ -3836,6 +4261,9 @@ mod tests {
             (AgentOpcode::SignTransfer, CommitBumpClass::NotCommitted),
             (AgentOpcode::PublicIdentity, CommitBumpClass::NotCommitted),
             (AgentOpcode::ProveIdentity, CommitBumpClass::NotCommitted),
+            // GET_RESTORE_PUBKEY (TASK-24 Slice 2a-ii): NotCommitted — generates a volatile ephemeral
+            // keypair (process-global), no sealed-state mutation, no anchor commit.
+            (AgentOpcode::GetRestorePubkey, CommitBumpClass::NotCommitted),
         ] {
             assert_eq!(op.commit_bump_class(), expected, "{op:?}");
             // CONSISTENCY: an op is committed (Structural|EpochOnly) IFF it is rollback-sensitive — the
@@ -3896,6 +4324,185 @@ mod tests {
         );
     }
 
+    // ---- TASK-24 Slice 2a-i: restore-ephemeral keypair lifecycle ----
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_install_once_and_basic_access() {
+        let _g = lock_and_reset_agent_process_globals();
+        assert!(
+            !is_restore_ephemeral_installed(),
+            "const-init None ⇒ fail-closed default"
+        );
+        let pub1 =
+            install_restore_ephemeral(b"dest-measurement-v1").expect("first install succeeds");
+        assert_eq!(pub1.measurement, b"dest-measurement-v1");
+        assert_eq!(
+            pub1.encaps_key.len(),
+            crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN,
+            "1568-byte ML-KEM-1024 encaps key"
+        );
+        assert!(is_restore_ephemeral_installed());
+        // Install-once: a second call returns None + does NOT overwrite the published key.
+        assert!(
+            install_restore_ephemeral(b"other").is_none(),
+            "install-once refuses overwrite"
+        );
+        let still = snapshot_restore_ephemeral().unwrap();
+        assert_eq!(
+            still.measurement, b"dest-measurement-v1",
+            "first key retained, not overwritten"
+        );
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_rejects_empty_measurement() {
+        let _g = lock_and_reset_agent_process_globals();
+        assert!(
+            install_restore_ephemeral(b"").is_none(),
+            "empty measurement rejected"
+        );
+        assert!(
+            !is_restore_ephemeral_installed(),
+            "no half-install on empty measurement"
+        );
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_snapshot_reconstructs_the_published_encaps_key() {
+        // The snapshot's decaps seed MUST reconstruct a DecapsulationKey whose encaps key == the one
+        // GET_RESTORE_PUBKEY published (the operator re-wrapped to that pubkey; the handler decapsulates
+        // with the matching private half). Pins the seed↔pubkey consistency the ceremony round-trip needs.
+        use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+        let _g = lock_and_reset_agent_process_globals();
+        let pub_info = install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        let snap = snapshot_restore_ephemeral().expect("snapshot after install");
+        assert_eq!(snap.measurement, b"dest-measurement-v1");
+        let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*snap.decaps_seed));
+        assert_eq!(
+            dk.encapsulation_key().to_bytes().as_slice(),
+            pub_info.encaps_key.as_slice(),
+            "snapshot seed reconstructs the published encaps key"
+        );
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_retire_is_single_use() {
+        // SINGLE-USE enforcement (claude-code AC#1 review): after retire, no ephemeral is published — a
+        // second restore must re-fetch GET_RESTORE_PUBKEY + fresh attestation + fresh re-wrap.
+        let _g = lock_and_reset_agent_process_globals();
+        install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        assert!(is_restore_ephemeral_installed());
+        retire_restore_ephemeral();
+        assert!(
+            !is_restore_ephemeral_installed(),
+            "retire clears (single-use)"
+        );
+        assert!(
+            snapshot_restore_ephemeral().is_none(),
+            "no snapshot after retire"
+        );
+        retire_restore_ephemeral(); // idempotent
+                                    // After retire a FRESH install is allowed (the next ceremony's key).
+        assert!(
+            install_restore_ephemeral(b"dest-measurement-v2").is_some(),
+            "fresh install allowed after retire"
+        );
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_ephemeral_snapshot_keeps_the_key_for_retry() {
+        // A snapshot (a FAILED restore attempt) does NOT retire — the operator can retry the ceremony
+        // with a corrected envelope to the SAME published key. Only a SUCCESSFUL restore retires.
+        let _g = lock_and_reset_agent_process_globals();
+        install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        let _snap = snapshot_restore_ephemeral().unwrap();
+        assert!(
+            is_restore_ephemeral_installed(),
+            "snapshot keeps the key for retry"
+        );
+        assert!(
+            snapshot_restore_ephemeral().is_some(),
+            "still snapshottable after a failed-attempt snapshot"
+        );
+    }
+
+    /// GET_RESTORE_PUBKEY(9) via the full dispatch path (TASK-24 Slice 2a-ii): publishes an attested
+    /// ephemeral pubkey, is IDEMPOTENT (a second call returns the SAME key), and generates a FRESH key
+    /// after a retire. Non-privileged (no capability at envelope key 5), NotCommitted (no anchor commit).
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn get_restore_pubkey_dispatch_is_idempotent_and_single_use() {
+        use crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN;
+        let _g = lock_and_reset_agent_process_globals();
+        let (body, _) = body_with_key();
+        let env = envelope(9, vec![]); // opcode 9, no cap, no payload
+                                       // First call generates + publishes.
+        let resp1 =
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"dest-measurement").unwrap();
+        let (ek1, meas1) = match resp1 {
+            AgentResponse::GetRestorePubkey {
+                encaps_key,
+                measurement,
+            } => (encaps_key, measurement),
+            _ => panic!("expected GetRestorePubkey, got a different AgentResponse variant"),
+        };
+        assert_eq!(
+            ek1.len(),
+            ML_KEM_1024_ENCAPS_KEY_LEN,
+            "1568-byte ML-KEM-1024 encaps key"
+        );
+        assert_eq!(
+            meas1, b"dest-measurement",
+            "the enclave's own measurement is returned"
+        );
+        assert!(is_restore_ephemeral_installed());
+        // Idempotent: a second call returns the SAME published key (no churn).
+        let resp2 =
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"dest-measurement").unwrap();
+        let ek2 = match resp2 {
+            AgentResponse::GetRestorePubkey { encaps_key, .. } => encaps_key,
+            _ => panic!("expected GetRestorePubkey"),
+        };
+        assert_eq!(ek1, ek2, "idempotent — same published key on re-query");
+        // After retire (a completed restore), a fresh key is generated.
+        retire_restore_ephemeral();
+        let resp3 =
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"dest-measurement").unwrap();
+        let ek3 = match resp3 {
+            AgentResponse::GetRestorePubkey { encaps_key, .. } => encaps_key,
+            _ => panic!("expected GetRestorePubkey"),
+        };
+        assert_ne!(
+            ek1, ek3,
+            "fresh key after retire (single-use across ceremonies)"
+        );
+    }
+
+    /// GET_RESTORE_PUBKEY is non-privileged: a request carrying a capability (envelope key 5) is Malformed
+    /// (caps are only for privileged ops). Mirrors the read-opcode cap-rejection rule.
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn get_restore_pubkey_with_capability_is_malformed() {
+        let _g = lock_and_reset_agent_process_globals();
+        let (body, key_ref) = body_with_key();
+        let payload = envelope(
+            9,
+            vec![
+                (Value::Integer(5.into()), Value::Map(vec![])), // a cap on a non-privileged op
+                (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
+            ],
+        );
+        assert_eq!(
+            dispatch_agent(Profile::AgentGateway, &payload, &body, b"test-measurement").err(),
+            Some(AgentError::Malformed)
+        );
+    }
+
     #[test]
     fn gate_blocks_generate_keys_when_unconfigured() {
         use ed25519_dalek::SigningKey;
@@ -3915,7 +4522,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::NotConfigured)
         );
     }
@@ -3927,7 +4534,13 @@ mod tests {
         // The gate fires before privilege/cap routing, so no cap is needed to observe the block.
         for op in [6u8, 7, 8] {
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &envelope(op, vec![]), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &envelope(op, vec![]),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::NotConfigured),
                 "opcode {op} must be gated when anti-rollback is unconfigured"
             );
@@ -3950,7 +4563,13 @@ mod tests {
         // gate is unconfigured it is therefore NOT blocked by the gate: without the preview it falls
         // through to the production fail-closed NotConfigured; WITH the preview it is live, so an empty
         // payload is Malformed — proving it passed the (unconfigured) gate rather than being blocked by it.
-        let err4 = dispatch_agent(Profile::AgentGateway, &envelope(4, vec![]), &body).err();
+        let err4 = dispatch_agent(
+            Profile::AgentGateway,
+            &envelope(4, vec![]),
+            &body,
+            b"test-measurement",
+        )
+        .err();
         #[cfg(not(feature = "agent-sign-transfer-preview"))]
         assert_eq!(err4, Some(AgentError::NotConfigured));
         #[cfg(feature = "agent-sign-transfer-preview")]
@@ -3961,7 +4580,13 @@ mod tests {
         );
         // SIGN_FAUCET_DISPENSE(5) IS gated → NotConfigured when the binding is unconfigured.
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &envelope(5, vec![]), &body).err(),
+            dispatch_agent(
+                Profile::AgentGateway,
+                &envelope(5, vec![]),
+                &body,
+                b"test-measurement"
+            )
+            .err(),
             Some(AgentError::NotConfigured)
         );
     }
@@ -3978,7 +4603,7 @@ mod tests {
             vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
         );
         assert!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).is_ok(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").is_ok(),
             "PUBLIC_IDENTITY is not gated by anti-rollback"
         );
     }
@@ -4007,7 +4632,7 @@ mod tests {
         );
         let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+            dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
             Some(AgentError::CapabilityRejected)
         );
     }
@@ -4157,6 +4782,7 @@ mod tests {
                 Profile::AgentGateway,
                 &golden_request(&key_ref, &from),
                 &body,
+                b"test-measurement",
             )
             .expect("golden SIGN_TRANSFER must succeed");
             let m = resp_map(&encode_agent_response(&resp));
@@ -4218,7 +4844,9 @@ mod tests {
             let val = || Value::Bytes(min_be(o["fields"]["value"].as_u64().unwrap()));
             let gp = || Value::Bytes(min_be(o["fields"]["gas_price"].as_u64().unwrap()));
             let empty = || Value::Bytes(vec![]);
-            let err = |req: &[u8]| dispatch_agent(Profile::AgentGateway, req, &body).err();
+            let err = |req: &[u8]| {
+                dispatch_agent(Profile::AgentGateway, req, &body, b"test-measurement").err()
+            };
 
             // wrong chain_id (never request-authoritative) → Malformed
             assert_eq!(
@@ -4394,7 +5022,8 @@ mod tests {
                 dispatch_agent(
                     Profile::AgentGateway,
                     &golden_request(&key_ref, &from),
-                    &body
+                    &body,
+                    b"test-measurement"
                 )
                 .err(),
                 Some(AgentError::KeyPurposeMismatch)
@@ -4438,7 +5067,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &req, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &req, &body, b"test-measurement").err(),
                 Some(AgentError::Malformed)
             );
         }
@@ -4471,7 +5100,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &missing, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &missing, &body, b"test-measurement").err(),
                 Some(AgentError::Malformed),
                 "missing data key"
             );
@@ -4500,7 +5129,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &extra, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &extra, &body, b"test-measurement").err(),
                 Some(AgentError::Malformed),
                 "extra payload key"
             );
@@ -4538,7 +5167,7 @@ mod tests {
             for bad_to in [vec![0u8; 19], vec![0u8; 21]] {
                 let req = build(Value::Bytes(from.to_vec()), Value::Bytes(bad_to));
                 assert_eq!(
-                    dispatch_agent(Profile::AgentGateway, &req, &body).err(),
+                    dispatch_agent(Profile::AgentGateway, &req, &body, b"test-measurement").err(),
                     Some(AgentError::Malformed),
                     "wrong-length to"
                 );
@@ -4547,7 +5176,7 @@ mod tests {
             // from!=derived 0x42 check) — pins the shape-vs-key band split for `from`.
             let req = build(Value::Bytes(vec![0u8; 19]), Value::Bytes(to.to_vec()));
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &req, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &req, &body, b"test-measurement").err(),
                 Some(AgentError::Malformed),
                 "wrong-length from"
             );
@@ -4572,7 +5201,7 @@ mod tests {
                 Value::Bytes(vec![]), // gas_price = 0
                 Value::Bytes(vec![]),
             );
-            let resp = dispatch_agent(Profile::AgentGateway, &req, &body)
+            let resp = dispatch_agent(Profile::AgentGateway, &req, &body, b"test-measurement")
                 .expect("zero-value transfer must sign");
             let m = resp_map(&encode_agent_response(&resp));
             assert_eq!(
@@ -4604,7 +5233,13 @@ mod tests {
                 ],
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &extra_outer, &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &extra_outer,
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::Malformed),
                 "unknown outer envelope key"
             );
@@ -4744,8 +5379,13 @@ mod tests {
         fn dispatch_accepts_and_debits_dual_counters() {
             let _g = gate_configured(); // rollback-sensitive ⇒ the binding must be installed
             let (body, from, to) = faucet_body(10_000_000);
-            let resp = dispatch_agent(Profile::AgentGateway, &good_request(&from, &to), &body)
-                .expect("an in-cap dispense to a known transfer key must succeed");
+            let resp = dispatch_agent(
+                Profile::AgentGateway,
+                &good_request(&from, &to),
+                &body,
+                b"test-measurement",
+            )
+            .expect("an in-cap dispense to a known transfer key must succeed");
             match resp {
                 AgentResponse::SignFaucetDispense {
                     signed,
@@ -4802,7 +5442,8 @@ mod tests {
                 dispatch_agent(
                     Profile::AgentGateway,
                     &good_request(&from, &stranger),
-                    &body
+                    &body,
+                    b"test-measurement"
                 )
                 .err(),
                 Some(AgentError::KeyPurposeMismatch),
@@ -4811,7 +5452,13 @@ mod tests {
             // The treasury's OWN address is also not a transfer-key recipient → still 0x42 (no self-dispense
             // shortcut past the allowlist).
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &good_request(&from, &from), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &good_request(&from, &from),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::KeyPurposeMismatch),
                 "treasury address is not an allowlisted recipient"
             );
@@ -4880,7 +5527,13 @@ mod tests {
                 Value::Bytes(vec![]),
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &transfer_signer, &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &transfer_signer,
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::KeyPurposeMismatch),
                 "transfer key cannot sign a faucet dispense"
             );
@@ -4897,7 +5550,7 @@ mod tests {
                 Value::Bytes(vec![]),
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &unknown, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &unknown, &body, b"test-measurement").err(),
                 Some(AgentError::KeyPurposeMismatch),
                 "unknown signer key_ref"
             );
@@ -4905,7 +5558,13 @@ mod tests {
             let mut bad_from = from;
             bad_from[0] ^= 0xff;
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &good_request(&bad_from, &to), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &good_request(&bad_from, &to),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::KeyPurposeMismatch),
                 "from != treasury derived address"
             );
@@ -4915,7 +5574,9 @@ mod tests {
         fn rejects_shape_errors_as_malformed() {
             let _g = gate_configured();
             let (body, from, to) = faucet_body(10_000_000);
-            let err = |req: &[u8]| dispatch_agent(Profile::AgentGateway, req, &body).err();
+            let err = |req: &[u8]| {
+                dispatch_agent(Profile::AgentGateway, req, &body, b"test-measurement").err()
+            };
             // wrong chain_id (never request-authoritative) → 0x40.
             assert_eq!(
                 err(&request(
@@ -5009,7 +5670,13 @@ mod tests {
             ]);
             let no_key_ref = envelope(5, vec![(Value::Integer(7.into()), payload)]);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &no_key_ref, &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &no_key_ref,
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::Malformed),
                 "absent key_ref → shape error (0x40), not the key band"
             );
@@ -5032,7 +5699,13 @@ mod tests {
                 Value::Bytes(vec![]),
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &over_amount, &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &over_amount,
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapExceeded),
                 "amount over per_dispense_max_amount"
             );
@@ -5049,21 +5722,33 @@ mod tests {
                 Value::Bytes(vec![]),
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &over_gas, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &over_gas, &body, b"test-measurement").err(),
                 Some(AgentError::CapExceeded),
                 "gas_limit over max_gas_limit"
             );
             // worst_case over the cumulative budget → 0x44 (budget too small for one dispense).
             let (tiny, from2, to2) = faucet_body(worst_case() - 1);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &good_request(&from2, &to2), &tiny).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &good_request(&from2, &to2),
+                    &tiny,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapExceeded),
                 "worst_case over cumulative_signing_budget"
             );
             // an UNCONFIGURED budget (==0) rejects every dispense, even an in-cap one → 0x44.
             let (unconf, from3, to3) = faucet_body(0);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &good_request(&from3, &to3), &unconf).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &good_request(&from3, &to3),
+                    &unconf,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapExceeded),
                 "unconfigured budget fails closed"
             );
@@ -5076,7 +5761,13 @@ mod tests {
             let _g = gate_unconfigured();
             let (body, from, to) = faucet_body(10_000_000);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &good_request(&from, &to), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &good_request(&from, &to),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::NotConfigured),
                 "anti-rollback unconfigured ⇒ NotConfigured"
             );
@@ -5304,7 +5995,14 @@ mod tests {
                 &min_be(1_000_000),
                 Some((30_000, 250)),
             );
-            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+            match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
                 AgentResponse::ConfigureTreasury {
                     candidate,
                     request_id,
@@ -5356,7 +6054,14 @@ mod tests {
                 &min_be(1_000_000),
                 Some((30_000, 250)),
             );
-            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+            match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
                     assert_eq!(
                         candidate.audit.records.len(),
@@ -5459,7 +6164,14 @@ mod tests {
             body.faucet.lifetime_spend = crate::u256::from_u64(456);
             let (cap, pay) =
                 cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
-            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+            match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
                     assert_eq!(
                         candidate.faucet.cumulative_signing_budget,
@@ -5495,7 +6207,13 @@ mod tests {
             let body = body_with_authorities(&admin, &recovery);
             let (cap, pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(0), None);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapExceeded),
                 "refill to zero re-disables the faucet ⇒ 0x44"
             );
@@ -5510,7 +6228,14 @@ mod tests {
             // threshold >= lifetime_spend: accepted.
             let (cap, pay) =
                 cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(5_000), None);
-            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+            match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
                     assert_eq!(
                         candidate.faucet.circuit_breaker_threshold,
@@ -5528,7 +6253,13 @@ mod tests {
             let (cap2, pay2) =
                 cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(999), None);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap2, pay2),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapExceeded),
                 "breaker below accumulated lifetime_spend ⇒ 0x44"
             );
@@ -5544,7 +6275,14 @@ mod tests {
             // reset to a lower target with a RECOVERY cap.
             let (cap, pay) =
                 cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
-            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+            match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
                     assert_eq!(
                         candidate.faucet.lifetime_spend,
@@ -5585,7 +6323,13 @@ mod tests {
             let (cap2, pay2) =
                 cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(20_000), None);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap2, pay2),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapExceeded),
                 "reset target above current lifetime_spend ⇒ 0x44"
             );
@@ -5604,7 +6348,14 @@ mod tests {
             body.faucet.circuit_breaker_threshold = Some(crate::u256::from_u64(12_000));
             let (cap, pay) =
                 cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
-            match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+            match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
                     assert_eq!(
                         candidate.audit.records.len(),
@@ -5649,11 +6400,17 @@ mod tests {
             // Drive the REAL handler to get the post-reset candidate (lifetime lowered to 2000).
             let (cap, pay) =
                 cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
-            let candidate =
-                match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
-                    AgentResponse::ConfigureTreasury { candidate, .. } => candidate,
-                    _ => panic!("expected ConfigureTreasury"),
-                };
+            let candidate = match dispatch_agent(
+                Profile::AgentGateway,
+                &env_for(cap, pay),
+                &body,
+                b"test-measurement",
+            )
+            .unwrap()
+            {
+                AgentResponse::ConfigureTreasury { candidate, .. } => candidate,
+                _ => panic!("expected ConfigureTreasury"),
+            };
             assert_eq!(
                 candidate.structural_version,
                 ls + 1,
@@ -5708,7 +6465,13 @@ mod tests {
             // reset(3) with an ADMIN cap (is_recovery=false) → 0x43 (verify-layer tier).
             let (cap, pay) = cap_and_payload(&admin, false, 3, &[0x11; 16], 1, &min_be(0), None);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapabilityRejected),
                 "reset with admin tier ⇒ 0x43"
             );
@@ -5716,7 +6479,13 @@ mod tests {
             let (cap2, pay2) =
                 cap_and_payload(&recovery, true, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap2, pay2),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapabilityRejected),
                 "set_limits with recovery tier ⇒ 0x43"
             );
@@ -5737,7 +6506,13 @@ mod tests {
                 (Value::Integer(2.into()), Value::Bytes(min_be(0))),
             ];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay3), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay3),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapabilityRejected),
                 "request sub_op != cap sub_op ⇒ 0x43"
             );
@@ -5765,7 +6540,13 @@ mod tests {
                 (Value::Integer(4.into()), Value::Integer(250u64.into())),
             ];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, altered), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, altered),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapabilityRejected),
                 "altered params under a valid cap ⇒ payload_binding mismatch 0x43"
             );
@@ -5801,7 +6582,13 @@ mod tests {
                 (Value::Integer(4.into()), Value::Integer(1u64.into())),
             ];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::CapabilityRejected),
                 "fleet-scoped treasury cap ⇒ 0x43 (financial must be enclave, AC#12)"
             );
@@ -5819,7 +6606,13 @@ mod tests {
                 (Value::Integer(2.into()), Value::Bytes(min_be(1))),
             ];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay4), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay4),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::Malformed),
                 "unknown sub_op in the request ⇒ 0x40"
             );
@@ -5836,7 +6629,13 @@ mod tests {
                 (Value::Integer(2.into()), Value::Bytes(vec![0x01; 33])), // 33 bytes → over-width
             ];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::Malformed),
                 "over-width u256 ⇒ 0x40"
             );
@@ -5856,7 +6655,13 @@ mod tests {
                 (Value::Integer(3.into()), Value::Integer(7u64.into())), // unexpected extra key
             ];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::Malformed),
                 "extra key for refill ⇒ 0x40"
             );
@@ -5870,7 +6675,13 @@ mod tests {
             let (cap, pay) =
                 cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &env_for(cap, pay),
+                    &body,
+                    b"test-measurement"
+                )
+                .err(),
                 Some(AgentError::NotConfigured),
                 "rollback-sensitive ⇒ NotConfigured when the binding is absent"
             );
@@ -6085,7 +6896,7 @@ mod tests {
             let body = export_body(&admin, 2, true);
             let pre_next = body.audit.next_seq;
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
-            match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+            match dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").unwrap() {
                 AgentResponse::ExportBackup {
                     candidate,
                     backup_blob,
@@ -6191,7 +7002,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
                 Some(AgentError::CapabilityRejected)
             );
         }
@@ -6209,7 +7020,7 @@ mod tests {
                 &ExportSelector::KeyRefs(vec![[0xfe; 32]]),
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
                 Some(AgentError::KeyPurposeMismatch)
             );
         }
@@ -6222,7 +7033,7 @@ mod tests {
             let body = export_body(&admin, 2, false); // export_body substitutes a wrong-LENGTH recovery key
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
                 Some(AgentError::SealFailed)
             );
         }
@@ -6241,7 +7052,7 @@ mod tests {
             body.audit.capacity = body.audit.records.len() as u32;
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").err(),
                 Some(AgentError::SealFailed),
                 "EXPORT append on a saturated undrained ring fails closed — no drain, no commit"
             );
@@ -6260,7 +7071,7 @@ mod tests {
             };
             generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation).unwrap();
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::BatchId(7));
-            match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
+            match dispatch_agent(Profile::AgentGateway, &env, &body, b"test-measurement").unwrap() {
                 AgentResponse::ExportBackup { backup_blob, .. } => {
                     assert_eq!(&backup_blob[..8], b"2DAGTBK\0");
                 }
@@ -6269,8 +7080,237 @@ mod tests {
             // A batch_id matching NO key ⇒ 0x42.
             let env2 = export_env(&admin, &[0x12; 16], 1, &ExportSelector::BatchId(123));
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &env2, &body).err(),
+                dispatch_agent(Profile::AgentGateway, &env2, &body, b"test-measurement").err(),
                 Some(AgentError::KeyPurposeMismatch)
+            );
+        }
+    }
+
+    #[cfg(feature = "agent-backup-export-preview")]
+    mod restore_backup {
+        use super::*;
+        use crate::agent_backup::{
+            build_key_refs_manifest, build_restore_ingress_payload, compute_manifest_hash,
+            compute_original_backup_digest, seal_restore_ingress_envelope_with_m,
+            RecoveryHighWater, RECOVERY_HIGH_WATER_DOMAIN,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const RSCOPE: &[u8] = b"restore_backup";
+        const DEST_MEAS: &[u8] = b"dest-tee-measurement-v1";
+        const DEST_SEED: [u8; 64] = [0x6c; 64];
+        const INGRESS_M: [u8; 32] = [0x43; 32];
+
+        fn recovery_key() -> SigningKey {
+            SigningKey::from_bytes(&[0xa2; 32])
+        }
+
+        /// A source body with `n` transfer keys (the backup origin) — its payload + marks get restored.
+        fn source_body(n: usize) -> KeystoreBody {
+            let mut body = base_body();
+            let creation = CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 0,
+                batch_id: 1,
+            };
+            generate_keys(&mut body, KeyPurpose::AgentTransferK1, n, creation).unwrap();
+            body
+        }
+
+        /// Sign the recovery-authority high-water over the source's marks_payload (the EXACT preimage
+        /// verify_recovery_high_water expects: domain ‖ request_id ‖ marks_payload).
+        fn signed_high_water(
+            recovery: &SigningKey,
+            request_id: &[u8],
+            marks_payload: &[u8],
+        ) -> RecoveryHighWater {
+            let mut preimage = Vec::with_capacity(
+                RECOVERY_HIGH_WATER_DOMAIN.len() + request_id.len() + marks_payload.len(),
+            );
+            preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+            preimage.extend_from_slice(request_id);
+            preimage.extend_from_slice(marks_payload);
+            RecoveryHighWater {
+                marks_payload: marks_payload.to_vec(),
+                signature: recovery.sign(&preimage).to_bytes(),
+            }
+        }
+
+        /// The full dispatch envelope for a RESTORE_BACKUP request: a recovery-tier cap (key 5) + the
+        /// key-7 restore-request map {1: ingress envelope, 2: original backup, 3: refs, 4: high-water}.
+        fn restore_env(
+            signer: &SigningKey,
+            is_recovery: bool,
+            request_id: &[u8],
+            counter: u64,
+            n_keys: usize,
+        ) -> Vec<u8> {
+            // Publish the destination ephemeral (deterministic seed ⇒ the test knows the decaps key).
+            let dest_pub =
+                crate::agent_dispatch::install_restore_ephemeral_with_seed(&DEST_MEAS, &DEST_SEED)
+                    .unwrap();
+            // Source body → restore-ingress payload + manifest.
+            let src = source_body(n_keys);
+            let refs: Vec<[u8; 32]> = src.entries.iter().map(|e| e.key_ref).collect();
+            let payload = build_restore_ingress_payload(&src, &refs).unwrap().to_vec();
+            let manifest = build_key_refs_manifest(&refs).unwrap();
+            let manifest_hash = compute_manifest_hash(&manifest);
+            // Original backup blob + digest.
+            let original_backup = b"test-original-backup-blob".to_vec();
+            let backup_digest = compute_original_backup_digest(&original_backup);
+            // Seal the ingress envelope to the dest ephemeral (AAD' = measurement/chain/env/manifest/digest).
+            let envelope_blob = seal_restore_ingress_envelope_with_m(
+                &dest_pub.encaps_key,
+                DEST_MEAS,
+                11565,
+                "testnet",
+                &manifest_hash,
+                &backup_digest,
+                &payload,
+                &INGRESS_M,
+            )
+            .unwrap();
+            // Signed high-water over the source's marks_payload.
+            let hwm = signed_high_water(signer, request_id, &src.encode_marks_payload());
+            // Key-7 restore-request map.
+            let req_map = vec![
+                (Value::Integer(1.into()), Value::Bytes(envelope_blob)),
+                (Value::Integer(2.into()), Value::Bytes(original_backup)),
+                (
+                    Value::Integer(3.into()),
+                    Value::Array(refs.iter().map(|r| Value::Bytes(r.to_vec())).collect()),
+                ),
+                (
+                    Value::Integer(4.into()),
+                    Value::Map(vec![
+                        (
+                            Value::Integer(1.into()),
+                            Value::Bytes(hwm.marks_payload.clone()),
+                        ),
+                        (
+                            Value::Integer(2.into()),
+                            Value::Bytes(hwm.signature.to_vec()),
+                        ),
+                    ]),
+                ),
+            ];
+            // Recovery-tier cap (opcode 8, is_recovery=true). payload_binding is a placeholder — the
+            // handler does not yet enforce it (a 2c refinement; the high-water signature binds the request).
+            let cap = crate::agent_capability::test_signed_capability(
+                signer,
+                8,
+                request_id,
+                counter,
+                is_recovery,
+                11565,
+                "testnet",
+                0,
+                RSCOPE,
+                1,
+                [0xab; 32],
+                [0xe1; 32],
+            );
+            envelope_rid(
+                8,
+                request_id,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(req_map)),
+                ],
+            )
+        }
+
+        /// End-to-end: a recovery-tier RESTORE_BACKUP through dispatch_agent reconstitutes the source
+        /// keystore's entries into a fresh destination TEE + advances strict_recovery (AC#6) + structural
+        /// (local+1, AC#4). The full ceremony path — ephemeral decap, AAD' verify, signed-high-water
+        /// verify, AC#6 forward-only gate, wholesale-replace — runs inside the one dispatch call.
+        #[test]
+        fn restore_backup_restores_entries_end_to_end() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body(); // fresh TEE: empty entries
+                                        // The cap + high-water signatures both verify against the sealed recovery_authority_pk — set it
+                                        // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2);
+            let resp = dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).unwrap();
+            match resp {
+                AgentResponse::RestoreBackup { candidate, .. } => {
+                    assert_eq!(
+                        candidate.entries.len(),
+                        2,
+                        "the 2 source entries are restored"
+                    );
+                    assert_eq!(
+                        candidate.counters.len(),
+                        source_body(2).counters.len(),
+                        "counters match the source (base_body+generate_keys seeds none)"
+                    );
+                    assert_eq!(
+                        candidate.strict_recovery_counter, 1,
+                        "strict_recovery advanced (max(local 0, backup 0)+1)"
+                    );
+                    assert_eq!(candidate.structural_version, 2, "local+1 (1 → 2, AC#4)");
+                    assert_eq!(candidate.freshness_epoch, 2, "epoch advanced");
+                    assert_eq!(
+                        candidate.config.environment_identifier, "testnet",
+                        "config-identity restored from the payload"
+                    );
+                }
+                _ => panic!("expected RestoreBackup"),
+            }
+        }
+
+        /// AC#11 fail-closed: no ephemeral published (GET_RESTORE_PUBKEY not run / retired) ⇒ the
+        /// handler cannot decap ⇒ NotConfigured (the operator must publish one first). No partial import.
+        #[test]
+        fn restore_backup_no_ephemeral_fails_closed() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2); // builds + installs the ephemeral
+            retire_restore_ephemeral(); // …then retire it ⇒ the handler finds no ephemeral
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::NotConfigured),
+                "no published ephemeral ⇒ fail closed (NotConfigured)"
+            );
+        }
+
+        /// AC#11 fail-closed: the envelope's AAD' `dest_measurement` != THIS enclave's measurement (a
+        /// re-wrap for a DIFFERENT TEE) ⇒ the AAD' semantic check rejects ⇒ SealFailed. No partial import.
+        #[test]
+        fn restore_backup_measurement_mismatch_fails_closed() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2); // envelope AAD' measurement = DEST_MEAS
+                                                                       // Dispatch claiming a DIFFERENT measurement ⇒ opened.dest_measurement != OWN ⇒ SealFailed.
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, b"OTHER-tee-measurement").err(),
+                Some(AgentError::SealFailed),
+                "dest_measurement mismatch ⇒ fail closed (SealFailed)"
+            );
+        }
+
+        /// AC#11 fail-closed: an ADMIN-tier cap (is_recovery=false) on a RESTORE_BACKUP opcode ⇒ the
+        /// capability tier check rejects (AC#10: an admin authority cannot authorize a restore) ⇒
+        /// CapabilityRejected, BEFORE any handler logic runs. No partial import.
+        #[test]
+        fn restore_backup_admin_cap_rejected() {
+            let _g = gate_configured();
+            let admin = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
+            let mut dest = base_body();
+            dest.config.admin_authority_pk = admin.verifying_key().to_bytes();
+            dest.config.recovery_authority_pk = recovery_key().verifying_key().to_bytes();
+            // An ADMIN-signed cap (is_recovery=false) for opcode 8 — tier-mismatch.
+            let env = restore_env(&admin, false, &[0x11; 16], 1, 2);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::CapabilityRejected),
+                "an admin cap on RESTORE_BACKUP ⇒ tier-rejected (AC#10)"
             );
         }
     }
@@ -7515,31 +8555,51 @@ mod tests {
             // any process global, so no guard is needed. Driven through the real dispatch_agent.
             let b = base_body();
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &neg_unknown_envelope_key(), &b)
-                    .err()
-                    .unwrap()
-                    .code(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &neg_unknown_envelope_key(),
+                    &b,
+                    b"test-measurement"
+                )
+                .err()
+                .unwrap()
+                .code(),
                 0x40
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &neg_runtime_op_with_capability(), &b)
-                    .err()
-                    .unwrap()
-                    .code(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &neg_runtime_op_with_capability(),
+                    &b,
+                    b"test-measurement"
+                )
+                .err()
+                .unwrap()
+                .code(),
                 0x40
             );
             assert_eq!(
-                dispatch_agent(Profile::Producer, &neg_wrong_profile_env(), &b)
-                    .err()
-                    .unwrap()
-                    .code(),
+                dispatch_agent(
+                    Profile::Producer,
+                    &neg_wrong_profile_env(),
+                    &b,
+                    b"test-measurement"
+                )
+                .err()
+                .unwrap()
+                .code(),
                 0x41
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &neg_key_not_found(), &b)
-                    .err()
-                    .unwrap()
-                    .code(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &neg_key_not_found(),
+                    &b,
+                    b"test-measurement"
+                )
+                .err()
+                .unwrap()
+                .code(),
                 0x42
             );
         }
@@ -7551,17 +8611,27 @@ mod tests {
             let _g = gate_configured();
             let b = cap_body();
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &neg_cap_wrong_signature(), &b)
-                    .err()
-                    .unwrap()
-                    .code(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &neg_cap_wrong_signature(),
+                    &b,
+                    b"test-measurement"
+                )
+                .err()
+                .unwrap()
+                .code(),
                 0x43
             );
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &neg_cap_counter_gap(), &b)
-                    .err()
-                    .unwrap()
-                    .code(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &neg_cap_counter_gap(),
+                    &b,
+                    b"test-measurement"
+                )
+                .err()
+                .unwrap()
+                .code(),
                 0x43
             );
         }
@@ -7576,7 +8646,8 @@ mod tests {
                 dispatch_agent(
                     Profile::AgentGateway,
                     &neg_generate_keys_not_configured(),
-                    &b
+                    &b,
+                    b"test-measurement"
                 )
                 .err()
                 .unwrap()
