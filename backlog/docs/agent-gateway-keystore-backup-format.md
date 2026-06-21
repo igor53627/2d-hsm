@@ -283,8 +283,10 @@ Three keying assumptions, stated separately:
    - `(ingress_kem_ct, ss') = ML-KEM-1024.Encaps(dest_ephemeral_pubkey)`
    - `ingress_key = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ ss')`
    - `ChaCha20Poly1305(ingress_key, ingress_nonce, payload, AAD')`, with
-     `AAD' = dest_attestation/measurement ‖ chain_id ‖ environment_identifier ‖
-     key-ref-manifest-hash ‖ original-backup-digest ‖ ingress_kem_ct`.
+     `AAD'` (semantic content — the fields authenticated; see the **AAD' encoding (frozen)** block
+     immediately below for the authoritative byte layout, which additionally binds `magic`, `version`,
+     and the length prefixes + `ingress_nonce`): `dest_attestation/measurement ‖ chain_id ‖
+     environment_identifier ‖ key-ref-manifest-hash ‖ original-backup-digest ‖ ingress_kem_ct`.
      **AAD' encoding (frozen, TASK-24 AC#1):** the semantic field list above is authenticated as the
      EXACT serialized header bytes — `magic ‖ version ‖ lp16(dest_measurement) ‖ chain_id(u64) ‖
      lp16(env) ‖ manifest_hash(32) ‖ original_backup_digest(32) ‖ ingress_kem_ct(1568) ‖
@@ -301,7 +303,10 @@ Three keying assumptions, stated separately:
      `2DAGRIE\0` (distinct from `2DAGTBK\0`/`2DRIGV1\0`/`2DAGTKS\0`/`2DHSMV1\0`); `restore_ingress_envelope
      _format_version = 1` (independent of the backup envelope + payload + keystore versions). Frozen golden:
      `testvectors/agent-gateway/restore_ingress_envelope_v1.{bin,json}` + the dest-ephemeral keypair
-     fixtures `restore_ingress_dest_ephemeral_keypair_v1.{encaps,decaps}.bin`.
+     fixtures `restore_ingress_dest_ephemeral_keypair_v1.{encaps,decaps}.bin`. The golden is SELF-CONSISTENT
+     (minted + opened by the paired enclave seal/open; no external interop oracle) — same residual as the
+     TASK-13b backup-envelope golden; cross-implementation validation is a Slice-2 / operator-tooling
+     obligation once an independent operator-side re-wrap exists.
 
    (iv) the destination TEE decapsulates with its ephemeral private key and, **before
    importing**, verifies that the attestation/measurement in `AAD'` is its own, that
@@ -310,8 +315,15 @@ Three keying assumptions, stated separately:
    plaintext scalars **only inside itself**. Plaintext therefore exists only in the trusted
    offline recovery environment and inside the attested destination TEE — never in a
    runtime/production TEE on an untrusted host, and the recovery private key never enters any
-   production TEE. A routine image upgrade adds the new measurement to the allowlist;
-   arbitrary measurements are refused.
+     production TEE. A routine image upgrade adds the new measurement to the allowlist;
+     arbitrary measurements are refused. **Defense-in-depth framing (claude-code design review):** the
+     `dest_measurement == OWN` check inside the TEE is the SECOND line of defense; the PRIMARY anti-
+     substitution control is the OPERATOR verifying, out-of-band (step (ii)), that the attestation quote
+     cryptographically binds the published ephemeral encaps key to that measurement — so a host cannot
+     substitute its own ephemeral key and still produce a measurement the operator will re-wrap to. With a
+     correct ephemeral key, a substituted envelope already fails decap (wrong key); the in-TEE `== OWN`
+     check additionally catches a re-wrap made for a DIFFERENT but equally-attested destination. The
+     operator-side attestation→key binding is the load-bearing control and is the AC#12 out-of-scope step.
 
 **Counter / spend high-water seeding** (AC#11/#12 — never zero, never stale): on fresh-TEE
 restore the enclave **must not** initialise capability counters or faucet cumulative-spend

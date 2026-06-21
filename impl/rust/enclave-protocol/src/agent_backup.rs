@@ -1607,7 +1607,9 @@ mod tests {
     /// in_blob` for the backup envelope) — NOT the CBOR `restore_ingress_v1.bin`, whose `Vec<u8>` scalars
     /// serialize as CBOR integer-arrays (`0x18 0x77` per byte — see agent_keystore.rs ~line 272) and so
     /// are never a contiguous `[0x77;32]` run. The raw payload makes the non-vacuous assertion possible;
-    /// the AEAD ciphertext hides the secret from the envelope either way.
+    /// the AEAD ciphertext hides the secret from the envelope either way. Uses a DISTINCT encaps message
+    /// `m'` (NOT `INGRESS_M`) so this envelope does not share `(ingress_key, nonce=0)` with the golden —
+    /// the test corpus should exemplify the one-message-per-key discipline the module documents.
     #[test]
     fn ingress_envelope_no_plaintext_secret_leak() {
         let (dest_encaps, _dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
@@ -1625,7 +1627,7 @@ mod tests {
             &manifest_hash,
             &backup_digest,
             &raw_payload,
-            &INGRESS_M,
+            &[0x44; 32], // DISTINCT m' — not INGRESS_M; avoids (key, nonce) reuse with the golden
         )
         .unwrap();
         assert!(
@@ -1782,18 +1784,38 @@ mod tests {
         );
     }
 
-    /// (h) The ingress KDF domain is DISJOINT from the backup DEM domain: an `ss` that derives a valid
-    /// backup DEM key does NOT derive a valid ingress key (and vice versa). Proves the two KEM-DEM layers
-    /// are cryptographically disjoint — a shared secret from one layer cannot decrypt the other.
+    /// (h) Domain separation: the three ingress domains (the KDF `RESTORE_INGRESS_KDF_DOMAIN` + the two
+    /// hash domains `MANIFEST_HASH_DOMAIN` / `BACKUP_DIGEST_DOMAIN`) are DISTINCT strings, so for any one
+    /// input they yield distinct SHA3-256 outputs — a shared secret / manifest / backup blob cannot be
+    /// confused across the three uses. The KDF↔backup-DEM disjointness (a shared `ss` derives a different
+    /// ingress vs backup key) is the cryptographically load-bearing one; the KDF↔hash disjointness pins
+    /// the in-code claim that no two ingress domains collide for the same bytes. NB the domains are
+    /// domain-STRING-separated (not structurally prefix-free — `RESTORE_INGRESS_KDF_DOMAIN` is a prefix of
+    /// the two hash domains); under SHA3-256 with the structurally-distinct inputs each domain feeds, the
+    /// collision probability is negligible, matching the backup envelope's accepted `derive_payload_key`
+    /// pattern.
     #[test]
-    fn ingress_kdf_domain_disjoint_from_backup_domain() {
-        let ss = [0xaa; 32]; // arbitrary shared secret
+    fn ingress_domains_are_pairwise_disjoint() {
+        let ss = [0xaa; 32]; // arbitrary shared secret, reused as the "data" for every domain
         let backup_key = derive_payload_key(&ss);
         let ingress_key = derive_ingress_key(&ss);
+        let manifest_hash_of_ss = compute_manifest_hash(&ss);
+        let backup_digest_of_ss = compute_original_backup_digest(&ss);
+        assert_ne!(backup_key.as_ref(), ingress_key.as_ref(), "ingress KDF ≠ backup DEM key");
         assert_ne!(
-            backup_key.as_ref(),
             ingress_key.as_ref(),
-            "the two KDF domains must yield distinct keys for the same ss"
+            &manifest_hash_of_ss[..],
+            "ingress KDF domain ≠ manifest-hash domain for the same bytes"
+        );
+        assert_ne!(
+            ingress_key.as_ref(),
+            &backup_digest_of_ss[..],
+            "ingress KDF domain ≠ backup-digest domain for the same bytes"
+        );
+        assert_ne!(
+            manifest_hash_of_ss,
+            backup_digest_of_ss,
+            "manifest-hash domain ≠ backup-digest domain for the same bytes"
         );
     }
 
