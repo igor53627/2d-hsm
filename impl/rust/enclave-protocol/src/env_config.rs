@@ -32,8 +32,10 @@ pub const LEGACY_HSM_ANCHOR_RELAY_PORT: &str = "2D_HSM_ANCHOR_RELAY_PORT";
 pub const TWOD_HSM_ANCHOR_ENDPOINT: &str = "TWOD_HSM_ANCHOR_ENDPOINT";
 pub const LEGACY_HSM_ANCHOR_ENDPOINT: &str = "2D_HSM_ANCHOR_ENDPOINT";
 
-pub const TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str = "TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
-pub const LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str = "2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
+pub const TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str =
+    "TWOD_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
+pub const LEGACY_HSM_PRODUCER_ATTESTATION_TRUST_FILE: &str =
+    "2D_HSM_PRODUCER_ATTESTATION_TRUST_FILE";
 
 pub const TWOD_HSM_PQ_SEAL_V1_ROOT_FILE: &str = "TWOD_HSM_PQ_SEAL_V1_ROOT_FILE";
 pub const LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE: &str = "2D_HSM_PQ_SEAL_V1_ROOT_FILE";
@@ -114,7 +116,9 @@ fn env_u32_or(primary: &str, legacy: &str, default: u32) -> Result<u32, String> 
         // (fail closed), matching var_twod's documented contract + the sibling env_u32_twod; never
         // silently default over a corrupt env value.
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(_) => Err(format!("{primary} (or legacy {legacy}) must be valid UTF-8")),
+        Err(_) => Err(format!(
+            "{primary} (or legacy {legacy}) must be valid UTF-8"
+        )),
     }
 }
 
@@ -124,7 +128,9 @@ fn env_u64_or(primary: &str, legacy: &str, default: u64) -> Result<u64, String> 
             .parse::<u64>()
             .map_err(|_| format!("{primary} (or legacy {legacy}) must be a u64 (milliseconds)")),
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(_) => Err(format!("{primary} (or legacy {legacy}) must be valid UTF-8")),
+        Err(_) => Err(format!(
+            "{primary} (or legacy {legacy}) must be valid UTF-8"
+        )),
     }
 }
 
@@ -219,7 +225,10 @@ mod boot_budget_tests {
         assert_eq!(per_leg, Duration::from_millis(5_000));
         // Derived overall comfortably exceeds the bare nominal 3·per_leg·attempts (3 legs since 5b-2e).
         let bare_nominal = per_leg.checked_mul(3 * attempts).unwrap();
-        assert!(overall > bare_nominal, "derived overall {overall:?} must exceed bare nominal {bare_nominal:?}");
+        assert!(
+            overall > bare_nominal,
+            "derived overall {overall:?} must exceed bare nominal {bare_nominal:?}"
+        );
         clear();
     }
 
@@ -269,7 +278,10 @@ mod boot_budget_tests {
         clear();
         std::env::set_var(TWOD_HSM_BOOT_MAX_ATTEMPTS, "not-a-number");
         let err = boot_budget_config_from_env().unwrap_err();
-        assert!(err.contains(TWOD_HSM_BOOT_MAX_ATTEMPTS), "err names the var: {err}");
+        assert!(
+            err.contains(TWOD_HSM_BOOT_MAX_ATTEMPTS),
+            "err names the var: {err}"
+        );
         clear();
         std::env::set_var(TWOD_HSM_BOOT_PER_LEG_TIMEOUT_MS, "x");
         assert!(boot_budget_config_from_env().is_err());
@@ -298,7 +310,10 @@ mod boot_budget_tests {
             TWOD_HSM_BOOT_OVERALL_BUDGET_MS,
             std::ffi::OsStr::from_bytes(&[0xff]),
         );
-        assert!(boot_budget_config_from_env().is_err(), "non-UTF-8 overall must fail closed");
+        assert!(
+            boot_budget_config_from_env().is_err(),
+            "non-UTF-8 overall must fail closed"
+        );
         clear();
     }
 }

@@ -99,15 +99,20 @@ pub fn reference_keystore_body() -> KeystoreBody {
         .expect("REFERENCE_TRANSFER_SCALAR is a valid non-zero scalar < n");
     let treasury = crate::secp256k1::Keypair::from_secret_bytes(&REFERENCE_TREASURY_SCALAR)
         .expect("REFERENCE_TREASURY_SCALAR is a valid non-zero scalar < n");
-    let key_entry = |key_ref, purpose, kp: &crate::secp256k1::Keypair, scalar: &[u8; 32]| KeyEntry {
-        key_ref,
-        purpose,
-        algorithm: KeyAlgorithm::Secp256k1,
-        public_identity: kp.public_key_uncompressed().to_vec(),
-        secret_scalar: Zeroizing::new(scalar.to_vec()),
-        creation_metadata: CreationMetadata { config_version: 0, counter_snapshot: 0, batch_id: 0 },
-        backup_export_metadata: Default::default(),
-    };
+    let key_entry =
+        |key_ref, purpose, kp: &crate::secp256k1::Keypair, scalar: &[u8; 32]| KeyEntry {
+            key_ref,
+            purpose,
+            algorithm: KeyAlgorithm::Secp256k1,
+            public_identity: kp.public_key_uncompressed().to_vec(),
+            secret_scalar: Zeroizing::new(scalar.to_vec()),
+            creation_metadata: CreationMetadata {
+                config_version: 0,
+                counter_snapshot: 0,
+                batch_id: 0,
+            },
+            backup_export_metadata: Default::default(),
+        };
     KeystoreBody {
         config: KeystoreConfig {
             twod_chain_id: REFERENCE_CHAIN_ID,
@@ -122,8 +127,18 @@ pub fn reference_keystore_body() -> KeystoreBody {
             fleet_scope_id: [0xf1; 32],
         },
         entries: vec![
-            key_entry(REFERENCE_TRANSFER_KEY_REF, KeyPurpose::AgentTransferK1, &transfer, &REFERENCE_TRANSFER_SCALAR),
-            key_entry(REFERENCE_TREASURY_KEY_REF, KeyPurpose::AgentFaucetTreasuryK1, &treasury, &REFERENCE_TREASURY_SCALAR),
+            key_entry(
+                REFERENCE_TRANSFER_KEY_REF,
+                KeyPurpose::AgentTransferK1,
+                &transfer,
+                &REFERENCE_TRANSFER_SCALAR,
+            ),
+            key_entry(
+                REFERENCE_TREASURY_KEY_REF,
+                KeyPurpose::AgentFaucetTreasuryK1,
+                &treasury,
+                &REFERENCE_TREASURY_SCALAR,
+            ),
         ],
         counters: vec![],
         faucet: FaucetState {
@@ -135,7 +150,12 @@ pub fn reference_keystore_body() -> KeystoreBody {
             circuit_breaker_threshold: None,
             cumulative_signing_budget: u256_be(10_000_000),
         },
-        audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
+        audit: AuditRing {
+            records: vec![],
+            capacity: 256,
+            last_exported_seq: 0,
+            next_seq: 1,
+        },
         freshness_epoch: 1,
         structural_version: 1,
         strict_recovery_counter: 0,
@@ -165,7 +185,10 @@ mod tests {
     #[test]
     fn public_identity_matches_frozen_golden() {
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        assert!(install_reference_agent_keystore(), "reference keystore installs");
+        assert!(
+            install_reference_agent_keystore(),
+            "reference keystore installs"
+        );
 
         // A PUBLIC_IDENTITY(2) request envelope for the reference transfer key_ref (keys {1,2,3,4,6}).
         let k = |n: u64| Value::Integer(n.into());
@@ -173,10 +196,21 @@ mod tests {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(
                 &Value::Map(vec![
-                    (k(1), Value::Integer((crate::agent_identity::AGENT_GATEWAY_VERSION as u64).into())),
+                    (
+                        k(1),
+                        Value::Integer(
+                            (crate::agent_identity::AGENT_GATEWAY_VERSION as u64).into(),
+                        ),
+                    ),
                     (k(2), Value::Integer(2u64.into())),
-                    (k(3), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
-                    (k(4), Value::Bytes(b"contract-test:public-identity".to_vec())),
+                    (
+                        k(3),
+                        Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string()),
+                    ),
+                    (
+                        k(4),
+                        Value::Bytes(b"contract-test:public-identity".to_vec()),
+                    ),
                     (k(6), Value::Bytes(REFERENCE_TRANSFER_KEY_REF.to_vec())),
                 ]),
                 &mut buf,
@@ -186,7 +220,8 @@ mod tests {
         };
 
         let out = crate::agent_dispatch::handle_agent_gateway_frame(&env);
-        let frozen: &[u8] = include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin");
+        let frozen: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin");
         assert_eq!(
             out.as_slice(),
             frozen,
@@ -202,9 +237,20 @@ mod tests {
     fn reference_body_has_both_keys_and_funded_faucet() {
         let b = reference_keystore_body();
         assert_eq!(b.entries.len(), 2, "transfer + treasury");
-        assert!(b.entries.iter().any(|e| e.key_ref == REFERENCE_TRANSFER_KEY_REF && e.purpose == KeyPurpose::AgentTransferK1));
-        assert!(b.entries.iter().any(|e| e.key_ref == REFERENCE_TREASURY_KEY_REF && e.purpose == KeyPurpose::AgentFaucetTreasuryK1));
-        assert_ne!(b.faucet.cumulative_signing_budget, [0u8; 32], "faucet budget is non-zero");
+        assert!(b
+            .entries
+            .iter()
+            .any(|e| e.key_ref == REFERENCE_TRANSFER_KEY_REF
+                && e.purpose == KeyPurpose::AgentTransferK1));
+        assert!(b
+            .entries
+            .iter()
+            .any(|e| e.key_ref == REFERENCE_TREASURY_KEY_REF
+                && e.purpose == KeyPurpose::AgentFaucetTreasuryK1));
+        assert_ne!(
+            b.faucet.cumulative_signing_budget, [0u8; 32],
+            "faucet budget is non-zero"
+        );
         assert!(b.validate().is_ok(), "reference body validates");
     }
 
@@ -218,15 +264,30 @@ mod tests {
             serde_json::from_str(include_str!("../testvectors/agent-gateway/keys.json")).unwrap();
         let unhex = |s: &str| hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap();
         let b = reference_keystore_body();
-        let pubkey = |kr: [u8; 32]| b.entries.iter().find(|e| e.key_ref == kr).unwrap().public_identity.clone();
+        let pubkey = |kr: [u8; 32]| {
+            b.entries
+                .iter()
+                .find(|e| e.key_ref == kr)
+                .unwrap()
+                .public_identity
+                .clone()
+        };
         assert_eq!(
             pubkey(REFERENCE_TRANSFER_KEY_REF),
-            unhex(keys["transfer_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+            unhex(
+                keys["transfer_key"]["pubkey_uncompressed_sec1"]
+                    .as_str()
+                    .unwrap()
+            ),
             "transfer pubkey == keys.json transfer_key",
         );
         assert_eq!(
             pubkey(REFERENCE_TREASURY_KEY_REF),
-            unhex(keys["treasury_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
+            unhex(
+                keys["treasury_key"]["pubkey_uncompressed_sec1"]
+                    .as_str()
+                    .unwrap()
+            ),
             "treasury pubkey == keys.json treasury_key",
         );
     }
@@ -237,14 +298,21 @@ mod tests {
     /// Slice-3 mutating-op contract lane will accept the frozen vectors (not just PUBLIC_IDENTITY).
     #[test]
     fn task22_generate_keys_cap_verifies_against_reference_config() {
-        let cap_bytes: &[u8] = include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin");
+        let cap_bytes: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin");
         let cap = match ciborium::de::from_reader::<Value, _>(cap_bytes).unwrap() {
             Value::Map(m) => m,
             _ => panic!("cap_full is a CBOR map"),
         };
         let rid: &[u8] = b"0x40-golden:cap:generate-keys:v1";
         assert_eq!(
-            crate::agent_capability::verify_capability(&cap, 1, rid, &reference_keystore_body().config, &[]),
+            crate::agent_capability::verify_capability(
+                &cap,
+                1,
+                rid,
+                &reference_keystore_body().config,
+                &[]
+            ),
             Ok(()),
             "frozen TASK-22 generate-keys cap must verify against the reference config",
         );

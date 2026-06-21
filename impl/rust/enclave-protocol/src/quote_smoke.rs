@@ -121,7 +121,8 @@ fn prefixed_residue() -> Result<Vec<String>, String> {
     for entry in entries {
         // Surface a read error, never skip it: a swallowed DirEntry fault could hide a stale
         // twod-hsm-q-* entry and turn gc-clean into a false residue=0 PASS (review finding).
-        let entry = entry.map_err(|e| format!("read_dir entry under {TSM_REPORT_DIR} failed: {e}"))?;
+        let entry =
+            entry.map_err(|e| format!("read_dir entry under {TSM_REPORT_DIR} failed: {e}"))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             return Err(format!("non-UTF-8 entry name under {TSM_REPORT_DIR} (cannot rule out a stale prefix entry)"));
@@ -141,7 +142,11 @@ fn prefixed_residue() -> Result<Vec<String>, String> {
 /// the whole-millisecond `poll(2)` truncation + single-tick early wake — see the slop const).
 fn phase_vsock_lapse() -> Result<String, String> {
     let start = Instant::now();
-    let r = connect_bounded_for_smoke(BLACK_HOLE_CID, BLACK_HOLE_PORT, start + LAPSE_PROBE_DEADLINE);
+    let r = connect_bounded_for_smoke(
+        BLACK_HOLE_CID,
+        BLACK_HOLE_PORT,
+        start + LAPSE_PROBE_DEADLINE,
+    );
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis();
     let floor = LAPSE_PROBE_DEADLINE - LAPSE_ELAPSED_FLOOR_SLOP;
@@ -164,7 +169,9 @@ fn phase_vsock_lapse() -> Result<String, String> {
         }
         // Covers the veto arm (kernel timer / unknown-CID RST preempted the lapse) and every other
         // arm: never a silent pass — the observed string is the triage.
-        Err(e) => Err(format!("expected the lapse arm, observed: {e} elapsed_ms={elapsed_ms}")),
+        Err(e) => Err(format!(
+            "expected the lapse arm, observed: {e} elapsed_ms={elapsed_ms}"
+        )),
     }
 }
 
@@ -186,7 +193,9 @@ fn phase_gc_seed() -> Result<String, String> {
         Err(e) => return Err(format!("mkdir {path} failed: {e}")),
     }
     if !std::path::Path::new(&path).is_dir() {
-        return Err(format!("seed {path} not present after mkdir (configfs lifecycle anomaly)"));
+        return Err(format!(
+            "seed {path} not present after mkdir (configfs lifecycle anomaly)"
+        ));
     }
     Ok(format!("seeded={path}"))
 }
@@ -206,17 +215,24 @@ fn phase_budget_claim() -> Result<(HardBoundedQuoteProducer, ValidatedBootBudget
         .map_err(|e| format!("first production() refused: {e}"))?;
     match HardBoundedQuoteProducer::production(&budget) {
         Ok(_) => {
-            return Err("second production() unexpectedly SUCCEEDED (claim permanence broken)"
-                .to_string())
+            return Err(
+                "second production() unexpectedly SUCCEEDED (claim permanence broken)".to_string(),
+            )
         }
         Err(e) => {
             let s = e.to_string();
             if !s.contains("quote producer: process quote ledger already claimed") {
-                return Err(format!("second production() refused with the WRONG error: {e}"));
+                return Err(format!(
+                    "second production() refused with the WRONG error: {e}"
+                ));
             }
         }
     }
-    Ok((producer, budget, "claim=permanent second-claim=refused".to_string()))
+    Ok((
+        producer,
+        budget,
+        "claim=permanent second-claim=refused".to_string(),
+    ))
 }
 
 /// The shared quote-leg call for phases 4 (`quote-1`: goals i+ii+iii healthy path — §8 acceptance
@@ -236,8 +252,9 @@ fn fetch_and_check(
     rd: &[u8; 64],
 ) -> Result<String, String> {
     let deadline = Instant::now() + budget.per_leg_timeout();
-    let (report, _cert_chain) =
-        producer.fetch(rd, deadline).map_err(|e| format!("fetch failed: {e}"))?;
+    let (report, _cert_chain) = producer
+        .fetch(rd, deadline)
+        .map_err(|e| format!("fetch failed: {e}"))?;
     if report.len() < REAL_REPORT_MIN_LEN {
         return Err(format!(
             "report below the real-quote ABI floor: report_len={} min={REAL_REPORT_MIN_LEN}",
@@ -246,13 +263,22 @@ fn fetch_and_check(
     }
     let echoed = report
         .get(REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64)
-        .ok_or_else(|| format!("report shorter than the echo window: report_len={}", report.len()))?;
+        .ok_or_else(|| {
+            format!(
+                "report shorter than the echo window: report_len={}",
+                report.len()
+            )
+        })?;
     if echoed != rd.as_slice() {
         return Err("report_data echo mismatch at offset 0x50".to_string());
     }
     let measurement =
         measurement_from_report(&report).map_err(|e| format!("measurement extract failed: {e}"))?;
-    Ok(format!("report_len={} measurement={}", report.len(), hex(&measurement)))
+    Ok(format!(
+        "report_len={} measurement={}",
+        report.len(),
+        hex(&measurement)
+    ))
 }
 
 /// Phase 5 — `gc-clean` (goal iii GC half; §8 "no-stale-entry-after-kill via the child-side prefix
@@ -268,7 +294,10 @@ fn phase_gc_clean() -> Result<String, String> {
     if residue.is_empty() {
         Ok("residue=0".to_string())
     } else {
-        Err(format!("stale prefix entries survived the child GC: {}", residue.join(",")))
+        Err(format!(
+            "stale prefix entries survived the child GC: {}",
+            residue.join(",")
+        ))
     }
 }
 
@@ -343,19 +372,21 @@ pub fn run_quote_smoke() -> ExitCode {
     phase(
         "quote-2",
         match claimed.as_mut() {
-            Some((producer, budget)) => fetch_and_check(producer, budget, &RD_B).and_then(|detail| {
-                // Single-claim reuse proven (second fetch, SAME producer, attempts=2 budget) —
-                // re-assert prefix-cleanliness after the second child exits.
-                let residue = prefixed_residue()?;
-                if residue.is_empty() {
-                    Ok(format!("{detail} post-fetch-residue=0"))
-                } else {
-                    Err(format!(
-                        "prefix entries survived the second fetch: {}",
-                        residue.join(",")
-                    ))
-                }
-            }),
+            Some((producer, budget)) => {
+                fetch_and_check(producer, budget, &RD_B).and_then(|detail| {
+                    // Single-claim reuse proven (second fetch, SAME producer, attempts=2 budget) —
+                    // re-assert prefix-cleanliness after the second child exits.
+                    let residue = prefixed_residue()?;
+                    if residue.is_empty() {
+                        Ok(format!("{detail} post-fetch-residue=0"))
+                    } else {
+                        Err(format!(
+                            "prefix entries survived the second fetch: {}",
+                            residue.join(",")
+                        ))
+                    }
+                })
+            }
             None => Err("skipped: no producer (budget-claim failed)".to_string()),
         },
     );

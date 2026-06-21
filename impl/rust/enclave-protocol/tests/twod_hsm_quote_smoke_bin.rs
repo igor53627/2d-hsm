@@ -60,7 +60,11 @@ fn bin_dispatches_first_and_stdout_is_byte_exact_err1() {
         ERR1_FRAME,
         "stdout must be EXACTLY the 2-byte ERR(1) frame (full-buffer equality, not the parser)"
     );
-    assert_eq!(out.status.code(), Some(1), "bad/missing report_data env exits 1");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "bad/missing report_data env exits 1"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("twod-hsm quote child: exit 1"),
@@ -91,5 +95,9 @@ fn bin_child_emits_byte_exact_err2_on_configfs_less_host() {
         ERR2_FRAME,
         "stdout must be EXACTLY the 2-byte ERR(2) frame (entry create fails first deviceless)"
     );
-    assert_eq!(out.status.code(), Some(2), "configfs create failure exits 2");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "configfs create failure exits 2"
+    );
 }

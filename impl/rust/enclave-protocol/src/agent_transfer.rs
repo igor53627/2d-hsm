@@ -138,7 +138,13 @@ pub(crate) fn sign_transfer(
     if recovered_addr != from {
         return Err(SignTransferError::RecoveryMismatch);
     }
-    Ok(SignedTransfer { signature, v, signing_hash, signed_rlp: signed, from })
+    Ok(SignedTransfer {
+        signature,
+        v,
+        signing_hash,
+        signed_rlp: signed,
+        from,
+    })
 }
 
 #[cfg(test)]
@@ -148,8 +154,10 @@ mod tests {
 
     const ORD: &str = include_str!("../testvectors/agent-gateway/ordinary_tx_v1.json");
     const KEYS: &str = include_str!("../testvectors/agent-gateway/keys.json");
-    const PREIMAGE_BIN: &[u8] = include_bytes!("../testvectors/agent-gateway/ordinary_tx_v1.preimage.bin");
-    const SIGNED_BIN: &[u8] = include_bytes!("../testvectors/agent-gateway/ordinary_tx_v1.signed.bin");
+    const PREIMAGE_BIN: &[u8] =
+        include_bytes!("../testvectors/agent-gateway/ordinary_tx_v1.preimage.bin");
+    const SIGNED_BIN: &[u8] =
+        include_bytes!("../testvectors/agent-gateway/ordinary_tx_v1.signed.bin");
     const SIGNING_HASH_BIN: &[u8] =
         include_bytes!("../testvectors/agent-gateway/ordinary_tx_v1.signing_hash.bin");
 
@@ -159,7 +167,9 @@ mod tests {
 
     fn transfer_keypair() -> Keypair {
         let k: Value = serde_json::from_str(KEYS).unwrap();
-        let sk: [u8; 32] = unhex(k["transfer_key"]["privkey"].as_str().unwrap()).try_into().unwrap();
+        let sk: [u8; 32] = unhex(k["transfer_key"]["privkey"].as_str().unwrap())
+            .try_into()
+            .unwrap();
         Keypair::from_secret_bytes(&sk).unwrap()
     }
 
@@ -191,8 +201,15 @@ mod tests {
     fn preimage_and_hash_match_golden() {
         let pre = unsigned_preimage(&golden_fields());
         assert_eq!(pre[0] >= 0xc0, true, "RLP list head >= 0xc0");
-        assert_eq!(pre, PREIMAGE_BIN, "preimage byte-exact vs ordinary_tx_v1.preimage.bin");
-        assert_eq!(keccak256(&pre).as_slice(), SIGNING_HASH_BIN, "signing hash byte-exact");
+        assert_eq!(
+            pre, PREIMAGE_BIN,
+            "preimage byte-exact vs ordinary_tx_v1.preimage.bin"
+        );
+        assert_eq!(
+            keccak256(&pre).as_slice(),
+            SIGNING_HASH_BIN,
+            "signing hash byte-exact"
+        );
     }
 
     #[test]
@@ -202,18 +219,37 @@ mod tests {
 
         // signature byte-exact + low-S + v + recovery_id
         let sig = &o["signature"];
-        assert_eq!(signed.signature.r.to_vec(), unhex(sig["r"].as_str().unwrap()), "r");
-        assert_eq!(signed.signature.s.to_vec(), unhex(sig["s"].as_str().unwrap()), "s");
+        assert_eq!(
+            signed.signature.r.to_vec(),
+            unhex(sig["r"].as_str().unwrap()),
+            "r"
+        );
+        assert_eq!(
+            signed.signature.s.to_vec(),
+            unhex(sig["s"].as_str().unwrap()),
+            "s"
+        );
         assert_eq!(
             signed.signature.recovery_id as u64,
             sig["recovery_id"].as_u64().unwrap(),
             "recovery_id"
         );
-        assert_eq!(signed.v, sig["v_eip155"].as_u64().unwrap(), "v = chain_id*2+35+rid");
-        assert_eq!(signed.signing_hash.as_slice(), SIGNING_HASH_BIN, "signing hash");
+        assert_eq!(
+            signed.v,
+            sig["v_eip155"].as_u64().unwrap(),
+            "v = chain_id*2+35+rid"
+        );
+        assert_eq!(
+            signed.signing_hash.as_slice(),
+            SIGNING_HASH_BIN,
+            "signing hash"
+        );
 
         // signed RLP byte-exact (the broadcastable artifact) + from
-        assert_eq!(signed.signed_rlp, SIGNED_BIN, "signed_rlp byte-exact vs ordinary_tx_v1.signed.bin");
+        assert_eq!(
+            signed.signed_rlp, SIGNED_BIN,
+            "signed_rlp byte-exact vs ordinary_tx_v1.signed.bin"
+        );
         assert_eq!(
             format!("0x{}", hex::encode(signed.from)),
             o["fields"]["from"].as_str().unwrap(),
@@ -281,7 +317,8 @@ mod tests {
         f.gas_limit = u64::MAX;
         let pre = unsigned_preimage(&f);
         assert!(
-            pre.windows(9).any(|w| w == [0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            pre.windows(9)
+                .any(|w| w == [0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
             "u64::MAX RLP-encodes as 0x88 followed by 8 0xff bytes"
         );
         // The recovery==from invariant still holds at max width (Ok proves it — it is checked inside).

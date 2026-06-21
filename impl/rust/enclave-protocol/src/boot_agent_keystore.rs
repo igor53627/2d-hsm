@@ -43,7 +43,8 @@ use crate::ProtocolError;
 /// committed genesis golden vector is sealed under THIS exact value, single-sourced here so the generator
 /// and the fallback cannot drift. The real attested 48-byte SNP launch measurement is a DEFERRED production
 /// obligation (the production seam derives it from the configfs-tsm/SNP report; never a placeholder).
-pub const AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT: &[u8] = b"agent-keystore-measurement-placeholder";
+pub const AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT: &[u8] =
+    b"agent-keystore-measurement-placeholder";
 
 /// Configure the agent provisioning root once at boot, BEFORE [`unseal_agent_keystore_at_boot`].
 ///
@@ -62,7 +63,9 @@ pub fn boot_configure_agent_seal_root() -> Result<(), ProtocolError> {
 
 #[cfg(feature = "lab-agent-keystore-from-file")]
 fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
-    use crate::env_config::{var_twod, LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE, TWOD_HSM_PQ_SEAL_V1_ROOT_FILE};
+    use crate::env_config::{
+        var_twod, LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE, TWOD_HSM_PQ_SEAL_V1_ROOT_FILE,
+    };
     let path = var_twod(TWOD_HSM_PQ_SEAL_V1_ROOT_FILE, LEGACY_HSM_PQ_SEAL_V1_ROOT_FILE).map_err(|_| {
         ProtocolError::PqSigningUnavailable(
             "agent keystore: TWOD_HSM_PQ_SEAL_V1_ROOT_FILE not set (expected path to a 32-byte provisioning root)",
@@ -75,7 +78,9 @@ fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
         "agent keystore: failed to read TWOD_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
     )?;
     bytes.try_into().map_err(|_| {
-        ProtocolError::PqSigningUnavailable("agent keystore: provisioning root file must be exactly 32 bytes")
+        ProtocolError::PqSigningUnavailable(
+            "agent keystore: provisioning root file must be exactly 32 bytes",
+        )
     })
 }
 
@@ -97,7 +102,8 @@ fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
 /// VERBATIM; (5) map any `KeystoreError` to a coarse `agent keystore:`-labelled `PqSigningUnavailable`.
 ///
 /// [`KeystoreBody`]: crate::agent_keystore::KeystoreBody
-pub fn unseal_agent_keystore_at_boot() -> Result<(crate::agent_keystore::KeystoreBody, Vec<u8>), ProtocolError> {
+pub fn unseal_agent_keystore_at_boot(
+) -> Result<(crate::agent_keystore::KeystoreBody, Vec<u8>), ProtocolError> {
     let measurement = agent_boot_measurement()?;
     let blob = agent_sealed_keystore_blob()?;
     // resolve_provisioning_root fails closed in a real build if no root was set; under cfg(test) /
@@ -110,8 +116,8 @@ pub fn unseal_agent_keystore_at_boot() -> Result<(crate::agent_keystore::Keystor
             "agent keystore: provisioning root not configured (run boot_configure_agent_seal_root at boot)",
         )
     })?;
-    let body =
-        crate::agent_keystore::unseal_body(&blob, &root, &measurement).map_err(map_keystore_error)?;
+    let body = crate::agent_keystore::unseal_body(&blob, &root, &measurement)
+        .map_err(map_keystore_error)?;
     Ok((body, measurement))
 }
 
@@ -124,7 +130,10 @@ fn agent_sealed_keystore_blob() -> Result<Vec<u8>, ProtocolError> {
     };
     // Try the file path FIRST; if not found (first boot), fall back to the provisioning ceremony
     // (only available on Linux + vsock-transport + agent-gateway — otherwise fail closed).
-    match var_twod(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE) {
+    match var_twod(
+        TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
+        LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE,
+    ) {
         Ok(path) => {
             // Check existence FIRST: read_boot_file_capped maps File::open errors to
             // PqSigningUnavailable (not Io), so a missing file wouldn't be distinguishable from
@@ -202,11 +211,11 @@ fn agent_sealed_keystore_blob_from_provisioning_or_fail() -> Result<Vec<u8>, Pro
     feature = "agent-gateway"
 ))]
 fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolError> {
-    use crate::provision_bootstrap::ProvisionReportProducer;
     use crate::env_config::{
-        var_twod, LEGACY_HSM_OPERATOR_CA_ROOT_HEX, TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE,
-        LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_OPERATOR_CA_ROOT_HEX,
+        var_twod, LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_OPERATOR_CA_ROOT_HEX,
+        TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, TWOD_HSM_OPERATOR_CA_ROOT_HEX,
     };
+    use crate::provision_bootstrap::ProvisionReportProducer;
     use std::io::Write as _;
 
     // Resolve the pinned operator CA root pubkey (hex → 32 bytes). LAB/DEV: from env var.
@@ -219,7 +228,7 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
     let ca_hex_trimmed = ca_hex.trim();
     if ca_hex_trimmed.len() != 64 {
         return Err(ProtocolError::PqSigningUnavailable(
-            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX must be exactly 64 hex chars (32 bytes)"
+            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX must be exactly 64 hex chars (32 bytes)",
         ));
     }
     let mut ca_arr = [0u8; 32];
@@ -227,27 +236,27 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
         let pair = &ca_hex_trimmed[i * 2..i * 2 + 2];
         *byte = u8::from_str_radix(pair, 16).map_err(|_| {
             ProtocolError::PqSigningUnavailable(
-                "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not valid hex"
+                "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not valid hex",
             )
         })?;
     }
     let pinned_root = ed25519_dalek::VerifyingKey::from_bytes(&ca_arr).map_err(|_| {
         ProtocolError::PqSigningUnavailable(
-            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not a valid Ed25519 public key"
+            "agent keystore: TWOD_HSM_OPERATOR_CA_ROOT_HEX is not a valid Ed25519 public key",
         )
     })?;
 
     // Resolve the provisioning vsock port (distinct from serve 5000 + relay 5001 — Q5).
     let prov_port = crate::vsock_addr::provisioning_vsock_port_from_env().map_err(|msg| {
         ProtocolError::PqSigningUnavailable(
-            "agent keystore: invalid provisioning vsock port config (see prior log line)"
+            "agent keystore: invalid provisioning vsock port config (see prior log line)",
         )
     })?;
 
     // Resolve the seal root (set at step A) + measurement (the existing source).
     let seal_root = crate::seal_root::resolve_provisioning_root().map_err(|_| {
         ProtocolError::PqSigningUnavailable(
-            "agent keystore: provisioning root not configured for the sealing ceremony"
+            "agent keystore: provisioning root not configured for the sealing ceremony",
         )
     })?;
     let measurement = agent_boot_measurement()?;
@@ -260,7 +269,10 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
     // the enclave).
     struct LabReportProducer;
     impl ProvisionReportProducer for LabReportProducer {
-        fn fetch_report(&self, _report_data: &[u8; 64]) -> Result<Vec<u8>, crate::agent_provision::ProvisionError> {
+        fn fetch_report(
+            &self,
+            _report_data: &[u8; 64],
+        ) -> Result<Vec<u8>, crate::agent_provision::ProvisionError> {
             // A fixed mock 1184-byte report. On a real SNP guest, this would call
             // snp_report::fetch_measurement_and_report with the report_data embedded in REPORT_DATA.
             Ok(vec![0u8; crate::agent_provision::SNP_REPORT_LEN])
@@ -280,9 +292,9 @@ fn agent_sealed_keystore_blob_from_provisioning() -> Result<Vec<u8>, ProtocolErr
             &LabReportProducer,
             idle_timeout,
         )
-        .map_err(|e| ProtocolError::PqSigningUnavailable(
-            "agent keystore: provisioning ceremony failed"
-        ))?;
+        .map_err(|e| {
+            ProtocolError::PqSigningUnavailable("agent keystore: provisioning ceremony failed")
+        })?;
 
     // Persist the sealed blob to the keystore file path (the HOST would do this in a real TEE;
     // in the lab/dev host process, we write it directly so subsequent boots unseal it).
@@ -407,8 +419,8 @@ fn map_keystore_error(e: crate::agent_keystore::KeystoreError) -> ProtocolError 
 mod tests {
     use super::*;
     use crate::agent_keystore::{
-        seal_keystore_with_nonce, unseal_body, AuditRing, FaucetState, KeystoreBody, KeystoreConfig,
-        MAX_KEYSTORE_BLOB_SIZE,
+        seal_keystore_with_nonce, unseal_body, AuditRing, FaucetState, KeystoreBody,
+        KeystoreConfig, MAX_KEYSTORE_BLOB_SIZE,
     };
     use crate::env_config::{
         LEGACY_HSM_AGENT_SEALED_KEYSTORE_FILE, LEGACY_HSM_ENCLAVE_MEASUREMENT_FILE,
@@ -419,7 +431,8 @@ mod tests {
     // The committed reference provisioning root — the genesis golden is sealed under it so a cfg(test)
     // unit run (resolve_provisioning_root's fallback returns this) unseals with NO root file, and the
     // root-step / integration tests point the root file at these same bytes.
-    const GOLDEN_AGENT_ROOT: &[u8; 32] = include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
+    const GOLDEN_AGENT_ROOT: &[u8; 32] =
+        include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
     /// Fixed nonce → byte-stable genesis golden blob (the only randomness in the seal).
     const GOLDEN_AGENT_NONCE: [u8; 24] = [0x5d; 24];
 
@@ -482,7 +495,12 @@ mod tests {
                 circuit_breaker_threshold: None,
                 cumulative_signing_budget: [0; 32],
             },
-            audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
+            audit: AuditRing {
+                records: vec![],
+                capacity: 256,
+                last_exported_seq: 0,
+                next_seq: 1,
+            },
             freshness_epoch: 1,
             structural_version: 1,
             strict_recovery_counter: 0,
@@ -536,7 +554,10 @@ mod tests {
         let err = unseal_agent_keystore_at_boot().unwrap_err();
         match err {
             ProtocolError::PqSigningUnavailable(s) => {
-                assert!(s.contains("TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE"), "names the var: {s}");
+                assert!(
+                    s.contains("TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE"),
+                    "names the var: {s}"
+                );
             }
             other => panic!("expected PqSigningUnavailable, got {other:?}"),
         }
@@ -643,12 +664,16 @@ mod tests {
         let (_d1, p1) = write_blob(&bad_magic);
         std::env::set_var(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, &p1);
         let e1 = unseal_agent_keystore_at_boot().unwrap_err();
-        assert!(matches!(e1, ProtocolError::PqSigningUnavailable(s) if s.contains("malformed sealed blob")));
+        assert!(
+            matches!(e1, ProtocolError::PqSigningUnavailable(s) if s.contains("malformed sealed blob"))
+        );
         // Too short.
         let (_d2, p2) = write_blob(&[0x00u8; 4]);
         std::env::set_var(TWOD_HSM_AGENT_SEALED_KEYSTORE_FILE, &p2);
         let e2 = unseal_agent_keystore_at_boot().unwrap_err();
-        assert!(matches!(e2, ProtocolError::PqSigningUnavailable(s) if s.contains("malformed sealed blob")));
+        assert!(
+            matches!(e2, ProtocolError::PqSigningUnavailable(s) if s.contains("malformed sealed blob"))
+        );
     }
 
     #[cfg(feature = "lab-agent-keystore-from-file")]
@@ -705,7 +730,13 @@ mod tests {
     #[test]
     fn map_keystore_error_total_and_coarse() {
         use crate::agent_keystore::KeystoreError as K;
-        for e in [K::MeasurementMismatch, K::UnsupportedVersion, K::InvalidStructuralVersion, K::Cbor, K::Decrypt] {
+        for e in [
+            K::MeasurementMismatch,
+            K::UnsupportedVersion,
+            K::InvalidStructuralVersion,
+            K::Cbor,
+            K::Decrypt,
+        ] {
             match map_keystore_error(e) {
                 ProtocolError::PqSigningUnavailable(s) => {
                     assert!(s.starts_with("agent keystore:"), "prefixed: {s}");
@@ -772,9 +803,21 @@ mod tests {
     fn genesis_body_seals_and_unseals_round_trip() {
         // The genesis fixture is a valid v4 body that round-trips through the seal envelope.
         let blob = genesis_sealed_blob();
-        assert_eq!(&blob[8..10], &[0x00, 0x04], "format_version 4 in the header");
-        assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE, "genesis blob is re-installable");
-        let body = unseal_body(&blob, GOLDEN_AGENT_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT).unwrap();
+        assert_eq!(
+            &blob[8..10],
+            &[0x00, 0x04],
+            "format_version 4 in the header"
+        );
+        assert!(
+            blob.len() <= MAX_KEYSTORE_BLOB_SIZE,
+            "genesis blob is re-installable"
+        );
+        let body = unseal_body(
+            &blob,
+            GOLDEN_AGENT_ROOT,
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+        )
+        .unwrap();
         assert_eq!(body, genesis_body());
     }
 
@@ -790,11 +833,21 @@ mod tests {
             "genesis golden drifted; if the body layout/format_version changed intentionally, regen via \
              `regen_agent_genesis_golden_vector` and re-mint the .json sidecar in the same commit"
         );
-        assert_eq!(&committed[8..10], &[0x00, 0x04], "format_version 4 (literal)");
-        assert!(committed.len() <= MAX_KEYSTORE_BLOB_SIZE, "golden blob is re-installable");
-        let body =
-            unseal_body(committed, GOLDEN_AGENT_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
-                .expect("committed golden unseals");
+        assert_eq!(
+            &committed[8..10],
+            &[0x00, 0x04],
+            "format_version 4 (literal)"
+        );
+        assert!(
+            committed.len() <= MAX_KEYSTORE_BLOB_SIZE,
+            "golden blob is re-installable"
+        );
+        let body = unseal_body(
+            committed,
+            GOLDEN_AGENT_ROOT,
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+        )
+        .expect("committed golden unseals");
         assert_eq!(body, genesis_body());
     }
 
@@ -807,8 +860,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let blob: &[u8] =
             include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
-        let sidecar =
-            include_str!("../testvectors/agent-gateway/agent_keystore_genesis_v2.json");
+        let sidecar = include_str!("../testvectors/agent-gateway/agent_keystore_genesis_v2.json");
         let hex = |bytes: &[u8]| -> String {
             let mut s = String::with_capacity(bytes.len() * 2);
             for b in bytes {
@@ -826,8 +878,16 @@ mod tests {
         let nonce = hex(&GOLDEN_AGENT_NONCE);
         let meas = hex(AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT);
         let root = hex(GOLDEN_AGENT_ROOT);
-        assert_eq!(v["blob_sha256"].as_str(), Some(sha.as_str()), "sidecar blob_sha256 drift — re-mint .json");
-        assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "sidecar blob_len_bytes drift");
+        assert_eq!(
+            v["blob_sha256"].as_str(),
+            Some(sha.as_str()),
+            "sidecar blob_sha256 drift — re-mint .json"
+        );
+        assert_eq!(
+            v["blob_len_bytes"].as_u64(),
+            Some(blob.len() as u64),
+            "sidecar blob_len_bytes drift"
+        );
         // Couple the documented format version to BOTH the const AND the actual header bytes [8],[9]
         // (big-endian) so a version bump that re-mints the blob but leaves the sidecar string stale fails CI.
         assert_eq!(
@@ -840,7 +900,11 @@ mod tests {
             Some(u64::from(u16::from_be_bytes([blob[8], blob[9]]))),
             "sidecar keystore_format_version drift vs blob header"
         );
-        assert_eq!(v["envelope"]["nonce_hex"].as_str(), Some(nonce.as_str()), "sidecar nonce_hex drift");
+        assert_eq!(
+            v["envelope"]["nonce_hex"].as_str(),
+            Some(nonce.as_str()),
+            "sidecar nonce_hex drift"
+        );
         assert_eq!(
             v["seal_inputs"]["enclave_measurement_hex"].as_str(),
             Some(meas.as_str()),

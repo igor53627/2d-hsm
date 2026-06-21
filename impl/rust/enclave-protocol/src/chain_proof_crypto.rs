@@ -53,9 +53,9 @@ impl ProducerAttestationTrust {
 ))]
 pub fn reference_test_attestation_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[
-        0x3d, 0x40, 0x4b, 0x52, 0x36, 0x7b, 0x5b, 0x8f, 0x86, 0x3c, 0x1f, 0x2e, 0x9a, 0x0d,
-        0x44, 0x8b, 0x6e, 0x2c, 0x4a, 0x1f, 0x9b, 0x5e, 0x7c, 0x3a, 0x8d, 0x2f, 0x1c, 0x6b,
-        0x9e, 0x4a, 0x7d, 0x2c,
+        0x3d, 0x40, 0x4b, 0x52, 0x36, 0x7b, 0x5b, 0x8f, 0x86, 0x3c, 0x1f, 0x2e, 0x9a, 0x0d, 0x44,
+        0x8b, 0x6e, 0x2c, 0x4a, 0x1f, 0x9b, 0x5e, 0x7c, 0x3a, 0x8d, 0x2f, 0x1c, 0x6b, 0x9e, 0x4a,
+        0x7d, 0x2c,
     ])
 }
 
@@ -226,9 +226,7 @@ pub fn verify_recent_chain_proof_crypto(
     }
 
     let signature_bytes = proof.signature_from_recent_producer.as_deref().ok_or(
-        ProtocolError::RecentChainProofValidation(
-            "signature_from_recent_producer is required",
-        ),
+        ProtocolError::RecentChainProofValidation("signature_from_recent_producer is required"),
     )?;
 
     if signature_bytes.len() != PRODUCER_ATTESTATION_SIGNATURE_LEN {
@@ -237,15 +235,9 @@ pub fn verify_recent_chain_proof_crypto(
         ));
     }
 
-    let signature = Signature::from_bytes(
-        signature_bytes
-            .try_into()
-            .map_err(|_| {
-                ProtocolError::RecentChainProofValidation(
-                    "invalid Ed25519 signature encoding",
-                )
-            })?,
-    );
+    let signature = Signature::from_bytes(signature_bytes.try_into().map_err(|_| {
+        ProtocolError::RecentChainProofValidation("invalid Ed25519 signature encoding")
+    })?);
 
     let preimage =
         recent_chain_proof_signing_preimage(proof, authorized, parsed.recovery_tail_digest);
@@ -278,14 +270,9 @@ mod tests {
         let authorized = sample_authorized();
         let sk = reference_test_attestation_signing_key();
         let trust = reference_test_attestation_trust();
-        let proof = build_signed_recent_chain_proof(
-            150,
-            [0xFE; 32],
-            vec![[0xCA; 32]],
-            &authorized,
-            &sk,
-        )
-        .unwrap();
+        let proof =
+            build_signed_recent_chain_proof(150, [0xFE; 32], vec![[0xCA; 32]], &authorized, &sk)
+                .unwrap();
 
         verify_recent_chain_proof_crypto(&proof, &authorized, &trust).unwrap();
     }
@@ -316,14 +303,9 @@ mod tests {
         let authorized = sample_authorized();
         let sk = reference_test_attestation_signing_key();
         let trust = reference_test_attestation_trust();
-        let proof = build_signed_recent_chain_proof(
-            150,
-            [0xFE; 32],
-            vec![[0xCA; 32]],
-            &authorized,
-            &sk,
-        )
-        .unwrap();
+        let proof =
+            build_signed_recent_chain_proof(150, [0xFE; 32], vec![[0xCA; 32]], &authorized, &sk)
+                .unwrap();
         let mut bad_arm = authorized.clone();
         bad_arm.measurement = b"attacker-measurement".to_vec();
         assert!(verify_recent_chain_proof_crypto(&proof, &bad_arm, &trust).is_err());
@@ -334,14 +316,9 @@ mod tests {
         let authorized = sample_authorized();
         let sk = reference_test_attestation_signing_key();
         let trust = reference_test_attestation_trust();
-        let mut proof = build_signed_recent_chain_proof(
-            150,
-            [0xFE; 32],
-            vec![[0xCA; 32]],
-            &authorized,
-            &sk,
-        )
-        .unwrap();
+        let mut proof =
+            build_signed_recent_chain_proof(150, [0xFE; 32], vec![[0xCA; 32]], &authorized, &sk)
+                .unwrap();
         proof.finalized_height = 999;
         assert!(verify_recent_chain_proof_crypto(&proof, &authorized, &trust).is_err());
     }
@@ -351,14 +328,9 @@ mod tests {
         let authorized = sample_authorized();
         let sk = reference_test_attestation_signing_key();
         let trust = reference_test_attestation_trust();
-        let mut proof = build_signed_recent_chain_proof(
-            150,
-            [0xFE; 32],
-            vec![[0xCA; 32]],
-            &authorized,
-            &sk,
-        )
-        .unwrap();
+        let mut proof =
+            build_signed_recent_chain_proof(150, [0xFE; 32], vec![[0xCA; 32]], &authorized, &sk)
+                .unwrap();
         proof.proof_data.push(0xFF);
         assert!(verify_recent_chain_proof_crypto(&proof, &authorized, &trust).is_err());
     }

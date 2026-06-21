@@ -23,13 +23,13 @@
 //!
 //! Built only under the `agent-gateway` feature.
 
+use crate::agent_capability::VerifiedCapability;
 use crate::agent_identity::{
     public_identity_from_entry, IdentityProof, PublicIdentity, AGENT_GATEWAY_VERSION,
 };
-use crate::agent_transfer::SignedTransfer;
-use crate::agent_capability::VerifiedCapability;
 use crate::agent_keygen::{generate_keys, GenerateKeysError, GeneratedKey};
 use crate::agent_keystore::{seal_body, CreationMetadata, KeyPurpose, KeystoreBody};
+use crate::agent_transfer::SignedTransfer;
 use ciborium::value::Value;
 use std::sync::Mutex;
 
@@ -176,27 +176,36 @@ impl AgentOpcode {
             // marks-covered. ACCEPTED RESIDUAL: Structural means a dropped/crashed EXPORT seal forces a
             // next-boot StructuralGap⇒restore (an availability cost for a routinely-run op), traded for
             // audit completeness.
-            // RESTORE_BACKUP (TASK-13b slice 2; handler deferred): wholesale-REPLACES the keystore body —
-            // entries / config / audit / `structural_version` — from the backup. Those are non-marks,
-            // non-AdoptForward-reconstructable surfaces the seeder (`seed_marks_forward`) silently drops, so
-            // EpochOnly would be UNSAFE: a dropped/crashed RESTORE seal would AdoptForward and SILENTLY LOSE
-            // the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
-            // already burned), and a successful RESTORE installs the backup's `structural_version` which,
-            // un-bumped on the anchor under EpochOnly, would mismatch next boot. Structural ⇒ a dropped seal
-            // triggers StructuralGap⇒restore (re-attempt, never a silent rollback). The earlier "EpochOnly
-            // because `strict_recovery_counter` is marks-covered" reasoning was INCOMPLETE — it covered only
-            // the counter, not the body replace (gemini PR #93). OPEN for the handler slice: RESTORE is the
-            // ONE committed op whose `structural_version` is SET from the backup (a non-monotone transition —
-            // it can be lower OR higher than the running enclave's), NOT a plain monotone `++`; the handler
-            // slice MUST define the post-restore anchor structural value (backup vs backup+1 vs local+1) +
-            // the reconcile rule that ADMITS a restored value not equal to `local+1` — almost certainly a
-            // DISTINCT recovery-ceremony path tied to `strict_recovery_counter` AC#11/#12, NOT this ordinary
-            // Structural `advance_commit_epoch(true)` `++`. Classing RESTORE Structural is the fail-closed-safe
-            // forward-declaration (a dropped seal can't silently regress); the exact structural mechanism is
-            // deferred with the handler.
-            Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup | Self::RestoreBackup => {
-                CommitBumpClass::Structural
-            }
+            // RESTORE_BACKUP (TASK-13b slice 2; handler deferred → TASK-24): wholesale-REPLACES the
+            // keystore body — entries / config-identity / counters / faucet / audit RECORDS — from the
+            // restore-ingress payload, and sets enclave-local `structural_version` + `freshness_epoch`
+            // (the payload carries NEITHER — AC#4). Those replaced surfaces are non-marks,
+            // non-AdoptForward-reconstructable (the seeder `seed_marks_forward` overwrites ONLY counters/
+            // spend/strict_recovery_counter), so EpochOnly would be UNSAFE: a dropped/crashed RESTORE seal
+            // would AdoptForward over a same-structural gap and SILENTLY LOSE the restore (the enclave stays
+            // in the pre-restore body while the `strict_recovery_counter` already burned). Structural ⇒ a
+            // dropped seal triggers StructuralGap⇒restore (re-attempt, never a silent rollback).
+            // DECISION (TASK-24 AC#4/#5, the `local+1` structural_version strategy): RESTORE stays
+            // `Structural` — it bumps `structural_version = local+1` via the ordinary
+            // `advance_commit_epoch(true)` `++`, NOT a backup-seeded or strict_recovery_counter-seeded value
+            // (the payload carries no structural_version; AC#4 sets it enclave-locally). The AC#5 invariant
+            // — "a dropped/crashed RESTORE seal ⇒ StructuralGap→restore-retry, never a silent rollback" — is
+            // SATISFIED by Structural + local+1: the anchor records structural+1 while a dropped seal leaves
+            // the local body at the pre-restore structural, so next-boot reconcile sees anchor-structural >
+            // local-structural ⇒ StructuralGap (AdoptForward fires ONLY on a same-structural_version gap —
+            // `boot_reconcile_anti_rollback`; verified by the agent_boot reconcile tests). The wholesale body
+            // replace touches non-marks surfaces (entries/config/audit) that AdoptForward can't reconstruct,
+            // which is EXACTLY why Structural (not EpochOnly) is correct. A distinct
+            // `CommitBumpClass::RestoreCeremony` is RESERVED as the extension point for a future non-local+1
+            // structural_version (e.g. backup-seeded), where the reconcile would need to admit a restored
+            // value != local+1; under local+1 that capability is unused, so the class is YAGNI for now. The
+            // RESTORE handler's RECOVERY-SPECIFIC mutation (vs a normal Structural op) is the forward-only
+            // `strict_recovery_counter` advance (AC#6, a marks surface) + the AC#11/#12 seeding gate — both
+            // handler-side, before the commit; they do NOT require a distinct commit class.
+            Self::GenerateKeys
+            | Self::ConfigureTreasury
+            | Self::ExportBackup
+            | Self::RestoreBackup => CommitBumpClass::Structural,
             // EPOCH-ONLY — the op's FULL effect is captured in the anchor's authenticated marks (so
             // AdoptForward reconstructs it byte-for-byte): ONLY SIGN_FAUCET_DISPENSE. PINNED to its handler
             // (`handle_sign_faucet_dispense`): the sole candidate-body mutation is `candidate.faucet =
@@ -207,7 +216,9 @@ impl AgentOpcode {
             // committed op touches a non-marks surface ⇒ Structural.
             Self::SignFaucetDispense => CommitBumpClass::EpochOnly,
             // NOT rollback-sensitive — no per-op commit (the commit path is gated on is_rollback_sensitive).
-            Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => CommitBumpClass::NotCommitted,
+            Self::SignTransfer | Self::PublicIdentity | Self::ProveIdentity => {
+                CommitBumpClass::NotCommitted
+            }
         }
     }
 }
@@ -575,8 +586,8 @@ fn handle_public_identity(
 ) -> Result<AgentResponse, AgentError> {
     let key_ref = env.key_ref.ok_or(AgentError::Malformed)?;
     // not-found collapses with wrong-purpose to 0x42 (anti-oracle).
-    let entry =
-        crate::agent_identity::find_entry(keystore, &key_ref).ok_or(AgentError::KeyPurposeMismatch)?;
+    let entry = crate::agent_identity::find_entry(keystore, &key_ref)
+        .ok_or(AgentError::KeyPurposeMismatch)?;
     let identity = public_identity_from_entry(entry).map_err(|_| AgentError::KeyPurposeMismatch)?;
     Ok(AgentResponse::PublicIdentity(identity))
 }
@@ -601,7 +612,8 @@ fn load_keypair_for(
     }
     let mut secret = zeroize::Zeroizing::new([0u8; 32]);
     secret.copy_from_slice(&entry.secret_scalar);
-    crate::secp256k1::Keypair::from_secret_bytes(&secret).map_err(|_| AgentError::KeyPurposeMismatch)
+    crate::secp256k1::Keypair::from_secret_bytes(&secret)
+        .map_err(|_| AgentError::KeyPurposeMismatch)
 }
 
 /// PROVE_IDENTITY(3): sign the EIP-191 identity proof for `key_ref` over the verifier-supplied
@@ -623,8 +635,8 @@ fn handle_prove_identity(
         Some(v) => as_bytes32(v).ok_or(AgentError::Malformed)?,
         None => return Err(AgentError::Malformed),
     };
-    let entry =
-        crate::agent_identity::find_entry(keystore, &key_ref).ok_or(AgentError::KeyPurposeMismatch)?;
+    let entry = crate::agent_identity::find_entry(keystore, &key_ref)
+        .ok_or(AgentError::KeyPurposeMismatch)?;
     let keypair = load_keypair_for(entry)?;
     let proof = sign_identity_proof(
         &keypair,
@@ -665,17 +677,33 @@ fn handle_sign_transfer(
     if payload.len() != 8 || !check_strict_keys(payload, |n| (1..=8).contains(&n)) {
         return Err(AgentError::Malformed);
     }
-    let req_chain_id = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let req_from = map_get(payload, 2).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
-    let to = map_get(payload, 3).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
-    let value_be = map_get(payload, 4).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
-    let nonce = map_get(payload, 5).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let gas_limit = map_get(payload, 6).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let gas_price_be = map_get(payload, 7).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+    let req_chain_id = map_get(payload, 1)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let req_from = map_get(payload, 2)
+        .and_then(as_bytes_n::<20>)
+        .ok_or(AgentError::Malformed)?;
+    let to = map_get(payload, 3)
+        .and_then(as_bytes_n::<20>)
+        .ok_or(AgentError::Malformed)?;
+    let value_be = map_get(payload, 4)
+        .and_then(as_u256_minimal_be)
+        .ok_or(AgentError::Malformed)?;
+    let nonce = map_get(payload, 5)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let gas_limit = map_get(payload, 6)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let gas_price_be = map_get(payload, 7)
+        .and_then(as_u256_minimal_be)
+        .ok_or(AgentError::Malformed)?;
     // data MUST be present and empty (MVP — non-empty calldata is a separate, semantically-parsed
     // command; §1). A precomputed-digest / arbitrary-bytes request can only land here as `data`, and a
     // non-empty `data` fails closed → there is no generic-digest signing path.
-    let data = map_get(payload, 8).and_then(as_bytes).ok_or(AgentError::Malformed)?;
+    let data = map_get(payload, 8)
+        .and_then(as_bytes)
+        .ok_or(AgentError::Malformed)?;
     if !data.is_empty() {
         return Err(AgentError::Malformed);
     }
@@ -699,7 +727,14 @@ fn handle_sign_transfer(
     if req_from != keypair.eth_address() {
         return Err(AgentError::KeyPurposeMismatch);
     }
-    let fields = EthTransferFields { chain_id: req_chain_id, nonce, gas_limit, to, value_be, gas_price_be };
+    let fields = EthTransferFields {
+        chain_id: req_chain_id,
+        nonce,
+        gas_limit,
+        to,
+        value_be,
+        gas_price_be,
+    };
     // Collapse any signing failure (the ~2^-128 x-reduced recovery_id rejection, or the
     // recovery==from invariant) to the per-key bucket — SIGN_TRANSFER never seals, so NOT SealFailed
     // (0x46). ValueTooWide/ChainIdOverflow are unreachable here (caps pre-validated above).
@@ -767,15 +802,31 @@ fn handle_sign_faucet_dispense(
     if payload.len() != 8 || !check_strict_keys(payload, |n| (1..=8).contains(&n)) {
         return Err(AgentError::Malformed);
     }
-    let req_chain_id = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let req_from = map_get(payload, 2).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
-    let to = map_get(payload, 3).and_then(as_bytes_n::<20>).ok_or(AgentError::Malformed)?;
-    let value_be = map_get(payload, 4).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
-    let nonce = map_get(payload, 5).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let gas_limit = map_get(payload, 6).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let gas_price_be = map_get(payload, 7).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+    let req_chain_id = map_get(payload, 1)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let req_from = map_get(payload, 2)
+        .and_then(as_bytes_n::<20>)
+        .ok_or(AgentError::Malformed)?;
+    let to = map_get(payload, 3)
+        .and_then(as_bytes_n::<20>)
+        .ok_or(AgentError::Malformed)?;
+    let value_be = map_get(payload, 4)
+        .and_then(as_u256_minimal_be)
+        .ok_or(AgentError::Malformed)?;
+    let nonce = map_get(payload, 5)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let gas_limit = map_get(payload, 6)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let gas_price_be = map_get(payload, 7)
+        .and_then(as_u256_minimal_be)
+        .ok_or(AgentError::Malformed)?;
     // data MUST be present and empty (native dispenses only — no calldata/memo, §2).
-    let data = map_get(payload, 8).and_then(as_bytes).ok_or(AgentError::Malformed)?;
+    let data = map_get(payload, 8)
+        .and_then(as_bytes)
+        .ok_or(AgentError::Malformed)?;
     if !data.is_empty() {
         return Err(AgentError::Malformed);
     }
@@ -827,7 +878,14 @@ fn handle_sign_faucet_dispense(
     // seal-before-emit commit succeeds). Collapse a signing failure (the ~2^-128 x-reduced recovery_id
     // rejection / recovery==from invariant) to the per-key bucket (0x42) — NOT SealFailed (0x46 is
     // reserved for the frame layer's seal/anchor-commit failure).
-    let fields = EthTransferFields { chain_id: req_chain_id, nonce, gas_limit, to, value_be, gas_price_be };
+    let fields = EthTransferFields {
+        chain_id: req_chain_id,
+        nonce,
+        gas_limit,
+        to,
+        value_be,
+        gas_price_be,
+    };
     let signed = sign_transfer(&keypair, &fields).map_err(|_| AgentError::KeyPurposeMismatch)?;
     // CANDIDATE: clone live → install the debited faucet → advance the EpochOnly commit (freshness_epoch
     // ONLY; the debit changed the marks surfaces cumulative_native_spend/lifetime_spend, which the
@@ -836,8 +894,10 @@ fn handle_sign_faucet_dispense(
     // rather than a hardcoded bool; an epoch overflow fails closed (0x46) with no swap.
     let mut candidate = keystore.clone();
     candidate.faucet = new_faucet;
-    let bumps_structural =
-        matches!(AgentOpcode::SignFaucetDispense.commit_bump_class(), CommitBumpClass::Structural);
+    let bumps_structural = matches!(
+        AgentOpcode::SignFaucetDispense.commit_bump_class(),
+        CommitBumpClass::Structural
+    );
     candidate
         .advance_commit_epoch(bumps_structural)
         .map_err(|_| AgentError::SealFailed)?;
@@ -884,7 +944,11 @@ pub(crate) fn configure_treasury_canonical_params(
         set_limits_gas_fields.is_some(),
         "set_limits(0) ⇔ gas fields present",
     );
-    let n_keys: u64 = if set_limits_gas_fields.is_some() { 4 } else { 2 };
+    let n_keys: u64 = if set_limits_gas_fields.is_some() {
+        4
+    } else {
+        2
+    };
     let mut out = Vec::new();
     put_uint(&mut out, 5, n_keys); // definite-length map header (RFC 8949 shortest form)
     put_uint(&mut out, 0, 1);
@@ -917,8 +981,12 @@ fn handle_generate_keys(
     if payload.len() != 2 {
         return Err(AgentError::Malformed);
     }
-    let purpose_code = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
-    let count = map_get(payload, 2).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let purpose_code = map_get(payload, 1)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
+    let count = map_get(payload, 2)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
     let purpose = match purpose_code {
         1 => KeyPurpose::AgentTransferK1,
         2 => KeyPurpose::AgentFaucetTreasuryK1,
@@ -988,8 +1056,10 @@ fn handle_generate_keys(
     // 6-4 — it is now LIVE alongside the commit (still only under `agent-keygen-exec-preview`).
     // This handler is GENERATE_KEYS-specific; derive its bump class from the single-source classifier
     // (Structural — key mint is anchor-unreconstructable) rather than a hardcoded bool.
-    let bumps_structural =
-        matches!(AgentOpcode::GenerateKeys.commit_bump_class(), CommitBumpClass::Structural);
+    let bumps_structural = matches!(
+        AgentOpcode::GenerateKeys.commit_bump_class(),
+        CommitBumpClass::Structural
+    );
     candidate
         .advance_commit_epoch(bumps_structural)
         .map_err(|_| AgentError::SealFailed)?;
@@ -1052,23 +1122,36 @@ fn handle_configure_treasury(
     // ---- ORDER 3: request shape / payload decode (0x40 Malformed) ----
     // payload (envelope key 7) = strict `{1: sub_op, ...per-sub-op fields}`. Decode the selector first.
     let payload = env.payload.as_deref().ok_or(AgentError::Malformed)?;
-    let sub_op_u64 = map_get(payload, 1).and_then(as_u64).ok_or(AgentError::Malformed)?;
+    let sub_op_u64 = map_get(payload, 1)
+        .and_then(as_u64)
+        .ok_or(AgentError::Malformed)?;
     let sub_op = u8::try_from(sub_op_u64).map_err(|_| AgentError::Malformed)?;
 
     // Decoded + lifted per-sub-op fields, carried from the shape phase to the mutation phase so the
     // anti-oracle band order (decode 0x40 → bind 0x43 → limits 0x44) is preserved.
     enum Params {
-        SetLimits { per_dispense_max: [u8; 32], max_gas_limit: u64, max_fee_rate: u64 },
-        RefillBudget { new_budget: [u8; 32] },
-        RaiseBreaker { new_threshold: [u8; 32] },
-        ResetBreaker { target_lifetime_spend: [u8; 32] },
+        SetLimits {
+            per_dispense_max: [u8; 32],
+            max_gas_limit: u64,
+            max_fee_rate: u64,
+        },
+        RefillBudget {
+            new_budget: [u8; 32],
+        },
+        RaiseBreaker {
+            new_threshold: [u8; 32],
+        },
+        ResetBreaker {
+            target_lifetime_spend: [u8; 32],
+        },
     }
     // Read a u256 field: BOTH the on-wire minimal-BE bytes (for the canonical_params preimage) and the
     // lifted `[u8; 32]` (for mutation/comparison). `as_u256_minimal_be` already bounds len ≤ 32, so
     // `from_minimal_be` cannot widen-reject — the `ok_or` is defense-in-depth (matches the faucet handler).
     let read_u256 = |key: u64| -> Result<(Vec<u8>, [u8; 32]), AgentError> {
-        let minimal =
-            map_get(payload, key).and_then(as_u256_minimal_be).ok_or(AgentError::Malformed)?;
+        let minimal = map_get(payload, key)
+            .and_then(as_u256_minimal_be)
+            .ok_or(AgentError::Malformed)?;
         let lifted = crate::u256::from_minimal_be(&minimal).ok_or(AgentError::Malformed)?;
         Ok((minimal, lifted))
     };
@@ -1082,14 +1165,25 @@ fn handle_configure_treasury(
                 return Err(AgentError::Malformed);
             }
             let (f2_min, per_dispense_max) = read_u256(2)?;
-            let max_gas_limit = map_get(payload, 3).and_then(as_u64).ok_or(AgentError::Malformed)?;
-            let max_fee_rate = map_get(payload, 4).and_then(as_u64).ok_or(AgentError::Malformed)?;
+            let max_gas_limit = map_get(payload, 3)
+                .and_then(as_u64)
+                .ok_or(AgentError::Malformed)?;
+            let max_fee_rate = map_get(payload, 4)
+                .and_then(as_u64)
+                .ok_or(AgentError::Malformed)?;
             let cp = configure_treasury_canonical_params(
                 sub_op,
                 &f2_min,
                 Some((max_gas_limit, max_fee_rate)),
             );
-            (Params::SetLimits { per_dispense_max, max_gas_limit, max_fee_rate }, cp)
+            (
+                Params::SetLimits {
+                    per_dispense_max,
+                    max_gas_limit,
+                    max_fee_rate,
+                },
+                cp,
+            )
         }
         1 => {
             // refill_budget: {1: sub_op, 2: new_cumulative_signing_budget(u256)}
@@ -1120,7 +1214,9 @@ fn handle_configure_treasury(
             }
             let (f2_min, target_lifetime_spend) = read_u256(2)?;
             (
-                Params::ResetBreaker { target_lifetime_spend },
+                Params::ResetBreaker {
+                    target_lifetime_spend,
+                },
                 configure_treasury_canonical_params(sub_op, &f2_min, None),
             )
         }
@@ -1164,7 +1260,11 @@ fn handle_configure_treasury(
     // treasury-key rotation (AC#17 — `FaucetState` is keyed independently of any `key_ref`) is preserved.
     let mut candidate = keystore.clone();
     match params {
-        Params::SetLimits { per_dispense_max, max_gas_limit, max_fee_rate } => {
+        Params::SetLimits {
+            per_dispense_max,
+            max_gas_limit,
+            max_fee_rate,
+        } => {
             // Forward config — no ordering constraint vs current spend; touches ONLY the limit triple.
             candidate.faucet.per_dispense_max_amount = per_dispense_max;
             candidate.faucet.max_gas_limit = max_gas_limit;
@@ -1191,7 +1291,9 @@ fn handle_configure_treasury(
             }
             candidate.faucet.circuit_breaker_threshold = Some(new_threshold);
         }
-        Params::ResetBreaker { target_lifetime_spend } => {
+        Params::ResetBreaker {
+            target_lifetime_spend,
+        } => {
             // Recovery-tier: clears the breaker and LOWERS `lifetime_spend` to a recovery target. `target`
             // can only LOWER (≤ current) — raising `lifetime_spend` is not a reset (and would be a covert
             // spend deflation/inflation of the lifetime total) ⇒ 0x44 on target > current. Advances the
@@ -1231,15 +1333,21 @@ fn handle_configure_treasury(
     // itself a rollback control; wrapping would corrupt the audit trail / break monotonicity. The
     // anti-rollback fence is the Structural `freshness_epoch`+`structural_version` bump below, which
     // every CONFIGURE sub-op rides.)
-    candidate.advance_treasury_config_version().map_err(|_| AgentError::SealFailed)?;
+    candidate
+        .advance_treasury_config_version()
+        .map_err(|_| AgentError::SealFailed)?;
 
     // Anti-rollback commit-epoch bump from the SUB-OP-level classifier. ALL FOUR sub-ops are Structural
     // (freshness_epoch + structural_version together) — including reset_lifetime_breaker, whose
     // marks-DECREASE + non-marks mutations are not AdoptForward-reconstructable (see the classifier docs).
     // A dropped seal therefore reconciles StructuralGap→restore for every sub-op. Overflow ⇒ 0x46, no swap.
-    let bumps_structural =
-        matches!(configure_treasury_sub_op_bump_class(sub_op), CommitBumpClass::Structural);
-    candidate.advance_commit_epoch(bumps_structural).map_err(|_| AgentError::SealFailed)?;
+    let bumps_structural = matches!(
+        configure_treasury_sub_op_bump_class(sub_op),
+        CommitBumpClass::Structural
+    );
+    candidate
+        .advance_commit_epoch(bumps_structural)
+        .map_err(|_| AgentError::SealFailed)?;
 
     // AC#14 audit record (slice 4c-1): append this privileged CONFIGURE op's full provenance onto the
     // finalized candidate ring — mirror of the 4b GENERATE_KEYS append. MUST be on the candidate BEFORE it
@@ -1324,9 +1432,9 @@ fn decode_export_selector(payload: &[(Value, Value)]) -> Result<ExportSelector, 
             }
             Ok(ExportSelector::KeyRefs(refs))
         }
-        (None, Some(v)) if payload.len() == 1 => {
-            Ok(ExportSelector::BatchId(as_u64(v).ok_or(AgentError::Malformed)?))
-        }
+        (None, Some(v)) if payload.len() == 1 => Ok(ExportSelector::BatchId(
+            as_u64(v).ok_or(AgentError::Malformed)?,
+        )),
         _ => Err(AgentError::Malformed), // both keys, or a stray key alongside one
     }
 }
@@ -1422,18 +1530,24 @@ fn handle_export_backup(
     // append above (0x46) and this drain never runs. EXPORT is NOT a guaranteed escape hatch; that is the
     // fail-closed-safe choice (drain-before-append would evict un-exported history). See the
     // keystore-backup-format §5 note + the `export_saturated_undrained_ring_fails_closed` test.
-    candidate.advance_export_high_water().map_err(|_| AgentError::SealFailed)?;
-    let bumps_structural =
-        matches!(AgentOpcode::ExportBackup.commit_bump_class(), CommitBumpClass::Structural);
-    candidate.advance_commit_epoch(bumps_structural).map_err(|_| AgentError::SealFailed)?;
+    candidate
+        .advance_export_high_water()
+        .map_err(|_| AgentError::SealFailed)?;
+    let bumps_structural = matches!(
+        AgentOpcode::ExportBackup.commit_bump_class(),
+        CommitBumpClass::Structural
+    );
+    candidate
+        .advance_commit_epoch(bumps_structural)
+        .map_err(|_| AgentError::SealFailed)?;
 
     // Build the DR blob from the POST-append candidate (so it captures the export's own audit record). The
     // manifest is built from the SAME ordered refs as the payload entries (structural consistency).
     let ordered = crate::agent_backup::selected_key_refs(&candidate, &requested);
     let payload_bytes = crate::agent_backup::build_restore_ingress_payload(&candidate, &ordered)
         .map_err(|_| AgentError::SealFailed)?;
-    let manifest =
-        crate::agent_backup::build_key_refs_manifest(&ordered).map_err(|_| AgentError::SealFailed)?;
+    let manifest = crate::agent_backup::build_key_refs_manifest(&ordered)
+        .map_err(|_| AgentError::SealFailed)?;
     let recovery_key = &candidate.config.backup_recovery_wrapping_pubkey;
     let recovery_key_id = crate::agent_backup::derive_recovery_key_id(recovery_key);
     let backup_blob = crate::agent_backup::seal_backup_blob(
@@ -1498,7 +1612,10 @@ pub fn install_agent_keystore(body: KeystoreBody, enclave_measurement: &[u8]) ->
     }
     match INSTALLED_KEYSTORE.lock() {
         Ok(mut guard) if guard.is_none() => {
-            *guard = Some(InstalledAgentKeystore { body, measurement: enclave_measurement.to_vec() });
+            *guard = Some(InstalledAgentKeystore {
+                body,
+                measurement: enclave_measurement.to_vec(),
+            });
             true
         }
         _ => false,
@@ -1507,7 +1624,10 @@ pub fn install_agent_keystore(body: KeystoreBody, enclave_measurement: &[u8]) ->
 
 /// Whether an agent keystore is installed (i.e. this instance runs the Agent Gateway profile).
 pub fn is_agent_keystore_installed() -> bool {
-    INSTALLED_KEYSTORE.lock().map(|g| g.is_some()).unwrap_or(false)
+    INSTALLED_KEYSTORE
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1596,7 +1716,10 @@ fn draw_commit_nonce() -> Result<[u8; 32], AgentError> {
 /// and the caller MUST NOT swap / emit and MUST discard the already-computed sealed blob (no offline
 /// window). The coarse fail-closed `SealFailed` keeps the anti-oracle surface minimal. Called under the
 /// `INSTALLED_KEYSTORE` lock, so the commit-channel round-trip is serialized.
-fn commit_candidate_to_anchor(candidate: &KeystoreBody, request_id: &[u8]) -> Result<(), AgentError> {
+fn commit_candidate_to_anchor(
+    candidate: &KeystoreBody,
+    request_id: &[u8],
+) -> Result<(), AgentError> {
     let nonce = draw_commit_nonce()?;
     let commit = crate::agent_boot_relay::AnchorCommit {
         new_epoch: candidate.freshness_epoch,
@@ -1703,7 +1826,9 @@ static AGENT_PROCESS_GLOBAL_TEST_GUARD: Mutex<()> = Mutex::new(());
 /// three modules stay symmetric by construction rather than by convention.
 #[cfg(test)]
 pub(crate) fn lock_and_reset_agent_process_globals() -> std::sync::MutexGuard<'static, ()> {
-    let g = AGENT_PROCESS_GLOBAL_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    let g = AGENT_PROCESS_GLOBAL_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // The FULL set: the installed keystore slot too (frame-path tests install into it), not just the
     // anti-rollback binding + freshness challenge — so the helper's "pristine state" claim actually holds
     // and no test inherits a keystore a prior frame test left installed.
@@ -1776,7 +1901,10 @@ fn commit_before_emit<F: FnOnce(&[u8]) -> Vec<u8>>(
     let body = encode_response(&sealed);
     // Swap the live in-memory slot so subsequent commands see the advanced state; durability is the
     // host's job (it persists the sealed blob returned in `body`).
-    *guard = Some(InstalledAgentKeystore { body: *candidate, measurement });
+    *guard = Some(InstalledAgentKeystore {
+        body: *candidate,
+        measurement,
+    });
     body
 }
 
@@ -1811,7 +1939,11 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
         None => return encode_agent_error(AgentError::WrongProfile),
     };
     match outcome {
-        Ok(AgentResponse::GenerateKeys { keys, candidate, request_id }) => {
+        Ok(AgentResponse::GenerateKeys {
+            keys,
+            candidate,
+            request_id,
+        }) => {
             // GENERATE_KEYS (the only LIVE mutating opcode, agent-keygen-exec-preview) goes through the
             // shared seal-before-emit seam. The only op-specific part is the success-body encoder
             // (key list + the sealed blob), invoked by the seam ONLY after the anchor commit succeeds.
@@ -1819,16 +1951,27 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 encode_generate_keys_response(&keys, sealed)
             })
         }
-        Ok(AgentResponse::SignFaucetDispense { signed, candidate, request_id }) => {
+        Ok(AgentResponse::SignFaucetDispense {
+            signed,
+            candidate,
+            request_id,
+        }) => {
             // SIGN_FAUCET_DISPENSE (rollback-sensitive, EpochOnly) goes through the SAME shared
             // seal-before-emit seam as GENERATE_KEYS — the only op-specific part is the success-body
             // encoder (the signed dispense tx + the sealed blob), invoked by the seam ONLY after the anchor
             // commit succeeds, so the signature never leaves before the debit is durably recorded.
-            commit_before_emit(candidate, &request_id, measurement, &mut guard, move |sealed| {
-                encode_sign_faucet_dispense_response(signed, sealed)
-            })
+            commit_before_emit(
+                candidate,
+                &request_id,
+                measurement,
+                &mut guard,
+                move |sealed| encode_sign_faucet_dispense_response(signed, sealed),
+            )
         }
-        Ok(AgentResponse::ConfigureTreasury { candidate, request_id }) => {
+        Ok(AgentResponse::ConfigureTreasury {
+            candidate,
+            request_id,
+        }) => {
             // CONFIGURE_TREASURY (rollback-sensitive; Structural for ALL FOUR sub-ops) goes through the SAME shared
             // seal-before-emit seam. A config op signs nothing — the only op-specific part is the
             // success-body encoder (just the sealed blob), invoked by the seam ONLY after the anchor commit
@@ -1837,15 +1980,23 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 encode_configure_treasury_response(sealed)
             })
         }
-        Ok(AgentResponse::ExportBackup { candidate, backup_blob, request_id }) => {
+        Ok(AgentResponse::ExportBackup {
+            candidate,
+            backup_blob,
+            request_id,
+        }) => {
             // EXPORT_BACKUP (rollback-sensitive; Structural — advances last_exported_seq) goes through the
             // SAME shared seal-before-emit seam. The backup blob was minted in the handler from the
             // post-append candidate; the encoder (invoked by the seam ONLY after the anchor commit succeeds)
             // emits the backup blob + the new sealed keystore, so the host receives the DR artifact iff the
             // drain/advance is durably committed.
-            commit_before_emit(candidate, &request_id, measurement, &mut guard, move |sealed| {
-                encode_export_backup_response(&backup_blob, sealed)
-            })
+            commit_before_emit(
+                candidate,
+                &request_id,
+                measurement,
+                &mut guard,
+                move |sealed| encode_export_backup_response(&backup_blob, sealed),
+            )
         }
         Ok(resp) => encode_agent_response(&resp),
         Err(e) => encode_agent_error(e),
@@ -1871,34 +2022,76 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
     match resp {
         // PUBLIC_IDENTITY response (spec §10.4).
         AgentResponse::PublicIdentity(id) => encode_body(vec![
-            (Value::Integer(1.into()), Value::Bytes(id.pubkey_uncompressed.to_vec())),
-            (Value::Integer(2.into()), Value::Bytes(id.eth_address.to_vec())),
-            (Value::Integer(3.into()), Value::Text(id.tron_address.clone())),
+            (
+                Value::Integer(1.into()),
+                Value::Bytes(id.pubkey_uncompressed.to_vec()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes(id.eth_address.to_vec()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Text(id.tron_address.clone()),
+            ),
             (Value::Integer(4.into()), Value::Bytes(id.key_ref.to_vec())),
-            (Value::Integer(5.into()), Value::Integer(key_purpose_code(id.key_purpose).into())),
+            (
+                Value::Integer(5.into()),
+                Value::Integer(key_purpose_code(id.key_purpose).into()),
+            ),
             // §10.4 key 6 = backend_version. Currently the agent protocol version (=1); the
             // build/protocol-version component (keygen-identity doc) is a follow-up — no host keys
             // off a build component yet, and no vector pins it.
-            (Value::Integer(6.into()), Value::Integer((id.agent_version as u64).into())),
+            (
+                Value::Integer(6.into()),
+                Value::Integer((id.agent_version as u64).into()),
+            ),
         ]),
         // PROVE_IDENTITY response: low-S recoverable signature + the bound address/pubkey.
         AgentResponse::ProveIdentity(proof) => encode_body(vec![
-            (Value::Integer(1.into()), Value::Bytes(proof.signature.r.to_vec())),
-            (Value::Integer(2.into()), Value::Bytes(proof.signature.s.to_vec())),
-            (Value::Integer(3.into()), Value::Integer((proof.signature.recovery_id as u64).into())),
-            (Value::Integer(4.into()), Value::Bytes(proof.address.to_vec())),
-            (Value::Integer(5.into()), Value::Bytes(proof.pubkey_uncompressed.to_vec())),
+            (
+                Value::Integer(1.into()),
+                Value::Bytes(proof.signature.r.to_vec()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes(proof.signature.s.to_vec()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Integer((proof.signature.recovery_id as u64).into()),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Bytes(proof.address.to_vec()),
+            ),
+            (
+                Value::Integer(5.into()),
+                Value::Bytes(proof.pubkey_uncompressed.to_vec()),
+            ),
         ]),
         // SIGN_TRANSFER response (TASK-7.6.4 — the spec left the response map open): the broadcastable
         // signed transaction + its components. Key 1 = `signed_rlp` (BYTES), so a success body is
         // distinguishable from a `{1: code(int)}` error body (cf. `decode_agent_error_code`).
         AgentResponse::SignTransfer(t) => encode_body(vec![
             (Value::Integer(1.into()), Value::Bytes(t.signed_rlp.clone())),
-            (Value::Integer(2.into()), Value::Bytes(t.signature.r.to_vec())),
-            (Value::Integer(3.into()), Value::Bytes(t.signature.s.to_vec())),
-            (Value::Integer(4.into()), Value::Integer((t.signature.recovery_id as u64).into())),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes(t.signature.r.to_vec()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Bytes(t.signature.s.to_vec()),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Integer((t.signature.recovery_id as u64).into()),
+            ),
             (Value::Integer(5.into()), Value::Integer(t.v.into())),
-            (Value::Integer(6.into()), Value::Bytes(t.signing_hash.to_vec())),
+            (
+                Value::Integer(6.into()),
+                Value::Bytes(t.signing_hash.to_vec()),
+            ),
             (Value::Integer(7.into()), Value::Bytes(t.from.to_vec())),
         ]),
         // GENERATE_KEYS MUST be encoded by the frame layer WITH its sealed blob
@@ -1930,9 +2123,18 @@ fn encode_generate_keys_response(keys: &[GeneratedKey], sealed_blob: &[u8]) -> V
         .map(|k| {
             Value::Map(vec![
                 (Value::Integer(1.into()), Value::Bytes(k.key_ref.to_vec())),
-                (Value::Integer(2.into()), Value::Bytes(k.pubkey_uncompressed.to_vec())),
-                (Value::Integer(3.into()), Value::Bytes(k.eth_address.to_vec())),
-                (Value::Integer(4.into()), Value::Text(k.tron_address.clone())),
+                (
+                    Value::Integer(2.into()),
+                    Value::Bytes(k.pubkey_uncompressed.to_vec()),
+                ),
+                (
+                    Value::Integer(3.into()),
+                    Value::Bytes(k.eth_address.to_vec()),
+                ),
+                (
+                    Value::Integer(4.into()),
+                    Value::Text(k.tron_address.clone()),
+                ),
                 (
                     Value::Integer(5.into()),
                     Value::Integer(key_purpose_code(k.key_purpose).into()),
@@ -1956,11 +2158,23 @@ fn encode_sign_faucet_dispense_response(signed: SignedTransfer, sealed_blob: &[u
     encode_body(vec![
         // `signed` is owned (moved out of the frame outcome), so move `signed_rlp` instead of cloning it.
         (Value::Integer(1.into()), Value::Bytes(signed.signed_rlp)),
-        (Value::Integer(2.into()), Value::Bytes(signed.signature.r.to_vec())),
-        (Value::Integer(3.into()), Value::Bytes(signed.signature.s.to_vec())),
-        (Value::Integer(4.into()), Value::Integer((signed.signature.recovery_id as u64).into())),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(signed.signature.r.to_vec()),
+        ),
+        (
+            Value::Integer(3.into()),
+            Value::Bytes(signed.signature.s.to_vec()),
+        ),
+        (
+            Value::Integer(4.into()),
+            Value::Integer((signed.signature.recovery_id as u64).into()),
+        ),
         (Value::Integer(5.into()), Value::Integer(signed.v.into())),
-        (Value::Integer(6.into()), Value::Bytes(signed.signing_hash.to_vec())),
+        (
+            Value::Integer(6.into()),
+            Value::Bytes(signed.signing_hash.to_vec()),
+        ),
         (Value::Integer(7.into()), Value::Bytes(signed.from.to_vec())),
         (Value::Integer(8.into()), Value::Bytes(sealed_blob.to_vec())),
     ])
@@ -1972,7 +2186,10 @@ fn encode_sign_faucet_dispense_response(signed: SignedTransfer, sealed_blob: &[u
 /// success body is distinguishable from a `{1: code(int)}` error body (cf. `decode_agent_error_code`).
 /// Called by the frame layer ONLY after the anchor commit succeeds.
 fn encode_configure_treasury_response(sealed_blob: &[u8]) -> Vec<u8> {
-    encode_body(vec![(Value::Integer(1.into()), Value::Bytes(sealed_blob.to_vec()))])
+    encode_body(vec![(
+        Value::Integer(1.into()),
+        Value::Bytes(sealed_blob.to_vec()),
+    )])
 }
 
 /// Encode the EXPORT_BACKUP response: `{1: backup_blob, 2: sealed_keystore_blob}`. Key 1 = the
@@ -1999,7 +2216,10 @@ fn encode_agent_error(e: AgentError) -> Vec<u8> {
         AgentError::SealFailed => "agent: seal failed",
     };
     encode_body(vec![
-        (Value::Integer(1.into()), Value::Integer((e.code() as u64).into())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer((e.code() as u64).into()),
+        ),
         (Value::Integer(2.into()), Value::Text(reason.to_string())),
     ])
 }
@@ -2023,14 +2243,14 @@ mod tests {
     };
     // KeyEntry construction is shared by the keygen-exec and sign-transfer preview test blocks; the
     // `any(..)` gate avoids a duplicate import when both previews are enabled.
+    #[cfg(feature = "agent-keygen-exec-preview")]
+    use crate::agent_keystore::MAX_TOTAL_KEY_ENTRIES;
     #[cfg(any(
         feature = "agent-keygen-exec-preview",
         feature = "agent-sign-transfer-preview",
         feature = "agent-sign-faucet-preview"
     ))]
     use crate::agent_keystore::{BackupExportMetadata, KeyAlgorithm, KeyEntry};
-    #[cfg(feature = "agent-keygen-exec-preview")]
-    use crate::agent_keystore::MAX_TOTAL_KEY_ENTRIES;
 
     fn base_body() -> KeystoreBody {
         KeystoreBody {
@@ -2057,7 +2277,12 @@ mod tests {
                 circuit_breaker_threshold: None,
                 cumulative_signing_budget: [0; 32],
             },
-            audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
+            audit: AuditRing {
+                records: vec![],
+                capacity: 64,
+                last_exported_seq: 0,
+                next_seq: 1,
+            },
             freshness_epoch: 1,
             structural_version: 1,
             strict_recovery_counter: 0,
@@ -2067,7 +2292,11 @@ mod tests {
     /// A body with one transfer key; returns (body, key_ref).
     fn body_with_key() -> (KeystoreBody, [u8; 32]) {
         let mut body = base_body();
-        let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 };
+        let creation = CreationMetadata {
+            config_version: 1,
+            counter_snapshot: 0,
+            batch_id: 1,
+        };
         let gen = generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation).unwrap();
         let key_ref = gen[0].key_ref;
         (body, key_ref)
@@ -2087,9 +2316,18 @@ mod tests {
     /// must carry a DISTINCT request_id (the per-op-unique admin precondition; see the audit-ring contract).
     fn envelope_rid(opcode: u8, request_id: &[u8], extra: Vec<(Value, Value)>) -> Vec<u8> {
         let mut m = vec![
-            (Value::Integer(1.into()), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
-            (Value::Integer(2.into()), Value::Integer((opcode as u64).into())),
-            (Value::Integer(3.into()), Value::Text(COMMAND_DOMAIN.to_string())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer((AGENT_GATEWAY_VERSION as u64).into()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Integer((opcode as u64).into()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Text(COMMAND_DOMAIN.to_string()),
+            ),
             (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
         ];
         m.extend(extra);
@@ -2104,7 +2342,10 @@ mod tests {
     /// fires. Read-only opcodes short-circuit the gate and need no guard.
     fn gate_configured() -> std::sync::MutexGuard<'static, ()> {
         let g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
-        let _ = install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: true });
+        let _ = install_anti_rollback_binding(AntiRollbackBinding {
+            epoch: 1,
+            active: true,
+        });
         g
     }
     fn gate_unconfigured() -> std::sync::MutexGuard<'static, ()> {
@@ -2152,13 +2393,19 @@ mod tests {
     ))]
     impl TestCommitChannel {
         fn new(act: CommitChannelAct) -> Self {
-            Self { act, calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+            Self {
+                act,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
         }
         /// Share a caller-held counter so the test can read how many commits were attempted. Only the
         /// keygen-exec frame tests use the counted form (the over-size-candidate never-commit proof); the
         /// faucet-preview lane reuses `TestCommitChannel` via `new` only, so allow it dead there.
         #[cfg_attr(not(feature = "agent-keygen-exec-preview"), allow(dead_code))]
-        fn counted(act: CommitChannelAct, calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        fn counted(
+            act: CommitChannelAct,
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
             Self { act, calls }
         }
     }
@@ -2209,7 +2456,10 @@ mod tests {
     #[test]
     fn producer_profile_rejects_all_agent_opcodes() {
         let (body, key_ref) = body_with_key();
-        let payload = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
+        let payload = envelope(
+            2,
+            vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
+        );
         assert_eq!(
             dispatch_agent(Profile::Producer, &payload, &body).err(),
             Some(AgentError::WrongProfile)
@@ -2219,7 +2469,10 @@ mod tests {
     #[test]
     fn public_identity_returns_unified_identity() {
         let (body, key_ref) = body_with_key();
-        let payload = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
+        let payload = envelope(
+            2,
+            vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
+        );
         let resp = dispatch_agent(Profile::AgentGateway, &payload, &body).unwrap();
         match resp {
             AgentResponse::PublicIdentity(id) => {
@@ -2235,7 +2488,10 @@ mod tests {
     #[test]
     fn public_identity_unknown_key_ref_collapses_to_purpose_mismatch() {
         let (body, _) = body_with_key();
-        let payload = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(vec![0xff; 32]))]);
+        let payload = envelope(
+            2,
+            vec![(Value::Integer(6.into()), Value::Bytes(vec![0xff; 32]))],
+        );
         assert_eq!(
             dispatch_agent(Profile::AgentGateway, &payload, &body).err(),
             Some(AgentError::KeyPurposeMismatch)
@@ -2253,7 +2509,10 @@ mod tests {
                 (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
                 (
                     Value::Integer(7.into()),
-                    Value::Map(vec![(Value::Integer(1.into()), Value::Bytes(nonce.to_vec()))]),
+                    Value::Map(vec![(
+                        Value::Integer(1.into()),
+                        Value::Bytes(nonce.to_vec()),
+                    )]),
                 ),
             ],
         );
@@ -2265,7 +2524,10 @@ mod tests {
                     &proof.signature,
                 )
                 .unwrap();
-                assert_eq!(recovered, proof.pubkey_uncompressed, "recovered == bound pubkey");
+                assert_eq!(
+                    recovered, proof.pubkey_uncompressed,
+                    "recovered == bound pubkey"
+                );
                 // bound address must equal the stored key's address.
                 let entry = crate::agent_identity::find_entry(&body, &key_ref).unwrap();
                 let id = public_identity_from_entry(entry).unwrap();
@@ -2286,7 +2548,10 @@ mod tests {
                 (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
                 (
                     Value::Integer(7.into()),
-                    Value::Map(vec![(Value::Integer(1.into()), Value::Bytes(vec![0xab; 32]))]),
+                    Value::Map(vec![(
+                        Value::Integer(1.into()),
+                        Value::Bytes(vec![0xab; 32]),
+                    )]),
                 ),
             ],
         );
@@ -2324,7 +2589,18 @@ mod tests {
         // EXPORT_BACKUP(7) is admin-tier but its handler is still deferred: a valid cap verifies,
         // then the request collapses to NotConfigured (0x45) — proves verify→handler routing.
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
+            &admin,
+            7,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            0,
+            b"export_backup",
+            1,
+            [0xab; 32],
+            [0xe1; 32],
         );
         let payload = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -2347,7 +2623,18 @@ mod tests {
         // NotConfigured (0x45) — pinning the verify→fail-closed contract so the stub can't silently become a
         // no-op handler. (An ADMIN-signed restore is separately rejected at the tier check, 0x43.)
         let cap = crate::agent_capability::test_signed_capability(
-            &recovery, 8, &[0x11; 16], 1, true, 11565, "testnet", 0, b"restore_backup", 1, [0xab; 32], [0xe1; 32],
+            &recovery,
+            8,
+            &[0x11; 16],
+            1,
+            true,
+            11565,
+            "testnet",
+            0,
+            b"restore_backup",
+            1,
+            [0xab; 32],
+            [0xe1; 32],
         );
         let payload = envelope(8, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -2364,7 +2651,18 @@ mod tests {
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         let mut cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
+            &admin,
+            7,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            0,
+            b"export_backup",
+            1,
+            [0xab; 32],
+            [0xe1; 32],
         );
         // Reverse the cap entries so the nested submap's keys are DESCENDING (non-canonical) while the
         // signed VALUES are unchanged. In ascending order this exact cap reaches NotConfigured (see
@@ -2397,11 +2695,24 @@ mod tests {
             &generate_keys_canonical_params(purpose_code, count),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            admin, 1, request_id, counter, false, 11565, "testnet", 0, scope_target,
-            purpose_code as u8, pb, [0xe1; 32],
+            admin,
+            1,
+            request_id,
+            counter,
+            false,
+            11565,
+            "testnet",
+            0,
+            scope_target,
+            purpose_code as u8,
+            pb,
+            [0xe1; 32],
         );
         let payload = vec![
-            (Value::Integer(1.into()), Value::Integer(purpose_code.into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer(purpose_code.into()),
+            ),
             (Value::Integer(2.into()), Value::Integer(count.into())),
         ];
         (cap, payload)
@@ -2415,7 +2726,8 @@ mod tests {
         let admin = SigningKey::from_bytes(&[7u8; 32]);
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
         let env = envelope(
             1,
             vec![
@@ -2424,9 +2736,13 @@ mod tests {
             ],
         );
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
-            AgentResponse::GenerateKeys { keys, candidate, .. } => {
+            AgentResponse::GenerateKeys {
+                keys, candidate, ..
+            } => {
                 assert_eq!(keys.len(), 3, "3 transfer keys generated");
-                assert!(keys.iter().all(|k| k.key_purpose == KeyPurpose::AgentTransferK1));
+                assert!(keys
+                    .iter()
+                    .all(|k| k.key_purpose == KeyPurpose::AgentTransferK1));
                 assert_eq!(candidate.entries.len(), 3, "candidate has the new entries");
                 let c = candidate
                     .counters
@@ -2450,7 +2766,8 @@ mod tests {
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         assert_eq!(body.structural_version, 1);
         // count=3: three keys minted in ONE committed op.
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
         let env = envelope(
             1,
             vec![
@@ -2461,13 +2778,23 @@ mod tests {
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
             AgentResponse::GenerateKeys { candidate, .. } => {
                 // +1 per COMMITTED op, regardless of count (NOT +3).
-                assert_eq!(candidate.structural_version, 2, "structural +1 per committed op");
+                assert_eq!(
+                    candidate.structural_version, 2,
+                    "structural +1 per committed op"
+                );
                 // 6-4: GENERATE_KEYS is Structural, so the ATOMIC bump advances freshness_epoch TOGETHER
                 // with structural_version (was LOCAL-ONLY/INERT before 6-4). The anchor commit records this
                 // advanced epoch and the seal binds it (the frame-layer seal-before-emit path).
-                assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "epoch advances atomically");
+                assert_eq!(
+                    candidate.freshness_epoch,
+                    body.freshness_epoch + 1,
+                    "epoch advances atomically"
+                );
                 // strict_recovery_counter is a marks surface, NOT bumped by a structural op.
-                assert_eq!(candidate.strict_recovery_counter, body.strict_recovery_counter);
+                assert_eq!(
+                    candidate.strict_recovery_counter,
+                    body.strict_recovery_counter
+                );
             }
             _ => panic!("expected GenerateKeys"),
         }
@@ -2482,7 +2809,8 @@ mod tests {
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         body.structural_version = u64::MAX; // checked_add → None → SealFailed, no swap
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
         let env = envelope(
             1,
             vec![
@@ -2505,7 +2833,8 @@ mod tests {
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // Cap binds count=3, but the request payload says count=99 ⇒ payload_binding mismatch ⇒ 0x43.
-        let (cap, _) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let (cap, _) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
         let tampered = vec![
             (Value::Integer(1.into()), Value::Integer(1.into())),
             (Value::Integer(2.into()), Value::Integer(99.into())),
@@ -2540,7 +2869,18 @@ mod tests {
             &generate_keys_canonical_params(2, 1),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_faucet", 1, pb, [0xe1; 32],
+            &admin,
+            1,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            0,
+            b"generate_faucet",
+            1,
+            pb,
+            [0xe1; 32],
         );
         let pay = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())), // purpose 2 (faucet)
@@ -2568,7 +2908,8 @@ mod tests {
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // Faucet treasury (purpose 2), enclave scope (0), singleton count 1.
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 2, 1, b"generate_faucet");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 2, 1, b"generate_faucet");
         let env = envelope(
             1,
             vec![
@@ -2577,7 +2918,9 @@ mod tests {
             ],
         );
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
-            AgentResponse::GenerateKeys { keys, candidate, .. } => {
+            AgentResponse::GenerateKeys {
+                keys, candidate, ..
+            } => {
                 assert_eq!(keys.len(), 1);
                 assert_eq!(keys[0].key_purpose, KeyPurpose::AgentFaucetTreasuryK1);
                 assert_eq!(candidate.entries.len(), 1);
@@ -2603,7 +2946,18 @@ mod tests {
             &generate_keys_canonical_params(2, 1),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 1, b"generate_faucet", 2, pb, [0xf1; 32],
+            &admin,
+            1,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            1,
+            b"generate_faucet",
+            2,
+            pb,
+            [0xf1; 32],
         );
         let pay = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
@@ -2647,7 +3001,18 @@ mod tests {
             &generate_keys_canonical_params(1, 1),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 1, &[0x11; 16], 1, false, 11565, "testnet", 1, b"generate_transfer", 1, pb, [0xf1; 32],
+            &admin,
+            1,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            1,
+            b"generate_transfer",
+            1,
+            pb,
+            [0xf1; 32],
         );
         let pay = vec![
             (Value::Integer(1.into()), Value::Integer(1.into())), // purpose 1 (transfer)
@@ -2669,7 +3034,7 @@ mod tests {
     }
 
     /// slice 6-5 VALIDATION PIN: the per-op commit reuses `env.request_id` VERBATIM as the anchor's
-    /// `request_id` idempotency key (the LOGICAL-op identity — keyed ALONE, NOT `(request_id, epoch)`) 
+    /// `request_id` idempotency key (the LOGICAL-op identity — keyed ALONE, NOT `(request_id, epoch)`)
     /// with NO length check of its own — its SOLE guard is this
     /// envelope (key-4) decode bound, `MAX_REQUEST_ID_LEN`=64. Pin that dependency: a 65-byte request_id
     /// is rejected `Malformed` at decode (so it never reaches the commit); a 64-byte and an EMPTY (len 0)
@@ -2683,17 +3048,27 @@ mod tests {
         // key_ref — drives the decode without needing a signed capability.
         let read_env = |rid: Vec<u8>| {
             enc(Value::Map(vec![
-                (Value::Integer(1.into()), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
+                (
+                    Value::Integer(1.into()),
+                    Value::Integer((AGENT_GATEWAY_VERSION as u64).into()),
+                ),
                 (Value::Integer(2.into()), Value::Integer(2u64.into())),
-                (Value::Integer(3.into()), Value::Text(COMMAND_DOMAIN.to_string())),
+                (
+                    Value::Integer(3.into()),
+                    Value::Text(COMMAND_DOMAIN.to_string()),
+                ),
                 (Value::Integer(4.into()), Value::Bytes(rid)),
                 (Value::Integer(6.into()), Value::Bytes(vec![0xfe; 32])),
             ]))
         };
         // 65 bytes ⇒ Malformed (the >64 reject the anchor keying depends on — never reaches the commit).
         assert_eq!(
-            dispatch_agent(Profile::AgentGateway, &read_env(vec![0x41; MAX_REQUEST_ID_LEN + 1]), &body)
-                .err(),
+            dispatch_agent(
+                Profile::AgentGateway,
+                &read_env(vec![0x41; MAX_REQUEST_ID_LEN + 1]),
+                &body
+            )
+            .err(),
             Some(AgentError::Malformed),
             "a request_id over MAX_REQUEST_ID_LEN must fail closed at decode"
         );
@@ -2718,7 +3093,8 @@ mod tests {
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // Cap bound to request_id [0x22;16]; the envelope's request_id is [0x11;16] ⇒ 0x43 (a cap
         // for one request cannot authorize another).
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x22; 16], 1, 1, 1, b"generate_transfer");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x22; 16], 1, 1, 1, b"generate_transfer");
         let env = envelope(
             1,
             vec![
@@ -2742,7 +3118,18 @@ mod tests {
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         // A well-formed cap signed by the wrong key ⇒ Ed25519 fails ⇒ CapabilityRejected (0x43).
         let cap = crate::agent_capability::test_signed_capability(
-            &wrong, 1, &[0x11; 16], 1, false, 11565, "testnet", 0, b"generate_transfer", 1, [0xab; 32], [0xe1; 32],
+            &wrong,
+            1,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            0,
+            b"generate_transfer",
+            1,
+            [0xab; 32],
+            [0xe1; 32],
         );
         let payload = envelope(1, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -2790,7 +3177,10 @@ mod tests {
         let bad_ver = enc(Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
             (Value::Integer(2.into()), Value::Integer(2.into())),
-            (Value::Integer(3.into()), Value::Text(COMMAND_DOMAIN.to_string())),
+            (
+                Value::Integer(3.into()),
+                Value::Text(COMMAND_DOMAIN.to_string()),
+            ),
             (Value::Integer(4.into()), Value::Bytes(vec![0x11; 16])),
         ]));
         assert_eq!(
@@ -2799,9 +3189,15 @@ mod tests {
         );
         // wrong domain
         let bad_dom = enc(Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer((AGENT_GATEWAY_VERSION as u64).into()),
+            ),
             (Value::Integer(2.into()), Value::Integer(2.into())),
-            (Value::Integer(3.into()), Value::Text("wrong/domain".to_string())),
+            (
+                Value::Integer(3.into()),
+                Value::Text("wrong/domain".to_string()),
+            ),
             (Value::Integer(4.into()), Value::Bytes(vec![0x11; 16])),
         ]));
         assert_eq!(
@@ -2898,90 +3294,128 @@ mod tests {
         // with (PUBLIC_IDENTITY ignores it).
         body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
         // One transfer key so PUBLIC_IDENTITY has something to return.
-        let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 };
+        let creation = CreationMetadata {
+            config_version: 1,
+            counter_snapshot: 0,
+            batch_id: 1,
+        };
         let key_ref =
             generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation).unwrap()[0].key_ref;
 
         // No keystore installed ⇒ producer/uninstalled ⇒ WrongProfile (0x41) error body.
-        let pubid_env =
-            envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&pubid_env)), Some(0x41));
+        let pubid_env = envelope(
+            2,
+            vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&pubid_env)),
+            Some(0x41)
+        );
 
         // Install ⇒ PUBLIC_IDENTITY returns a success body (key 1 = 65-byte pubkey).
-        assert!(install_agent_keystore(body, b"meas"), "install-once succeeds on an empty slot");
+        assert!(
+            install_agent_keystore(body, b"meas"),
+            "install-once succeeds on an empty slot"
+        );
         let ok_body = handle_agent_gateway_frame(&pubid_env);
-        assert_eq!(decode_agent_error_code(&ok_body), None, "success body, not an error map");
+        assert_eq!(
+            decode_agent_error_code(&ok_body),
+            None,
+            "success body, not an error map"
+        );
         let Value::Map(m) = ciborium::de::from_reader(&ok_body[..]).unwrap() else {
             panic!("response is a map")
         };
-        assert_eq!(as_bytes(map_get(&m, 1).unwrap()).unwrap().len(), 65, "pubkey 65B");
-        assert_eq!(as_bytes(map_get(&m, 4).unwrap()).unwrap(), key_ref, "key_ref echoed");
+        assert_eq!(
+            as_bytes(map_get(&m, 1).unwrap()).unwrap().len(),
+            65,
+            "pubkey 65B"
+        );
+        assert_eq!(
+            as_bytes(map_get(&m, 4).unwrap()).unwrap(),
+            key_ref,
+            "key_ref echoed"
+        );
 
         // Unknown key_ref ⇒ collapsed 0x42 error body.
-        let bad = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(vec![0xfe; 32]))]);
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&bad)), Some(0x42));
+        let bad = envelope(
+            2,
+            vec![(Value::Integer(6.into()), Value::Bytes(vec![0xfe; 32]))],
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&bad)),
+            Some(0x42)
+        );
 
         // GENERATE_KEYS through the FRAME — live execution is preview-gated, so this whole section
         // only compiles/runs under `agent-keygen-exec-preview`. Success body carries the key list
         // (key 1) AND the new sealed keystore blob (key 2) for the host to persist.
         #[cfg(feature = "agent-keygen-exec-preview")]
         {
-        // 6-4 seal-before-emit: install a conformant commit channel so the per-op anchor commit succeeds
-        // and the frame proceeds to seal + swap.
-        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
-        let (cap, pay) =
-            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
-        let gen_env = envelope(
-            1,
-            vec![
-                (Value::Integer(5.into()), Value::Map(cap)),
-                (Value::Integer(7.into()), Value::Map(pay)),
-            ],
-        );
-        let gen_body = handle_agent_gateway_frame(&gen_env);
-        assert_eq!(decode_agent_error_code(&gen_body), None, "GENERATE_KEYS success");
-        let Value::Map(gm) = ciborium::de::from_reader(&gen_body[..]).unwrap() else { panic!() };
-        match map_get(&gm, 1).unwrap() {
-            Value::Array(a) => assert_eq!(a.len(), 2, "2 keys generated"),
-            _ => panic!("key 1 is the key list"),
-        }
-        assert!(
-            !as_bytes(map_get(&gm, 2).unwrap()).unwrap().is_empty(),
-            "key 2 is the non-empty sealed keystore blob"
-        );
+            // 6-4 seal-before-emit: install a conformant commit channel so the per-op anchor commit succeeds
+            // and the frame proceeds to seal + swap.
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Ok
+            ))));
+            let (cap, pay) =
+                generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
+            let gen_env = envelope(
+                1,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap)),
+                    (Value::Integer(7.into()), Value::Map(pay)),
+                ],
+            );
+            let gen_body = handle_agent_gateway_frame(&gen_env);
+            assert_eq!(
+                decode_agent_error_code(&gen_body),
+                None,
+                "GENERATE_KEYS success"
+            );
+            let Value::Map(gm) = ciborium::de::from_reader(&gen_body[..]).unwrap() else {
+                panic!()
+            };
+            match map_get(&gm, 1).unwrap() {
+                Value::Array(a) => assert_eq!(a.len(), 2, "2 keys generated"),
+                _ => panic!("key 1 is the key list"),
+            }
+            assert!(
+                !as_bytes(map_get(&gm, 2).unwrap()).unwrap().is_empty(),
+                "key 2 is the non-empty sealed keystore blob"
+            );
 
-        // Replay the SAME cap (counter 1) ⇒ now 0x43: the swap advanced the live counter to 1, so the
-        // contiguity check expects 2. End-to-end replay rejection + proof the swap happened.
-        let (cap_r, pay_r) =
-            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
-        let replay_env = envelope(
-            1,
-            vec![
-                (Value::Integer(5.into()), Value::Map(cap_r)),
-                (Value::Integer(7.into()), Value::Map(pay_r)),
-            ],
-        );
-        assert_eq!(
-            decode_agent_error_code(&handle_agent_gateway_frame(&replay_env)),
-            Some(0x43),
-            "replay of the consumed counter is rejected after the swap"
-        );
+            // Replay the SAME cap (counter 1) ⇒ now 0x43: the swap advanced the live counter to 1, so the
+            // contiguity check expects 2. End-to-end replay rejection + proof the swap happened.
+            let (cap_r, pay_r) =
+                generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 2, b"generate_transfer");
+            let replay_env = envelope(
+                1,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap_r)),
+                    (Value::Integer(7.into()), Value::Map(pay_r)),
+                ],
+            );
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&replay_env)),
+                Some(0x43),
+                "replay of the consumed counter is rejected after the swap"
+            );
 
-        // The next contiguous counter (2) succeeds against the swapped live slot.
-        let (cap2, pay2) =
-            generate_keys_cap_and_payload(&admin, &[0x11; 16], 2, 1, 1, b"generate_transfer");
-        let next_env = envelope(
-            1,
-            vec![
-                (Value::Integer(5.into()), Value::Map(cap2)),
-                (Value::Integer(7.into()), Value::Map(pay2)),
-            ],
-        );
-        assert_eq!(
-            decode_agent_error_code(&handle_agent_gateway_frame(&next_env)),
-            None,
-            "counter 2 accepted against the advanced live slot"
-        );
+            // The next contiguous counter (2) succeeds against the swapped live slot.
+            let (cap2, pay2) =
+                generate_keys_cap_and_payload(&admin, &[0x11; 16], 2, 1, 1, b"generate_transfer");
+            let next_env = envelope(
+                1,
+                vec![
+                    (Value::Integer(5.into()), Value::Map(cap2)),
+                    (Value::Integer(7.into()), Value::Map(pay2)),
+                ],
+            );
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&next_env)),
+                None,
+                "counter 2 accepted against the advanced live slot"
+            );
         } // end #[cfg(agent-keygen-exec-preview)] GENERATE_KEYS frame section
 
         reset_agent_keystore_for_tests();
@@ -3018,7 +3452,9 @@ mod tests {
             "no commit channel ⇒ SealFailed"
         );
         // (b) a TRANSPORT failure on the commit → fail closed 0x46.
-        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Transport))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+            CommitChannelAct::Transport
+        ))));
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
             Some(0x46),
@@ -3026,7 +3462,9 @@ mod tests {
         );
         reset_commit_channel_for_tests();
         // (c) a FORGED ACK (wrong signer) → fail closed 0x46 (the durable record didn't verify).
-        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::WrongKey))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+            CommitChannelAct::WrongKey
+        ))));
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
             Some(0x46),
@@ -3036,7 +3474,9 @@ mod tests {
         // (d) PROOF OF NO SWAP across all three failures: the live counter never advanced, so the SAME cap
         //     (counter 1) is STILL accepted once a conformant channel is installed. If any failed op had
         //     swapped, the live counter would be 1 and this cap (contiguity expects 2) would be 0x43.
-        assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+        assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+            CommitChannelAct::Ok
+        ))));
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&gen_env)),
             None,
@@ -3080,7 +3520,11 @@ mod tests {
                         p
                     },
                     secret_scalar: zeroize::Zeroizing::new(vec![0x11u8; 32]),
-                    creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                    creation_metadata: CreationMetadata {
+                        config_version: 1,
+                        counter_snapshot: 0,
+                        batch_id: 1,
+                    },
                     backup_export_metadata: BackupExportMetadata::default(),
                 }
             })
@@ -3088,10 +3532,9 @@ mod tests {
         assert!(install_agent_keystore(body, b"meas"));
         // A CONFORMANT channel (would ACK happily) instrumented with a shared call-counter.
         let calls = Arc::new(AtomicUsize::new(0));
-        assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
-            CommitChannelAct::Ok,
-            Arc::clone(&calls),
-        ))));
+        assert!(install_commit_channel(Box::new(
+            TestCommitChannel::counted(CommitChannelAct::Ok, Arc::clone(&calls),)
+        )));
         let (cap, pay) =
             generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
         let gen_env = envelope(
@@ -3132,7 +3575,8 @@ mod tests {
         // config_version assertion can't pass by field-confusion with a same-valued field.
         body.config.monotonic_treasury_config_version = 7;
         // count=3 keys in ONE op ⇒ still exactly ONE audit record (record-per-op, not per-key).
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 3, b"generate_transfer");
         let env = envelope(
             1,
             vec![
@@ -3142,18 +3586,40 @@ mod tests {
         );
         match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
             AgentResponse::GenerateKeys { candidate, .. } => {
-                assert_eq!(candidate.audit.records.len(), 1, "exactly one audit record per committed op");
-                assert_eq!(candidate.audit.next_seq, 2, "next_seq advanced 1→2 (base next_seq was 1)");
+                assert_eq!(
+                    candidate.audit.records.len(),
+                    1,
+                    "exactly one audit record per committed op"
+                );
+                assert_eq!(
+                    candidate.audit.next_seq, 2,
+                    "next_seq advanced 1→2 (base next_seq was 1)"
+                );
                 let r = &candidate.audit.records[0];
                 assert_eq!(r.seq, 1, "first record gets seq 1");
                 assert_eq!(r.op, 1, "op = the GENERATE_KEYS wire opcode");
-                assert_eq!(r.authority, admin.verifying_key().to_bytes(), "authority = the cap authority");
+                assert_eq!(
+                    r.authority,
+                    admin.verifying_key().to_bytes(),
+                    "authority = the cap authority"
+                );
                 assert_eq!(r.counter, 1, "counter = the accepted cap batch sequence");
-                assert_eq!(r.config_version, 7, "config_version = the live treasury config version (==7)");
+                assert_eq!(
+                    r.config_version, 7,
+                    "config_version = the live treasury config version (==7)"
+                );
                 // Full provenance (the 4b schema widening): scope + request_id disambiguate the op.
                 assert_eq!(r.scope_class, 0, "scope_class = the cap scope_class");
-                assert_eq!(r.scope_target, b"generate_transfer".to_vec(), "scope_target = the cap scope");
-                assert_eq!(r.request_id, vec![0x11u8; 16], "request_id = the envelope request_id");
+                assert_eq!(
+                    r.scope_target,
+                    b"generate_transfer".to_vec(),
+                    "scope_target = the cap scope"
+                );
+                assert_eq!(
+                    r.request_id,
+                    vec![0x11u8; 16],
+                    "request_id = the envelope request_id"
+                );
             }
             _ => panic!("expected GenerateKeys"),
         }
@@ -3179,15 +3645,20 @@ mod tests {
         body.audit.capacity = 2; // room for exactly two un-exported records
         assert!(install_agent_keystore(body, b"meas"));
         let calls = Arc::new(AtomicUsize::new(0));
-        assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
-            CommitChannelAct::Ok,
-            Arc::clone(&calls),
-        ))));
+        assert!(install_commit_channel(Box::new(
+            TestCommitChannel::counted(CommitChannelAct::Ok, Arc::clone(&calls),)
+        )));
         // Each logical op carries a DISTINCT request_id (the per-op-unique admin precondition) — reusing one
         // would model a sequence a real anchor treats as an idempotent replay, not three distinct ops.
         let op = |counter: u64, request_id: &[u8]| {
-            let (cap, pay) =
-                generate_keys_cap_and_payload(&admin, request_id, counter, 1, 1, b"generate_transfer");
+            let (cap, pay) = generate_keys_cap_and_payload(
+                &admin,
+                request_id,
+                counter,
+                1,
+                1,
+                b"generate_transfer",
+            );
             envelope_rid(
                 1,
                 request_id,
@@ -3198,8 +3669,16 @@ mod tests {
             )
         };
         // Two contiguous ops fill the ring to capacity; each seals a growing audit ring + swaps.
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(1, &[0x21; 16]))), None, "op 1 (record 1) succeeds");
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&op(2, &[0x22; 16]))), None, "op 2 (record 2) succeeds");
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&op(1, &[0x21; 16]))),
+            None,
+            "op 1 (record 1) succeeds"
+        );
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&op(2, &[0x22; 16]))),
+            None,
+            "op 2 (record 2) succeeds"
+        );
         // Third op: the swapped live ring is now full AND undrained ⇒ backpressure ⇒ fail closed, no swap.
         assert_eq!(
             decode_agent_error_code(&handle_agent_gateway_frame(&op(3, &[0x23; 16]))),
@@ -3232,23 +3711,21 @@ mod tests {
         // Saturate the ring (capacity 1, one un-exported record) via record_audit so the state is
         // guaranteed validate()-consistent: records=[seq1], next_seq=2, last_exported_seq=0.
         body.audit.capacity = 1;
-        body
-            .record_audit(&crate::agent_keystore::AuditAppend {
-                op: 1,
-                authority: &[0u8; 32],
-                counter: 0,
-                config_version: 0,
-                scope_class: 0,
-                scope_target: b"seed",
-                request_id: b"seed",
-            })
-            .expect("first append fills the cap-1 ring");
+        body.record_audit(&crate::agent_keystore::AuditAppend {
+            op: 1,
+            authority: &[0u8; 32],
+            counter: 0,
+            config_version: 0,
+            scope_class: 0,
+            scope_target: b"seed",
+            request_id: b"seed",
+        })
+        .expect("first append fills the cap-1 ring");
         assert!(install_agent_keystore(body, b"meas"));
         let calls = Arc::new(AtomicUsize::new(0));
-        assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
-            CommitChannelAct::Ok,
-            Arc::clone(&calls),
-        ))));
+        assert!(install_commit_channel(Box::new(
+            TestCommitChannel::counted(CommitChannelAct::Ok, Arc::clone(&calls),)
+        )));
         let (cap, pay) =
             generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
         let gen_env = envelope(
@@ -3284,7 +3761,8 @@ mod tests {
         let mut body = base_body();
         body.config.admin_authority_pk = admin.verifying_key().to_bytes();
         body.audit.next_seq = u64::MAX; // checked_add(1) → None → MonotonicOverflow → SealFailed
-        let (cap, pay) = generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
+        let (cap, pay) =
+            generate_keys_cap_and_payload(&admin, &[0x11; 16], 1, 1, 1, b"generate_transfer");
         let env = envelope(
             1,
             vec![
@@ -3364,7 +3842,11 @@ mod tests {
             // commit path is gated on is_rollback_sensitive, so a NotCommitted op must never commit and
             // every rollback-sensitive op must carry a bump class.
             let committed = op.commit_bump_class() != CommitBumpClass::NotCommitted;
-            assert_eq!(committed, op.is_rollback_sensitive(), "{op:?}: committed-ness must match is_rollback_sensitive");
+            assert_eq!(
+                committed,
+                op.is_rollback_sensitive(),
+                "{op:?}: committed-ness must match is_rollback_sensitive"
+            );
         }
     }
 
@@ -3385,21 +3867,33 @@ mod tests {
     #[test]
     fn install_binding_is_install_once_and_rejects_inactive() {
         let _g = gate_unconfigured(); // resets the slot to None + serializes
-        // An inactive binding is refused (only a successful reconcile installs ⇒ active).
-        assert!(!install_anti_rollback_binding(AntiRollbackBinding { epoch: 1, active: false }));
+                                      // An inactive binding is refused (only a successful reconcile installs ⇒ active).
+        assert!(!install_anti_rollback_binding(AntiRollbackBinding {
+            epoch: 1,
+            active: false
+        }));
         assert!(!is_anti_rollback_configured());
         // First active install wins.
-        assert!(install_anti_rollback_binding(AntiRollbackBinding { epoch: 5, active: true }));
+        assert!(install_anti_rollback_binding(AntiRollbackBinding {
+            epoch: 5,
+            active: true
+        }));
         assert!(is_anti_rollback_configured());
         // Second install is refused (no overwrite) — a security-relevant property: a later call can't
         // swap in a different epoch over a live binding.
-        assert!(!install_anti_rollback_binding(AntiRollbackBinding { epoch: 9, active: true }));
+        assert!(!install_anti_rollback_binding(AntiRollbackBinding {
+            epoch: 9,
+            active: true
+        }));
     }
 
     #[test]
     fn fail_closed_default_no_binding() {
         let _g = gate_unconfigured(); // resets the slot to None
-        assert!(!is_anti_rollback_configured(), "const-init None ⇒ fail-closed default");
+        assert!(
+            !is_anti_rollback_configured(),
+            "const-init None ⇒ fail-closed default"
+        );
     }
 
     #[test]
@@ -3444,8 +3938,14 @@ mod tests {
     fn sign_transfer_not_gated_but_faucet_is() {
         let _g = gate_unconfigured();
         let body = base_body();
-        assert!(!AgentOpcode::SignTransfer.is_rollback_sensitive(), "transfer carries no rollback state");
-        assert!(AgentOpcode::SignFaucetDispense.is_rollback_sensitive(), "faucet dispense debits spend");
+        assert!(
+            !AgentOpcode::SignTransfer.is_rollback_sensitive(),
+            "transfer carries no rollback state"
+        );
+        assert!(
+            AgentOpcode::SignFaucetDispense.is_rollback_sensitive(),
+            "faucet dispense debits spend"
+        );
         // SIGN_TRANSFER(4) is NOT anti-rollback-gated (the classification above is the lock). When the
         // gate is unconfigured it is therefore NOT blocked by the gate: without the preview it falls
         // through to the production fail-closed NotConfigured; WITH the preview it is live, so an empty
@@ -3454,7 +3954,11 @@ mod tests {
         #[cfg(not(feature = "agent-sign-transfer-preview"))]
         assert_eq!(err4, Some(AgentError::NotConfigured));
         #[cfg(feature = "agent-sign-transfer-preview")]
-        assert_eq!(err4, Some(AgentError::Malformed), "transfer is live — not gate-blocked");
+        assert_eq!(
+            err4,
+            Some(AgentError::Malformed),
+            "transfer is live — not gate-blocked"
+        );
         // SIGN_FAUCET_DISPENSE(5) IS gated → NotConfigured when the binding is unconfigured.
         assert_eq!(
             dispatch_agent(Profile::AgentGateway, &envelope(5, vec![]), &body).err(),
@@ -3469,7 +3973,10 @@ mod tests {
         // PUBLIC_IDENTITY(2) is not rollback-sensitive → allowed with no anti-rollback binding.
         // (PROVE_IDENTITY(3)'s gate-pass when unconfigured is covered by prove_identity_signs_and_recovers
         // under agent-prove-identity-preview, and op3==false is locked by the exhaustive classification.)
-        let env = envelope(2, vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))]);
+        let env = envelope(
+            2,
+            vec![(Value::Integer(6.into()), Value::Bytes(key_ref.to_vec()))],
+        );
         assert!(
             dispatch_agent(Profile::AgentGateway, &env, &body).is_ok(),
             "PUBLIC_IDENTITY is not gated by anti-rollback"
@@ -3485,7 +3992,18 @@ mod tests {
         // verify_capability, which rejects the wrong key (0x43). Proves the binding unblocks the gate.
         let wrong = SigningKey::from_bytes(&[9u8; 32]);
         let cap = crate::agent_capability::test_signed_capability(
-            &wrong, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
+            &wrong,
+            7,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            0,
+            b"export_backup",
+            1,
+            [0xab; 32],
+            [0xe1; 32],
         );
         let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
         assert_eq!(
@@ -3506,10 +4024,24 @@ mod tests {
         // EXPORT_BACKUP(7) with a valid cap, through the REAL frame handler, no anti-rollback binding ⇒
         // the gate fires ⇒ 0x45 (proves the gate is on the production frame path).
         let cap = crate::agent_capability::test_signed_capability(
-            &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, b"export_backup", 1, [0xab; 32], [0xe1; 32],
+            &admin,
+            7,
+            &[0x11; 16],
+            1,
+            false,
+            11565,
+            "testnet",
+            0,
+            b"export_backup",
+            1,
+            [0xab; 32],
+            [0xe1; 32],
         );
         let env = envelope(7, vec![(Value::Integer(5.into()), Value::Map(cap))]);
-        assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&env)), Some(0x45));
+        assert_eq!(
+            decode_agent_error_code(&handle_agent_gateway_frame(&env)),
+            Some(0x45)
+        );
         reset_agent_keystore_for_tests();
     }
 
@@ -3546,10 +4078,18 @@ mod tests {
                 algorithm: KeyAlgorithm::Secp256k1,
                 public_identity: unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
                 secret_scalar: zeroize::Zeroizing::new(unhex(k[name]["privkey"].as_str().unwrap())),
-                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                creation_metadata: CreationMetadata {
+                    config_version: 1,
+                    counter_snapshot: 0,
+                    batch_id: 1,
+                },
                 backup_export_metadata: BackupExportMetadata::default(),
             });
-            (body, key_ref, arr20(k[name]["eth_address"].as_str().unwrap()))
+            (
+                body,
+                key_ref,
+                arr20(k[name]["eth_address"].as_str().unwrap()),
+            )
         }
 
         /// Build a SIGN_TRANSFER request envelope from explicit field values (each test perturbs one).
@@ -3613,18 +4153,34 @@ mod tests {
         #[test]
         fn dispatch_matches_golden() {
             let (body, key_ref, from) = body_with_key("transfer_key", KeyPurpose::AgentTransferK1);
-            let resp = dispatch_agent(Profile::AgentGateway, &golden_request(&key_ref, &from), &body)
-                .expect("golden SIGN_TRANSFER must succeed");
+            let resp = dispatch_agent(
+                Profile::AgentGateway,
+                &golden_request(&key_ref, &from),
+                &body,
+            )
+            .expect("golden SIGN_TRANSFER must succeed");
             let m = resp_map(&encode_agent_response(&resp));
             let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
             let bytes = |k: u64| as_bytes(map_get(&m, k).unwrap()).unwrap().to_vec();
             let uint = |k: u64| as_u64(map_get(&m, k).unwrap()).unwrap();
-            assert_eq!(bytes(1), unhex(o["signed_rlp"].as_str().unwrap()), "signed_rlp");
+            assert_eq!(
+                bytes(1),
+                unhex(o["signed_rlp"].as_str().unwrap()),
+                "signed_rlp"
+            );
             assert_eq!(bytes(2), unhex(o["signature"]["r"].as_str().unwrap()), "r");
             assert_eq!(bytes(3), unhex(o["signature"]["s"].as_str().unwrap()), "s");
-            assert_eq!(uint(4), o["signature"]["recovery_id"].as_u64().unwrap(), "recovery_id");
+            assert_eq!(
+                uint(4),
+                o["signature"]["recovery_id"].as_u64().unwrap(),
+                "recovery_id"
+            );
             assert_eq!(uint(5), o["signature"]["v_eip155"].as_u64().unwrap(), "v");
-            assert_eq!(bytes(6), unhex(o["signing_hash_keccak256"].as_str().unwrap()), "signing_hash");
+            assert_eq!(
+                bytes(6),
+                unhex(o["signing_hash_keccak256"].as_str().unwrap()),
+                "signing_hash"
+            );
             assert_eq!(bytes(7), from.to_vec(), "from");
         }
 
@@ -3636,7 +4192,11 @@ mod tests {
             assert!(install_agent_keystore(body, b"meas"));
             let out = handle_agent_gateway_frame(&golden_request(&key_ref, &from));
             // A success body has BYTES at key 1 (signed_rlp), so the error-code decoder returns None.
-            assert_eq!(decode_agent_error_code(&out), None, "must be a success body, not an error");
+            assert_eq!(
+                decode_agent_error_code(&out),
+                None,
+                "must be a success body, not an error"
+            );
             let m = resp_map(&out);
             let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
             assert_eq!(
@@ -3662,7 +4222,17 @@ mod tests {
 
             // wrong chain_id (never request-authoritative) → Malformed
             assert_eq!(
-                err(&request(&key_ref, cid + 1, &from, &to, val(), 0, 21000, gp(), empty())),
+                err(&request(
+                    &key_ref,
+                    cid + 1,
+                    &from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    gp(),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "wrong chain_id"
             );
@@ -3671,54 +4241,144 @@ mod tests {
             let mut bad_from = from;
             bad_from[0] ^= 0xff;
             assert_eq!(
-                err(&request(&key_ref, cid, &bad_from, &to, val(), 0, 21000, gp(), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &bad_from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    gp(),
+                    empty()
+                )),
                 Some(AgentError::KeyPurposeMismatch),
                 "from != derived"
             );
             // non-empty `data` (no generic-digest / calldata path in MVP) → Malformed
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, gp(), Value::Bytes(vec![0xde, 0xad]))),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    gp(),
+                    Value::Bytes(vec![0xde, 0xad])
+                )),
                 Some(AgentError::Malformed),
                 "non-empty data"
             );
             // over-width amount (33 bytes > u256) → Malformed (never truncated, §2 AC#8)
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, Value::Bytes(vec![0x01; 33]), 0, 21000, gp(), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    Value::Bytes(vec![0x01; 33]),
+                    0,
+                    21000,
+                    gp(),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "over-width amount"
             );
             // non-minimal amount (leading zero byte) → Malformed (canonical u256 wire form)
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, Value::Bytes(vec![0x00, 0x01]), 0, 21000, gp(), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    Value::Bytes(vec![0x00, 0x01]),
+                    0,
+                    21000,
+                    gp(),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "non-minimal amount"
             );
             // amount as a CBOR uint (not a byte string) → Malformed (u256 fields are byte strings)
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, Value::Integer(5.into()), 0, 21000, gp(), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    Value::Integer(5.into()),
+                    0,
+                    21000,
+                    gp(),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "amount not a bstr"
             );
             // unknown key_ref → KeyPurposeMismatch (anti-oracle: not-found ≡ wrong-purpose)
             assert_eq!(
-                err(&request(&[0x99; 32], cid, &from, &to, val(), 0, 21000, gp(), empty())),
+                err(&request(
+                    &[0x99; 32],
+                    cid,
+                    &from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    gp(),
+                    empty()
+                )),
                 Some(AgentError::KeyPurposeMismatch),
                 "unknown key_ref"
             );
             // the SAME malformed u256 encodings on `gas_price` (key 7) → Malformed — symmetric with
             // `amount` (key 4); both decode through `as_u256_minimal_be`, so this pins key 7's wiring.
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, Value::Bytes(vec![0x01; 33]), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    Value::Bytes(vec![0x01; 33]),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "over-width gas_price"
             );
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, Value::Bytes(vec![0x00, 0x01]), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    Value::Bytes(vec![0x00, 0x01]),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "non-minimal gas_price"
             );
             assert_eq!(
-                err(&request(&key_ref, cid, &from, &to, val(), 0, 21000, Value::Integer(5.into()), empty())),
+                err(&request(
+                    &key_ref,
+                    cid,
+                    &from,
+                    &to,
+                    val(),
+                    0,
+                    21000,
+                    Value::Integer(5.into()),
+                    empty()
+                )),
                 Some(AgentError::Malformed),
                 "gas_price not a bstr"
             );
@@ -3728,9 +4388,15 @@ mod tests {
         fn rejects_wrong_key_purpose() {
             // A faucet-treasury key under SIGN_TRANSFER → KeyPurposeMismatch (cross-use, §4). Collapses
             // with key-not-found so the host cannot tell "wrong purpose" from "absent".
-            let (body, key_ref, from) = body_with_key("treasury_key", KeyPurpose::AgentFaucetTreasuryK1);
+            let (body, key_ref, from) =
+                body_with_key("treasury_key", KeyPurpose::AgentFaucetTreasuryK1);
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &golden_request(&key_ref, &from), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &golden_request(&key_ref, &from),
+                    &body
+                )
+                .err(),
                 Some(AgentError::KeyPurposeMismatch)
             );
         }
@@ -3742,19 +4408,31 @@ mod tests {
             let o: serde_json::Value = serde_json::from_str(ORD).unwrap();
             let to = arr20(o["fields"]["to"].as_str().unwrap());
             let payload = Value::Map(vec![
-                (Value::Integer(1.into()), Value::Integer(o["chain_id"].as_u64().unwrap().into())),
+                (
+                    Value::Integer(1.into()),
+                    Value::Integer(o["chain_id"].as_u64().unwrap().into()),
+                ),
                 (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
                 (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
-                (Value::Integer(4.into()), Value::Bytes(min_be(o["fields"]["value"].as_u64().unwrap()))),
+                (
+                    Value::Integer(4.into()),
+                    Value::Bytes(min_be(o["fields"]["value"].as_u64().unwrap())),
+                ),
                 (Value::Integer(5.into()), Value::Integer(0.into())),
                 (Value::Integer(6.into()), Value::Integer(21000.into())),
-                (Value::Integer(7.into()), Value::Bytes(min_be(o["fields"]["gas_price"].as_u64().unwrap()))),
+                (
+                    Value::Integer(7.into()),
+                    Value::Bytes(min_be(o["fields"]["gas_price"].as_u64().unwrap())),
+                ),
                 (Value::Integer(8.into()), Value::Bytes(vec![])),
             ]);
             let req = envelope(
                 4,
                 vec![
-                    (Value::Integer(5.into()), Value::Map(vec![(Value::Integer(1.into()), Value::Integer(1.into()))])),
+                    (
+                        Value::Integer(5.into()),
+                        Value::Map(vec![(Value::Integer(1.into()), Value::Integer(1.into()))]),
+                    ),
                     (Value::Integer(6.into()), Value::Bytes(key_ref.to_vec())),
                     (Value::Integer(7.into()), payload),
                 ],
@@ -3778,7 +4456,10 @@ mod tests {
                     (
                         Value::Integer(7.into()),
                         Value::Map(vec![
-                            (Value::Integer(1.into()), Value::Integer(o["chain_id"].as_u64().unwrap().into())),
+                            (
+                                Value::Integer(1.into()),
+                                Value::Integer(o["chain_id"].as_u64().unwrap().into()),
+                            ),
                             (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
                             (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
                             (Value::Integer(4.into()), Value::Bytes(min_be(1))),
@@ -3802,7 +4483,10 @@ mod tests {
                     (
                         Value::Integer(7.into()),
                         Value::Map(vec![
-                            (Value::Integer(1.into()), Value::Integer(o["chain_id"].as_u64().unwrap().into())),
+                            (
+                                Value::Integer(1.into()),
+                                Value::Integer(o["chain_id"].as_u64().unwrap().into()),
+                            ),
                             (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
                             (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
                             (Value::Integer(4.into()), Value::Bytes(min_be(1))),
@@ -3891,8 +4575,15 @@ mod tests {
             let resp = dispatch_agent(Profile::AgentGateway, &req, &body)
                 .expect("zero-value transfer must sign");
             let m = resp_map(&encode_agent_response(&resp));
-            assert_eq!(as_bytes(map_get(&m, 7).unwrap()).unwrap().to_vec(), from.to_vec(), "from");
-            assert!(!as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(), "signed_rlp present");
+            assert_eq!(
+                as_bytes(map_get(&m, 7).unwrap()).unwrap().to_vec(),
+                from.to_vec(),
+                "from"
+            );
+            assert!(
+                !as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(),
+                "signed_rlp present"
+            );
         }
 
         #[test]
@@ -3904,7 +4595,10 @@ mod tests {
             let extra_outer = envelope(
                 4,
                 vec![
-                    (Value::Integer(6.into()), Value::Bytes([0x33u8; 32].to_vec())),
+                    (
+                        Value::Integer(6.into()),
+                        Value::Bytes([0x33u8; 32].to_vec()),
+                    ),
                     (Value::Integer(7.into()), Value::Map(vec![])),
                     (Value::Integer(8.into()), Value::Integer(0.into())),
                 ],
@@ -3945,7 +4639,11 @@ mod tests {
                 algorithm: KeyAlgorithm::Secp256k1,
                 public_identity: unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
                 secret_scalar: zeroize::Zeroizing::new(unhex(k[name]["privkey"].as_str().unwrap())),
-                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: batch },
+                creation_metadata: CreationMetadata {
+                    config_version: 1,
+                    counter_snapshot: 0,
+                    batch_id: batch,
+                },
                 backup_export_metadata: BackupExportMetadata::default(),
             }
         }
@@ -3969,8 +4667,18 @@ mod tests {
         /// (body, treasury_from, recipient_to).
         fn faucet_body(budget: u64) -> (KeystoreBody, [u8; 20], [u8; 20]) {
             let mut body = base_body();
-            body.entries.push(entry("treasury_key", TREASURY_REF, KeyPurpose::AgentFaucetTreasuryK1, 1));
-            body.entries.push(entry("transfer_key", TRANSFER_REF, KeyPurpose::AgentTransferK1, 2));
+            body.entries.push(entry(
+                "treasury_key",
+                TREASURY_REF,
+                KeyPurpose::AgentFaucetTreasuryK1,
+                1,
+            ));
+            body.entries.push(entry(
+                "transfer_key",
+                TRANSFER_REF,
+                KeyPurpose::AgentTransferK1,
+                2,
+            ));
             body.faucet.per_dispense_max_amount = crate::u256::from_u64(1_000_000);
             body.faucet.max_gas_limit = 21_000;
             body.faucet.max_effective_gas_fee_rate = 1_000_000_000;
@@ -4039,20 +4747,45 @@ mod tests {
             let resp = dispatch_agent(Profile::AgentGateway, &good_request(&from, &to), &body)
                 .expect("an in-cap dispense to a known transfer key must succeed");
             match resp {
-                AgentResponse::SignFaucetDispense { signed, candidate, request_id } => {
+                AgentResponse::SignFaucetDispense {
+                    signed,
+                    candidate,
+                    request_id,
+                } => {
                     // Signed FROM the treasury key (recovery==from invariant holds inside sign_transfer).
                     assert_eq!(signed.from, from, "dispense signed by the treasury key");
-                    assert!(!signed.signed_rlp.is_empty(), "broadcastable signed tx present");
+                    assert!(
+                        !signed.signed_rlp.is_empty(),
+                        "broadcastable signed tx present"
+                    );
                     // The envelope's request_id is echoed verbatim — the frame layer keys the anchor
                     // commit record by it (idempotency).
-                    assert_eq!(request_id, vec![0x11; 16], "request_id echoed from the envelope");
+                    assert_eq!(
+                        request_id,
+                        vec![0x11; 16],
+                        "request_id echoed from the envelope"
+                    );
                     // BOTH spend counters advanced by worst_case; budget/caps untouched; EpochOnly bump.
                     let wc = crate::u256::from_u64(worst_case());
-                    assert_eq!(candidate.faucet.cumulative_native_spend, wc, "cumulative debited");
+                    assert_eq!(
+                        candidate.faucet.cumulative_native_spend, wc,
+                        "cumulative debited"
+                    );
                     assert_eq!(candidate.faucet.lifetime_spend, wc, "lifetime debited");
-                    assert_eq!(candidate.faucet.cumulative_signing_budget, body.faucet.cumulative_signing_budget, "budget unchanged");
-                    assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "EpochOnly: epoch advanced");
-                    assert_eq!(candidate.structural_version, body.structural_version, "EpochOnly: structural untouched");
+                    assert_eq!(
+                        candidate.faucet.cumulative_signing_budget,
+                        body.faucet.cumulative_signing_budget,
+                        "budget unchanged"
+                    );
+                    assert_eq!(
+                        candidate.freshness_epoch,
+                        body.freshness_epoch + 1,
+                        "EpochOnly: epoch advanced"
+                    );
+                    assert_eq!(
+                        candidate.structural_version, body.structural_version,
+                        "EpochOnly: structural untouched"
+                    );
                 }
                 _ => panic!("expected SignFaucetDispense"),
             }
@@ -4066,7 +4799,12 @@ mod tests {
             // missing/mis-purposed treasury key; the host cannot probe which addresses are known).
             let stranger = [0xab; 20];
             assert_eq!(
-                dispatch_agent(Profile::AgentGateway, &good_request(&from, &stranger), &body).err(),
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &good_request(&from, &stranger),
+                    &body
+                )
+                .err(),
                 Some(AgentError::KeyPurposeMismatch),
                 "recipient not a known transfer identity"
             );
@@ -4085,9 +4823,18 @@ mod tests {
             let (body, treasury_from, transfer_to) = faucet_body(10_000_000);
             // The stored transfer key's address matches; the treasury's own address does NOT (only
             // AgentTransferK1 entries are recipients); a stranger does not.
-            assert!(is_known_transfer_recipient(&body, &transfer_to), "stored transfer key is a recipient");
-            assert!(!is_known_transfer_recipient(&body, &treasury_from), "treasury address is not a recipient");
-            assert!(!is_known_transfer_recipient(&body, &[0xab; 20]), "stranger is not a recipient");
+            assert!(
+                is_known_transfer_recipient(&body, &transfer_to),
+                "stored transfer key is a recipient"
+            );
+            assert!(
+                !is_known_transfer_recipient(&body, &treasury_from),
+                "treasury address is not a recipient"
+            );
+            assert!(
+                !is_known_transfer_recipient(&body, &[0xab; 20]),
+                "stranger is not a recipient"
+            );
             // A malformed transfer entry (wrong-length public_identity) never matches — fail-closed, no
             // panic (defense-in-depth on a trusted-but-validated sealed entry).
             let mut malformed = body.clone();
@@ -4097,12 +4844,22 @@ mod tests {
                 algorithm: KeyAlgorithm::Secp256k1,
                 public_identity: vec![0x04; 64], // 64 bytes, not the 65-byte SEC1 form
                 secret_scalar: zeroize::Zeroizing::new(vec![0x01; 32]),
-                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 9 },
+                creation_metadata: CreationMetadata {
+                    config_version: 1,
+                    counter_snapshot: 0,
+                    batch_id: 9,
+                },
                 backup_export_metadata: BackupExportMetadata::default(),
             });
-            assert!(!is_known_transfer_recipient(&malformed, &[0x00; 20]), "malformed entry never matches");
+            assert!(
+                !is_known_transfer_recipient(&malformed, &[0x00; 20]),
+                "malformed entry never matches"
+            );
             // and the GOOD transfer key still matches alongside the malformed one.
-            assert!(is_known_transfer_recipient(&malformed, &transfer_to), "good entry still matches");
+            assert!(
+                is_known_transfer_recipient(&malformed, &transfer_to),
+                "good entry still matches"
+            );
         }
 
         #[test]
@@ -4112,8 +4869,15 @@ mod tests {
             // The TRANSFER key as the signer (key_ref) → 0x42 (faucet accepts only the treasury purpose;
             // cross-use collapses with not-found).
             let transfer_signer = request(
-                &TRANSFER_REF, 11565, &addr("transfer_key"), &to,
-                Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+                &TRANSFER_REF,
+                11565,
+                &addr("transfer_key"),
+                &to,
+                Value::Bytes(min_be(DISP_AMOUNT)),
+                0,
+                DISP_GAS_LIMIT,
+                Value::Bytes(min_be(DISP_GAS_PRICE)),
+                Value::Bytes(vec![]),
             );
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &transfer_signer, &body).err(),
@@ -4122,8 +4886,15 @@ mod tests {
             );
             // unknown key_ref → 0x42.
             let unknown = request(
-                &[0x99; 32], 11565, &from, &to,
-                Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+                &[0x99; 32],
+                11565,
+                &from,
+                &to,
+                Value::Bytes(min_be(DISP_AMOUNT)),
+                0,
+                DISP_GAS_LIMIT,
+                Value::Bytes(min_be(DISP_GAS_PRICE)),
+                Value::Bytes(vec![]),
             );
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &unknown, &body).err(),
@@ -4147,26 +4918,66 @@ mod tests {
             let err = |req: &[u8]| dispatch_agent(Profile::AgentGateway, req, &body).err();
             // wrong chain_id (never request-authoritative) → 0x40.
             assert_eq!(
-                err(&request(&TREASURY_REF, 11566, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]))),
+                err(&request(
+                    &TREASURY_REF,
+                    11566,
+                    &from,
+                    &to,
+                    Value::Bytes(min_be(DISP_AMOUNT)),
+                    0,
+                    DISP_GAS_LIMIT,
+                    Value::Bytes(min_be(DISP_GAS_PRICE)),
+                    Value::Bytes(vec![])
+                )),
                 Some(AgentError::Malformed),
                 "wrong chain_id"
             );
             // non-empty data (no calldata/memo) → 0x40.
             assert_eq!(
-                err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![0xde, 0xad]))),
+                err(&request(
+                    &TREASURY_REF,
+                    11565,
+                    &from,
+                    &to,
+                    Value::Bytes(min_be(DISP_AMOUNT)),
+                    0,
+                    DISP_GAS_LIMIT,
+                    Value::Bytes(min_be(DISP_GAS_PRICE)),
+                    Value::Bytes(vec![0xde, 0xad])
+                )),
                 Some(AgentError::Malformed),
                 "non-empty data"
             );
             // over-width amount (33 bytes) → 0x40 (never truncated, §2 AC#8) — a SHAPE error caught at
             // decode BEFORE the §2 cap gate (which would be 0x44), pinning the band split.
             assert_eq!(
-                err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(vec![0x01; 33]), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]))),
+                err(&request(
+                    &TREASURY_REF,
+                    11565,
+                    &from,
+                    &to,
+                    Value::Bytes(vec![0x01; 33]),
+                    0,
+                    DISP_GAS_LIMIT,
+                    Value::Bytes(min_be(DISP_GAS_PRICE)),
+                    Value::Bytes(vec![])
+                )),
                 Some(AgentError::Malformed),
                 "over-width amount"
             );
             // non-minimal gas_price (leading zero) → 0x40.
             assert_eq!(
-                err(&request(&TREASURY_REF, 11565, &from, &to, Value::Bytes(min_be(DISP_AMOUNT)), 0, DISP_GAS_LIMIT, Value::Bytes(vec![0x00, 0x01]), Value::Bytes(vec![]))),
+                err(&request(
+                    &TREASURY_REF,
+                    11565,
+                    &from,
+                    &to,
+                    Value::Bytes(min_be(DISP_AMOUNT)),
+                    0,
+                    DISP_GAS_LIMIT,
+                    Value::Bytes(vec![0x00, 0x01]),
+                    Value::Bytes(vec![])
+                )),
                 Some(AgentError::Malformed),
                 "non-minimal gas_price"
             );
@@ -4186,8 +4997,14 @@ mod tests {
                 (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
                 (Value::Integer(4.into()), Value::Bytes(min_be(DISP_AMOUNT))),
                 (Value::Integer(5.into()), Value::Integer(0.into())),
-                (Value::Integer(6.into()), Value::Integer(DISP_GAS_LIMIT.into())),
-                (Value::Integer(7.into()), Value::Bytes(min_be(DISP_GAS_PRICE))),
+                (
+                    Value::Integer(6.into()),
+                    Value::Integer(DISP_GAS_LIMIT.into()),
+                ),
+                (
+                    Value::Integer(7.into()),
+                    Value::Bytes(min_be(DISP_GAS_PRICE)),
+                ),
                 (Value::Integer(8.into()), Value::Bytes(vec![])),
             ]);
             let no_key_ref = envelope(5, vec![(Value::Integer(7.into()), payload)]);
@@ -4204,8 +5021,15 @@ mod tests {
             // amount over the per-dispense cap → 0x44 (key+recipient valid, so the §2 gate is reached).
             let (body, from, to) = faucet_body(10_000_000_000);
             let over_amount = request(
-                &TREASURY_REF, 11565, &from, &to,
-                Value::Bytes(min_be(2_000_000)), 0, DISP_GAS_LIMIT, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+                &TREASURY_REF,
+                11565,
+                &from,
+                &to,
+                Value::Bytes(min_be(2_000_000)),
+                0,
+                DISP_GAS_LIMIT,
+                Value::Bytes(min_be(DISP_GAS_PRICE)),
+                Value::Bytes(vec![]),
             );
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &over_amount, &body).err(),
@@ -4214,8 +5038,15 @@ mod tests {
             );
             // gas_limit over the cap → 0x44.
             let over_gas = request(
-                &TREASURY_REF, 11565, &from, &to,
-                Value::Bytes(min_be(DISP_AMOUNT)), 0, 21_001, Value::Bytes(min_be(DISP_GAS_PRICE)), Value::Bytes(vec![]),
+                &TREASURY_REF,
+                11565,
+                &from,
+                &to,
+                Value::Bytes(min_be(DISP_AMOUNT)),
+                0,
+                21_001,
+                Value::Bytes(min_be(DISP_GAS_PRICE)),
+                Value::Bytes(vec![]),
             );
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &over_gas, &body).err(),
@@ -4261,15 +5092,31 @@ mod tests {
             let (mut body, from, to) = faucet_body(worst_case());
             body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
             assert!(install_agent_keystore(body, b"meas"));
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Ok
+            ))));
 
             let out = handle_agent_gateway_frame(&good_request(&from, &to));
-            assert_eq!(decode_agent_error_code(&out), None, "first dispense is a success body");
+            assert_eq!(
+                decode_agent_error_code(&out),
+                None,
+                "first dispense is a success body"
+            );
             let m = resp_map(&out);
             // signed-tx 7-key map + key 8 = the non-empty sealed keystore blob the host persists.
-            assert_eq!(as_bytes(map_get(&m, 7).unwrap()).unwrap().to_vec(), from.to_vec(), "from = treasury");
-            assert!(!as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(), "key 1 = signed_rlp");
-            assert!(!as_bytes(map_get(&m, 8).unwrap()).unwrap().is_empty(), "key 8 = sealed blob");
+            assert_eq!(
+                as_bytes(map_get(&m, 7).unwrap()).unwrap().to_vec(),
+                from.to_vec(),
+                "from = treasury"
+            );
+            assert!(
+                !as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(),
+                "key 1 = signed_rlp"
+            );
+            assert!(
+                !as_bytes(map_get(&m, 8).unwrap()).unwrap().is_empty(),
+                "key 8 = sealed blob"
+            );
 
             // PROOF OF SWAP: the live slot now carries the debit, so the SAME dispense (cumulative would be
             // 2*worst_case > budget) is rejected 0x44. If the first hadn't swapped, this would succeed.
@@ -4299,7 +5146,9 @@ mod tests {
                 "no commit channel ⇒ SealFailed"
             );
             // (b) transport failure → 0x46.
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Transport))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Transport
+            ))));
             assert_eq!(
                 decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
                 Some(0x46),
@@ -4307,7 +5156,9 @@ mod tests {
             );
             reset_commit_channel_for_tests();
             // (c) forged ACK (wrong signer) → 0x46.
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::WrongKey))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::WrongKey
+            ))));
             assert_eq!(
                 decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
                 Some(0x46),
@@ -4316,7 +5167,9 @@ mod tests {
             reset_commit_channel_for_tests();
             // (d) PROOF OF NO DEBIT: the live faucet never advanced across all three failures, so a
             // conformant channel now accepts the SAME single-worst_case dispense against the full budget.
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Ok
+            ))));
             assert_eq!(
                 decode_agent_error_code(&handle_agent_gateway_frame(&good_request(&from, &to))),
                 None,
@@ -4343,7 +5196,10 @@ mod tests {
             );
         }
         // Consistent with the opcode-level class (Structural for the whole opcode).
-        assert_eq!(AgentOpcode::ConfigureTreasury.commit_bump_class(), CommitBumpClass::Structural);
+        assert_eq!(
+            AgentOpcode::ConfigureTreasury.commit_bump_class(),
+            CommitBumpClass::Structural
+        );
     }
 
     #[cfg(feature = "agent-configure-treasury-preview")]
@@ -4382,11 +5238,25 @@ mod tests {
             let cp = configure_treasury_canonical_params(sub_op, field2_min, set_limits_gas);
             let pb = crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &cp);
             let cap = crate::agent_capability::test_signed_capability_with_sub_op(
-                authority, 6, Some(sub_op), request_id, counter, is_recovery, 11565, "testnet", 0, SCOPE,
-                2, pb, [0xe1; 32],
+                authority,
+                6,
+                Some(sub_op),
+                request_id,
+                counter,
+                is_recovery,
+                11565,
+                "testnet",
+                0,
+                SCOPE,
+                2,
+                pb,
+                [0xe1; 32],
             );
             let mut payload = vec![
-                (Value::Integer(1.into()), Value::Integer(u64::from(sub_op).into())),
+                (
+                    Value::Integer(1.into()),
+                    Value::Integer(u64::from(sub_op).into()),
+                ),
                 (Value::Integer(2.into()), Value::Bytes(field2_min.to_vec())),
             ];
             if let Some((gl, fr)) = set_limits_gas {
@@ -4425,18 +5295,37 @@ mod tests {
             let _g = gate_configured();
             let (admin, recovery) = (admin_key(), recovery_key());
             let body = body_with_authorities(&admin, &recovery);
-            let (cap, pay) =
-                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            let (cap, pay) = cap_and_payload(
+                &admin,
+                false,
+                0,
+                &[0x11; 16],
+                1,
+                &min_be(1_000_000),
+                Some((30_000, 250)),
+            );
             match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
-                AgentResponse::ConfigureTreasury { candidate, request_id } => {
+                AgentResponse::ConfigureTreasury {
+                    candidate,
+                    request_id,
+                } => {
                     assert_eq!(request_id, vec![0x11; 16], "request_id echoed");
-                    assert_eq!(candidate.faucet.per_dispense_max_amount, crate::u256::from_u64(1_000_000));
+                    assert_eq!(
+                        candidate.faucet.per_dispense_max_amount,
+                        crate::u256::from_u64(1_000_000)
+                    );
                     assert_eq!(candidate.faucet.max_gas_limit, 30_000);
                     assert_eq!(candidate.faucet.max_effective_gas_fee_rate, 250);
                     // spend/budget untouched.
-                    assert_eq!(candidate.faucet.cumulative_native_spend, body.faucet.cumulative_native_spend);
+                    assert_eq!(
+                        candidate.faucet.cumulative_native_spend,
+                        body.faucet.cumulative_native_spend
+                    );
                     assert_eq!(candidate.faucet.lifetime_spend, body.faucet.lifetime_spend);
-                    assert_eq!(candidate.faucet.cumulative_signing_budget, body.faucet.cumulative_signing_budget);
+                    assert_eq!(
+                        candidate.faucet.cumulative_signing_budget,
+                        body.faucet.cumulative_signing_budget
+                    );
                     // Structural: config_version + structural + epoch all advance.
                     assert_eq!(
                         candidate.config.monotonic_treasury_config_version,
@@ -4458,16 +5347,35 @@ mod tests {
             let _g = gate_configured();
             let (admin, recovery) = (admin_key(), recovery_key());
             let body = body_with_authorities(&admin, &recovery);
-            let (cap, pay) =
-                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            let (cap, pay) = cap_and_payload(
+                &admin,
+                false,
+                0,
+                &[0x11; 16],
+                1,
+                &min_be(1_000_000),
+                Some((30_000, 250)),
+            );
             match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
-                    assert_eq!(candidate.audit.records.len(), 1, "exactly one audit record per committed op");
-                    assert_eq!(candidate.audit.next_seq, body.audit.next_seq + 1, "next_seq advanced by 1");
+                    assert_eq!(
+                        candidate.audit.records.len(),
+                        1,
+                        "exactly one audit record per committed op"
+                    );
+                    assert_eq!(
+                        candidate.audit.next_seq,
+                        body.audit.next_seq + 1,
+                        "next_seq advanced by 1"
+                    );
                     let r = &candidate.audit.records[0];
                     assert_eq!(r.seq, body.audit.next_seq, "record seq = the old next_seq");
                     assert_eq!(r.op, 6, "op = CONFIGURE_TREASURY wire opcode");
-                    assert_eq!(r.authority, admin.verifying_key().to_bytes(), "authority = cap authority");
+                    assert_eq!(
+                        r.authority,
+                        admin.verifying_key().to_bytes(),
+                        "authority = cap authority"
+                    );
                     assert_eq!(r.counter, 1, "counter = the accepted cap batch sequence");
                     assert_eq!(
                         r.config_version,
@@ -4480,7 +5388,11 @@ mod tests {
                     );
                     assert_eq!(r.scope_class, 0, "scope_class = cap scope_class");
                     assert_eq!(r.scope_target, SCOPE.to_vec(), "scope_target = cap scope");
-                    assert_eq!(r.request_id, vec![0x11u8; 16], "request_id = envelope request_id");
+                    assert_eq!(
+                        r.request_id,
+                        vec![0x11u8; 16],
+                        "request_id = envelope request_id"
+                    );
                 }
                 _ => panic!("expected ConfigureTreasury"),
             }
@@ -4512,12 +5424,18 @@ mod tests {
             .expect("first append fills the cap-1 ring");
             assert!(install_agent_keystore(body, b"meas"));
             let calls = Arc::new(AtomicUsize::new(0));
-            assert!(install_commit_channel(Box::new(TestCommitChannel::counted(
-                CommitChannelAct::Ok,
-                Arc::clone(&calls),
-            ))));
-            let (cap, pay) =
-                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            assert!(install_commit_channel(Box::new(
+                TestCommitChannel::counted(CommitChannelAct::Ok, Arc::clone(&calls),)
+            )));
+            let (cap, pay) = cap_and_payload(
+                &admin,
+                false,
+                0,
+                &[0x11; 16],
+                1,
+                &min_be(1_000_000),
+                Some((30_000, 250)),
+            );
             assert_eq!(
                 decode_agent_error_code(&handle_agent_gateway_frame(&env_for(cap, pay))),
                 Some(0x46),
@@ -4539,13 +5457,28 @@ mod tests {
             let mut body = body_with_authorities(&admin, &recovery);
             body.faucet.cumulative_native_spend = crate::u256::from_u64(123);
             body.faucet.lifetime_spend = crate::u256::from_u64(456);
-            let (cap, pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
             match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
-                    assert_eq!(candidate.faucet.cumulative_signing_budget, crate::u256::from_u64(9_000_000));
-                    assert_eq!(candidate.faucet.cumulative_native_spend, [0u8; 32], "refill resets native spend");
-                    assert_eq!(candidate.faucet.lifetime_spend, crate::u256::from_u64(456), "lifetime untouched");
-                    assert_eq!(candidate.structural_version, body.structural_version + 1, "Structural");
+                    assert_eq!(
+                        candidate.faucet.cumulative_signing_budget,
+                        crate::u256::from_u64(9_000_000)
+                    );
+                    assert_eq!(
+                        candidate.faucet.cumulative_native_spend, [0u8; 32],
+                        "refill resets native spend"
+                    );
+                    assert_eq!(
+                        candidate.faucet.lifetime_spend,
+                        crate::u256::from_u64(456),
+                        "lifetime untouched"
+                    );
+                    assert_eq!(
+                        candidate.structural_version,
+                        body.structural_version + 1,
+                        "Structural"
+                    );
                     assert_eq!(
                         candidate.config.monotonic_treasury_config_version,
                         body.config.monotonic_treasury_config_version + 1
@@ -4575,16 +5508,25 @@ mod tests {
             let mut body = body_with_authorities(&admin, &recovery);
             body.faucet.lifetime_spend = crate::u256::from_u64(1_000);
             // threshold >= lifetime_spend: accepted.
-            let (cap, pay) = cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(5_000), None);
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(5_000), None);
             match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
-                    assert_eq!(candidate.faucet.circuit_breaker_threshold, Some(crate::u256::from_u64(5_000)));
-                    assert_eq!(candidate.structural_version, body.structural_version + 1, "Structural");
+                    assert_eq!(
+                        candidate.faucet.circuit_breaker_threshold,
+                        Some(crate::u256::from_u64(5_000))
+                    );
+                    assert_eq!(
+                        candidate.structural_version,
+                        body.structural_version + 1,
+                        "Structural"
+                    );
                 }
                 _ => panic!("expected ConfigureTreasury"),
             }
             // threshold < lifetime_spend: 0x44 (anti-inversion — would trip immediately).
-            let (cap2, pay2) = cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(999), None);
+            let (cap2, pay2) =
+                cap_and_payload(&admin, false, 2, &[0x11; 16], 1, &min_be(999), None);
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
                 Some(AgentError::CapExceeded),
@@ -4600,11 +5542,19 @@ mod tests {
             body.faucet.lifetime_spend = crate::u256::from_u64(10_000);
             body.faucet.circuit_breaker_threshold = Some(crate::u256::from_u64(12_000));
             // reset to a lower target with a RECOVERY cap.
-            let (cap, pay) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
+            let (cap, pay) =
+                cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
             match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
-                    assert_eq!(candidate.faucet.lifetime_spend, crate::u256::from_u64(2_000), "lifetime lowered");
-                    assert_eq!(candidate.faucet.circuit_breaker_threshold, None, "breaker cleared");
+                    assert_eq!(
+                        candidate.faucet.lifetime_spend,
+                        crate::u256::from_u64(2_000),
+                        "lifetime lowered"
+                    );
+                    assert_eq!(
+                        candidate.faucet.circuit_breaker_threshold, None,
+                        "breaker cleared"
+                    );
                     assert_eq!(
                         candidate.strict_recovery_counter,
                         body.strict_recovery_counter + 1,
@@ -4619,15 +5569,21 @@ mod tests {
                     // AdoptForward belt rejects) + clears the breaker + bumps config_version, so a dropped
                     // seal must StructuralGap→restore — structural_version MUST advance.
                     assert_eq!(
-                        candidate.structural_version, body.structural_version + 1,
+                        candidate.structural_version,
+                        body.structural_version + 1,
                         "Structural: structural_version advances (TASK-15 15-4 review fix)"
                     );
-                    assert_eq!(candidate.freshness_epoch, body.freshness_epoch + 1, "epoch advanced");
+                    assert_eq!(
+                        candidate.freshness_epoch,
+                        body.freshness_epoch + 1,
+                        "epoch advanced"
+                    );
                 }
                 _ => panic!("expected ConfigureTreasury"),
             }
             // target ABOVE current lifetime_spend → 0x44 (reset can only lower).
-            let (cap2, pay2) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(20_000), None);
+            let (cap2, pay2) =
+                cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(20_000), None);
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
                 Some(AgentError::CapExceeded),
@@ -4646,10 +5602,15 @@ mod tests {
             let mut body = body_with_authorities(&admin, &recovery);
             body.faucet.lifetime_spend = crate::u256::from_u64(10_000);
             body.faucet.circuit_breaker_threshold = Some(crate::u256::from_u64(12_000));
-            let (cap, pay) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
+            let (cap, pay) =
+                cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
             match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
                 AgentResponse::ConfigureTreasury { candidate, .. } => {
-                    assert_eq!(candidate.audit.records.len(), 1, "one record even for the recovery-tier sub-op");
+                    assert_eq!(
+                        candidate.audit.records.len(),
+                        1,
+                        "one record even for the recovery-tier sub-op"
+                    );
                     let r = &candidate.audit.records[0];
                     assert_eq!(r.op, 6, "op = CONFIGURE_TREASURY");
                     assert_eq!(
@@ -4686,13 +5647,22 @@ mod tests {
             let lmarks = body.compute_local_marks_digest();
 
             // Drive the REAL handler to get the post-reset candidate (lifetime lowered to 2000).
-            let (cap, pay) = cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
-            let candidate = match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
-                AgentResponse::ConfigureTreasury { candidate, .. } => candidate,
-                _ => panic!("expected ConfigureTreasury"),
-            };
-            assert_eq!(candidate.structural_version, ls + 1, "reset is Structural — structural advanced");
-            assert!(candidate.faucet.lifetime_spend < body.faucet.lifetime_spend, "reset LOWERED lifetime_spend (the marks decrease)");
+            let (cap, pay) =
+                cap_and_payload(&recovery, true, 3, &[0x11; 16], 1, &min_be(2_000), None);
+            let candidate =
+                match dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).unwrap() {
+                    AgentResponse::ConfigureTreasury { candidate, .. } => candidate,
+                    _ => panic!("expected ConfigureTreasury"),
+                };
+            assert_eq!(
+                candidate.structural_version,
+                ls + 1,
+                "reset is Structural — structural advanced"
+            );
+            assert!(
+                candidate.faucet.lifetime_spend < body.faucet.lifetime_spend,
+                "reset LOWERED lifetime_spend (the marks decrease)"
+            );
 
             let anchor_of = |b: &KeystoreBody| AnchorState {
                 epoch: b.freshness_epoch,
@@ -4743,7 +5713,8 @@ mod tests {
                 "reset with admin tier ⇒ 0x43"
             );
             // set_limits(0) with a RECOVERY cap → 0x43.
-            let (cap2, pay2) = cap_and_payload(&recovery, true, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
+            let (cap2, pay2) =
+                cap_and_payload(&recovery, true, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env_for(cap2, pay2), &body).err(),
                 Some(AgentError::CapabilityRejected),
@@ -4759,7 +5730,8 @@ mod tests {
             let _g = gate_configured();
             let (admin, recovery) = (admin_key(), recovery_key());
             let body = body_with_authorities(&admin, &recovery);
-            let (cap, _pay0) = cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
+            let (cap, _pay0) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
             let pay3 = vec![
                 (Value::Integer(1.into()), Value::Integer(3u64.into())),
                 (Value::Integer(2.into()), Value::Bytes(min_be(0))),
@@ -4777,8 +5749,15 @@ mod tests {
             let (admin, recovery) = (admin_key(), recovery_key());
             let body = body_with_authorities(&admin, &recovery);
             // valid cap for set_limits, but the request alters max_gas_limit under it.
-            let (cap, _pay) =
-                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            let (cap, _pay) = cap_and_payload(
+                &admin,
+                false,
+                0,
+                &[0x11; 16],
+                1,
+                &min_be(1_000_000),
+                Some((30_000, 250)),
+            );
             let altered = vec![
                 (Value::Integer(1.into()), Value::Integer(0u64.into())),
                 (Value::Integer(2.into()), Value::Bytes(min_be(1_000_000))),
@@ -4801,7 +5780,19 @@ mod tests {
             let cp = configure_treasury_canonical_params(0, &min_be(1), Some((1, 1)));
             let pb = crate::agent_capability::payload_binding(6, Some(0), &[0x11; 16], &cp);
             let cap = crate::agent_capability::test_signed_capability_with_sub_op(
-                &admin, 6, Some(0), &[0x11; 16], 1, false, 11565, "testnet", 1, SCOPE, 2, pb, [0xf1; 32],
+                &admin,
+                6,
+                Some(0),
+                &[0x11; 16],
+                1,
+                false,
+                11565,
+                "testnet",
+                1,
+                SCOPE,
+                2,
+                pb,
+                [0xf1; 32],
             );
             let pay = vec![
                 (Value::Integer(1.into()), Value::Integer(0u64.into())),
@@ -4857,7 +5848,8 @@ mod tests {
             let (admin, recovery) = (admin_key(), recovery_key());
             let body = body_with_authorities(&admin, &recovery);
             // refill(1) expects exactly 2 keys; send an extra key 3 → 0x40.
-            let (cap, _pay) = cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
+            let (cap, _pay) =
+                cap_and_payload(&admin, false, 1, &[0x11; 16], 1, &min_be(9_000_000), None);
             let pay = vec![
                 (Value::Integer(1.into()), Value::Integer(1u64.into())),
                 (Value::Integer(2.into()), Value::Bytes(min_be(9_000_000))),
@@ -4875,7 +5867,8 @@ mod tests {
             let _g = gate_unconfigured();
             let (admin, recovery) = (admin_key(), recovery_key());
             let body = body_with_authorities(&admin, &recovery);
-            let (cap, pay) = cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
+            let (cap, pay) =
+                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1), Some((1, 1)));
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env_for(cap, pay), &body).err(),
                 Some(AgentError::NotConfigured),
@@ -4890,19 +5883,42 @@ mod tests {
             let mut body = body_with_authorities(&admin, &recovery);
             body.config.anchor_root = anchor_test_key().verifying_key().to_bytes();
             assert!(install_agent_keystore(body, b"meas"));
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Ok
+            ))));
 
-            let (cap, pay) =
-                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+            let (cap, pay) = cap_and_payload(
+                &admin,
+                false,
+                0,
+                &[0x11; 16],
+                1,
+                &min_be(1_000_000),
+                Some((30_000, 250)),
+            );
             let out = handle_agent_gateway_frame(&env_for(cap, pay));
-            assert_eq!(decode_agent_error_code(&out), None, "first config is a success body");
+            assert_eq!(
+                decode_agent_error_code(&out),
+                None,
+                "first config is a success body"
+            );
             let m = resp_map(&out);
-            assert!(!as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(), "key 1 = sealed blob");
+            assert!(
+                !as_bytes(map_get(&m, 1).unwrap()).unwrap().is_empty(),
+                "key 1 = sealed blob"
+            );
 
             // PROOF OF SWAP: the live slot's counter advanced to 1, so a second request reusing counter 1 is
             // now non-contiguous ⇒ 0x43. (If the first hadn't swapped, counter 1 would still be expected.)
-            let (cap2, pay2) =
-                cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(2_000_000), Some((30_000, 250)));
+            let (cap2, pay2) = cap_and_payload(
+                &admin,
+                false,
+                0,
+                &[0x11; 16],
+                1,
+                &min_be(2_000_000),
+                Some((30_000, 250)),
+            );
             assert_eq!(
                 decode_agent_error_code(&handle_agent_gateway_frame(&env_for(cap2, pay2))),
                 Some(0x43),
@@ -4921,23 +5937,48 @@ mod tests {
             assert!(install_agent_keystore(body, b"meas"));
 
             let mk = || {
-                let (cap, pay) =
-                    cap_and_payload(&admin, false, 0, &[0x11; 16], 1, &min_be(1_000_000), Some((30_000, 250)));
+                let (cap, pay) = cap_and_payload(
+                    &admin,
+                    false,
+                    0,
+                    &[0x11; 16],
+                    1,
+                    &min_be(1_000_000),
+                    Some((30_000, 250)),
+                );
                 env_for(cap, pay)
             };
             // (a) no channel → 0x46.
-            assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&mk())), Some(0x46), "no channel ⇒ 0x46");
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&mk())),
+                Some(0x46),
+                "no channel ⇒ 0x46"
+            );
             // (b) transport failure → 0x46.
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Transport))));
-            assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&mk())), Some(0x46), "transport ⇒ 0x46");
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Transport
+            ))));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&mk())),
+                Some(0x46),
+                "transport ⇒ 0x46"
+            );
             reset_commit_channel_for_tests();
             // (c) forged ACK → 0x46.
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::WrongKey))));
-            assert_eq!(decode_agent_error_code(&handle_agent_gateway_frame(&mk())), Some(0x46), "forged ack ⇒ 0x46");
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::WrongKey
+            ))));
+            assert_eq!(
+                decode_agent_error_code(&handle_agent_gateway_frame(&mk())),
+                Some(0x46),
+                "forged ack ⇒ 0x46"
+            );
             reset_commit_channel_for_tests();
             // (d) PROOF OF NO MUTATION: the live config never advanced across the 3 failures, so the SAME
             // request (counter 1) now SUCCEEDS once a conformant channel is installed.
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Ok
+            ))));
             assert_eq!(
                 decode_agent_error_code(&handle_agent_gateway_frame(&mk())),
                 None,
@@ -4978,7 +6019,11 @@ mod tests {
             } else {
                 vec![0xb0; 100] // wrong length ⇒ seal_backup_blob InvalidEncapsKeyLen ⇒ SealFailed
             };
-            let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 7 };
+            let creation = CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 0,
+                batch_id: 7,
+            };
             generate_keys(&mut body, KeyPurpose::AgentTransferK1, n, creation).unwrap();
             for i in 0..2u64 {
                 body.record_audit(&crate::agent_keystore::AuditAppend {
@@ -4995,7 +6040,12 @@ mod tests {
             body
         }
 
-        fn export_env(admin: &SigningKey, request_id: &[u8], counter: u64, selector: &ExportSelector) -> Vec<u8> {
+        fn export_env(
+            admin: &SigningKey,
+            request_id: &[u8],
+            counter: u64,
+            selector: &ExportSelector,
+        ) -> Vec<u8> {
             let pb = crate::agent_capability::payload_binding(
                 7,
                 None,
@@ -5003,7 +6053,8 @@ mod tests {
                 &export_canonical_params(selector),
             );
             let cap = crate::agent_capability::test_signed_capability(
-                admin, 7, request_id, counter, false, 11565, "testnet", 0, ESCOPE, 1, pb, [0xe1; 32],
+                admin, 7, request_id, counter, false, 11565, "testnet", 0, ESCOPE, 1, pb,
+                [0xe1; 32],
             );
             let payload = match selector {
                 ExportSelector::All => vec![],
@@ -5035,10 +6086,18 @@ mod tests {
             let pre_next = body.audit.next_seq;
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
             match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
-                AgentResponse::ExportBackup { candidate, backup_blob, request_id } => {
+                AgentResponse::ExportBackup {
+                    candidate,
+                    backup_blob,
+                    request_id,
+                } => {
                     assert_eq!(request_id, vec![0x11; 16]);
                     assert_eq!(&backup_blob[..8], b"2DAGTBK\0", "backup envelope magic");
-                    assert_eq!(candidate.audit.next_seq, pre_next + 1, "one EXPORT audit record appended");
+                    assert_eq!(
+                        candidate.audit.next_seq,
+                        pre_next + 1,
+                        "one EXPORT audit record appended"
+                    );
                     let last = candidate.audit.records.last().unwrap();
                     assert_eq!(last.op, 7, "the appended record is the EXPORT event");
                     assert_eq!(last.authority, admin.verifying_key().to_bytes());
@@ -5047,9 +6106,17 @@ mod tests {
                         candidate.audit.next_seq - 1,
                         "FULL drain covers the export's own record"
                     );
-                    assert_eq!(candidate.structural_version, body.structural_version + 1, "Structural bump");
+                    assert_eq!(
+                        candidate.structural_version,
+                        body.structural_version + 1,
+                        "Structural bump"
+                    );
                     // cap counter consumed (anti-replay).
-                    let c = candidate.counters.iter().find(|c| c.scope_target == ESCOPE).unwrap();
+                    let c = candidate
+                        .counters
+                        .iter()
+                        .find(|c| c.scope_target == ESCOPE)
+                        .unwrap();
                     assert_eq!(c.highest_accepted_counter, 1);
                 }
                 _ => panic!("expected ExportBackup"),
@@ -5063,7 +6130,9 @@ mod tests {
             let admin = admin_key();
             let body = export_body(&admin, 2, true);
             assert!(install_agent_keystore(body, b"meas"));
-            assert!(install_commit_channel(Box::new(TestCommitChannel::new(CommitChannelAct::Ok))));
+            assert!(install_commit_channel(Box::new(TestCommitChannel::new(
+                CommitChannelAct::Ok
+            ))));
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::All);
             let out = handle_agent_gateway_frame(&env);
             assert_eq!(decode_agent_error_code(&out), None, "EXPORT success body");
@@ -5071,8 +6140,15 @@ mod tests {
                 Value::Map(m) => m,
                 _ => panic!("response is a map"),
             };
-            assert_eq!(&as_bytes(map_get(&m, 1).unwrap()).unwrap()[..8], b"2DAGTBK\0", "key 1 = backup blob");
-            assert!(!as_bytes(map_get(&m, 2).unwrap()).unwrap().is_empty(), "key 2 = sealed keystore blob");
+            assert_eq!(
+                &as_bytes(map_get(&m, 1).unwrap()).unwrap()[..8],
+                b"2DAGTBK\0",
+                "key 1 = backup blob"
+            );
+            assert!(
+                !as_bytes(map_get(&m, 2).unwrap()).unwrap().is_empty(),
+                "key 2 = sealed keystore blob"
+            );
             reset_agent_keystore_for_tests();
             reset_commit_channel_for_tests();
         }
@@ -5090,14 +6166,28 @@ mod tests {
                 &export_canonical_params(&ExportSelector::All),
             );
             let cap = crate::agent_capability::test_signed_capability(
-                &admin, 7, &[0x11; 16], 1, false, 11565, "testnet", 0, ESCOPE, 1, pb, [0xe1; 32],
+                &admin,
+                7,
+                &[0x11; 16],
+                1,
+                false,
+                11565,
+                "testnet",
+                0,
+                ESCOPE,
+                1,
+                pb,
+                [0xe1; 32],
             );
             // Cap signed for ALL, but the request carries a batch_id selector.
             let env = envelope(
                 7,
                 vec![
                     (Value::Integer(5.into()), Value::Map(cap)),
-                    (Value::Integer(7.into()), Value::Map(vec![(Value::Integer(2.into()), Value::Integer(7.into()))])),
+                    (
+                        Value::Integer(7.into()),
+                        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(7.into()))]),
+                    ),
                 ],
             );
             assert_eq!(
@@ -5112,7 +6202,12 @@ mod tests {
             let _g = gate_configured();
             let admin = admin_key();
             let body = export_body(&admin, 2, true);
-            let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::KeyRefs(vec![[0xfe; 32]]));
+            let env = export_env(
+                &admin,
+                &[0x11; 16],
+                1,
+                &ExportSelector::KeyRefs(vec![[0xfe; 32]]),
+            );
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &body).err(),
                 Some(AgentError::KeyPurposeMismatch)
@@ -5158,7 +6253,11 @@ mod tests {
             let _g = gate_configured();
             let admin = admin_key();
             let mut body = export_body(&admin, 2, true); // 2 keys, batch 7
-            let creation = CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 99 };
+            let creation = CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 0,
+                batch_id: 99,
+            };
             generate_keys(&mut body, KeyPurpose::AgentTransferK1, 1, creation).unwrap();
             let env = export_env(&admin, &[0x11; 16], 1, &ExportSelector::BatchId(7));
             match dispatch_agent(Profile::AgentGateway, &env, &body).unwrap() {
@@ -5196,12 +6295,12 @@ mod tests {
 
         // Addresses mirror ordinary_tx_v1.json (transfer-key `from`, treasury-key `to`).
         const TRANSFER_FROM: [u8; 20] = [
-            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
-            0xff, 0xb9, 0x22, 0x66,
+            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72,
+            0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
         ];
         const TREASURY_TO: [u8; 20] = [
-            0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01, 0x0c, 0x7d, 0x01, 0xb5, 0x0e, 0x0d,
-            0x17, 0xdc, 0x79, 0xc8,
+            0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01, 0x0c, 0x7d, 0x01, 0xb5,
+            0x0e, 0x0d, 0x17, 0xdc, 0x79, 0xc8,
         ];
         const GOLDEN_KEY_REF: [u8; 32] = [0x11; 32];
         const GOLDEN_PROVE_NONCE: [u8; 32] = [0x22; 32];
@@ -5222,7 +6321,8 @@ mod tests {
         }
         fn enc(map: Vec<(Value, Value)>) -> Vec<u8> {
             let mut buf = Vec::new();
-            ciborium::ser::into_writer(&Value::Map(map), &mut buf).expect("canonical envelope encodes");
+            ciborium::ser::into_writer(&Value::Map(map), &mut buf)
+                .expect("canonical envelope encodes");
             buf
         }
         fn k(n: u64) -> Value {
@@ -5294,10 +6394,34 @@ mod tests {
         /// purely for deterministic regen.
         fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static [u8], bool)> {
             vec![
-                ("req_prove_identity_v1.bin", req_prove_identity(), 3, RID_PROVE_IDENTITY, true),
-                ("req_public_identity_v1.bin", req_public_identity(), 2, RID_PUBLIC_IDENTITY, false),
-                ("req_sign_faucet_dispense_v1.bin", req_sign_faucet(), 5, RID_SIGN_FAUCET, true),
-                ("req_sign_transfer_v1.bin", req_sign_transfer(), 4, RID_SIGN_TRANSFER, true),
+                (
+                    "req_prove_identity_v1.bin",
+                    req_prove_identity(),
+                    3,
+                    RID_PROVE_IDENTITY,
+                    true,
+                ),
+                (
+                    "req_public_identity_v1.bin",
+                    req_public_identity(),
+                    2,
+                    RID_PUBLIC_IDENTITY,
+                    false,
+                ),
+                (
+                    "req_sign_faucet_dispense_v1.bin",
+                    req_sign_faucet(),
+                    5,
+                    RID_SIGN_FAUCET,
+                    true,
+                ),
+                (
+                    "req_sign_transfer_v1.bin",
+                    req_sign_transfer(),
+                    4,
+                    RID_SIGN_TRANSFER,
+                    true,
+                ),
             ]
         }
 
@@ -5307,14 +6431,34 @@ mod tests {
             // map-ordering / minimal-int / bstr drift in the encoder flips this. Regen via
             // `regen_golden_request_envelopes` (-- --ignored) and re-mint the .json in the same commit.
             let committed: &[(&str, &[u8])] = &[
-                ("req_public_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/req_public_identity_v1.bin")),
-                ("req_prove_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/req_prove_identity_v1.bin")),
-                ("req_sign_transfer_v1.bin", include_bytes!("../testvectors/agent-gateway/req_sign_transfer_v1.bin")),
-                ("req_sign_faucet_dispense_v1.bin", include_bytes!("../testvectors/agent-gateway/req_sign_faucet_dispense_v1.bin")),
+                (
+                    "req_public_identity_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/req_public_identity_v1.bin"),
+                ),
+                (
+                    "req_prove_identity_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/req_prove_identity_v1.bin"),
+                ),
+                (
+                    "req_sign_transfer_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/req_sign_transfer_v1.bin"),
+                ),
+                (
+                    "req_sign_faucet_dispense_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/req_sign_faucet_dispense_v1.bin"),
+                ),
             ];
             for (name, built, ..) in vectors() {
-                let c = committed.iter().find(|(n, _)| *n == name).expect("committed vector present").1;
-                assert_eq!(built.as_slice(), c, "{name} golden drifted; regen + re-mint .json in the same commit");
+                let c = committed
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .expect("committed vector present")
+                    .1;
+                assert_eq!(
+                    built.as_slice(),
+                    c,
+                    "{name} golden drifted; regen + re-mint .json in the same commit"
+                );
             }
         }
 
@@ -5324,14 +6468,25 @@ mod tests {
             // to the intended fields — couples the frozen bytes to the real `decode_envelope` so an
             // encoder/decoder divergence (the exact cross-language drift these vectors guard) breaks CI.
             for (name, bytes, opcode, request_id, has_payload) in vectors() {
-                let env = decode_envelope(&bytes).unwrap_or_else(|_| panic!("{name} must decode canonically"));
-                assert_eq!(env.agent_version, AGENT_GATEWAY_VERSION, "{name} agent_version");
+                let env = decode_envelope(&bytes)
+                    .unwrap_or_else(|_| panic!("{name} must decode canonically"));
+                assert_eq!(
+                    env.agent_version, AGENT_GATEWAY_VERSION,
+                    "{name} agent_version"
+                );
                 assert_eq!(env.command_domain, COMMAND_DOMAIN, "{name} command_domain");
                 assert_eq!(env.opcode, opcode, "{name} opcode");
                 assert_eq!(env.request_id.as_slice(), request_id, "{name} request_id");
                 assert_eq!(env.key_ref, Some(GOLDEN_KEY_REF), "{name} key_ref");
-                assert!(env.capability.is_none(), "{name} non-privileged ⇒ no capability");
-                assert_eq!(env.payload.is_some(), has_payload, "{name} payload presence");
+                assert!(
+                    env.capability.is_none(),
+                    "{name} non-privileged ⇒ no capability"
+                );
+                assert_eq!(
+                    env.payload.is_some(),
+                    has_payload,
+                    "{name} payload presence"
+                );
             }
         }
 
@@ -5339,10 +6494,26 @@ mod tests {
         fn golden_request_envelope_canonical_headers() {
             // Hand-audited canonical CBOR markers (RFC 8949 §4.2.1) a lenient re-encoder would mask: the
             // map-pair count in the head byte, and key 3 = text(23) "2d-hsm/agent-gateway/v1".
-            assert_eq!(req_public_identity()[0], 0xA5, "public-identity = 5-pair map {{1,2,3,4,6}}");
-            assert_eq!(req_prove_identity()[0], 0xA6, "prove-identity = 6-pair map {{1,2,3,4,6,7}}");
-            assert_eq!(req_sign_transfer()[0], 0xA6, "sign-transfer = 6-pair map {{1,2,3,4,6,7}}");
-            assert_eq!(req_sign_faucet()[0], 0xA6, "sign-faucet = 6-pair map {{1,2,3,4,6,7}}");
+            assert_eq!(
+                req_public_identity()[0],
+                0xA5,
+                "public-identity = 5-pair map {{1,2,3,4,6}}"
+            );
+            assert_eq!(
+                req_prove_identity()[0],
+                0xA6,
+                "prove-identity = 6-pair map {{1,2,3,4,6,7}}"
+            );
+            assert_eq!(
+                req_sign_transfer()[0],
+                0xA6,
+                "sign-transfer = 6-pair map {{1,2,3,4,6,7}}"
+            );
+            assert_eq!(
+                req_sign_faucet()[0],
+                0xA6,
+                "sign-faucet = 6-pair map {{1,2,3,4,6,7}}"
+            );
             // command_domain at key 3: int-key 0x03, then text(23) head 0x77 (major 3 | len 23) ‖ the bytes.
             assert_eq!(COMMAND_DOMAIN.len(), 23, "0x77 text head assumes len 23");
             let needle = [&[0x03u8, 0x77][..], COMMAND_DOMAIN.as_bytes()].concat();
@@ -5359,9 +6530,18 @@ mod tests {
             // Couple the descriptive `.json` index (consumed by no runtime path) to the committed `.bin`s
             // and the source constants, so a regen that forgets the manual `.json` re-mint fails CI.
             let sidecar = include_str!("../testvectors/agent-gateway/request_envelopes_v1.json");
-            let v: serde_json::Value = serde_json::from_str(sidecar).expect("request-envelope index is valid JSON");
-            assert_eq!(v["command_domain"].as_str(), Some(COMMAND_DOMAIN), "index command_domain");
-            assert_eq!(v["agent_version"].as_u64(), Some(AGENT_GATEWAY_VERSION as u64), "index agent_version");
+            let v: serde_json::Value =
+                serde_json::from_str(sidecar).expect("request-envelope index is valid JSON");
+            assert_eq!(
+                v["command_domain"].as_str(),
+                Some(COMMAND_DOMAIN),
+                "index command_domain"
+            );
+            assert_eq!(
+                v["agent_version"].as_u64(),
+                Some(AGENT_GATEWAY_VERSION as u64),
+                "index agent_version"
+            );
             // No STALE/extra vector keys: the index must hold EXACTLY the current vectors, else a renamed
             // or dropped vector would leave a lingering entry the per-vector loop below never visits.
             assert_eq!(
@@ -5371,15 +6551,39 @@ mod tests {
             );
             for (name, bytes, opcode, request_id, has_payload) in vectors() {
                 let e = &v["vectors"][name];
-                assert_eq!(e["blob_sha256"].as_str(), Some(hex(&Sha256::digest(&bytes)).as_str()), "{name} sha256");
-                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
+                assert_eq!(
+                    e["blob_sha256"].as_str(),
+                    Some(hex(&Sha256::digest(&bytes)).as_str()),
+                    "{name} sha256"
+                );
+                assert_eq!(
+                    e["blob_len_bytes"].as_u64(),
+                    Some(bytes.len() as u64),
+                    "{name} len"
+                );
                 assert_eq!(e["opcode"].as_u64(), Some(opcode as u64), "{name} opcode");
-                assert_eq!(e["request_id_hex"].as_str(), Some(hex(request_id).as_str()), "{name} request_id");
-                assert_eq!(e["has_payload"].as_bool(), Some(has_payload), "{name} has_payload");
+                assert_eq!(
+                    e["request_id_hex"].as_str(),
+                    Some(hex(request_id).as_str()),
+                    "{name} request_id"
+                );
+                assert_eq!(
+                    e["has_payload"].as_bool(),
+                    Some(has_payload),
+                    "{name} has_payload"
+                );
                 // Couple the full bytes (blob_hex) + key_ref_hex too — the README advertises blob_hex as a
                 // decode source, so a hand-edit/merge that corrupts ONLY blob_hex must fail CI.
-                assert_eq!(e["blob_hex"].as_str(), Some(hex(&bytes).as_str()), "{name} blob_hex");
-                assert_eq!(e["key_ref_hex"].as_str(), Some(hex(&GOLDEN_KEY_REF).as_str()), "{name} key_ref_hex");
+                assert_eq!(
+                    e["blob_hex"].as_str(),
+                    Some(hex(&bytes).as_str()),
+                    "{name} blob_hex"
+                );
+                assert_eq!(
+                    e["key_ref_hex"].as_str(),
+                    Some(hex(&GOLDEN_KEY_REF).as_str()),
+                    "{name} key_ref_hex"
+                );
             }
         }
 
@@ -5477,7 +6681,8 @@ mod tests {
         }
         fn enc(map: Vec<(Value, Value)>) -> Vec<u8> {
             let mut buf = Vec::new();
-            ciborium::ser::into_writer(&Value::Map(map), &mut buf).expect("canonical envelope encodes");
+            ciborium::ser::into_writer(&Value::Map(map), &mut buf)
+                .expect("canonical envelope encodes");
             buf
         }
         fn k(n: u64) -> Value {
@@ -5488,9 +6693,25 @@ mod tests {
         /// payload_binding is over `generate_keys_canonical_params(1, 1)` so it matches THIS payload.
         fn req_generate_keys() -> Vec<u8> {
             let admin = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-            let pb = crate::agent_capability::payload_binding(1, None, RID_GENERATE, &generate_keys_canonical_params(1, 1));
+            let pb = crate::agent_capability::payload_binding(
+                1,
+                None,
+                RID_GENERATE,
+                &generate_keys_canonical_params(1, 1),
+            );
             let cap = crate::agent_capability::test_signed_capability(
-                &admin, 1, RID_GENERATE, 1, false, CHAIN, ENV_ID, 0, SCOPE_GENERATE, 1, pb, [0xe1; 32],
+                &admin,
+                1,
+                RID_GENERATE,
+                1,
+                false,
+                CHAIN,
+                ENV_ID,
+                0,
+                SCOPE_GENERATE,
+                1,
+                pb,
+                [0xe1; 32],
             );
             enc(vec![
                 (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
@@ -5498,7 +6719,13 @@ mod tests {
                 (k(3), Value::Text(COMMAND_DOMAIN.to_string())),
                 (k(4), Value::Bytes(RID_GENERATE.to_vec())),
                 (k(5), Value::Map(cap)),
-                (k(7), Value::Map(vec![(k(1), Value::Integer(1u64.into())), (k(2), Value::Integer(1u64.into()))])),
+                (
+                    k(7),
+                    Value::Map(vec![
+                        (k(1), Value::Integer(1u64.into())),
+                        (k(2), Value::Integer(1u64.into())),
+                    ]),
+                ),
             ])
         }
 
@@ -5507,10 +6734,26 @@ mod tests {
         /// `configure_treasury_canonical_params(0, min_be(1e6), Some((21000, 1e9)))` to match THIS payload.
         fn req_configure_set_limits() -> Vec<u8> {
             let admin = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-            let params = configure_treasury_canonical_params(0, &min_be(1_000_000), Some((21_000, 1_000_000_000)));
+            let params = configure_treasury_canonical_params(
+                0,
+                &min_be(1_000_000),
+                Some((21_000, 1_000_000_000)),
+            );
             let pb = crate::agent_capability::payload_binding(6, Some(0), RID_SET_LIMITS, &params);
             let cap = crate::agent_capability::test_signed_capability_with_sub_op(
-                &admin, 6, Some(0), RID_SET_LIMITS, 1, false, CHAIN, ENV_ID, 0, SCOPE_CONFIGURE, 2, pb, [0xe1; 32],
+                &admin,
+                6,
+                Some(0),
+                RID_SET_LIMITS,
+                1,
+                false,
+                CHAIN,
+                ENV_ID,
+                0,
+                SCOPE_CONFIGURE,
+                2,
+                pb,
+                [0xe1; 32],
             );
             enc(vec![
                 (k(1), Value::Integer((AGENT_GATEWAY_VERSION as u64).into())),
@@ -5533,20 +6776,42 @@ mod tests {
         /// (filename, bytes, opcode, request_id, cap_full filename to cross-reference).
         fn vectors() -> Vec<(&'static str, Vec<u8>, u8, &'static [u8], &'static str)> {
             vec![
-                ("req_configure_set_limits_v1.bin", req_configure_set_limits(), 6, RID_SET_LIMITS, "cap_full_configure_set_limits_v1.bin"),
-                ("req_generate_keys_v1.bin", req_generate_keys(), 1, RID_GENERATE, "cap_full_generate_keys_v1.bin"),
+                (
+                    "req_configure_set_limits_v1.bin",
+                    req_configure_set_limits(),
+                    6,
+                    RID_SET_LIMITS,
+                    "cap_full_configure_set_limits_v1.bin",
+                ),
+                (
+                    "req_generate_keys_v1.bin",
+                    req_generate_keys(),
+                    1,
+                    RID_GENERATE,
+                    "cap_full_generate_keys_v1.bin",
+                ),
             ]
         }
 
         #[test]
         fn golden_cap_envelopes_are_byte_exact() {
             let committed: &[(&str, &[u8])] = &[
-                ("req_configure_set_limits_v1.bin", include_bytes!("../testvectors/agent-gateway/req_configure_set_limits_v1.bin")),
-                ("req_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/req_generate_keys_v1.bin")),
+                (
+                    "req_configure_set_limits_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/req_configure_set_limits_v1.bin"),
+                ),
+                (
+                    "req_generate_keys_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/req_generate_keys_v1.bin"),
+                ),
             ];
             for (name, built, ..) in vectors() {
                 let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
-                assert_eq!(built.as_slice(), c, "{name} golden drifted; regen + re-mint .json in the same commit");
+                assert_eq!(
+                    built.as_slice(),
+                    c,
+                    "{name} golden drifted; regen + re-mint .json in the same commit"
+                );
             }
         }
 
@@ -5557,8 +6822,16 @@ mod tests {
             // frozen cap_full_*_v1.bin (AC#2) — which the capability slice proved is accepted by the live
             // verify_capability. So the envelope provably carries a valid, verifier-accepted capability.
             let cap_full: &[(&str, &[u8])] = &[
-                ("cap_full_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin")),
-                ("cap_full_configure_set_limits_v1.bin", include_bytes!("../testvectors/agent-gateway/cap_full_configure_set_limits_v1.bin")),
+                (
+                    "cap_full_generate_keys_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/cap_full_generate_keys_v1.bin"),
+                ),
+                (
+                    "cap_full_configure_set_limits_v1.bin",
+                    include_bytes!(
+                        "../testvectors/agent-gateway/cap_full_configure_set_limits_v1.bin"
+                    ),
+                ),
             ];
             for (name, bytes, opcode, request_id, cap_file) in vectors() {
                 let env = decode_envelope(&bytes).unwrap_or_else(|_| panic!("{name} must decode"));
@@ -5566,12 +6839,21 @@ mod tests {
                 assert_eq!(env.command_domain, COMMAND_DOMAIN, "{name} domain");
                 assert_eq!(env.opcode, opcode, "{name} opcode");
                 assert_eq!(env.request_id.as_slice(), request_id, "{name} request_id");
-                assert!(env.key_ref.is_none(), "{name} privileged op carries NO key_ref");
+                assert!(
+                    env.key_ref.is_none(),
+                    "{name} privileged op carries NO key_ref"
+                );
                 assert!(env.payload.is_some(), "{name} has a payload");
-                let cap = env.capability.unwrap_or_else(|| panic!("{name} has a capability (key 5)"));
+                let cap = env
+                    .capability
+                    .unwrap_or_else(|| panic!("{name} has a capability (key 5)"));
                 let cap_bytes = enc(cap);
                 let expected = cap_full.iter().find(|(n, _)| *n == cap_file).unwrap().1;
-                assert_eq!(cap_bytes.as_slice(), expected, "{name} embedded cap must equal {cap_file}");
+                assert_eq!(
+                    cap_bytes.as_slice(),
+                    expected,
+                    "{name} embedded cap must equal {cap_file}"
+                );
             }
         }
 
@@ -5593,7 +6875,12 @@ mod tests {
                     1 => {
                         let purpose = map_get(&payload, 1).and_then(as_u64).unwrap();
                         let count = map_get(&payload, 2).and_then(as_u64).unwrap();
-                        crate::agent_capability::payload_binding(1, None, request_id, &generate_keys_canonical_params(purpose, count))
+                        crate::agent_capability::payload_binding(
+                            1,
+                            None,
+                            request_id,
+                            &generate_keys_canonical_params(purpose, count),
+                        )
                     }
                     6 => {
                         // Mirror handle_configure_treasury's payload SHAPE checks exactly, so a malformed
@@ -5609,19 +6896,40 @@ mod tests {
                         )
                         .unwrap_or_else(|| panic!("{name}: field2 is canonical minimal-BE u256"));
                         let set_limits = if sub_op == 0 {
-                            assert_eq!(payload.len(), 4, "{name}: set_limits(0) payload has exactly keys 1..=4");
-                            let g = map_get(&payload, 3).and_then(as_u64).unwrap_or_else(|| panic!("{name}: gas_limit"));
-                            let f = map_get(&payload, 4).and_then(as_u64).unwrap_or_else(|| panic!("{name}: fee_rate"));
+                            assert_eq!(
+                                payload.len(),
+                                4,
+                                "{name}: set_limits(0) payload has exactly keys 1..=4"
+                            );
+                            let g = map_get(&payload, 3)
+                                .and_then(as_u64)
+                                .unwrap_or_else(|| panic!("{name}: gas_limit"));
+                            let f = map_get(&payload, 4)
+                                .and_then(as_u64)
+                                .unwrap_or_else(|| panic!("{name}: fee_rate"));
                             Some((g, f))
                         } else {
-                            assert_eq!(payload.len(), 2, "{name}: sub-op {sub_op} payload has exactly keys 1..=2 (no gas)");
+                            assert_eq!(
+                                payload.len(),
+                                2,
+                                "{name}: sub-op {sub_op} payload has exactly keys 1..=2 (no gas)"
+                            );
                             None
                         };
-                        crate::agent_capability::payload_binding(6, Some(sub_op), request_id, &configure_treasury_canonical_params(sub_op, &field2, set_limits))
+                        crate::agent_capability::payload_binding(
+                            6,
+                            Some(sub_op),
+                            request_id,
+                            &configure_treasury_canonical_params(sub_op, &field2, set_limits),
+                        )
                     }
                     other => panic!("{name}: unexpected opcode {other}"),
                 };
-                assert_eq!(cap_pb.as_slice(), recomputed.as_slice(), "{name}: cap payload_binding must cover its own payload");
+                assert_eq!(
+                    cap_pb.as_slice(),
+                    recomputed.as_slice(),
+                    "{name}: cap payload_binding must cover its own payload"
+                );
             }
         }
 
@@ -5636,9 +6944,18 @@ mod tests {
         #[test]
         fn golden_cap_envelope_sidecar_matches() {
             let sidecar = include_str!("../testvectors/agent-gateway/cap_envelopes_v1.json");
-            let v: serde_json::Value = serde_json::from_str(sidecar).expect("cap-envelope index is valid JSON");
-            assert_eq!(v["command_domain"].as_str(), Some(COMMAND_DOMAIN), "index command_domain");
-            assert_eq!(v["agent_version"].as_u64(), Some(AGENT_GATEWAY_VERSION as u64), "index agent_version");
+            let v: serde_json::Value =
+                serde_json::from_str(sidecar).expect("cap-envelope index is valid JSON");
+            assert_eq!(
+                v["command_domain"].as_str(),
+                Some(COMMAND_DOMAIN),
+                "index command_domain"
+            );
+            assert_eq!(
+                v["agent_version"].as_u64(),
+                Some(AGENT_GATEWAY_VERSION as u64),
+                "index agent_version"
+            );
             assert_eq!(
                 v["vectors"].as_object().map(|o| o.len()),
                 Some(vectors().len()),
@@ -5646,12 +6963,32 @@ mod tests {
             );
             for (name, bytes, opcode, request_id, cap_file) in vectors() {
                 let e = &v["vectors"][name];
-                assert_eq!(e["blob_sha256"].as_str(), Some(hex(&Sha256::digest(&bytes)).as_str()), "{name} sha256");
-                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
-                assert_eq!(e["blob_hex"].as_str(), Some(hex(&bytes).as_str()), "{name} blob_hex");
+                assert_eq!(
+                    e["blob_sha256"].as_str(),
+                    Some(hex(&Sha256::digest(&bytes)).as_str()),
+                    "{name} sha256"
+                );
+                assert_eq!(
+                    e["blob_len_bytes"].as_u64(),
+                    Some(bytes.len() as u64),
+                    "{name} len"
+                );
+                assert_eq!(
+                    e["blob_hex"].as_str(),
+                    Some(hex(&bytes).as_str()),
+                    "{name} blob_hex"
+                );
                 assert_eq!(e["opcode"].as_u64(), Some(opcode as u64), "{name} opcode");
-                assert_eq!(e["request_id_hex"].as_str(), Some(hex(request_id).as_str()), "{name} request_id");
-                assert_eq!(e["embedded_cap_file"].as_str(), Some(cap_file), "{name} cap cross-ref");
+                assert_eq!(
+                    e["request_id_hex"].as_str(),
+                    Some(hex(request_id).as_str()),
+                    "{name} request_id"
+                );
+                assert_eq!(
+                    e["embedded_cap_file"].as_str(),
+                    Some(cap_file),
+                    "{name} cap cross-ref"
+                );
             }
         }
 
@@ -5678,8 +7015,11 @@ mod tests {
                 "command_domain": COMMAND_DOMAIN,
                 "vectors": serde_json::Value::Object(index),
             });
-            std::fs::write(format!("{dir}cap_envelopes_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
-                .expect("write cap-envelope index");
+            std::fs::write(
+                format!("{dir}cap_envelopes_v1.json"),
+                serde_json::to_string_pretty(&doc).unwrap() + "\n",
+            )
+            .expect("write cap-envelope index");
             eprintln!("wrote 2 cap-envelope vectors + cap_envelopes_v1.json -> {dir}");
         }
     }
@@ -5710,7 +7050,8 @@ mod tests {
         const ORD: &str = include_str!("../testvectors/agent-gateway/ordinary_tx_v1.json");
         /// A valid, byte-stable sealed keystore used as the representative sealed blob in the mutating
         /// responses (the blob is opaque AEAD; the response vector pins the SHAPE around it).
-        const GENESIS_BLOB: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
+        const GENESIS_BLOB: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/agent_keystore_genesis_v2.sealed.bin");
         const GOLDEN_KEY_REF: [u8; 32] = [0x33; 32];
 
         fn hx(b: &[u8]) -> String {
@@ -5730,9 +7071,19 @@ mod tests {
                 key_ref: GOLDEN_KEY_REF,
                 purpose: KeyPurpose::AgentTransferK1,
                 algorithm: KeyAlgorithm::Secp256k1,
-                public_identity: unhex(k["transfer_key"]["pubkey_uncompressed_sec1"].as_str().unwrap()),
-                secret_scalar: zeroize::Zeroizing::new(unhex(k["transfer_key"]["privkey"].as_str().unwrap())),
-                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                public_identity: unhex(
+                    k["transfer_key"]["pubkey_uncompressed_sec1"]
+                        .as_str()
+                        .unwrap(),
+                ),
+                secret_scalar: zeroize::Zeroizing::new(unhex(
+                    k["transfer_key"]["privkey"].as_str().unwrap(),
+                )),
+                creation_metadata: CreationMetadata {
+                    config_version: 1,
+                    counter_snapshot: 0,
+                    batch_id: 1,
+                },
                 backup_export_metadata: BackupExportMetadata::default(),
             }
         }
@@ -5744,7 +7095,8 @@ mod tests {
                 signature: RecoverableSignature {
                     r: arr::<32>(o["signature"]["r"].as_str().unwrap()),
                     s: arr::<32>(o["signature"]["s"].as_str().unwrap()),
-                    recovery_id: u8::try_from(o["signature"]["recovery_id"].as_u64().unwrap()).expect("recovery_id fits u8"),
+                    recovery_id: u8::try_from(o["signature"]["recovery_id"].as_u64().unwrap())
+                        .expect("recovery_id fits u8"),
                 },
                 v: o["signature"]["v_eip155"].as_u64().unwrap(),
                 signing_hash: arr::<32>(o["signing_hash_keccak256"].as_str().unwrap()),
@@ -5800,7 +7152,10 @@ mod tests {
                 ("resp_configure_treasury_v1.bin", resp_configure_treasury()),
                 ("resp_generate_keys_v1.bin", resp_generate_keys()),
                 ("resp_public_identity_v1.bin", resp_public_identity()),
-                ("resp_sign_faucet_dispense_v1.bin", resp_sign_faucet_dispense()),
+                (
+                    "resp_sign_faucet_dispense_v1.bin",
+                    resp_sign_faucet_dispense(),
+                ),
                 ("resp_sign_transfer_v1.bin", resp_sign_transfer()),
             ]
         }
@@ -5808,15 +7163,34 @@ mod tests {
         #[test]
         fn golden_response_bodies_are_byte_exact() {
             let committed: &[(&str, &[u8])] = &[
-                ("resp_configure_treasury_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_configure_treasury_v1.bin")),
-                ("resp_generate_keys_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_generate_keys_v1.bin")),
-                ("resp_public_identity_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin")),
-                ("resp_sign_faucet_dispense_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_sign_faucet_dispense_v1.bin")),
-                ("resp_sign_transfer_v1.bin", include_bytes!("../testvectors/agent-gateway/resp_sign_transfer_v1.bin")),
+                (
+                    "resp_configure_treasury_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/resp_configure_treasury_v1.bin"),
+                ),
+                (
+                    "resp_generate_keys_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/resp_generate_keys_v1.bin"),
+                ),
+                (
+                    "resp_public_identity_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/resp_public_identity_v1.bin"),
+                ),
+                (
+                    "resp_sign_faucet_dispense_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/resp_sign_faucet_dispense_v1.bin"),
+                ),
+                (
+                    "resp_sign_transfer_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/resp_sign_transfer_v1.bin"),
+                ),
             ];
             for (name, built) in vectors() {
                 let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
-                assert_eq!(built.as_slice(), c, "{name} drifted; regen + re-mint .json in the same commit");
+                assert_eq!(
+                    built.as_slice(),
+                    c,
+                    "{name} drifted; regen + re-mint .json in the same commit"
+                );
             }
         }
 
@@ -5832,22 +7206,43 @@ mod tests {
                     _ => None,
                 }
             };
-            assert_eq!(get(&resp_configure_treasury(), 1), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "configure key1=blob");
-            assert_eq!(get(&resp_generate_keys(), 2), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "generate key2=blob");
-            assert_eq!(get(&resp_sign_faucet_dispense(), 8), Some(Value::Bytes(GENESIS_BLOB.to_vec())), "faucet key8=blob");
+            assert_eq!(
+                get(&resp_configure_treasury(), 1),
+                Some(Value::Bytes(GENESIS_BLOB.to_vec())),
+                "configure key1=blob"
+            );
+            assert_eq!(
+                get(&resp_generate_keys(), 2),
+                Some(Value::Bytes(GENESIS_BLOB.to_vec())),
+                "generate key2=blob"
+            );
+            assert_eq!(
+                get(&resp_sign_faucet_dispense(), 8),
+                Some(Value::Bytes(GENESIS_BLOB.to_vec())),
+                "faucet key8=blob"
+            );
             for (name, bytes) in vectors() {
-                assert_eq!(decode_agent_error_code(&bytes), None, "{name} must be a SUCCESS body, not an error");
+                assert_eq!(
+                    decode_agent_error_code(&bytes),
+                    None,
+                    "{name} must be a SUCCESS body, not an error"
+                );
             }
             // The §10.9 error bodies, conversely, ARE decodable as {1:code,2:reason}.
             for (code, body) in agent_errors() {
-                assert_eq!(decode_agent_error_code(&body), Some(code), "error body code {code:#x}");
+                assert_eq!(
+                    decode_agent_error_code(&body),
+                    Some(code),
+                    "error body code {code:#x}"
+                );
             }
         }
 
         #[test]
         fn golden_response_sidecar_matches() {
             let sidecar = include_str!("../testvectors/agent-gateway/response_bodies_v1.json");
-            let v: serde_json::Value = serde_json::from_str(sidecar).expect("response index is valid JSON");
+            let v: serde_json::Value =
+                serde_json::from_str(sidecar).expect("response index is valid JSON");
             assert_eq!(
                 v["responses"].as_object().map(|o| o.len()),
                 Some(vectors().len()),
@@ -5855,9 +7250,21 @@ mod tests {
             );
             for (name, bytes) in vectors() {
                 let e = &v["responses"][name];
-                assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
-                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
-                assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
+                assert_eq!(
+                    e["blob_sha256"].as_str(),
+                    Some(hx(&Sha256::digest(&bytes)).as_str()),
+                    "{name} sha"
+                );
+                assert_eq!(
+                    e["blob_len_bytes"].as_u64(),
+                    Some(bytes.len() as u64),
+                    "{name} len"
+                );
+                assert_eq!(
+                    e["blob_hex"].as_str(),
+                    Some(hx(&bytes).as_str()),
+                    "{name} hex"
+                );
             }
             // The 7 error bodies, keyed by code hex — exactly 7, no stale/extra entry.
             assert_eq!(
@@ -5867,8 +7274,16 @@ mod tests {
             );
             for (code, body) in agent_errors() {
                 let e = &v["agent_errors"][format!("{code:#04x}")];
-                assert_eq!(e["body_hex"].as_str(), Some(hx(&body).as_str()), "error {code:#x} hex");
-                assert_eq!(e["body_len_bytes"].as_u64(), Some(body.len() as u64), "error {code:#x} len");
+                assert_eq!(
+                    e["body_hex"].as_str(),
+                    Some(hx(&body).as_str()),
+                    "error {code:#x} hex"
+                );
+                assert_eq!(
+                    e["body_len_bytes"].as_u64(),
+                    Some(body.len() as u64),
+                    "error {code:#x} len"
+                );
             }
         }
 
@@ -5899,9 +7314,14 @@ mod tests {
                 "responses": serde_json::Value::Object(responses),
                 "agent_errors": serde_json::Value::Object(errors),
             });
-            std::fs::write(format!("{dir}response_bodies_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
-                .expect("write response index");
-            eprintln!("wrote 5 response vectors + 7 error bodies + response_bodies_v1.json -> {dir}");
+            std::fs::write(
+                format!("{dir}response_bodies_v1.json"),
+                serde_json::to_string_pretty(&doc).unwrap() + "\n",
+            )
+            .expect("write response index");
+            eprintln!(
+                "wrote 5 response vectors + 7 error bodies + response_bodies_v1.json -> {dir}"
+            );
         }
     }
 
@@ -5941,24 +7361,50 @@ mod tests {
             b
         }
         fn genkeys_payload() -> Value {
-            Value::Map(vec![(k(1), Value::Integer(1u64.into())), (k(2), Value::Integer(1u64.into()))])
+            Value::Map(vec![
+                (k(1), Value::Integer(1u64.into())),
+                (k(2), Value::Integer(1u64.into())),
+            ])
         }
         /// A GENERATE_KEYS cap on the admin lane; `pb` is unchecked by the verify layer (handler-only), so a
         /// placeholder is fine for verify-band negatives.
         fn genkeys_cap(signer: &ed25519_dalek::SigningKey, counter: u64) -> Vec<(Value, Value)> {
             crate::agent_capability::test_signed_capability(
-                signer, 1, RID, counter, false, CHAIN, ENV_ID, 0, b"golden-scope-generate", 1, [0xbb; 32], [0xe1; 32],
+                signer,
+                1,
+                RID,
+                counter,
+                false,
+                CHAIN,
+                ENV_ID,
+                0,
+                b"golden-scope-generate",
+                1,
+                [0xbb; 32],
+                [0xe1; 32],
             )
         }
 
         // ---- the frozen negative request envelopes (deterministic; the code is asserted separately) ----
         fn neg_unknown_envelope_key() -> Vec<u8> {
             // Extra key 8 — decode_envelope's strict allow-list (keys 1..=7) rejects ⇒ 0x40.
-            envelope(2, vec![(k(6), Value::Bytes(vec![0x33; 32])), (k(8), Value::Integer(0u64.into()))])
+            envelope(
+                2,
+                vec![
+                    (k(6), Value::Bytes(vec![0x33; 32])),
+                    (k(8), Value::Integer(0u64.into())),
+                ],
+            )
         }
         fn neg_runtime_op_with_capability() -> Vec<u8> {
             // SIGN_TRANSFER(4) is a runtime op; a capability at key 5 is structurally invalid ⇒ 0x40.
-            envelope(4, vec![(k(5), Value::Map(genkeys_cap(&admin(), 1))), (k(6), Value::Bytes(vec![0x33; 32]))])
+            envelope(
+                4,
+                vec![
+                    (k(5), Value::Map(genkeys_cap(&admin(), 1))),
+                    (k(6), Value::Bytes(vec![0x33; 32])),
+                ],
+            )
         }
         fn neg_wrong_profile_env() -> Vec<u8> {
             // A well-formed PUBLIC_IDENTITY env — the negative is dispatching it on Profile::Producer ⇒ 0x41.
@@ -5971,16 +7417,34 @@ mod tests {
         fn neg_cap_wrong_signature() -> Vec<u8> {
             // GENERATE_KEYS cap signed by a NON-admin key ⇒ Ed25519 verify fails ⇒ 0x43.
             let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]);
-            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&wrong, 1))), (k(7), genkeys_payload())])
+            envelope(
+                1,
+                vec![
+                    (k(5), Value::Map(genkeys_cap(&wrong, 1))),
+                    (k(7), genkeys_payload()),
+                ],
+            )
         }
         fn neg_cap_counter_gap() -> Vec<u8> {
             // Valid admin cap but counter=5 with an empty counter table (expected 1) ⇒ non-contiguous ⇒ 0x43.
-            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&admin(), 5))), (k(7), genkeys_payload())])
+            envelope(
+                1,
+                vec![
+                    (k(5), Value::Map(genkeys_cap(&admin(), 5))),
+                    (k(7), genkeys_payload()),
+                ],
+            )
         }
         fn neg_generate_keys_not_configured() -> Vec<u8> {
             // A well-formed, validly-capped GENERATE_KEYS — the negative is the anti-rollback binding being
             // ABSENT, so the fund-custody gate fires ⇒ 0x45 (before cap routing).
-            envelope(1, vec![(k(5), Value::Map(genkeys_cap(&admin(), 1))), (k(7), genkeys_payload())])
+            envelope(
+                1,
+                vec![
+                    (k(5), Value::Map(genkeys_cap(&admin(), 1))),
+                    (k(7), genkeys_payload()),
+                ],
+            )
         }
 
         /// (filename, bytes, expected code, short cause). The code is asserted in the *_codes tests below.
@@ -6002,17 +7466,46 @@ mod tests {
         #[test]
         fn golden_negative_vectors_are_byte_exact() {
             let committed: &[(&str, &[u8])] = &[
-                ("neg_cap_counter_gap_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_cap_counter_gap_v1.bin")),
-                ("neg_cap_wrong_signature_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_cap_wrong_signature_v1.bin")),
-                ("neg_generate_keys_not_configured_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_generate_keys_not_configured_v1.bin")),
-                ("neg_key_not_found_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_key_not_found_v1.bin")),
-                ("neg_runtime_op_with_capability_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_runtime_op_with_capability_v1.bin")),
-                ("neg_unknown_envelope_key_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_unknown_envelope_key_v1.bin")),
-                ("neg_wrong_profile_v1.bin", include_bytes!("../testvectors/agent-gateway/neg_wrong_profile_v1.bin")),
+                (
+                    "neg_cap_counter_gap_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/neg_cap_counter_gap_v1.bin"),
+                ),
+                (
+                    "neg_cap_wrong_signature_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/neg_cap_wrong_signature_v1.bin"),
+                ),
+                (
+                    "neg_generate_keys_not_configured_v1.bin",
+                    include_bytes!(
+                        "../testvectors/agent-gateway/neg_generate_keys_not_configured_v1.bin"
+                    ),
+                ),
+                (
+                    "neg_key_not_found_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/neg_key_not_found_v1.bin"),
+                ),
+                (
+                    "neg_runtime_op_with_capability_v1.bin",
+                    include_bytes!(
+                        "../testvectors/agent-gateway/neg_runtime_op_with_capability_v1.bin"
+                    ),
+                ),
+                (
+                    "neg_unknown_envelope_key_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/neg_unknown_envelope_key_v1.bin"),
+                ),
+                (
+                    "neg_wrong_profile_v1.bin",
+                    include_bytes!("../testvectors/agent-gateway/neg_wrong_profile_v1.bin"),
+                ),
             ];
             for (name, built, ..) in vectors() {
                 let c = committed.iter().find(|(n, _)| *n == name).unwrap().1;
-                assert_eq!(built.as_slice(), c, "{name} drifted; regen + re-mint .json in the same commit");
+                assert_eq!(
+                    built.as_slice(),
+                    c,
+                    "{name} drifted; regen + re-mint .json in the same commit"
+                );
             }
         }
 
@@ -6021,10 +7514,34 @@ mod tests {
             // Shape (0x40) + profile (0x41) + key (0x42) bands — all reached BEFORE the anti-rollback gate /
             // any process global, so no guard is needed. Driven through the real dispatch_agent.
             let b = base_body();
-            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_unknown_envelope_key(), &b).err().unwrap().code(), 0x40);
-            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_runtime_op_with_capability(), &b).err().unwrap().code(), 0x40);
-            assert_eq!(dispatch_agent(Profile::Producer, &neg_wrong_profile_env(), &b).err().unwrap().code(), 0x41);
-            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_key_not_found(), &b).err().unwrap().code(), 0x42);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &neg_unknown_envelope_key(), &b)
+                    .err()
+                    .unwrap()
+                    .code(),
+                0x40
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &neg_runtime_op_with_capability(), &b)
+                    .err()
+                    .unwrap()
+                    .code(),
+                0x40
+            );
+            assert_eq!(
+                dispatch_agent(Profile::Producer, &neg_wrong_profile_env(), &b)
+                    .err()
+                    .unwrap()
+                    .code(),
+                0x41
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &neg_key_not_found(), &b)
+                    .err()
+                    .unwrap()
+                    .code(),
+                0x42
+            );
         }
 
         #[test]
@@ -6033,8 +7550,20 @@ mod tests {
             // gate would return 0x45 first). gate_configured installs it + holds the process-global guard.
             let _g = gate_configured();
             let b = cap_body();
-            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_cap_wrong_signature(), &b).err().unwrap().code(), 0x43);
-            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_cap_counter_gap(), &b).err().unwrap().code(), 0x43);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &neg_cap_wrong_signature(), &b)
+                    .err()
+                    .unwrap()
+                    .code(),
+                0x43
+            );
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &neg_cap_counter_gap(), &b)
+                    .err()
+                    .unwrap()
+                    .code(),
+                0x43
+            );
         }
 
         #[test]
@@ -6043,7 +7572,17 @@ mod tests {
             // even with an otherwise-valid cap. gate_unconfigured clears the binding + holds the guard.
             let _g = gate_unconfigured();
             let b = cap_body();
-            assert_eq!(dispatch_agent(Profile::AgentGateway, &neg_generate_keys_not_configured(), &b).err().unwrap().code(), 0x45);
+            assert_eq!(
+                dispatch_agent(
+                    Profile::AgentGateway,
+                    &neg_generate_keys_not_configured(),
+                    &b
+                )
+                .err()
+                .unwrap()
+                .code(),
+                0x45
+            );
         }
 
         #[test]
@@ -6055,15 +7594,20 @@ mod tests {
             // CONFIGURE) would turn this into a 0x40 negative; until then this pins the accepted-but-ignored
             // shape so the frozen negative set stays consistent with actual behavior.
             let env = envelope(6, vec![(k(6), Value::Bytes(vec![0x33; 32]))]);
-            let decoded = decode_envelope(&env).expect("stray key_ref on CONFIGURE is currently accepted");
+            let decoded =
+                decode_envelope(&env).expect("stray key_ref on CONFIGURE is currently accepted");
             assert_eq!(decoded.opcode, 6, "opcode preserved");
-            assert!(decoded.key_ref.is_some(), "the stray key_ref is present (decoded) but unused by the handler");
+            assert!(
+                decoded.key_ref.is_some(),
+                "the stray key_ref is present (decoded) but unused by the handler"
+            );
         }
 
         #[test]
         fn golden_negative_sidecar_matches() {
             let sidecar = include_str!("../testvectors/agent-gateway/negative_vectors_v1.json");
-            let v: serde_json::Value = serde_json::from_str(sidecar).expect("negative index is valid JSON");
+            let v: serde_json::Value =
+                serde_json::from_str(sidecar).expect("negative index is valid JSON");
             assert_eq!(
                 v["negatives"].as_object().map(|o| o.len()),
                 Some(vectors().len()),
@@ -6071,12 +7615,32 @@ mod tests {
             );
             for (name, bytes, code, cause, precondition) in vectors() {
                 let e = &v["negatives"][name];
-                assert_eq!(e["expected_code"].as_u64(), Some(code as u64), "{name} code");
+                assert_eq!(
+                    e["expected_code"].as_u64(),
+                    Some(code as u64),
+                    "{name} code"
+                );
                 assert_eq!(e["cause"].as_str(), Some(cause), "{name} cause");
-                assert_eq!(e["precondition"].as_str(), Some(precondition), "{name} precondition");
-                assert_eq!(e["blob_sha256"].as_str(), Some(hx(&Sha256::digest(&bytes)).as_str()), "{name} sha");
-                assert_eq!(e["blob_len_bytes"].as_u64(), Some(bytes.len() as u64), "{name} len");
-                assert_eq!(e["blob_hex"].as_str(), Some(hx(&bytes).as_str()), "{name} hex");
+                assert_eq!(
+                    e["precondition"].as_str(),
+                    Some(precondition),
+                    "{name} precondition"
+                );
+                assert_eq!(
+                    e["blob_sha256"].as_str(),
+                    Some(hx(&Sha256::digest(&bytes)).as_str()),
+                    "{name} sha"
+                );
+                assert_eq!(
+                    e["blob_len_bytes"].as_u64(),
+                    Some(bytes.len() as u64),
+                    "{name} len"
+                );
+                assert_eq!(
+                    e["blob_hex"].as_str(),
+                    Some(hx(&bytes).as_str()),
+                    "{name} hex"
+                );
             }
         }
 
@@ -6101,8 +7665,11 @@ mod tests {
                 "_comment": "TASK-22 AC#4 — byte-exact 0x40 NEGATIVE vectors: {request bytes → expected §10.9 code}, asserted via the real dispatch_agent. 0x40 shape / 0x41 profile / 0x42 key / 0x43 capability / 0x45 not-configured. 0x44 (CapExceeded) and 0x46 (SealFailed) are handler/preview-level — deferred. CONFIGURE stray key_ref is accepted+ignored today (TASK-20 document-the-ignore). TEST KEYS ONLY. Regen: cargo test --features agent-gateway golden_negative_vectors::regen_golden_negative_vectors -- --ignored --nocapture",
                 "negatives": serde_json::Value::Object(negatives),
             });
-            std::fs::write(format!("{dir}negative_vectors_v1.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n")
-                .expect("write negative index");
+            std::fs::write(
+                format!("{dir}negative_vectors_v1.json"),
+                serde_json::to_string_pretty(&doc).unwrap() + "\n",
+            )
+            .expect("write negative index");
             eprintln!("wrote 7 negative vectors + negative_vectors_v1.json -> {dir}");
         }
     }

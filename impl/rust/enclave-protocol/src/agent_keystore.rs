@@ -191,8 +191,7 @@ pub fn seal_keystore_with_nonce(
     }
     let meas_digest = measurement_digest(enclave_measurement);
     let key = derive_aead_key(provisioning_root, &meas_digest);
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
 
     let mut out = Vec::with_capacity(HEADER_LEN + body.len() + TAG_LEN);
     out.extend_from_slice(KEYSTORE_MAGIC);
@@ -250,12 +249,17 @@ pub fn unseal_keystore(
         return Err(KeystoreError::MeasurementMismatch);
     }
     let key = derive_aead_key(provisioning_root, &expected_meas);
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| KeystoreError::AeadKey)?;
     let nonce = XNonce::from_slice(&blob[AAD_LEN..HEADER_LEN]);
     let aad = &blob[..AAD_LEN];
     let plain = cipher
-        .decrypt(nonce, Payload { msg: &blob[HEADER_LEN..], aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &blob[HEADER_LEN..],
+                aad,
+            },
+        )
         .map_err(|_| KeystoreError::Decrypt)?;
     Ok(Zeroizing::new(plain))
 }
@@ -495,7 +499,8 @@ impl FaucetState {
         // `amount` is capped only by the u256 per_dispense_max_amount, which may be large).
         let gas_cost =
             u256::checked_mul_u64(gas_price, gas_limit).ok_or(FaucetCapError::WorstCaseOverflow)?;
-        let worst_case = u256::checked_add(amount, &gas_cost).ok_or(FaucetCapError::WorstCaseOverflow)?;
+        let worst_case =
+            u256::checked_add(amount, &gas_cost).ok_or(FaucetCapError::WorstCaseOverflow)?;
         // Cumulative refillable budget ceiling.
         let new_cumulative = u256::checked_add(&self.cumulative_native_spend, &worst_case)
             .ok_or(FaucetCapError::WorstCaseOverflow)?;
@@ -543,7 +548,10 @@ pub struct AuditRecord {
 /// so the three byte-ish inputs (`authority`, `scope_target`, `request_id`) cannot be transposed at a
 /// call site. Lengths are bounded by [`KeystoreBody::validate`] (the seal/unseal gate), so a forged or
 /// over-cap ring fails closed there; callers pass already-cap-validated capability/request fields.
-#[cfg_attr(not(any(test, feature = "agent-keygen-exec-preview")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "agent-keygen-exec-preview")),
+    allow(dead_code)
+)]
 pub(crate) struct AuditAppend<'a> {
     pub op: u8,
     pub authority: &'a [u8; 32],
@@ -782,8 +790,14 @@ impl KeystoreBody {
     /// handler (`advance_counter` etc.) BEFORE the marks digest is computed; epoch/structural are not
     /// marks surfaces, so this bump leaves `compute_local_marks_digest()` unchanged.
     #[cfg_attr(not(test), allow(dead_code))] // staged slice-6-2; consumed by the 6-4 dispatch wiring
-    pub(crate) fn advance_commit_epoch(&mut self, bumps_structural: bool) -> Result<(), KeystoreError> {
-        let new_epoch = self.freshness_epoch.checked_add(1).ok_or(KeystoreError::MonotonicOverflow)?;
+    pub(crate) fn advance_commit_epoch(
+        &mut self,
+        bumps_structural: bool,
+    ) -> Result<(), KeystoreError> {
+        let new_epoch = self
+            .freshness_epoch
+            .checked_add(1)
+            .ok_or(KeystoreError::MonotonicOverflow)?;
         let new_structural = if bumps_structural {
             Some(
                 self.structural_version
@@ -817,7 +831,10 @@ impl KeystoreBody {
     /// `EXPORT_BACKUP` drains via [`Self::advance_export_high_water`], re-enabling appends.
     // Live under `agent-keygen-exec-preview` (the GENERATE_KEYS handler calls it, slice 4b) or under
     // test; dead otherwise (the handler itself is dead-code-allowed when the preview feature is off).
-    #[cfg_attr(not(any(test, feature = "agent-keygen-exec-preview")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "agent-keygen-exec-preview")),
+        allow(dead_code)
+    )]
     pub(crate) fn record_audit(&mut self, fields: &AuditAppend) -> Result<(), KeystoreError> {
         let cap = self.audit.capacity as u64;
         if cap == 0 {
@@ -835,7 +852,11 @@ impl KeystoreBody {
             return Err(KeystoreError::AuditBackpressure);
         }
         // Checked next_seq BEFORE any mutation (unreachable overflow, fail-closed by contract).
-        let new_next = self.audit.next_seq.checked_add(1).ok_or(KeystoreError::MonotonicOverflow)?;
+        let new_next = self
+            .audit
+            .next_seq
+            .checked_add(1)
+            .ok_or(KeystoreError::MonotonicOverflow)?;
         let record = AuditRecord {
             seq: self.audit.next_seq,
             op: fields.op,
@@ -865,7 +886,10 @@ impl KeystoreBody {
     /// pull-export). Never regresses; `next_seq-1` is already overflow-checked by [`Self::record_audit`].
     // Live under `agent-backup-export-preview` (the EXPORT_BACKUP handler drains via it, slice 4c-2b) or
     // under test; dead otherwise (the handler is compiled only under that feature).
-    #[cfg_attr(not(any(test, feature = "agent-backup-export-preview")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "agent-backup-export-preview")),
+        allow(dead_code)
+    )]
     pub(crate) fn advance_export_high_water(&mut self) -> Result<(), KeystoreError> {
         let target = self.audit.next_seq.saturating_sub(1);
         if target > self.audit.last_exported_seq {
@@ -978,7 +1002,6 @@ impl KeystoreBody {
         Ok(())
     }
 
-
     /// Structural validation enforced on both seal (before commit) and unseal (after decrypt):
     /// environment-id rules, total-capacity (AC#5), and fixed byte-field lengths.
     pub fn validate(&self) -> Result<(), KeystoreError> {
@@ -1004,9 +1027,7 @@ impl KeystoreBody {
         if self.config.backup_recovery_wrapping_pubkey.len() != ML_KEM_1024_ENCAPS_KEY_LEN {
             return Err(KeystoreError::InvalidFieldLength);
         }
-        if self.entries.len() > MAX_TOTAL_KEY_ENTRIES
-            || self.counters.len() > MAX_COUNTER_ENTRIES
-        {
+        if self.entries.len() > MAX_TOTAL_KEY_ENTRIES || self.counters.len() > MAX_COUNTER_ENTRIES {
             return Err(KeystoreError::CapacityExceeded);
         }
         let mut seen_refs = std::collections::HashSet::with_capacity(self.entries.len());
@@ -1142,7 +1163,11 @@ pub fn seal_body(
     ciborium::ser::into_writer(body, &mut *cbor).map_err(|_| KeystoreError::Cbor)?;
     // Both passes must encode the same length; if not, pass 2 exceeded the reserved capacity and
     // reallocated (leaking a copy), or encoding is non-deterministic — either way a bug.
-    debug_assert_eq!(cbor.len(), counter.0, "seal_body CBOR length mismatch between passes");
+    debug_assert_eq!(
+        cbor.len(),
+        counter.0,
+        "seal_body CBOR length mismatch between passes"
+    );
     seal_keystore(&cbor, provisioning_root, enclave_measurement)
 }
 
@@ -1184,7 +1209,10 @@ mod tests {
     fn seal_unseal_round_trip() {
         let blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         assert_eq!(&blob[..8], KEYSTORE_MAGIC.as_slice());
-        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), KEYSTORE_FORMAT_VERSION);
+        assert_eq!(
+            u16::from_be_bytes([blob[8], blob[9]]),
+            KEYSTORE_FORMAT_VERSION
+        );
         let out = unseal_keystore(&blob, &ROOT, MEAS_A).unwrap();
         assert_eq!(out.as_slice(), body().as_slice());
     }
@@ -1194,8 +1222,14 @@ mod tests {
         let a = seal_keystore(&body(), &ROOT, MEAS_A).unwrap();
         let b = seal_keystore(&body(), &ROOT, MEAS_A).unwrap();
         assert_ne!(a, b, "random nonce ⇒ distinct sealed blobs");
-        assert_eq!(unseal_keystore(&a, &ROOT, MEAS_A).unwrap().as_slice(), body().as_slice());
-        assert_eq!(unseal_keystore(&b, &ROOT, MEAS_A).unwrap().as_slice(), body().as_slice());
+        assert_eq!(
+            unseal_keystore(&a, &ROOT, MEAS_A).unwrap().as_slice(),
+            body().as_slice()
+        );
+        assert_eq!(
+            unseal_keystore(&b, &ROOT, MEAS_A).unwrap().as_slice(),
+            body().as_slice()
+        );
     }
 
     #[test]
@@ -1205,7 +1239,10 @@ mod tests {
         let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         blob[8] = 0x00;
         blob[9] = 0x05;
-        assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::UnsupportedVersion));
+        assert_eq!(
+            unseal_keystore(&blob, &ROOT, MEAS_A),
+            Err(KeystoreError::UnsupportedVersion)
+        );
     }
 
     #[test]
@@ -1233,21 +1270,30 @@ mod tests {
         // A producer-style `2DHSMV1\0` blob (or any non-keystore magic) must fail on magic.
         let mut blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         blob[..8].copy_from_slice(b"2DHSMV1\0");
-        assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_A), Err(KeystoreError::BadMagic));
+        assert_eq!(
+            unseal_keystore(&blob, &ROOT, MEAS_A),
+            Err(KeystoreError::BadMagic)
+        );
     }
 
     #[test]
     fn measurement_binding_rejects_other_enclave() {
         let blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         // Sealed under measurement A; a different measurement B must not unseal.
-        assert_eq!(unseal_keystore(&blob, &ROOT, MEAS_B), Err(KeystoreError::MeasurementMismatch));
+        assert_eq!(
+            unseal_keystore(&blob, &ROOT, MEAS_B),
+            Err(KeystoreError::MeasurementMismatch)
+        );
     }
 
     #[test]
     fn wrong_root_fails_decrypt() {
         let blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         let other_root = [0x99; 32];
-        assert_eq!(unseal_keystore(&blob, &other_root, MEAS_A), Err(KeystoreError::Decrypt));
+        assert_eq!(
+            unseal_keystore(&blob, &other_root, MEAS_A),
+            Err(KeystoreError::Decrypt)
+        );
     }
 
     #[test]
@@ -1257,29 +1303,50 @@ mod tests {
         let mut ct = base.clone();
         let i = HEADER_LEN + 1;
         ct[i] ^= 0xff;
-        assert_eq!(unseal_keystore(&ct, &ROOT, MEAS_A), Err(KeystoreError::Decrypt));
+        assert_eq!(
+            unseal_keystore(&ct, &ROOT, MEAS_A),
+            Err(KeystoreError::Decrypt)
+        );
         // Flip a tag byte (last byte).
         let mut tag = base.clone();
         let last = tag.len() - 1;
         tag[last] ^= 0xff;
-        assert_eq!(unseal_keystore(&tag, &ROOT, MEAS_A), Err(KeystoreError::Decrypt));
+        assert_eq!(
+            unseal_keystore(&tag, &ROOT, MEAS_A),
+            Err(KeystoreError::Decrypt)
+        );
     }
 
     #[test]
     fn truncated_blob_too_short() {
         let blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
         // Below the header+tag floor ⇒ TooShort (rejected before any magic/version check).
-        assert_eq!(unseal_keystore(&blob[..HEADER_LEN + TAG_LEN - 1], &ROOT, MEAS_A), Err(KeystoreError::TooShort));
-        assert_eq!(unseal_keystore(&blob[..10], &ROOT, MEAS_A), Err(KeystoreError::TooShort));
+        assert_eq!(
+            unseal_keystore(&blob[..HEADER_LEN + TAG_LEN - 1], &ROOT, MEAS_A),
+            Err(KeystoreError::TooShort)
+        );
+        assert_eq!(
+            unseal_keystore(&blob[..10], &ROOT, MEAS_A),
+            Err(KeystoreError::TooShort)
+        );
         // Above the floor but with a truncated body ⇒ passes length/magic/version, fails AEAD.
-        assert_eq!(unseal_keystore(&blob[..HEADER_LEN + TAG_LEN + 2], &ROOT, MEAS_A), Err(KeystoreError::Decrypt));
+        assert_eq!(
+            unseal_keystore(&blob[..HEADER_LEN + TAG_LEN + 2], &ROOT, MEAS_A),
+            Err(KeystoreError::Decrypt)
+        );
     }
 
     #[test]
     fn empty_measurement_refused() {
-        assert_eq!(seal_keystore_with_nonce(&body(), &ROOT, b"", &NONCE), Err(KeystoreError::EmptyMeasurement));
+        assert_eq!(
+            seal_keystore_with_nonce(&body(), &ROOT, b"", &NONCE),
+            Err(KeystoreError::EmptyMeasurement)
+        );
         let blob = seal_keystore_with_nonce(&body(), &ROOT, MEAS_A, &NONCE).unwrap();
-        assert_eq!(unseal_keystore(&blob, &ROOT, b""), Err(KeystoreError::EmptyMeasurement));
+        assert_eq!(
+            unseal_keystore(&blob, &ROOT, b""),
+            Err(KeystoreError::EmptyMeasurement)
+        );
     }
 
     #[test]
@@ -1296,12 +1363,21 @@ mod tests {
             h.update(meas_digest);
             h.finalize().into()
         };
-        assert_ne!(&keystore_key[..], &producer_key[..], "keystore vs producer AEAD key must differ");
+        assert_ne!(
+            &keystore_key[..],
+            &producer_key[..],
+            "keystore vs producer AEAD key must differ"
+        );
     }
 
     // --- keystore body (CBOR plaintext) ---
 
-    fn sample_entry(purpose: KeyPurpose, secret_fill: u8, pub_fill: u8, key_ref_fill: u8) -> KeyEntry {
+    fn sample_entry(
+        purpose: KeyPurpose,
+        secret_fill: u8,
+        pub_fill: u8,
+        key_ref_fill: u8,
+    ) -> KeyEntry {
         let mut public_identity = vec![0x04u8; SECP256K1_UNCOMPRESSED_LEN];
         for b in public_identity[1..].iter_mut() {
             *b = pub_fill;
@@ -1312,7 +1388,11 @@ mod tests {
             algorithm: KeyAlgorithm::Secp256k1,
             public_identity,
             secret_scalar: Zeroizing::new(vec![secret_fill; SECRET_SCALAR_LEN]),
-            creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 7 },
+            creation_metadata: CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 0,
+                batch_id: 7,
+            },
             backup_export_metadata: BackupExportMetadata::default(),
         }
     }
@@ -1351,7 +1431,12 @@ mod tests {
                 circuit_breaker_threshold: None,
                 cumulative_signing_budget: [0; 32],
             },
-            audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
+            audit: AuditRing {
+                records: vec![],
+                capacity: 256,
+                last_exported_seq: 0,
+                next_seq: 1,
+            },
             freshness_epoch: 1,
             structural_version: 2,
             strict_recovery_counter: 0,
@@ -1371,7 +1456,12 @@ mod tests {
     /// A small (cap=2) audit ring on a fresh body for the boundary tests.
     fn body_with_small_audit() -> KeystoreBody {
         let mut b = sample_body();
-        b.audit = AuditRing { records: vec![], capacity: 2, last_exported_seq: 0, next_seq: 1 };
+        b.audit = AuditRing {
+            records: vec![],
+            capacity: 2,
+            last_exported_seq: 0,
+            next_seq: 1,
+        };
         b
     }
     const AUD_AUTH: [u8; 32] = [0xa1; 32];
@@ -1395,7 +1485,11 @@ mod tests {
         let mut b = body_with_small_audit();
         b.record_audit(&aud(7, 1)).unwrap();
         b.record_audit(&aud(6, 2)).unwrap();
-        assert_eq!(b.audit.records.len(), 2, "two appends, ring not yet evicting");
+        assert_eq!(
+            b.audit.records.len(),
+            2,
+            "two appends, ring not yet evicting"
+        );
         assert_eq!(b.audit.records[0].seq, 1, "first record seq starts at 1");
         assert_eq!(b.audit.records[1].seq, 2);
         assert_eq!(b.audit.records[0].op, 7, "op byte recorded");
@@ -1408,9 +1502,19 @@ mod tests {
         b.record_audit(&aud(7, 1)).unwrap();
         b.record_audit(&aud(7, 2)).unwrap();
         // Ring full (len==cap==2) and NOTHING drained (last_exported_seq=0) ⇒ fail closed.
-        assert_eq!(b.record_audit(&aud(7, 3)), Err(KeystoreError::AuditBackpressure));
-        assert_eq!(b.audit.records.len(), 2, "rejected append did not mutate the ring");
-        assert_eq!(b.audit.next_seq, 3, "rejected append did not advance next_seq");
+        assert_eq!(
+            b.record_audit(&aud(7, 3)),
+            Err(KeystoreError::AuditBackpressure)
+        );
+        assert_eq!(
+            b.audit.records.len(),
+            2,
+            "rejected append did not mutate the ring"
+        );
+        assert_eq!(
+            b.audit.next_seq, 3,
+            "rejected append did not advance next_seq"
+        );
     }
 
     #[test]
@@ -1420,10 +1524,17 @@ mod tests {
         b.record_audit(&aud(7, 2)).unwrap();
         // Drain marks both present records exported (last_exported_seq → next_seq-1 == 2).
         b.advance_export_high_water().unwrap();
-        assert_eq!(b.audit.last_exported_seq, 2, "drain advances to the highest appended seq");
+        assert_eq!(
+            b.audit.last_exported_seq, 2,
+            "drain advances to the highest appended seq"
+        );
         // Now a 3rd append succeeds, evicting the oldest (seq 1) and keeping len==capacity.
         b.record_audit(&aud(6, 3)).unwrap();
-        assert_eq!(b.audit.records.len(), 2, "len stays == capacity (validate() belt)");
+        assert_eq!(
+            b.audit.records.len(),
+            2,
+            "len stays == capacity (validate() belt)"
+        );
         assert_eq!(b.audit.records[0].seq, 2, "oldest (seq 1) evicted");
         assert_eq!(b.audit.records[1].seq, 3);
     }
@@ -1434,7 +1545,10 @@ mod tests {
         b.record_audit(&aud(7, 1)).unwrap();
         b.audit.last_exported_seq = 5; // already ahead (e.g. a prior export)
         b.advance_export_high_water().unwrap();
-        assert_eq!(b.audit.last_exported_seq, 5, "never regresses below an already-higher water mark");
+        assert_eq!(
+            b.audit.last_exported_seq, 5,
+            "never regresses below an already-higher water mark"
+        );
     }
 
     #[test]
@@ -1448,8 +1562,14 @@ mod tests {
         b.audit.next_seq = u64::MAX;
         b.audit.last_exported_seq = u64::MAX; // keep drained so backpressure doesn't pre-empt at MAX
         let before = b.audit.records.clone();
-        assert_eq!(b.record_audit(&aud(6, 3)), Err(KeystoreError::MonotonicOverflow));
-        assert_eq!(b.audit.records, before, "overflow rejection did not mutate the ring (no partial mutation)");
+        assert_eq!(
+            b.record_audit(&aud(6, 3)),
+            Err(KeystoreError::MonotonicOverflow)
+        );
+        assert_eq!(
+            b.audit.records, before,
+            "overflow rejection did not mutate the ring (no partial mutation)"
+        );
         assert_eq!(b.audit.next_seq, u64::MAX, "next_seq unchanged on overflow");
     }
 
@@ -1464,13 +1584,19 @@ mod tests {
         b.record_audit(&aud(7, 1)).unwrap();
         b.record_audit(&aud(7, 2)).unwrap(); // records [1,2], next_seq=3
         b.audit.last_exported_seq = 1; // FORGE: only seq 1 exported (1 of 2 live un-exported)
-        // live_unexported = (3-1)-1 = 1 < cap 2 ⇒ append OK; FIFO evicts the EXPORTED seq 1.
+                                       // live_unexported = (3-1)-1 = 1 < cap 2 ⇒ append OK; FIFO evicts the EXPORTED seq 1.
         b.record_audit(&aud(6, 3)).unwrap();
-        assert_eq!(b.audit.records[0].seq, 2, "evicted the exported oldest (seq 1), kept un-exported seq 2");
+        assert_eq!(
+            b.audit.records[0].seq, 2,
+            "evicted the exported oldest (seq 1), kept un-exported seq 2"
+        );
         assert_eq!(b.audit.records[1].seq, 3);
         // No further drain ⇒ both live (seq 2,3) un-exported relative to last_exported_seq=1:
         // live_unexported = (4-1)-1 = 2 >= cap 2 ⇒ fail closed (the next eviction would drop un-exported seq 2).
-        assert_eq!(b.record_audit(&aud(6, 4)), Err(KeystoreError::AuditBackpressure));
+        assert_eq!(
+            b.record_audit(&aud(6, 4)),
+            Err(KeystoreError::AuditBackpressure)
+        );
     }
 
     /// A forged/oversized ring (`records.len() > capacity`) is NOT silently normalized by `record_audit`:
@@ -1495,8 +1621,16 @@ mod tests {
         b.audit.next_seq = 4;
         b.audit.last_exported_seq = 3; // drained so backpressure doesn't pre-empt
         b.record_audit(&aud(6, 4)).unwrap(); // full-branch remove(0)+push, net len unchanged
-        assert_eq!(b.audit.records.len(), 3, "record_audit does NOT shrink an oversized ring toward capacity");
-        assert_eq!(seal_body(&b, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded), "seal fails closed, not masked");
+        assert_eq!(
+            b.audit.records.len(),
+            3,
+            "record_audit does NOT shrink an oversized ring toward capacity"
+        );
+        assert_eq!(
+            seal_body(&b, &ROOT, MEAS_A),
+            Err(KeystoreError::CapacityExceeded),
+            "seal fails closed, not masked"
+        );
     }
 
     /// `validate()` (via `seal_body`) enforces the audit-ring seq invariant record_audit relies on
@@ -1518,22 +1652,37 @@ mod tests {
         let mut dup = body_with_small_audit();
         dup.audit.records = vec![rec(2), rec(2)];
         dup.audit.next_seq = 3;
-        assert_eq!(seal_body(&dup, &ROOT, MEAS_A), Err(KeystoreError::AuditSeqDisorder), "duplicate seq rejected");
+        assert_eq!(
+            seal_body(&dup, &ROOT, MEAS_A),
+            Err(KeystoreError::AuditSeqDisorder),
+            "duplicate seq rejected"
+        );
         // Backward seq.
         let mut backward = body_with_small_audit();
         backward.audit.records = vec![rec(5), rec(4)];
         backward.audit.next_seq = 6;
-        assert_eq!(seal_body(&backward, &ROOT, MEAS_A), Err(KeystoreError::AuditSeqDisorder), "backward seq rejected");
+        assert_eq!(
+            seal_body(&backward, &ROOT, MEAS_A),
+            Err(KeystoreError::AuditSeqDisorder),
+            "backward seq rejected"
+        );
         // next_seq not past the last seq ⇒ the next append would reuse seq 5.
         let mut stale = body_with_small_audit();
         stale.audit.records = vec![rec(5)];
         stale.audit.next_seq = 5;
-        assert_eq!(seal_body(&stale, &ROOT, MEAS_A), Err(KeystoreError::AuditSeqDisorder), "next_seq <= max rejected");
+        assert_eq!(
+            seal_body(&stale, &ROOT, MEAS_A),
+            Err(KeystoreError::AuditSeqDisorder),
+            "next_seq <= max rejected"
+        );
         // A well-ordered ring (what record_audit produces) validates.
         let mut ok = body_with_small_audit();
         ok.record_audit(&aud(7, 1)).unwrap();
         ok.record_audit(&aud(6, 2)).unwrap();
-        assert!(seal_body(&ok, &ROOT, MEAS_A).is_ok(), "strictly-ascending ring + next_seq>max validates");
+        assert!(
+            seal_body(&ok, &ROOT, MEAS_A).is_ok(),
+            "strictly-ascending ring + next_seq>max validates"
+        );
     }
 
     /// `validate()` rejects an export high-water (`last_exported_seq`) at or past `next_seq` (auto-review
@@ -1596,8 +1745,16 @@ mod tests {
     #[test]
     fn record_audit_zero_capacity_fails_closed_no_panic() {
         let mut b = sample_body();
-        b.audit = AuditRing { records: vec![], capacity: 0, last_exported_seq: 0, next_seq: 1 };
-        assert_eq!(b.record_audit(&aud(7, 1)), Err(KeystoreError::AuditBackpressure));
+        b.audit = AuditRing {
+            records: vec![],
+            capacity: 0,
+            last_exported_seq: 0,
+            next_seq: 1,
+        };
+        assert_eq!(
+            b.record_audit(&aud(7, 1)),
+            Err(KeystoreError::AuditBackpressure)
+        );
     }
 
     #[test]
@@ -1615,7 +1772,10 @@ mod tests {
         .unwrap();
         let blob = seal_body(&b, &ROOT, MEAS_A).unwrap();
         let out = unseal_body(&blob, &ROOT, MEAS_A).unwrap();
-        assert_eq!(out, b, "audit ring (incl. the appended record + next_seq) survives seal/unseal + validate()");
+        assert_eq!(
+            out, b,
+            "audit ring (incl. the appended record + next_seq) survives seal/unseal + validate()"
+        );
         assert_eq!(
             out.audit.records[0],
             AuditRecord {
@@ -1638,11 +1798,13 @@ mod tests {
         body.counters.clear();
         let auth = [0x11u8; 32];
         // First advance on an absent tuple inserts the row.
-        body.advance_counter(&auth, 0, b"generate_transfer", 1).unwrap();
+        body.advance_counter(&auth, 0, b"generate_transfer", 1)
+            .unwrap();
         assert_eq!(body.counters.len(), 1);
         assert_eq!(body.counters[0].highest_accepted_counter, 1);
         // A forward advance updates in place.
-        body.advance_counter(&auth, 0, b"generate_transfer", 2).unwrap();
+        body.advance_counter(&auth, 0, b"generate_transfer", 2)
+            .unwrap();
         assert_eq!(body.counters.len(), 1);
         assert_eq!(body.counters[0].highest_accepted_counter, 2);
         // A replay (==) or rollback (<) is refused — high-water is forward-only.
@@ -1655,7 +1817,8 @@ mod tests {
             Err(KeystoreError::CounterRegression)
         );
         // A different scope_target is a different tuple ⇒ a fresh row.
-        body.advance_counter(&auth, 0, b"generate_faucet", 1).unwrap();
+        body.advance_counter(&auth, 0, b"generate_faucet", 1)
+            .unwrap();
         assert_eq!(body.counters.len(), 2);
     }
 
@@ -1666,7 +1829,12 @@ mod tests {
         // of `fill` bytes is `(0x18 fill) × 32`. Search for THAT pattern (not a raw `[fill;32]`,
         // which never appears in the CBOR encoding and would make this test vacuous).
         let secret_pattern = |fill: u8| -> Vec<u8> {
-            [0x18u8, fill].iter().copied().cycle().take(2 * SECRET_SCALAR_LEN).collect()
+            [0x18u8, fill]
+                .iter()
+                .copied()
+                .cycle()
+                .take(2 * SECRET_SCALAR_LEN)
+                .collect()
         };
         let body = sample_body(); // treasury secret 0x77×32, transfer secret 0x88×32
 
@@ -1696,7 +1864,10 @@ mod tests {
     #[test]
     fn environment_identifier_rules() {
         for ok in ["mainnet", "test-net-2", "a", "x9", "2d"] {
-            assert!(validate_environment_identifier(ok).is_ok(), "{ok} should be valid");
+            assert!(
+                validate_environment_identifier(ok).is_ok(),
+                "{ok} should be valid"
+            );
         }
         for bad in ["", "-x", "x-", "a--b", "Main", "x_y", "под"] {
             assert_eq!(
@@ -1718,25 +1889,37 @@ mod tests {
         body.entries = (0..(MAX_TOTAL_KEY_ENTRIES + 1))
             .map(|_| sample_entry(KeyPurpose::AgentTransferK1, 0x01, 0x02, 0x03))
             .collect();
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::CapacityExceeded)
+        );
     }
 
     #[test]
     fn invalid_field_length_rejected() {
         let mut body = sample_body();
         body.entries[0].secret_scalar = Zeroizing::new(vec![0x77; SECRET_SCALAR_LEN - 1]);
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidFieldLength)
+        );
 
         let mut body2 = sample_body();
         body2.entries[0].public_identity = vec![0x04; SECP256K1_UNCOMPRESSED_LEN - 1];
-        assert_eq!(seal_body(&body2, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+        assert_eq!(
+            seal_body(&body2, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidFieldLength)
+        );
     }
 
     #[test]
     fn invalid_environment_id_rejected_on_seal() {
         let mut body = sample_body();
         body.config.environment_identifier = "Main--net".to_string();
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidEnvironmentId));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidEnvironmentId)
+        );
     }
 
     #[test]
@@ -1752,7 +1935,10 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&with_extra, &mut buf).unwrap();
         let r: Result<CreationMetadata, _> = ciborium::de::from_reader(&buf[..]);
-        assert!(r.is_err(), "deny_unknown_fields must reject the extra 'bogus' key");
+        assert!(
+            r.is_err(),
+            "deny_unknown_fields must reject the extra 'bogus' key"
+        );
 
         // Sanity: the same map without the extra key decodes.
         let clean = Value::Map(vec![
@@ -1763,28 +1949,44 @@ mod tests {
         let mut buf2 = Vec::new();
         ciborium::ser::into_writer(&clean, &mut buf2).unwrap();
         let cm: CreationMetadata = ciborium::de::from_reader(&buf2[..]).unwrap();
-        assert_eq!(cm, CreationMetadata { config_version: 1, counter_snapshot: 2, batch_id: 3 });
+        assert_eq!(
+            cm,
+            CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 2,
+                batch_id: 3
+            }
+        );
     }
 
     #[test]
     fn body_measurement_binding() {
         let body = sample_body();
         let blob = seal_body(&body, &ROOT, MEAS_A).unwrap();
-        assert_eq!(unseal_body(&blob, &ROOT, MEAS_B), Err(KeystoreError::MeasurementMismatch));
+        assert_eq!(
+            unseal_body(&blob, &ROOT, MEAS_B),
+            Err(KeystoreError::MeasurementMismatch)
+        );
     }
 
     #[test]
     fn counter_environment_must_match_config() {
         let mut body = sample_body();
         body.counters[0].environment_identifier = "testnet".to_string(); // valid format, wrong env
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidEnvironmentId));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidEnvironmentId)
+        );
     }
 
     #[test]
     fn wrapping_pubkey_length_enforced() {
         let mut body = sample_body();
         body.config.backup_recovery_wrapping_pubkey = vec![0xb0; 32]; // not ML-KEM-1024 size
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidFieldLength)
+        );
     }
 
     #[test]
@@ -1804,14 +2006,20 @@ mod tests {
             };
             3
         ];
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::CapacityExceeded)
+        );
     }
 
     #[test]
     fn audit_capacity_bounded() {
         let mut body = sample_body();
         body.audit.capacity = MAX_AUDIT_CAPACITY + 1;
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::CapacityExceeded));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::CapacityExceeded)
+        );
     }
 
     #[test]
@@ -1819,14 +2027,20 @@ mod tests {
         let mut body = sample_body();
         let r = body.entries[0].key_ref;
         body.entries[1].key_ref = r; // collide the two entries' opaque handles
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::DuplicateKeyRef));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::DuplicateKeyRef)
+        );
     }
 
     #[test]
     fn public_identity_prefix_enforced() {
         let mut body = sample_body();
         body.entries[0].public_identity[0] = 0x02; // valid length, wrong SEC1 prefix
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidFieldLength)
+        );
     }
 
     #[test]
@@ -1839,7 +2053,10 @@ mod tests {
         let mut body = sample_body();
         let base = body.counters[0].clone();
         body.counters.push(base); // identical tuple — a second row with the same (auth, class, target)
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::DuplicateCounterTuple));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::DuplicateCounterTuple)
+        );
     }
 
     #[test]
@@ -1850,16 +2067,26 @@ mod tests {
         let cap = crate::agent_cbor::MARKS_SCOPE_TARGET_MAX_LEN;
         let mut body = sample_body();
         body.counters[0].scope_target = vec![0x01u8; cap + 1];
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::InvalidFieldLength));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::InvalidFieldLength)
+        );
         // The cap itself is accepted (inclusive), and the round-trip holds at the boundary.
         body.counters[0].scope_target = vec![0x01u8; cap];
-        assert!(body.validate().is_ok(), "a scope_target exactly at the cap is valid");
+        assert!(
+            body.validate().is_ok(),
+            "a scope_target exactly at the cap is valid"
+        );
         let decoded = crate::agent_cbor::strict_decode_marks_payload(
             &body.encode_marks_payload(),
             MAX_COUNTER_ENTRIES,
         )
         .expect("a validate()-accepted body round-trips through the strict marks decoder");
-        assert_eq!(decoded.rows.len(), body.counters.len(), "every counter row survives the round-trip");
+        assert_eq!(
+            decoded.rows.len(),
+            body.counters.len(),
+            "every counter row survives the round-trip"
+        );
     }
 
     #[test]
@@ -1874,7 +2101,10 @@ mod tests {
                 e
             })
             .collect();
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::BlobTooLarge));
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::BlobTooLarge)
+        );
     }
 
     #[test]
@@ -1929,7 +2159,10 @@ mod tests {
         body.counters.push(make_row(idx, pad_len));
         let s0 = sealed_size(&body);
         let last_len = (pad_len as isize + (target as isize - s0 as isize)) as usize;
-        assert!(last_len >= 1 && last_len <= cap, "tuning length {last_len} must be within [1, cap]");
+        assert!(
+            last_len >= 1 && last_len <= cap,
+            "tuning length {last_len} must be within [1, cap]"
+        );
         body.counters.last_mut().unwrap().scope_target = vec![0x01u8; last_len];
         let s1 = sealed_size(&body);
         assert!(
@@ -1937,8 +2170,14 @@ mod tests {
             "boundary blob sealed={s1} not in (MAX_KEYSTORE_BLOB_SIZE, MAX_MESSAGE_SIZE]"
         );
         // validate() PASSES (capped scope_targets, unique tuples) so seal reaches the blob-size budget.
-        assert!(body.validate().is_ok(), "the padded body must pass validate() to reach the size budget");
-        assert_eq!(seal_body(&body, &ROOT, MEAS_A), Err(KeystoreError::BlobTooLarge));
+        assert!(
+            body.validate().is_ok(),
+            "the padded body must pass validate() to reach the size budget"
+        );
+        assert_eq!(
+            seal_body(&body, &ROOT, MEAS_A),
+            Err(KeystoreError::BlobTooLarge)
+        );
     }
 
     // --- frozen golden vector (format-drift guard) ---
@@ -1971,7 +2210,11 @@ mod tests {
                 algorithm: KeyAlgorithm::Secp256k1,
                 public_identity,
                 secret_scalar: Zeroizing::new(vec![0x09; SECRET_SCALAR_LEN]),
-                creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+                creation_metadata: CreationMetadata {
+                    config_version: 1,
+                    counter_snapshot: 0,
+                    batch_id: 1,
+                },
                 backup_export_metadata: BackupExportMetadata::default(),
             }],
             counters: vec![],
@@ -1984,7 +2227,12 @@ mod tests {
                 circuit_breaker_threshold: None,
                 cumulative_signing_budget: [0; 32],
             },
-            audit: AuditRing { records: vec![], capacity: 64, last_exported_seq: 0, next_seq: 1 },
+            audit: AuditRing {
+                records: vec![],
+                capacity: 64,
+                last_exported_seq: 0,
+                next_seq: 1,
+            },
             freshness_epoch: 1,
             structural_version: 1,
             strict_recovery_counter: 0,
@@ -2001,10 +2249,15 @@ mod tests {
         body.validate().unwrap();
         let mut cbor = Zeroizing::new(Vec::new());
         ciborium::ser::into_writer(&body, &mut *cbor).unwrap();
-        let blob = seal_keystore_with_nonce(&cbor, &GOLDEN_ROOT, GOLDEN_MEAS, &GOLDEN_NONCE).unwrap();
+        let blob =
+            seal_keystore_with_nonce(&cbor, &GOLDEN_ROOT, GOLDEN_MEAS, &GOLDEN_NONCE).unwrap();
         // Independently pin the on-wire format-version byte to the literal 4 (not just the const), so a
         // stealth const edit can't pass on the hash alone.
-        assert_eq!(u16::from_be_bytes([blob[8], blob[9]]), 4, "sealed format_version must be 4");
+        assert_eq!(
+            u16::from_be_bytes([blob[8], blob[9]]),
+            4,
+            "sealed format_version must be 4"
+        );
 
         let digest: [u8; 32] = {
             let mut h = Sha3_256::new();
@@ -2096,9 +2349,15 @@ mod tests {
                 assert_eq!(d.scope_target, c.scope_target);
                 assert_eq!(d.highest_accepted_counter, c.highest_accepted_counter);
             }
-            assert_eq!(decoded.cumulative_native_spend, body.faucet.cumulative_native_spend);
+            assert_eq!(
+                decoded.cumulative_native_spend,
+                body.faucet.cumulative_native_spend
+            );
             assert_eq!(decoded.lifetime_spend, body.faucet.lifetime_spend);
-            assert_eq!(decoded.strict_recovery_counter, body.strict_recovery_counter);
+            assert_eq!(
+                decoded.strict_recovery_counter,
+                body.strict_recovery_counter
+            );
         }
     }
 
@@ -2122,12 +2381,25 @@ mod tests {
         let mut candidate = marks_body();
         candidate.freshness_epoch = 1;
         candidate.structural_version = 5;
-        candidate.seed_marks_forward(&decoded, 99).expect("seed validates");
+        candidate
+            .seed_marks_forward(&decoded, 99)
+            .expect("seed validates");
 
-        assert_eq!(candidate.freshness_epoch, 99, "freshness_epoch bumped to the adopted epoch");
-        assert_eq!(candidate.structural_version, 5, "structural_version UNCHANGED (counter/spend gap)");
-        assert!(candidate.counters.iter().all(|c| c.environment_identifier == candidate.config.environment_identifier),
-            "every reconstructed row carries the config env (env-fold inverse)");
+        assert_eq!(
+            candidate.freshness_epoch, 99,
+            "freshness_epoch bumped to the adopted epoch"
+        );
+        assert_eq!(
+            candidate.structural_version, 5,
+            "structural_version UNCHANGED (counter/spend gap)"
+        );
+        assert!(
+            candidate
+                .counters
+                .iter()
+                .all(|c| c.environment_identifier == candidate.config.environment_identifier),
+            "every reconstructed row carries the config env (env-fold inverse)"
+        );
         assert_eq!(
             candidate.compute_local_marks_digest(),
             source.compute_local_marks_digest(),
@@ -2153,8 +2425,12 @@ mod tests {
             let p = b.encode_marks_payload();
             crate::agent_cbor::strict_decode_marks_payload(&p, MAX_COUNTER_ENTRIES).unwrap()
         };
-        body.seed_marks_forward(&lower, 2).expect("absolute seed validates");
-        assert_eq!(body.counters[0].highest_accepted_counter, 5, "absolute write, not forward-only");
+        body.seed_marks_forward(&lower, 2)
+            .expect("absolute seed validates");
+        assert_eq!(
+            body.counters[0].highest_accepted_counter, 5,
+            "absolute write, not forward-only"
+        );
 
         // The seeded body re-seals + unseals (re-installable on the re-run). seal_body validates +
         // honors MAX_KEYSTORE_BLOB_SIZE; unseal recovers the exact body.
@@ -2184,7 +2460,10 @@ mod tests {
         a.counters = vec![ctr(1, 0, b"x", 5), ctr(2, 0, b"y", 7)];
         let mut b = marks_body();
         b.counters = vec![ctr(2, 0, b"y", 7), ctr(1, 0, b"x", 5)]; // reversed arrival order
-        assert_eq!(a.compute_local_marks_digest(), b.compute_local_marks_digest());
+        assert_eq!(
+            a.compute_local_marks_digest(),
+            b.compute_local_marks_digest()
+        );
     }
 
     #[test]
@@ -2196,7 +2475,10 @@ mod tests {
         assert!(payload.windows(2).any(|w| w == [0x18, 0xC8]));
         let mut b0 = marks_body();
         b0.counters = vec![ctr(1, 0, b"x", 5)];
-        assert_ne!(b.compute_local_marks_digest(), b0.compute_local_marks_digest());
+        assert_ne!(
+            b.compute_local_marks_digest(),
+            b0.compute_local_marks_digest()
+        );
     }
 
     #[test]
@@ -2210,7 +2492,10 @@ mod tests {
         let mut rec = marks_body();
         rec.strict_recovery_counter = 1;
         // spend=1 (a 32-byte string) and strict_recovery_counter=1 (a uint) are different contributions.
-        assert_ne!(spend.compute_local_marks_digest(), rec.compute_local_marks_digest());
+        assert_ne!(
+            spend.compute_local_marks_digest(),
+            rec.compute_local_marks_digest()
+        );
     }
 
     #[test]
@@ -2220,7 +2505,10 @@ mod tests {
         a.counters = vec![ctr(1, 0, &[0x10], 5)];
         let mut b = marks_body();
         b.counters = vec![ctr(1, 0, &[0x10, 0x00], 5)];
-        assert_ne!(a.compute_local_marks_digest(), b.compute_local_marks_digest());
+        assert_ne!(
+            a.compute_local_marks_digest(),
+            b.compute_local_marks_digest()
+        );
     }
 
     #[test]
@@ -2245,7 +2533,10 @@ mod tests {
     #[test]
     fn marks_digest_is_deterministic() {
         let b = marks_body();
-        assert_eq!(b.compute_local_marks_digest(), b.compute_local_marks_digest());
+        assert_eq!(
+            b.compute_local_marks_digest(),
+            b.compute_local_marks_digest()
+        );
     }
 
     #[test]
@@ -2268,7 +2559,8 @@ mod tests {
         assert_eq!(m.len(), 4, "exactly 4 keys (no spilled row items)");
         let mut key1 = None;
         for (k, val) in &m {
-            if matches!(k, ciborium::value::Value::Integer(i) if u64::try_from(*i).ok() == Some(1)) {
+            if matches!(k, ciborium::value::Value::Integer(i) if u64::try_from(*i).ok() == Some(1))
+            {
                 key1 = Some(val);
             }
         }
@@ -2280,7 +2572,11 @@ mod tests {
             let ciborium::value::Value::Array(fields) = row else {
                 panic!("each row must be a CBOR array(4)");
             };
-            assert_eq!(fields.len(), 4, "row = [authority, scope_class, scope_target, counter]");
+            assert_eq!(
+                fields.len(),
+                4,
+                "row = [authority, scope_class, scope_target, counter]"
+            );
         }
     }
 
@@ -2304,11 +2600,19 @@ mod tests {
         // all-zero enclave_scope_id.
         let mut b = sample_body();
         b.config.enclave_scope_id = [0u8; 32];
-        assert_eq!(b.validate(), Err(KeystoreError::InvalidScopeId), "all-zero enclave_scope_id");
+        assert_eq!(
+            b.validate(),
+            Err(KeystoreError::InvalidScopeId),
+            "all-zero enclave_scope_id"
+        );
         // all-zero fleet_scope_id.
         let mut b = sample_body();
         b.config.fleet_scope_id = [0u8; 32];
-        assert_eq!(b.validate(), Err(KeystoreError::InvalidScopeId), "all-zero fleet_scope_id");
+        assert_eq!(
+            b.validate(),
+            Err(KeystoreError::InvalidScopeId),
+            "all-zero fleet_scope_id"
+        );
         // collapsing equality: enclave == fleet.
         let mut b = sample_body();
         b.config.fleet_scope_id = b.config.enclave_scope_id;
@@ -2338,8 +2642,16 @@ mod tests {
         let mut b = sample_body();
         let (e, s) = (b.freshness_epoch, b.structural_version);
         b.advance_commit_epoch(true).unwrap();
-        assert_eq!(b.freshness_epoch, e + 1, "structural op advances freshness_epoch");
-        assert_eq!(b.structural_version, s + 1, "... AND structural_version, as one unit");
+        assert_eq!(
+            b.freshness_epoch,
+            e + 1,
+            "structural op advances freshness_epoch"
+        );
+        assert_eq!(
+            b.structural_version,
+            s + 1,
+            "... AND structural_version, as one unit"
+        );
     }
 
     #[test]
@@ -2347,8 +2659,15 @@ mod tests {
         let mut b = sample_body();
         let (e, s) = (b.freshness_epoch, b.structural_version);
         b.advance_commit_epoch(false).unwrap();
-        assert_eq!(b.freshness_epoch, e + 1, "epoch-only op advances freshness_epoch");
-        assert_eq!(b.structural_version, s, "... and MUST NOT touch structural_version");
+        assert_eq!(
+            b.freshness_epoch,
+            e + 1,
+            "epoch-only op advances freshness_epoch"
+        );
+        assert_eq!(
+            b.structural_version, s,
+            "... and MUST NOT touch structural_version"
+        );
     }
 
     /// slice 6-6: the co-advance invariant pinned END-TO-END to `reconcile`'s asymmetry (this is what
@@ -2383,7 +2702,10 @@ mod tests {
         // AdoptForward. The co-advance guarantees structural stayed put, so this never mis-fires.
         let mut epoch_only = local.clone();
         epoch_only.advance_commit_epoch(false).unwrap();
-        assert_eq!(epoch_only.structural_version, ls, "epoch-only kept structural (co-advance invariant)");
+        assert_eq!(
+            epoch_only.structural_version, ls,
+            "epoch-only kept structural (co-advance invariant)"
+        );
         assert_eq!(epoch_only.compute_local_marks_digest(), lmarks, "the bump leaves marks untouched (isolates the structural asymmetry; reconcile ignores marks in the epoch-ahead arm)");
         assert_eq!(
             reconcile(le, ls, &lmarks, &anchor_of(&epoch_only)),
@@ -2397,8 +2719,15 @@ mod tests {
         for _ in 0..5 {
             many.advance_commit_epoch(false).unwrap();
         }
-        assert_eq!(many.structural_version, ls, "5 epoch-only advances still keep structural");
-        assert_eq!(many.compute_local_marks_digest(), lmarks, "5 bumps still leave marks untouched");
+        assert_eq!(
+            many.structural_version, ls,
+            "5 epoch-only advances still keep structural"
+        );
+        assert_eq!(
+            many.compute_local_marks_digest(),
+            lmarks,
+            "5 bumps still leave marks untouched"
+        );
         assert_eq!(
             reconcile(le, ls, &lmarks, &anchor_of(&many)),
             ReconcileDecision::AdoptForward { epoch: le + 5 },
@@ -2409,8 +2738,16 @@ mod tests {
         // supply the new key/config material ⇒ StructuralGap ⇒ fail-closed/restore. THIS is the asymmetry.
         let mut structural = local.clone();
         structural.advance_commit_epoch(true).unwrap();
-        assert_eq!(structural.structural_version, ls + 1, "structural op co-advanced structural");
-        assert_eq!(structural.compute_local_marks_digest(), lmarks, "the bump leaves marks untouched — the gap is purely structural");
+        assert_eq!(
+            structural.structural_version,
+            ls + 1,
+            "structural op co-advanced structural"
+        );
+        assert_eq!(
+            structural.compute_local_marks_digest(),
+            lmarks,
+            "the bump leaves marks untouched — the gap is purely structural"
+        );
         assert_eq!(
             reconcile(le, ls, &lmarks, &anchor_of(&structural)),
             ReconcileDecision::FailClosed(FailReason::StructuralGap),
@@ -2424,7 +2761,11 @@ mod tests {
         // away. Marks held equal so the divergence is purely structural.
         let mut diverged = local.clone();
         diverged.structural_version = ls + 1;
-        assert_eq!(diverged.compute_local_marks_digest(), lmarks, "marks held equal — the divergence is purely structural");
+        assert_eq!(
+            diverged.compute_local_marks_digest(),
+            lmarks,
+            "marks held equal — the divergence is purely structural"
+        );
         assert_eq!(
             reconcile(le, ls, &lmarks, &anchor_of(&diverged)),
             ReconcileDecision::FailClosed(FailReason::Inconsistent),
@@ -2438,16 +2779,28 @@ mod tests {
         let mut b = sample_body();
         b.freshness_epoch = u64::MAX;
         let s = b.structural_version;
-        assert_eq!(b.advance_commit_epoch(true), Err(KeystoreError::MonotonicOverflow));
+        assert_eq!(
+            b.advance_commit_epoch(true),
+            Err(KeystoreError::MonotonicOverflow)
+        );
         assert_eq!(b.freshness_epoch, u64::MAX, "epoch unchanged on overflow");
-        assert_eq!(b.structural_version, s, "structural untouched when epoch overflows");
+        assert_eq!(
+            b.structural_version, s,
+            "structural untouched when epoch overflows"
+        );
         // structural at u64::MAX (epoch fine) → structural overflow aborts; epoch untouched BECAUSE both
         // increments are computed BEFORE either is written.
         let mut b = sample_body();
         b.structural_version = u64::MAX;
         let e = b.freshness_epoch;
-        assert_eq!(b.advance_commit_epoch(true), Err(KeystoreError::MonotonicOverflow));
-        assert_eq!(b.freshness_epoch, e, "epoch untouched when structural overflows (computed-before-assign)");
+        assert_eq!(
+            b.advance_commit_epoch(true),
+            Err(KeystoreError::MonotonicOverflow)
+        );
+        assert_eq!(
+            b.freshness_epoch, e,
+            "epoch untouched when structural overflows (computed-before-assign)"
+        );
         assert_eq!(b.structural_version, u64::MAX, "no partial mutation");
         // EPOCH-ONLY path: the epoch check is UNCONDITIONAL (runs regardless of bumps_structural), so an
         // epoch at u64::MAX must overflow even when bumps_structural=false. Pins the unconditional-epoch
@@ -2455,9 +2808,19 @@ mod tests {
         let mut b = sample_body();
         b.freshness_epoch = u64::MAX;
         let s = b.structural_version;
-        assert_eq!(b.advance_commit_epoch(false), Err(KeystoreError::MonotonicOverflow));
-        assert_eq!(b.freshness_epoch, u64::MAX, "epoch-only overflow leaves epoch unchanged");
-        assert_eq!(b.structural_version, s, "epoch-only never touches structural");
+        assert_eq!(
+            b.advance_commit_epoch(false),
+            Err(KeystoreError::MonotonicOverflow)
+        );
+        assert_eq!(
+            b.freshness_epoch,
+            u64::MAX,
+            "epoch-only overflow leaves epoch unchanged"
+        );
+        assert_eq!(
+            b.structural_version, s,
+            "epoch-only never touches structural"
+        );
     }
 
     /// Slice 15-4: `advance_treasury_config_version` bumps ONLY `config_version` (NOT freshness_epoch /
@@ -2471,13 +2834,27 @@ mod tests {
             b.structural_version,
         );
         b.advance_treasury_config_version().unwrap();
-        assert_eq!(b.config.monotonic_treasury_config_version, v + 1, "config_version += 1");
-        assert_eq!(b.freshness_epoch, e, "config bump must NOT touch freshness_epoch");
-        assert_eq!(b.structural_version, s, "config bump must NOT touch structural_version (no aliasing)");
+        assert_eq!(
+            b.config.monotonic_treasury_config_version,
+            v + 1,
+            "config_version += 1"
+        );
+        assert_eq!(
+            b.freshness_epoch, e,
+            "config bump must NOT touch freshness_epoch"
+        );
+        assert_eq!(
+            b.structural_version, s,
+            "config bump must NOT touch structural_version (no aliasing)"
+        );
         // config_version is not a marks surface — the bump leaves the marks digest unchanged.
         let before = b.compute_local_marks_digest();
         b.advance_treasury_config_version().unwrap();
-        assert_eq!(b.compute_local_marks_digest(), before, "config_version is not a marks surface");
+        assert_eq!(
+            b.compute_local_marks_digest(),
+            before,
+            "config_version is not a marks surface"
+        );
         // Overflow fails closed (never wraps — a wrapped version would let a loosened config re-apply).
         b.config.monotonic_treasury_config_version = u64::MAX;
         assert_eq!(
@@ -2485,7 +2862,11 @@ mod tests {
             Err(KeystoreError::MonotonicOverflow),
             "config_version at u64::MAX ⇒ MonotonicOverflow"
         );
-        assert_eq!(b.config.monotonic_treasury_config_version, u64::MAX, "no wrap on overflow");
+        assert_eq!(
+            b.config.monotonic_treasury_config_version,
+            u64::MAX,
+            "no wrap on overflow"
+        );
     }
 
     #[test]
@@ -2496,7 +2877,11 @@ mod tests {
         let mut b = sample_body();
         let before = b.compute_local_marks_digest();
         b.advance_commit_epoch(true).unwrap();
-        assert_eq!(b.compute_local_marks_digest(), before, "epoch/structural are not marks surfaces");
+        assert_eq!(
+            b.compute_local_marks_digest(),
+            before,
+            "epoch/structural are not marks surfaces"
+        );
     }
 
     #[test]
@@ -2510,7 +2895,11 @@ mod tests {
             ciborium::ser::into_writer(body, &mut v).unwrap();
             v
         };
-        assert_ne!(enc(&a), enc(&b), "structural_version is actually encoded in the sealed body");
+        assert_ne!(
+            enc(&a),
+            enc(&b),
+            "structural_version is actually encoded in the sealed body"
+        );
     }
 
     #[test]
@@ -2527,15 +2916,20 @@ mod tests {
         for field in ["structural_version", "strict_recovery_counter"] {
             let mut shortened_entries = entries.clone();
             let before = shortened_entries.len();
-            shortened_entries.retain(
-                |(k, _)| !matches!(k, ciborium::value::Value::Text(s) if s == field),
-            );
+            shortened_entries
+                .retain(|(k, _)| !matches!(k, ciborium::value::Value::Text(s) if s == field));
             assert_eq!(shortened_entries.len(), before - 1, "removed {field}");
             let mut shortened = Vec::new();
-            ciborium::ser::into_writer(&ciborium::value::Value::Map(shortened_entries), &mut shortened)
-                .unwrap();
+            ciborium::ser::into_writer(
+                &ciborium::value::Value::Map(shortened_entries),
+                &mut shortened,
+            )
+            .unwrap();
             let res: Result<KeystoreBody, _> = ciborium::de::from_reader(&shortened[..]);
-            assert!(res.is_err(), "body missing {field} must fail closed, not default");
+            assert!(
+                res.is_err(),
+                "body missing {field} must fail closed, not default"
+            );
         }
     }
 
@@ -2565,7 +2959,11 @@ mod tests {
         faucet_entries.retain(
             |(k, _)| !matches!(k, ciborium::value::Value::Text(s) if s == "cumulative_signing_budget"),
         );
-        assert_eq!(faucet_entries.len(), before - 1, "removed faucet.cumulative_signing_budget");
+        assert_eq!(
+            faucet_entries.len(),
+            before - 1,
+            "removed faucet.cumulative_signing_budget"
+        );
         let mut shortened = Vec::new();
         ciborium::ser::into_writer(&ciborium::value::Value::Map(entries), &mut shortened).unwrap();
         assert!(
@@ -2585,7 +2983,10 @@ mod tests {
         let base = sample_body();
         let mut bumped = base.clone();
         bumped.faucet.cumulative_signing_budget = [0xff; 32];
-        assert_ne!(base.faucet, bumped.faucet, "precondition: the budget field actually differs");
+        assert_ne!(
+            base.faucet, bumped.faucet,
+            "precondition: the budget field actually differs"
+        );
         assert_eq!(
             base.encode_marks_payload(),
             bumped.encode_marks_payload(),
@@ -2626,21 +3027,53 @@ mod tests {
         let out = f
             .accept_and_debit(&be(500_000), 21_000, &be(1_000_000_000))
             .expect("within all caps");
-        assert_eq!(out.cumulative_native_spend, be(worst), "cumulative += worst_case");
-        assert_eq!(out.lifetime_spend, be(worst), "lifetime += worst_case (even with no breaker)");
+        assert_eq!(
+            out.cumulative_native_spend,
+            be(worst),
+            "cumulative += worst_case"
+        );
+        assert_eq!(
+            out.lifetime_spend,
+            be(worst),
+            "lifetime += worst_case (even with no breaker)"
+        );
         // EVERY non-counter field carries through unchanged (only the two spend counters move).
-        assert_eq!(out.cumulative_signing_budget, f.cumulative_signing_budget, "budget unchanged");
-        assert_eq!(out.per_dispense_max_amount, f.per_dispense_max_amount, "per-dispense cap unchanged");
-        assert_eq!(out.max_gas_limit, f.max_gas_limit, "max_gas_limit unchanged");
-        assert_eq!(out.max_effective_gas_fee_rate, f.max_effective_gas_fee_rate, "max fee rate unchanged");
-        assert_eq!(out.circuit_breaker_threshold, f.circuit_breaker_threshold, "breaker unchanged");
+        assert_eq!(
+            out.cumulative_signing_budget, f.cumulative_signing_budget,
+            "budget unchanged"
+        );
+        assert_eq!(
+            out.per_dispense_max_amount, f.per_dispense_max_amount,
+            "per-dispense cap unchanged"
+        );
+        assert_eq!(
+            out.max_gas_limit, f.max_gas_limit,
+            "max_gas_limit unchanged"
+        );
+        assert_eq!(
+            out.max_effective_gas_fee_rate, f.max_effective_gas_fee_rate,
+            "max fee rate unchanged"
+        );
+        assert_eq!(
+            out.circuit_breaker_threshold, f.circuit_breaker_threshold,
+            "breaker unchanged"
+        );
         assert_eq!(f.cumulative_native_spend, be(0), "self is never mutated");
         assert_eq!(f.lifetime_spend, be(0), "self lifetime never mutated");
         // amount EXACTLY at the per-dispense cap is accepted (≤, not <).
-        assert!(f.accept_and_debit(&be(1_000_000), 0, &be(0)).is_ok(), "amount == max_amount accepted");
+        assert!(
+            f.accept_and_debit(&be(1_000_000), 0, &be(0)).is_ok(),
+            "amount == max_amount accepted"
+        );
         // a second dispense accumulates onto the first
-        let out2 = out.accept_and_debit(&be(0), 0, &be(0)).expect("zero dispense ok");
-        assert_eq!(out2.cumulative_native_spend, be(worst), "zero-cost dispense leaves the counter");
+        let out2 = out
+            .accept_and_debit(&be(0), 0, &be(0))
+            .expect("zero dispense ok");
+        assert_eq!(
+            out2.cumulative_native_spend,
+            be(worst),
+            "zero-cost dispense leaves the counter"
+        );
     }
 
     #[test]
@@ -2659,14 +3092,27 @@ mod tests {
             circuit_breaker_threshold: None,
             cumulative_signing_budget: [0xff; 32],
         };
-        let out = f.accept_and_debit(&two_128, 0, &[0; 32]).expect("2^128 dispense within caps");
-        assert_eq!(out.cumulative_native_spend, two_128, "cumulative debited into the high half");
-        assert_eq!(out.lifetime_spend, two_128, "lifetime debited into the high half");
+        let out = f
+            .accept_and_debit(&two_128, 0, &[0; 32])
+            .expect("2^128 dispense within caps");
+        assert_eq!(
+            out.cumulative_native_spend, two_128,
+            "cumulative debited into the high half"
+        );
+        assert_eq!(
+            out.lifetime_spend, two_128,
+            "lifetime debited into the high half"
+        );
         // a second 2^128 dispense ⇒ 2^129 = 2·2^128 = 0x02 at byte 15 (high-half add).
         let mut two_129 = [0u8; 32];
         two_129[15] = 0x02; // 2^129
-        let out2 = out.accept_and_debit(&two_128, 0, &[0; 32]).expect("second 2^128 dispense");
-        assert_eq!(out2.cumulative_native_spend, two_129, "high-half add: 2^128 + 2^128 = 2^129");
+        let out2 = out
+            .accept_and_debit(&two_128, 0, &[0; 32])
+            .expect("second 2^128 dispense");
+        assert_eq!(
+            out2.cumulative_native_spend, two_129,
+            "high-half add: 2^128 + 2^128 = 2^129"
+        );
     }
 
     #[test]
@@ -2675,34 +3121,60 @@ mod tests {
         // faucet_cumulative_budget_and_breaker_reject; this pins that an in-threshold dispense SUCCEEDS
         // (guards an inverted breaker comparison that would DoS legitimate dispenses).
         let worst = 1u128 + 21_000u128 * 1u128; // 21_001
-        // breaker EXACTLY at worst_case ⇒ new_lifetime == breaker ⇒ accept (≤).
+                                                // breaker EXACTLY at worst_case ⇒ new_lifetime == breaker ⇒ accept (≤).
         let f = faucet_with(u128::MAX, Some(worst));
-        let out = f.accept_and_debit(&be(1), 21_000, &be(1)).expect("new_lifetime == breaker is accepted");
-        assert_eq!(out.lifetime_spend, be(worst), "lifetime advanced to exactly the breaker");
+        let out = f
+            .accept_and_debit(&be(1), 21_000, &be(1))
+            .expect("new_lifetime == breaker is accepted");
+        assert_eq!(
+            out.lifetime_spend,
+            be(worst),
+            "lifetime advanced to exactly the breaker"
+        );
     }
 
     #[test]
     fn faucet_exact_per_field_cap_boundaries_and_accumulation() {
         let f = faucet_with(u128::MAX, None);
         // each per-field cap EXACTLY at the limit is accepted (≤, not <).
-        assert!(f.accept_and_debit(&be(1_000_000), 0, &be(0)).is_ok(), "amount == per_dispense_max_amount");
-        assert!(f.accept_and_debit(&be(0), 21_000, &be(0)).is_ok(), "gas_limit == max_gas_limit");
-        assert!(f.accept_and_debit(&be(0), 0, &be(1_000_000_000)).is_ok(), "gas_price == max_effective_gas_fee_rate");
+        assert!(
+            f.accept_and_debit(&be(1_000_000), 0, &be(0)).is_ok(),
+            "amount == per_dispense_max_amount"
+        );
+        assert!(
+            f.accept_and_debit(&be(0), 21_000, &be(0)).is_ok(),
+            "gas_limit == max_gas_limit"
+        );
+        assert!(
+            f.accept_and_debit(&be(0), 0, &be(1_000_000_000)).is_ok(),
+            "gas_price == max_effective_gas_fee_rate"
+        );
         // accumulation from NON-ZERO bases: each counter advances from its own independent starting value.
         let mut g = faucet_with(u128::MAX, None);
         g.cumulative_native_spend = be(100);
         g.lifetime_spend = be(7); // distinct from cumulative, so a swapped-counter bug would show
         let worst = 5u128 + 21_000u128 * 1u128; // amount 5 + gas_limit 21000 * gas_price 1
-        let out = g.accept_and_debit(&be(5), 21_000, &be(1)).expect("within caps");
-        assert_eq!(out.cumulative_native_spend, be(100 + worst), "cumulative accumulates from its base");
-        assert_eq!(out.lifetime_spend, be(7 + worst), "lifetime accumulates from its (independent) base");
+        let out = g
+            .accept_and_debit(&be(5), 21_000, &be(1))
+            .expect("within caps");
+        assert_eq!(
+            out.cumulative_native_spend,
+            be(100 + worst),
+            "cumulative accumulates from its base"
+        );
+        assert_eq!(
+            out.lifetime_spend,
+            be(7 + worst),
+            "lifetime accumulates from its (independent) base"
+        );
     }
 
     #[test]
     fn faucet_per_field_caps_reject_individually() {
         let f = faucet_with(u128::MAX, None);
         assert_eq!(
-            f.accept_and_debit(&be(1_000_001), 21_000, &be(1)).unwrap_err(),
+            f.accept_and_debit(&be(1_000_001), 21_000, &be(1))
+                .unwrap_err(),
             FaucetCapError::PerDispenseAmount,
             "amount over per_dispense_max_amount"
         );
@@ -2712,7 +3184,8 @@ mod tests {
             "gas_limit over max_gas_limit"
         );
         assert_eq!(
-            f.accept_and_debit(&be(1), 1, &be(1_000_000_001)).unwrap_err(),
+            f.accept_and_debit(&be(1), 1, &be(1_000_000_001))
+                .unwrap_err(),
             FaucetCapError::GasFeeRate,
             "gas_price over max_effective_gas_fee_rate"
         );
@@ -2725,7 +3198,8 @@ mod tests {
         let f = faucet_with(u128::MAX, None);
         let gas_price_over_u64 = be(1u128 << 64); // 2^64, just past u64::MAX
         assert_eq!(
-            f.accept_and_debit(&be(1), 1, &gas_price_over_u64).unwrap_err(),
+            f.accept_and_debit(&be(1), 1, &gas_price_over_u64)
+                .unwrap_err(),
             FaucetCapError::GasFeeRate,
             "a >u64 gas_price is rejected by the lifted-to-u256 comparison, never downcast/wrapped"
         );
@@ -2742,11 +3216,16 @@ mod tests {
         );
         // exactly at the budget ⇒ accept (≤, not <)
         let exact = faucet_with(worst, None);
-        assert!(exact.accept_and_debit(&be(1), 21_000, &be(1)).is_ok(), "spend == budget is allowed");
+        assert!(
+            exact.accept_and_debit(&be(1), 21_000, &be(1)).is_ok(),
+            "spend == budget is allowed"
+        );
         // breaker just below worst_case ⇒ LifetimeBreaker (budget generous)
         let breaker = faucet_with(u128::MAX, Some(worst - 1));
         assert_eq!(
-            breaker.accept_and_debit(&be(1), 21_000, &be(1)).unwrap_err(),
+            breaker
+                .accept_and_debit(&be(1), 21_000, &be(1))
+                .unwrap_err(),
             FaucetCapError::LifetimeBreaker
         );
     }
@@ -2770,7 +3249,10 @@ mod tests {
         );
         // The boundary the moment a budget IS sealed: a 1-wei budget accepts a 1-wei dispense.
         let configured = faucet_with(1, None);
-        assert!(configured.accept_and_debit(&be(1), 0, &be(0)).is_ok(), "a sealed budget enables dispensing");
+        assert!(
+            configured.accept_and_debit(&be(1), 0, &be(0)).is_ok(),
+            "a sealed budget enables dispensing"
+        );
     }
 
     #[test]
@@ -2786,7 +3268,9 @@ mod tests {
         };
         // (1) worst_case ADD overflow: amount(2^256-1) + a positive gas_cost.
         assert_eq!(
-            maxed().accept_and_debit(&[0xff; 32], 21_000, &be(1_000_000_000)).unwrap_err(),
+            maxed()
+                .accept_and_debit(&[0xff; 32], 21_000, &be(1_000_000_000))
+                .unwrap_err(),
             FaucetCapError::WorstCaseOverflow,
             "amount(2^256-1) + gas_cost overflows"
         );

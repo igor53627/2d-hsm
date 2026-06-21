@@ -70,7 +70,10 @@ pub(crate) const MAX_QUOTE_FRAME_LEN: usize =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildReply {
     /// Successful fetch: the raw SNP report (outblob) + best-effort cert chain (auxblob; may be empty).
-    Quote { report: Vec<u8>, cert_chain: Vec<u8> },
+    Quote {
+        report: Vec<u8>,
+        cert_chain: Vec<u8>,
+    },
     /// The child reported a step failure (fixed code table, mapped to static strings at parse time so
     /// the parent never invents triage text).
     ChildError(&'static str),
@@ -107,7 +110,11 @@ fn child_err_str(code: u8) -> &'static str {
 /// Precondition: `b.len() >= 4` (every caller length-guards first — `from_be_bytes` over the
 /// `try_into` makes the 4-byte intent explicit; a short slice still panics rather than misparses).
 fn be_u32(b: &[u8]) -> u32 {
-    u32::from_be_bytes(b[..4].try_into().expect("be_u32 caller guarantees >= 4 bytes"))
+    u32::from_be_bytes(
+        b[..4]
+            .try_into()
+            .expect("be_u32 caller guarantees >= 4 bytes"),
+    )
 }
 
 /// Incremental, cap-before-alloc frame parser. Length fields are validated against the crate ABI bounds
@@ -123,9 +130,13 @@ pub(crate) fn parse_child_frame(accum: &[u8]) -> Result<FrameProgress, ProtocolE
                 return Ok(FrameProgress::NeedMore);
             }
             if accum.len() > 2 {
-                return Err(ProtocolError::WireProtocol("quote child: trailing bytes after frame"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: trailing bytes after frame",
+                ));
             }
-            Ok(FrameProgress::Complete { reply: ChildReply::ChildError(child_err_str(accum[1])) })
+            Ok(FrameProgress::Complete {
+                reply: ChildReply::ChildError(child_err_str(accum[1])),
+            })
         }
         FRAME_STATUS_OK => {
             if accum.len() < 1 + 4 {
@@ -133,10 +144,14 @@ pub(crate) fn parse_child_frame(accum: &[u8]) -> Result<FrameProgress, ProtocolE
             }
             let report_len = be_u32(&accum[1..5]) as usize;
             if report_len < crate::snp_report::MIN_REPORT_LEN {
-                return Err(ProtocolError::WireProtocol("quote child: report below ABI minimum"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: report below ABI minimum",
+                ));
             }
             if report_len > crate::snp_report::MAX_OUTBLOB_LEN {
-                return Err(ProtocolError::WireProtocol("quote child: report length over cap"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: report length over cap",
+                ));
             }
             let chain_at = 1 + 4 + report_len;
             if accum.len() < chain_at + 4 {
@@ -144,14 +159,18 @@ pub(crate) fn parse_child_frame(accum: &[u8]) -> Result<FrameProgress, ProtocolE
             }
             let chain_len = be_u32(&accum[chain_at..chain_at + 4]) as usize;
             if chain_len > crate::snp_report::MAX_CERT_CHAIN_LEN {
-                return Err(ProtocolError::WireProtocol("quote child: cert chain length over cap"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: cert chain length over cap",
+                ));
             }
             let total = chain_at + 4 + chain_len;
             if accum.len() < total {
                 return Ok(FrameProgress::NeedMore);
             }
             if accum.len() > total {
-                return Err(ProtocolError::WireProtocol("quote child: trailing bytes after frame"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: trailing bytes after frame",
+                ));
             }
             Ok(FrameProgress::Complete {
                 reply: ChildReply::Quote {
@@ -160,7 +179,9 @@ pub(crate) fn parse_child_frame(accum: &[u8]) -> Result<FrameProgress, ProtocolE
                 },
             })
         }
-        _ => Err(ProtocolError::WireProtocol("quote child: malformed frame status")),
+        _ => Err(ProtocolError::WireProtocol(
+            "quote child: malformed frame status",
+        )),
     }
 }
 
@@ -170,10 +191,14 @@ pub(crate) fn encode_ok_frame(report: &[u8], cert_chain: &[u8]) -> Result<Vec<u8
     if report.len() < crate::snp_report::MIN_REPORT_LEN
         || report.len() > crate::snp_report::MAX_OUTBLOB_LEN
     {
-        return Err(ProtocolError::WireProtocol("quote child: encode report length out of range"));
+        return Err(ProtocolError::WireProtocol(
+            "quote child: encode report length out of range",
+        ));
     }
     if cert_chain.len() > crate::snp_report::MAX_CERT_CHAIN_LEN {
-        return Err(ProtocolError::WireProtocol("quote child: encode cert chain over cap"));
+        return Err(ProtocolError::WireProtocol(
+            "quote child: encode cert chain over cap",
+        ));
     }
     let mut out = Vec::with_capacity(1 + 4 + report.len() + 4 + cert_chain.len());
     out.push(FRAME_STATUS_OK);
@@ -223,7 +248,11 @@ pub(crate) fn read_child_reply<R: std::os::fd::AsFd + std::io::Read>(
         match pipe.read(&mut buf) {
             // EOF: legitimate only AFTER a complete frame (which returns below) — here it means the
             // writer died mid-frame.
-            Ok(0) => return Err(ProtocolError::WireProtocol("quote child: pipe closed mid-frame")),
+            Ok(0) => {
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: pipe closed mid-frame",
+                ))
+            }
             Ok(n) => {
                 accum.extend_from_slice(&buf[..n]);
                 if let FrameProgress::Complete { reply } = parse_child_frame(&accum)? {
@@ -335,12 +364,15 @@ pub(crate) const QUOTE_ATTEMPT_OVERHEAD: Duration =
 
 impl<H: ChildHandle> AbandonedLedger<H> {
     fn new() -> Self {
-        Self { children: Vec::new() }
+        Self {
+            children: Vec::new(),
+        }
     }
     /// O(≤budget) WNOHANG sweep: drop every since-exited child, keep the rest. Run at every fetch start
     /// so un-wedged children are reclaimed promptly.
     fn sweep(&mut self) {
-        self.children.retain_mut(|h| h.try_reap() == ReapOutcome::Running);
+        self.children
+            .retain_mut(|h| h.try_reap() == ReapOutcome::Running);
     }
     fn abandon(&mut self, h: H) {
         self.children.push(h);
@@ -466,12 +498,16 @@ fn fetch_quote_via_child_inner<S: QuoteChildSpawn>(
     // exists to permit other spawner impls, and a future impl that faithfully implements the trait
     // contract would otherwise lose the depth-1 guarantee (the orchestration owns the policy).
     if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
-        return Err(ProtocolError::WireProtocol("quote child: fetch refused inside child"));
+        return Err(ProtocolError::WireProtocol(
+            "quote child: fetch refused inside child",
+        ));
     }
     // (1) Reclaim since-un-wedged children, then (2) enforce the budget BEFORE spawning.
     ledger.sweep();
     if ledger.is_full() {
-        return Err(ProtocolError::WireProtocol("quote child: abandoned-child budget exhausted"));
+        return Err(ProtocolError::WireProtocol(
+            "quote child: abandoned-child budget exhausted",
+        ));
     }
     // (3) Spawn under the RAII guard.
     let (mut pipe, handle) = spawn.spawn(report_data)?;
@@ -501,12 +537,17 @@ fn fetch_quote_via_child_inner<S: QuoteChildSpawn>(
         ChildReply::ChildError(msg) => Err(ProtocolError::WireProtocol(msg)),
         ChildReply::Quote { report, cert_chain } => {
             if report.len() < crate::snp_report::MIN_REPORT_LEN {
-                return Err(ProtocolError::WireProtocol("quote child: report below ABI minimum"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: report below ABI minimum",
+                ));
             }
-            let echoed = crate::snp_report::report_data_from_report(&report)
-                .map_err(|_| ProtocolError::WireProtocol("quote child: report_data echo unreadable"))?;
+            let echoed = crate::snp_report::report_data_from_report(&report).map_err(|_| {
+                ProtocolError::WireProtocol("quote child: report_data echo unreadable")
+            })?;
             if &echoed != report_data {
-                return Err(ProtocolError::WireProtocol("quote child: report_data echo mismatch"));
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: report_data echo mismatch",
+                ));
             }
             Ok((report, cert_chain))
         }
@@ -546,8 +587,12 @@ pub(crate) const QUOTE_CHILD_REPORT_DATA_ENV: &str = "TWOD_HSM_QUOTE_CHILD_REPOR
 /// This is probe staging, NOT a production parent shape: the production spawner
 /// ([`ExecChildSpawn`]) always sets report_data (reserved keys win — see its `spawn`), so the
 /// absent-env arm is reachable only through deliberate staging like this.
-#[cfg(all(target_os = "linux", feature = "vsock-transport",
-          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway",
+    feature = "lab-quote-smoke"
+))]
 pub(crate) fn smoke_breadcrumb_arm() -> Result<(i32, Vec<u8>), String> {
     use std::io::Read as _;
 
@@ -593,7 +638,9 @@ pub(crate) fn smoke_breadcrumb_arm() -> Result<(i32, Vec<u8>), String> {
                 if std::time::Instant::now() >= reap_deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("child failed to exit within the 5s reap ceiling (killed)".to_string());
+                    return Err(
+                        "child failed to exit within the 5s reap ceiling (killed)".to_string()
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -708,7 +755,9 @@ impl QuoteChildSpawn for ExecChildSpawn {
     fn spawn(&self, report_data: &[u8; 64]) -> Result<(Self::Pipe, Self::Handle), ProtocolError> {
         // Anti-fork-bomb brake: inside a quote child the marker is set — refuse to recurse.
         if std::env::var_os(QUOTE_CHILD_ENV).is_some() {
-            return Err(ProtocolError::WireProtocol("quote child: spawn refused inside child"));
+            return Err(ProtocolError::WireProtocol(
+                "quote child: spawn refused inside child",
+            ));
         }
         let mut cmd = std::process::Command::new(&self.program);
         cmd.args(&self.leading_args);
@@ -748,7 +797,9 @@ impl QuoteChildSpawn for ExecChildSpawn {
             PipeSource::Stdout => guard.get_mut().0.stdout.take().map(QuotePipe::Stdout),
             PipeSource::Stderr => guard.get_mut().0.stderr.take().map(QuotePipe::Stderr),
         }
-        .ok_or(ProtocolError::WireProtocol("quote child: pipe end missing after spawn"))?;
+        .ok_or(ProtocolError::WireProtocol(
+            "quote child: pipe end missing after spawn",
+        ))?;
         // (That ok_or is DEFENSIVE-UNREACHABLE: std guarantees the Option is Some when the matching
         // Stdio::piped() was configured and spawn() returned Ok — kept because reaching it must still
         // kill the child via the guard rather than leak it. The O_NONBLOCK fcntl deliberately does NOT
@@ -880,7 +931,10 @@ impl<S: QuoteChildSpawn> HardBoundedQuoteProducer<S> {
     /// The ONE construction literal (private, unconditional): `new()` reaches it only after winning
     /// the claim; the cfg(test) escape hatch reaches it directly.
     fn unclaimed(spawn: S) -> Self {
-        Self { spawn, ledger: AbandonedLedger::new() }
+        Self {
+            spawn,
+            ledger: AbandonedLedger::new(),
+        }
     }
 
     /// Test-only escape hatch: bypasses the process claim so behavior tests parallelize (cfg(test) —
@@ -909,7 +963,9 @@ impl HardBoundedQuoteProducer<ExecChildSpawn> {
     }
 }
 
-impl<S: QuoteChildSpawn> crate::agent_boot_relay::BootQuoteProducer for HardBoundedQuoteProducer<S> {
+impl<S: QuoteChildSpawn> crate::agent_boot_relay::BootQuoteProducer
+    for HardBoundedQuoteProducer<S>
+{
     /// Pure delegation to [`fetch_quote_via_child`] over the owned spawner + THE owned ledger (sweep →
     /// budget refuse → spawn → drain → unconditional dispose). All errors (child ERR frames, lapses,
     /// budget refusal) stay [`ProtocolError`] and fold to the retryable transport class at the
@@ -1100,7 +1156,9 @@ impl ValidatedBootBudget {
         overall_boot_budget: Duration,
     ) -> Result<Self, ProtocolError> {
         if max_attempts == 0 {
-            return Err(ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1"));
+            return Err(ProtocolError::WireProtocol(
+                "boot budget: max_attempts must be >= 1",
+            ));
         }
         if max_attempts > crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING {
             return Err(ProtocolError::WireProtocol(
@@ -1127,7 +1185,12 @@ impl ValidatedBootBudget {
                 "boot budget: nominal boot cost exceeds overall_boot_budget",
             ));
         }
-        Ok(Self { max_attempts, per_leg_timeout, overall_boot_budget, nominal_boot_cost })
+        Ok(Self {
+            max_attempts,
+            per_leg_timeout,
+            overall_boot_budget,
+            nominal_boot_cost,
+        })
     }
 
     /// For `run_boot_anti_rollback_handshake` — DISCHARGED at (4b): `run_boot_handshake_wired`
@@ -1158,7 +1221,8 @@ impl ValidatedBootBudget {
     /// merely keeps the LOG path panic-free. The §8 "checked NOT saturating" rule targets budget
     /// PRODUCTS feeding the `≤` comparison, not a log-only difference of already-validated fields.
     pub(crate) fn slack(&self) -> Duration {
-        self.overall_boot_budget.saturating_sub(self.nominal_boot_cost)
+        self.overall_boot_budget
+            .saturating_sub(self.nominal_boot_cost)
     }
 
     /// The ONE producer+transport mint body — claims the process producer (gate #1) and mints the
@@ -1335,7 +1399,10 @@ fn emit<W: std::io::Write>(out: &mut W, frame: &[u8], ok_code: i32) -> i32 {
         // drains. The alternative — fcntl(O_NONBLOCK) on inherited stderr — flips the SHARED open
         // file description non-blocking for every process holding it (incl. a still-alive parent's
         // own stderr), a strictly worse failure mode than a delayed orphan exit.
-        let _ = writeln!(std::io::stderr(), "twod-hsm quote child: frame write failed (parent gone?)");
+        let _ = writeln!(
+            std::io::stderr(),
+            "twod-hsm quote child: frame write failed (parent gone?)"
+        );
         CHILD_EXIT_WRITE_FAILED
     }
 }
@@ -1355,7 +1422,10 @@ pub(crate) fn quote_child_main_with<F: crate::snp_report::TsmFs, W: std::io::Wri
     out: &mut W,
 ) -> i32 {
     let entry_path = crate::snp_report::quote_child_entry_path();
-    let tracker = StepTracker { inner: fs, last: std::cell::Cell::new(FetchStep::None) };
+    let tracker = StepTracker {
+        inner: fs,
+        last: std::cell::Cell::new(FetchStep::None),
+    };
     // Unbounded BY STRUCTURE ((4a) deleted the deadline parameter): the parent's pipe poll + SIGKILL
     // is the ONLY bound. Any future deadline-bearing variant must first rework child_err_code's step
     // mapping (a mid-sequence lapse would masquerade as the previous step).
@@ -1387,12 +1457,14 @@ pub(crate) fn quote_child_main_with<F: crate::snp_report::TsmFs, W: std::io::Wri
 /// Returns `Err` (never panics) so a malformed/missing env folds to the ERR(1) frame + exit 1 — a
 /// child must never die with an unexplained panic when it can still tell the parent why.
 pub(crate) fn parse_report_data_env(val: &std::ffi::OsStr) -> Result<[u8; 64], ProtocolError> {
-    let s = val
-        .to_str()
-        .ok_or(ProtocolError::WireProtocol("quote child: report_data env not UTF-8"))?;
+    let s = val.to_str().ok_or(ProtocolError::WireProtocol(
+        "quote child: report_data env not UTF-8",
+    ))?;
     let b = s.as_bytes();
     if b.len() != 128 {
-        return Err(ProtocolError::WireProtocol("quote child: report_data env wrong length"));
+        return Err(ProtocolError::WireProtocol(
+            "quote child: report_data env wrong length",
+        ));
     }
     fn nib(c: u8) -> Option<u8> {
         match c {
@@ -1407,7 +1479,11 @@ pub(crate) fn parse_report_data_env(val: &std::ffi::OsStr) -> Result<[u8; 64], P
         let lo = nib(b[2 * i + 1]);
         match (hi, lo) {
             (Some(h), Some(l)) => out[i] = (h << 4) | l,
-            _ => return Err(ProtocolError::WireProtocol("quote child: report_data env bad hex")),
+            _ => {
+                return Err(ProtocolError::WireProtocol(
+                    "quote child: report_data env bad hex",
+                ))
+            }
         }
     }
     Ok(out)
@@ -1443,7 +1519,9 @@ pub(crate) fn agent_quote_child_main() -> ! {
     }
     let mut out = std::io::stdout();
     let rd = std::env::var_os(QUOTE_CHILD_REPORT_DATA_ENV)
-        .ok_or(ProtocolError::WireProtocol("quote child: report_data env missing"))
+        .ok_or(ProtocolError::WireProtocol(
+            "quote child: report_data env missing",
+        ))
         .and_then(|v| parse_report_data_env(&v));
     let rd = match rd {
         Ok(rd) => rd,
@@ -1549,11 +1627,21 @@ mod tests {
         let frame = encode_ok_frame(&report, &chain).expect("encode");
         // Golden header: status 0xA1, report_len = MIN_REPORT_LEN (192) as BE u32.
         assert_eq!(frame[0], 0xA1, "status byte is pinned wire ABI");
-        assert_eq!(&frame[1..5], &(192u32).to_be_bytes(), "report_len BE header pinned");
+        assert_eq!(
+            &frame[1..5],
+            &(192u32).to_be_bytes(),
+            "report_len BE header pinned"
+        );
         assert_eq!(frame.len(), 1 + 4 + 192 + 4 + 3);
         assert_eq!(&frame[1 + 4 + 192..1 + 4 + 192 + 4], &(3u32).to_be_bytes());
         match parse_child_frame(&frame).expect("parse") {
-            FrameProgress::Complete { reply: ChildReply::Quote { report: r, cert_chain: c } } => {
+            FrameProgress::Complete {
+                reply:
+                    ChildReply::Quote {
+                        report: r,
+                        cert_chain: c,
+                    },
+            } => {
                 assert_eq!(r, report);
                 assert_eq!(c, chain);
             }
@@ -1566,14 +1654,19 @@ mod tests {
         assert!(
             matches!(
                 parse_child_frame(&with_junk),
-                Err(ProtocolError::WireProtocol("quote child: trailing bytes after frame"))
+                Err(ProtocolError::WireProtocol(
+                    "quote child: trailing bytes after frame"
+                ))
             ),
             "parser must reject trailing bytes itself"
         );
         // Empty cert_chain roundtrips (auxblob is best-effort).
         let frame2 = encode_ok_frame(&report, &[]).expect("encode empty chain");
         match parse_child_frame(&frame2).expect("parse") {
-            FrameProgress::Complete { reply: ChildReply::Quote { cert_chain, .. }, .. } => {
+            FrameProgress::Complete {
+                reply: ChildReply::Quote { cert_chain, .. },
+                ..
+            } => {
                 assert!(cert_chain.is_empty());
             }
             other => panic!("expected Complete/Quote, got {other:?}"),
@@ -1582,9 +1675,20 @@ mod tests {
         let max_report = test_report_of_len(crate::snp_report::MAX_OUTBLOB_LEN, &rd);
         let max_chain = vec![0xAB; crate::snp_report::MAX_CERT_CHAIN_LEN];
         let max_frame = encode_ok_frame(&max_report, &max_chain).expect("encode max");
-        assert_eq!(max_frame.len(), MAX_QUOTE_FRAME_LEN, "derived max-frame const matches encoder");
+        assert_eq!(
+            max_frame.len(),
+            MAX_QUOTE_FRAME_LEN,
+            "derived max-frame const matches encoder"
+        );
         match parse_child_frame(&max_frame).expect("parse max") {
-            FrameProgress::Complete { reply: ChildReply::Quote { report: r, cert_chain: c }, .. } => {
+            FrameProgress::Complete {
+                reply:
+                    ChildReply::Quote {
+                        report: r,
+                        cert_chain: c,
+                    },
+                ..
+            } => {
                 assert_eq!(r.len(), crate::snp_report::MAX_OUTBLOB_LEN);
                 assert_eq!(c.len(), crate::snp_report::MAX_CERT_CHAIN_LEN);
             }
@@ -1598,7 +1702,10 @@ mod tests {
         // header bytes are available, never allocate toward the claimed length.
         let mut frame = vec![0xA1];
         frame.extend_from_slice(&((crate::snp_report::MAX_OUTBLOB_LEN as u32) + 1).to_be_bytes());
-        assert!(parse_child_frame(&frame).is_err(), "oversize report_len must error at header time");
+        assert!(
+            parse_child_frame(&frame).is_err(),
+            "oversize report_len must error at header time"
+        );
     }
 
     #[test]
@@ -1609,8 +1716,12 @@ mod tests {
         let mut frame = vec![0xA1];
         frame.extend_from_slice(&(report.len() as u32).to_be_bytes());
         frame.extend_from_slice(&report);
-        frame.extend_from_slice(&((crate::snp_report::MAX_CERT_CHAIN_LEN as u32) + 1).to_be_bytes());
-        assert!(parse_child_frame(&frame).is_err(), "oversize chain_len must error at header time");
+        frame
+            .extend_from_slice(&((crate::snp_report::MAX_CERT_CHAIN_LEN as u32) + 1).to_be_bytes());
+        assert!(
+            parse_child_frame(&frame).is_err(),
+            "oversize chain_len must error at header time"
+        );
     }
 
     #[test]
@@ -1618,7 +1729,10 @@ mod tests {
         // Regression: a garbled short report parsed as success (it could not even carry report_data).
         let mut frame = vec![0xA1];
         frame.extend_from_slice(&((crate::snp_report::MIN_REPORT_LEN as u32) - 1).to_be_bytes());
-        assert!(parse_child_frame(&frame).is_err(), "below-ABI-min report_len must error");
+        assert!(
+            parse_child_frame(&frame).is_err(),
+            "below-ABI-min report_len must error"
+        );
     }
 
     #[test]
@@ -1626,7 +1740,10 @@ mod tests {
         // Regression: banner/garbage-class first byte mis-parsed instead of erroring retryably —
         // 0x00 (zeros), ASCII (libtest banner "r" of "running"), etc.
         for status in [0x00u8, b'r', 0xFF, 0xA0] {
-            assert!(parse_child_frame(&[status]).is_err(), "status {status:#x} must be malformed");
+            assert!(
+                parse_child_frame(&[status]).is_err(),
+                "status {status:#x} must be malformed"
+            );
         }
     }
 
@@ -1639,7 +1756,9 @@ mod tests {
             (200, "quote child: unknown error code"),
         ] {
             match parse_child_frame(&encode_err_frame(code)).expect("ERR frame parses") {
-                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
+                FrameProgress::Complete {
+                    reply: ChildReply::ChildError(msg),
+                } => {
                     assert_eq!(msg, expect);
                 }
                 other => panic!("expected Complete/ChildError, got {other:?}"),
@@ -1652,7 +1771,10 @@ mod tests {
         // Regression: the incremental parser prematurely erroring on a legitimate partial read.
         assert_eq!(parse_child_frame(&[]).unwrap(), FrameProgress::NeedMore);
         assert_eq!(parse_child_frame(&[0xA1]).unwrap(), FrameProgress::NeedMore);
-        assert_eq!(parse_child_frame(&[0xA1, 0x00, 0x00]).unwrap(), FrameProgress::NeedMore);
+        assert_eq!(
+            parse_child_frame(&[0xA1, 0x00, 0x00]).unwrap(),
+            FrameProgress::NeedMore
+        );
         assert_eq!(parse_child_frame(&[0xA2]).unwrap(), FrameProgress::NeedMore);
     }
 
@@ -1696,15 +1818,23 @@ mod tests {
         let report = test_report_of_len(crate::snp_report::MAX_OUTBLOB_LEN, &rd);
         let chain = vec![0x77; crate::snp_report::MAX_CERT_CHAIN_LEN];
         let frame = encode_ok_frame(&report, &chain).unwrap();
-        assert_eq!(frame.len(), MAX_QUOTE_FRAME_LEN, "must exercise the max frame");
+        assert_eq!(
+            frame.len(),
+            MAX_QUOTE_FRAME_LEN,
+            "must exercise the max frame"
+        );
         let mut bw = b;
         let w = std::thread::spawn(move || {
-            bw.write_all(&frame).expect("writer completes ONLY if the parent drains incrementally");
+            bw.write_all(&frame)
+                .expect("writer completes ONLY if the parent drains incrementally");
         });
         let reply = read_child_reply(&mut a, Instant::now() + Duration::from_secs(10))
             .expect("incremental drain must reassemble the max frame");
         match reply {
-            ChildReply::Quote { report: r, cert_chain: c } => {
+            ChildReply::Quote {
+                report: r,
+                cert_chain: c,
+            } => {
                 assert_eq!(r.len(), crate::snp_report::MAX_OUTBLOB_LEN);
                 assert_eq!(c.len(), crate::snp_report::MAX_CERT_CHAIN_LEN);
             }
@@ -1729,7 +1859,10 @@ mod tests {
         });
         let err = read_child_reply(&mut a, future()).expect_err("trailing bytes must be rejected");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: trailing bytes after frame")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: trailing bytes after frame")
+            ),
             "got {err:?}"
         );
         w.join().unwrap();
@@ -1748,7 +1881,10 @@ mod tests {
         });
         let err = read_child_reply(&mut a, future()).expect_err("mid-frame EOF must error");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: pipe closed mid-frame")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: pipe closed mid-frame")
+            ),
             "got {err:?}"
         );
         w.join().unwrap();
@@ -1767,7 +1903,10 @@ mod tests {
             matches!(err, ProtocolError::WireProtocol(DEADLINE_LAPSED_MSG)),
             "must surface the UNRELABELED shared lapse const, got {err:?}"
         );
-        assert!(start.elapsed() < Duration::from_secs(2), "must return at the deadline, not hang");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline, not hang"
+        );
     }
 
     #[test]
@@ -1781,7 +1920,10 @@ mod tests {
         let start = Instant::now();
         let err = read_child_reply(&mut a, start + Duration::from_millis(200))
             .expect_err("partial frame + silence must lapse");
-        assert!(matches!(err, ProtocolError::WireProtocol(DEADLINE_LAPSED_MSG)), "got {err:?}");
+        assert!(
+            matches!(err, ProtocolError::WireProtocol(DEADLINE_LAPSED_MSG)),
+            "got {err:?}"
+        );
         let elapsed = start.elapsed();
         assert!(
             elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2),
@@ -1856,7 +1998,10 @@ mod tests {
     impl QuoteChildSpawn for FakeSpawn {
         type Pipe = UnixStream;
         type Handle = FakeHandle;
-        fn spawn(&self, _report_data: &[u8; 64]) -> Result<(UnixStream, FakeHandle), ProtocolError> {
+        fn spawn(
+            &self,
+            _report_data: &[u8; 64],
+        ) -> Result<(UnixStream, FakeHandle), ProtocolError> {
             *self.spawns.borrow_mut() += 1;
             let (reader, mut writer) = UnixStream::pair().unwrap();
             match &self.plan {
@@ -1887,15 +2032,30 @@ mod tests {
         let spawn = FakeSpawn::new(FakePlan::Silent, false);
         let mut ledger = AbandonedLedger::new();
         let start = Instant::now();
-        let err = fetch_quote_via_child(&spawn, &mut ledger, &[0u8; 64], start + Duration::from_millis(200))
-            .expect_err("silent child must lapse");
+        let err = fetch_quote_via_child(
+            &spawn,
+            &mut ledger,
+            &[0u8; 64],
+            start + Duration::from_millis(200),
+        )
+        .expect_err("silent child must lapse");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "got {err:?}"
         );
-        assert!(start.elapsed() < Duration::from_secs(2), "must return at the deadline, not block");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline, not block"
+        );
         assert_eq!(*spawn.kills.borrow(), 1, "exactly one SIGKILL");
-        assert_eq!(ledger.len(), 1, "unreapable child must be abandoned to the ledger");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "unreapable child must be abandoned to the ledger"
+        );
     }
 
     #[test]
@@ -1910,7 +2070,11 @@ mod tests {
             fetch_quote_via_child(&spawn, &mut ledger, &rd, future()).expect("fetch succeeds");
         assert_eq!(report, test_report(&rd));
         assert_eq!(chain, vec![0x01]);
-        assert_eq!(*spawn.kills.borrow(), 1, "disposition (kill) runs on SUCCESS too");
+        assert_eq!(
+            *spawn.kills.borrow(),
+            1,
+            "disposition (kill) runs on SUCCESS too"
+        );
         assert_eq!(ledger.len(), 0, "reapable child must not be abandoned");
     }
 
@@ -1923,7 +2087,10 @@ mod tests {
         let err = fetch_quote_via_child(&spawn, &mut ledger, &[0u8; 64], future())
             .expect_err("ERR frame must fail the fetch");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: outblob read failed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: outblob read failed")
+            ),
             "got {err:?}"
         );
         assert_eq!(*spawn.kills.borrow(), 1);
@@ -1935,7 +2102,12 @@ mod tests {
         // reapable) must be reclaimed by the NEXT fetch's sweep.
         let spawn = FakeSpawn::new(FakePlan::Silent, false);
         let mut ledger = AbandonedLedger::new();
-        let _ = fetch_quote_via_child(&spawn, &mut ledger, &[0u8; 64], Instant::now() + Duration::from_millis(150));
+        let _ = fetch_quote_via_child(
+            &spawn,
+            &mut ledger,
+            &[0u8; 64],
+            Instant::now() + Duration::from_millis(150),
+        );
         assert_eq!(ledger.len(), 1, "precondition: one abandoned child");
         // The wedged child "un-wedges": flip the abandoned handles' reapable flags via the ledger.
         for h in &ledger.children {
@@ -1945,7 +2117,11 @@ mod tests {
         let frame = encode_ok_frame(&test_report(&rd), &[]).unwrap();
         let spawn2 = FakeSpawn::new(FakePlan::FullFrame(frame), true);
         fetch_quote_via_child(&spawn2, &mut ledger, &rd, future()).expect("fetch 2 succeeds");
-        assert_eq!(ledger.len(), 0, "sweep at fetch start must reclaim the un-wedged child");
+        assert_eq!(
+            ledger.len(),
+            0,
+            "sweep at fetch start must reclaim the un-wedged child"
+        );
     }
 
     #[test]
@@ -1960,7 +2136,10 @@ mod tests {
         let err = fetch_quote_via_child(&spawn, &mut ledger, &[0u8; 64], future())
             .expect_err("full ledger must refuse");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: abandoned-child budget exhausted")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: abandoned-child budget exhausted")
+            ),
             "got {err:?}"
         );
         assert_eq!(*spawn.spawns.borrow(), 0, "must refuse BEFORE spawning");
@@ -2009,7 +2188,10 @@ mod tests {
         let err = fetch_quote_via_child(&spawn, &mut ledger, &[0u8; 64], past)
             .expect_err("past deadline must fast-path");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "fast-path lapse must carry the quote-leg triage label, got {err:?}"
         );
         assert_eq!(*spawn.spawns.borrow(), 0, "no spawn on the fast path");
@@ -2042,7 +2224,11 @@ mod tests {
         let (kills, reaps) = (Rc::clone(&h.kills), Rc::clone(&h.reaps));
         drop(KillOnDrop::new(h));
         assert_eq!(*kills.borrow(), 1, "guard drop must kill");
-        assert_eq!(*reaps.borrow(), 1, "guard drop must attempt ONE best-effort reap");
+        assert_eq!(
+            *reaps.borrow(),
+            1,
+            "guard drop must attempt ONE best-effort reap"
+        );
     }
 
     #[test]
@@ -2056,7 +2242,10 @@ mod tests {
         let err = fetch_quote_via_child(&spawn, &mut ledger, &requested, future())
             .expect_err("echo mismatch must fail");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: report_data echo mismatch")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: report_data echo mismatch")
+            ),
             "got {err:?}"
         );
     }
@@ -2081,21 +2270,40 @@ mod tests {
             .fetch(&[0u8; 64], start + Duration::from_millis(100))
             .expect_err("wedged child must lapse through the trait path");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "got {err:?}"
         );
-        assert!(start.elapsed() < Duration::from_secs(2), "must return at the deadline");
-        assert_eq!(*kills.borrow(), 1, "exactly one SIGKILL through the wrapper");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline"
+        );
+        assert_eq!(
+            *kills.borrow(),
+            1,
+            "exactly one SIGKILL through the wrapper"
+        );
         assert_eq!(p.ledger.len(), 1, "abandoned to THE producer-owned ledger");
         let past = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
-        let err = p.fetch(&[0u8; 64], past).expect_err("past deadline must fast-path");
+        let err = p
+            .fetch(&[0u8; 64], past)
+            .expect_err("past deadline must fast-path");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "got {err:?}"
         );
-        assert_eq!(*spawns.borrow(), 1, "no spawn on the past-deadline arm (deadline not re-minted)");
+        assert_eq!(
+            *spawns.borrow(),
+            1,
+            "no spawn on the past-deadline arm (deadline not re-minted)"
+        );
     }
 
     #[test]
@@ -2115,18 +2323,31 @@ mod tests {
             let _ = p
                 .fetch(&[0u8; 64], Instant::now() + Duration::from_millis(50))
                 .expect_err("silent child must lapse");
-            assert_eq!(p.ledger.len(), expected, "ledger must accumulate MONOTONE across fetches");
+            assert_eq!(
+                p.ledger.len(),
+                expected,
+                "ledger must accumulate MONOTONE across fetches"
+            );
         }
         while p.ledger.len() < ABANDONED_CHILD_BUDGET {
             p.ledger.abandon(FakeHandle::unreapable());
         }
         let before = *spawns.borrow();
-        let err = p.fetch(&[0u8; 64], future()).expect_err("full ledger must refuse via the trait");
+        let err = p
+            .fetch(&[0u8; 64], future())
+            .expect_err("full ledger must refuse via the trait");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: abandoned-child budget exhausted")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: abandoned-child budget exhausted")
+            ),
             "got {err:?}"
         );
-        assert_eq!(*spawns.borrow(), before, "budget refuse must come BEFORE spawn");
+        assert_eq!(
+            *spawns.borrow(),
+            before,
+            "budget refuse must come BEFORE spawn"
+        );
     }
 
     #[test]
@@ -2138,10 +2359,16 @@ mod tests {
         let spawn = FakeSpawn::new(FakePlan::FullFrame(frame), true);
         let kills = Rc::clone(&spawn.kills);
         let mut p = HardBoundedQuoteProducer::new_unclaimed_for_tests(spawn);
-        let (report, chain) = p.fetch(&rd, future()).expect("healthy fetch through the trait");
+        let (report, chain) = p
+            .fetch(&rd, future())
+            .expect("healthy fetch through the trait");
         assert_eq!(report, test_report(&rd));
         assert_eq!(chain, vec![0x01]);
-        assert_eq!(*kills.borrow(), 1, "unconditional disposition must fire THROUGH the wrapper");
+        assert_eq!(
+            *kills.borrow(),
+            1,
+            "unconditional disposition must fire THROUGH the wrapper"
+        );
         assert_eq!(p.ledger.len(), 0, "reapable child must not be abandoned");
     }
 
@@ -2166,10 +2393,16 @@ mod tests {
         // shape-pin test asserts ExecChildSpawn::production() directly; THIS assert closes the gap
         // where production()'s one-line body silently swaps in a different shape and every CI test
         // stays green until the expensive (4c) in-guest failure).
-        assert_eq!(first.spawn.program, std::path::PathBuf::from("/proc/self/exe"));
+        assert_eq!(
+            first.spawn.program,
+            std::path::PathBuf::from("/proc/self/exe")
+        );
         assert_eq!(first.spawn.pipe_source, PipeSource::Stdout);
         assert!(first.spawn.clear_env && first.spawn.leading_args.is_empty());
-        assert!(first.spawn.extra_env.is_empty(), "production child env = marker + report_data ONLY");
+        assert!(
+            first.spawn.extra_env.is_empty(),
+            "production child env = marker + report_data ONLY"
+        );
         let err = HardBoundedQuoteProducer::new(&budget, FakeSpawn::new(FakePlan::Silent, false))
             .err()
             .expect("second construction must refuse");
@@ -2182,7 +2415,8 @@ mod tests {
         );
         drop(first);
         assert!(
-            HardBoundedQuoteProducer::new(&budget, FakeSpawn::new(FakePlan::Silent, false)).is_err(),
+            HardBoundedQuoteProducer::new(&budget, FakeSpawn::new(FakePlan::Silent, false))
+                .is_err(),
             "Drop must NOT release the claim (release-on-drop re-opens the voided-cap hole)"
         );
         // Re-locking while holding g would deadlock (the guard Mutex is non-reentrant) — drop FIRST.
@@ -2207,10 +2441,24 @@ mod tests {
         // PATH replacing the exec-time-coherent /proc/self/exe LITERAL) shipping unnoticed until an
         // expensive in-guest failure.
         let s = ExecChildSpawn::production();
-        assert_eq!(s.program, std::path::PathBuf::from("/proc/self/exe"), "the LITERAL, not a path");
-        assert!(s.leading_args.is_empty(), "no leading args (dispatch-first bin contract)");
-        assert!(s.extra_env.is_empty(), "no extra env (clear_env + marker + report_data only)");
-        assert_eq!(s.pipe_source, PipeSource::Stdout, "protocol pipe = stdout (PROTOCOL-ONLY)");
+        assert_eq!(
+            s.program,
+            std::path::PathBuf::from("/proc/self/exe"),
+            "the LITERAL, not a path"
+        );
+        assert!(
+            s.leading_args.is_empty(),
+            "no leading args (dispatch-first bin contract)"
+        );
+        assert!(
+            s.extra_env.is_empty(),
+            "no extra env (clear_env + marker + report_data only)"
+        );
+        assert_eq!(
+            s.pipe_source,
+            PipeSource::Stdout,
+            "protocol pipe = stdout (PROTOCOL-ONLY)"
+        );
         assert!(s.clear_env, "production child env must be cleared");
     }
 
@@ -2221,9 +2469,14 @@ mod tests {
         // REAL child core through THE HardBoundedQuoteProducer trait fetch.
         let rd = [0x5Bu8; 64];
         let mut p = HardBoundedQuoteProducer::new_unclaimed_for_tests(smoke_spawn("child-main-ok"));
-        let (report, chain) =
-            p.fetch(&rd, Instant::now() + Duration::from_secs(10)).expect("producer e2e fetch");
-        assert_eq!(report, test_report(&rd), "report delivered verbatim (incl. echo)");
+        let (report, chain) = p
+            .fetch(&rd, Instant::now() + Duration::from_secs(10))
+            .expect("producer e2e fetch");
+        assert_eq!(
+            report,
+            test_report(&rd),
+            "report delivered verbatim (incl. echo)"
+        );
         assert_eq!(chain, vec![0xC1, 0xC2]);
         assert_eventually_swept(&mut p.ledger);
     }
@@ -2238,10 +2491,16 @@ mod tests {
             .fetch(&[0u8; 64], start + Duration::from_millis(400))
             .expect_err("wedged real child must lapse through the producer");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "got {err:?}"
         );
-        assert!(start.elapsed() < Duration::from_secs(3), "must return ~at the deadline");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "must return ~at the deadline"
+        );
         assert_eventually_swept(&mut p.ledger);
     }
 
@@ -2259,8 +2518,10 @@ mod tests {
         let nonce = [0x5Cu8; 32];
         let rd = crate::agent_anchor::anchor_handshake_report_data(7, "env-x", &nonce);
         let frame = encode_ok_frame(&test_report(&rd), &[0xC7; 8]).unwrap();
-        let producer =
-            HardBoundedQuoteProducer::new_unclaimed_for_tests(FakeSpawn::new(FakePlan::FullFrame(frame), true));
+        let producer = HardBoundedQuoteProducer::new_unclaimed_for_tests(FakeSpawn::new(
+            FakePlan::FullFrame(frame),
+            true,
+        ));
         // Minimal channel: records the request frame via a shared handle (the transport's fields are
         // private to agent_boot_relay, and its scripted mock lives in that module's tests), returns
         // canned bytes.
@@ -2288,7 +2549,10 @@ mod tests {
             }
         }
         let seen = Rc::new(RefCell::new(Vec::new()));
-        let channel = CapturingChannel { seen: Rc::clone(&seen), reply: vec![0xAB; 64] };
+        let channel = CapturingChannel {
+            seen: Rc::clone(&seen),
+            reply: vec![0xAB; 64],
+        };
         let mut transport = crate::agent_boot_relay::RelayAnchorTransport::new(
             producer,
             channel,
@@ -2301,14 +2565,23 @@ mod tests {
             report_data: rd,
         };
         use crate::agent_boot_driver::AnchorBootTransport as _;
-        let reply = transport.anchor_round_trip(&req).expect("composed round-trip");
+        let reply = transport
+            .anchor_round_trip(&req)
+            .expect("composed round-trip");
         assert_eq!(reply, vec![0xAB; 64], "anchor bytes returned VERBATIM");
         let captured = seen.borrow();
         assert_eq!(captured.len(), 1, "exactly one channel round-trip");
         let decoded =
             crate::agent_boot_relay::decode_anchor_boot_request(&captured[0]).expect("decodable");
-        assert_eq!(decoded.quote_report, test_report(&rd), "producer report flowed into the frame");
-        assert_eq!(decoded.report_data, rd, "report_data binding flowed unmodified");
+        assert_eq!(
+            decoded.quote_report,
+            test_report(&rd),
+            "producer report flowed into the frame"
+        );
+        assert_eq!(
+            decoded.report_data, rd,
+            "report_data binding flowed unmodified"
+        );
     }
 
     // ---- (d-ii)/3 ValidatedBootBudget (pure; gate #2 of the TWO-artifact live-serve gate) ----
@@ -2334,7 +2607,10 @@ mod tests {
         let err = ValidatedBootBudget::validate(0, Duration::from_millis(50), generous())
             .expect_err("zero attempts must refuse");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1")
+            ),
             "got {err:?}"
         );
     }
@@ -2349,7 +2625,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING")
+                ProtocolError::WireProtocol(
+                    "boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING"
+                )
             ),
             "got {err:?}"
         );
@@ -2367,7 +2645,10 @@ mod tests {
         let err = ValidatedBootBudget::validate(0, Duration::ZERO, Duration::ZERO)
             .expect_err("all-violated must refuse");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("boot budget: max_attempts must be >= 1")
+            ),
             "zero-attempts must win over floor/budget, got {err:?}"
         );
         let over = crate::agent_boot_driver::MAX_BOOT_ATTEMPTS_CEILING + 1;
@@ -2376,7 +2657,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING")
+                ProtocolError::WireProtocol(
+                    "boot budget: max_attempts exceeds MAX_BOOT_ATTEMPTS_CEILING"
+                )
             ),
             "ceiling must win over floor/budget, got {err:?}"
         );
@@ -2385,7 +2668,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET")
+                ProtocolError::WireProtocol(
+                    "boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET"
+                )
             ),
             "floor must precede the budget arithmetic, got {err:?}"
         );
@@ -2396,13 +2681,18 @@ mod tests {
         // Regression: a 0ms/sub-floor leg reaching the platform (set_read_timeout(ZERO) is an Err
         // on vsock; sub-floor poll budgets are the MIN_BOUNDARY_BUDGET hazard). Consts only — a
         // floor retune moves this test with it. Floor INCLUSIVE: == MIN passes.
-        for bad in [Duration::ZERO, MIN_BOUNDARY_BUDGET - Duration::from_nanos(1)] {
+        for bad in [
+            Duration::ZERO,
+            MIN_BOUNDARY_BUDGET - Duration::from_nanos(1),
+        ] {
             let err = ValidatedBootBudget::validate(1, bad, generous())
                 .expect_err("sub-floor timeout must refuse");
             assert!(
                 matches!(
                     err,
-                    ProtocolError::WireProtocol("boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET")
+                    ProtocolError::WireProtocol(
+                        "boot budget: per-leg timeout below MIN_BOUNDARY_BUDGET"
+                    )
                 ),
                 "got {err:?}"
             );
@@ -2425,7 +2715,11 @@ mod tests {
         assert_eq!(b.max_attempts(), n);
         assert_eq!(b.per_leg_timeout(), t);
         assert_eq!(b.overall_boot_budget(), overall);
-        assert_eq!(b.nominal_boot_cost(), overall, "stored nominal == the computed product");
+        assert_eq!(
+            b.nominal_boot_cost(),
+            overall,
+            "stored nominal == the computed product"
+        );
     }
 
     #[test]
@@ -2440,7 +2734,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: nominal boot cost exceeds overall_boot_budget")
+                ProtocolError::WireProtocol(
+                    "boot budget: nominal boot cost exceeds overall_boot_budget"
+                )
             ),
             "got {err:?}"
         );
@@ -2468,7 +2764,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: nominal boot cost exceeds overall_boot_budget")
+                ProtocolError::WireProtocol(
+                    "boot budget: nominal boot cost exceeds overall_boot_budget"
+                )
             ),
             "got {err:?}"
         );
@@ -2485,12 +2783,15 @@ mod tests {
         // seconds are i64), so without the ceiling arm `u64::MAX / 2` secs passes every other arm
         // against overall == Duration::MAX and aborts boot on the FIRST round-trip instead of the
         // wiring-time Err the gate promises. TEST DISCIPLINE: huge values go STRAIGHT into validate.
-        let err = ValidatedBootBudget::validate(1, Duration::from_secs(u64::MAX / 2), Duration::MAX)
-            .expect_err("an Instant-overflow-capable timeout must refuse at the ceiling");
+        let err =
+            ValidatedBootBudget::validate(1, Duration::from_secs(u64::MAX / 2), Duration::MAX)
+                .expect_err("an Instant-overflow-capable timeout must refuse at the ceiling");
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT")
+                ProtocolError::WireProtocol(
+                    "boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT"
+                )
             ),
             "got {err:?}"
         );
@@ -2498,13 +2799,18 @@ mod tests {
             ValidatedBootBudget::validate(1, MAX_PER_LEG_TIMEOUT, Duration::MAX).is_ok(),
             "the ceiling itself is valid (inclusive on the pass side)"
         );
-        let err =
-            ValidatedBootBudget::validate(1, MAX_PER_LEG_TIMEOUT + Duration::from_nanos(1), Duration::MAX)
-                .expect_err("one nanosecond over the ceiling must refuse");
+        let err = ValidatedBootBudget::validate(
+            1,
+            MAX_PER_LEG_TIMEOUT + Duration::from_nanos(1),
+            Duration::MAX,
+        )
+        .expect_err("one nanosecond over the ceiling must refuse");
         assert!(
             matches!(
                 err,
-                ProtocolError::WireProtocol("boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT")
+                ProtocolError::WireProtocol(
+                    "boot budget: per-leg timeout exceeds MAX_PER_LEG_TIMEOUT"
+                )
             ),
             "got {err:?}"
         );
@@ -2525,7 +2831,10 @@ mod tests {
             Duration::from_secs(u64::MAX),
         )
         .expect_err("add overflow must refuse, not wrap or pass");
-        assert!(matches!(err, ProtocolError::WireProtocol(BOOT_BUDGET_OVERFLOW_MSG)), "got {err:?}");
+        assert!(
+            matches!(err, ProtocolError::WireProtocol(BOOT_BUDGET_OVERFLOW_MSG)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2650,7 +2959,10 @@ mod tests {
         let code = quote_child_main_with(&fs, &rd, &mut out);
         assert_eq!(code, 0, "healthy fetch must exit 0");
         let expect = encode_ok_frame(&test_report(&rd), &[0xC1, 0xC2]).unwrap();
-        assert_eq!(out, expect, "child output must be byte-equal to the canonical OK frame");
+        assert_eq!(
+            out, expect,
+            "child output must be byte-equal to the canonical OK frame"
+        );
     }
 
     #[test]
@@ -2670,7 +2982,10 @@ mod tests {
         assert!(!paths.is_empty());
         for p in paths.iter() {
             let (_op, path) = p.split_once(':').unwrap();
-            assert_eq!(path, want, "every seam op must target the self-named entry, got {p}");
+            assert_eq!(
+                path, want,
+                "every seam op must target the self-named entry, got {p}"
+            );
         }
     }
 
@@ -2687,9 +3002,15 @@ mod tests {
             let mut out = Vec::new();
             let exit = quote_child_main_with(&fs, &[0u8; 64], &mut out);
             assert_eq!(exit, i32::from(code), "step {step} must exit with its code");
-            assert_eq!(out, encode_err_frame(code), "step {step} must emit ERR({code})");
+            assert_eq!(
+                out,
+                encode_err_frame(code),
+                "step {step} must emit ERR({code})"
+            );
             match parse_child_frame(&out).unwrap() {
-                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
+                FrameProgress::Complete {
+                    reply: ChildReply::ChildError(msg),
+                } => {
                     assert_eq!(msg, expect_msg);
                 }
                 other => panic!("expected ChildError, got {other:?}"),
@@ -2705,7 +3026,10 @@ mod tests {
                 "outblob" => vec!["remove", "create", "inblob", "outblob", "remove"],
                 _ => unreachable!(),
             };
-            assert_eq!(ops, expect_ops, "step {step}: sequence must stop at the failure + cleanup");
+            assert_eq!(
+                ops, expect_ops,
+                "step {step}: sequence must stop at the failure + cleanup"
+            );
         }
     }
 
@@ -2721,10 +3045,19 @@ mod tests {
             let fs = OkFs::failing_at(step);
             let mut out = Vec::new();
             let exit = quote_child_main_with(&fs, &[0u8; 64], &mut out);
-            assert_eq!(exit, i32::from(code), "post-check {step} must refine to code {code}");
+            assert_eq!(
+                exit,
+                i32::from(code),
+                "post-check {step} must refine to code {code}"
+            );
             match parse_child_frame(&out).unwrap() {
-                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
-                    assert_eq!(msg, parent_msg, "the PARENT half of the {code} row must decode");
+                FrameProgress::Complete {
+                    reply: ChildReply::ChildError(msg),
+                } => {
+                    assert_eq!(
+                        msg, parent_msg,
+                        "the PARENT half of the {code} row must decode"
+                    );
                 }
                 other => panic!("expected ChildError, got {other:?}"),
             }
@@ -2738,7 +3071,9 @@ mod tests {
         // of silently folding to "unknown error code" at the parent.
         for code in 1u8..=6 {
             match parse_child_frame(&encode_err_frame(code)).unwrap() {
-                FrameProgress::Complete { reply: ChildReply::ChildError(msg) } => {
+                FrameProgress::Complete {
+                    reply: ChildReply::ChildError(msg),
+                } => {
                     assert_ne!(
                         msg, "quote child: unknown error code",
                         "code {code} must have a real parent string"
@@ -2757,9 +3092,15 @@ mod tests {
         let mut fs = OkFs::healthy(&rd);
         fs.auxblob = vec![0xEE; crate::snp_report::MAX_CERT_CHAIN_LEN + 1];
         let mut out = Vec::new();
-        assert_eq!(quote_child_main_with(&fs, &rd, &mut out), 0, "over-cap chain must not fail");
+        assert_eq!(
+            quote_child_main_with(&fs, &rd, &mut out),
+            0,
+            "over-cap chain must not fail"
+        );
         match parse_child_frame(&out).unwrap() {
-            FrameProgress::Complete { reply: ChildReply::Quote { report, cert_chain } } => {
+            FrameProgress::Complete {
+                reply: ChildReply::Quote { report, cert_chain },
+            } => {
                 assert_eq!(report, test_report(&rd));
                 assert!(cert_chain.is_empty(), "over-cap chain folds to empty");
             }
@@ -2773,14 +3114,26 @@ mod tests {
         // ERR(1)+exit(1) contract.
         use std::ffi::OsStr;
         let good = hex128(&[0xABu8; 64]);
-        assert_eq!(parse_report_data_env(OsStr::new(&good)).unwrap(), [0xABu8; 64]);
+        assert_eq!(
+            parse_report_data_env(OsStr::new(&good)).unwrap(),
+            [0xABu8; 64]
+        );
         assert!(parse_report_data_env(OsStr::new("")).is_err(), "empty");
-        assert!(parse_report_data_env(OsStr::new(&good[..126])).is_err(), "short");
+        assert!(
+            parse_report_data_env(OsStr::new(&good[..126])).is_err(),
+            "short"
+        );
         let upper = good.to_uppercase();
-        assert!(parse_report_data_env(OsStr::new(&upper)).is_err(), "uppercase (lowercase-only)");
+        assert!(
+            parse_report_data_env(OsStr::new(&upper)).is_err(),
+            "uppercase (lowercase-only)"
+        );
         let mut bad = good.clone();
         bad.replace_range(0..1, "g");
-        assert!(parse_report_data_env(OsStr::new(&bad)).is_err(), "non-hex char");
+        assert!(
+            parse_report_data_env(OsStr::new(&bad)).is_err(),
+            "non-hex char"
+        );
     }
 
     // ---- real-subprocess smokes (current_exe + env-guarded #[ignore] helper; protocol over STDERR
@@ -2896,7 +3249,10 @@ mod tests {
             if let Some(st) = h.try_status() {
                 return st;
             }
-            assert!(start.elapsed() < within, "child did not exit within {within:?}");
+            assert!(
+                start.elapsed() < within,
+                "child did not exit within {within:?}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2913,7 +3269,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             ledger.sweep();
         }
-        assert_eq!(ledger.len(), 0, "killed child must be reaped by a subsequent sweep");
+        assert_eq!(
+            ledger.len(),
+            0,
+            "killed child must be reaped by a subsequent sweep"
+        );
     }
 
     #[test]
@@ -2929,7 +3289,11 @@ mod tests {
             Instant::now() + Duration::from_secs(10),
         )
         .expect("end-to-end fetch over a real subprocess");
-        assert_eq!(report, test_report(&rd), "report delivered verbatim (incl. echo)");
+        assert_eq!(
+            report,
+            test_report(&rd),
+            "report delivered verbatim (incl. echo)"
+        );
         assert_eq!(chain, vec![0xC1, 0xC2]);
         assert_eventually_swept(&mut ledger);
     }
@@ -2947,7 +3311,10 @@ mod tests {
         )
         .expect_err("trailing junk must be rejected");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("quote child: trailing bytes after frame")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("quote child: trailing bytes after frame")
+            ),
             "got {err:?}"
         );
     }
@@ -2969,10 +3336,16 @@ mod tests {
         )
         .expect_err("wedged child must lapse");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "got {err:?}"
         );
-        assert!(start.elapsed() < Duration::from_secs(3), "must return at the deadline");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "must return at the deadline"
+        );
         assert_eventually_swept(&mut ledger);
     }
 
@@ -2989,7 +3362,11 @@ mod tests {
         let mut guard = KillOnDrop::new(handle);
         guard.get_mut().kill_best_effort();
         let status = poll_status(guard.get_mut(), Duration::from_secs(2));
-        assert_eq!(status.signal(), Some(9), "the wedged child must die by SIGKILL, got {status:?}");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the wedged child must die by SIGKILL, got {status:?}"
+        );
         drop(pipe);
     }
 
@@ -3009,7 +3386,10 @@ mod tests {
         )
         .expect_err("partial frame + wedge must lapse");
         assert!(
-            matches!(err, ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")),
+            matches!(
+                err,
+                ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed")
+            ),
             "must be the LAPSE, not a decode error: {err:?}"
         );
         assert!(start.elapsed() < Duration::from_secs(3));
@@ -3026,7 +3406,10 @@ mod tests {
         let (pipe, handle) = spawn.spawn(&[0u8; 64]).expect("spawn");
         let mut guard = KillOnDrop::new(handle); // leak-proof if the poll assert panics
         let status = poll_status(guard.get_mut(), Duration::from_secs(10));
-        assert!(status.success(), "guard-less helper must no-op PASS, got {status:?}");
+        assert!(
+            status.success(),
+            "guard-less helper must no-op PASS, got {status:?}"
+        );
         drop(pipe);
     }
 
@@ -3053,7 +3436,9 @@ mod tests {
     fn child_exits_nonzero_on_epipe() {
         // Regression: a child that lingers (or exits 0) after its frame write fails — the orphan-leak
         // rule. Drop the read end BEFORE the child writes; expect CHILD_EXIT_WRITE_FAILED.
-        let (pipe, handle) = smoke_spawn("child-main-epipe").spawn(&[0u8; 64]).expect("spawn");
+        let (pipe, handle) = smoke_spawn("child-main-epipe")
+            .spawn(&[0u8; 64])
+            .expect("spawn");
         drop(pipe); // close the read end while the child is still in its 300ms sleep
         let mut guard = KillOnDrop::new(handle);
         let status = poll_status(guard.get_mut(), Duration::from_secs(10));

@@ -148,7 +148,9 @@ fn unseal_sealed_keypair(
             ));
         }
     }
-    Err(ProtocolError::PqSigningUnavailable("unknown sealed PQ blob magic"))
+    Err(ProtocolError::PqSigningUnavailable(
+        "unknown sealed PQ blob magic",
+    ))
 }
 
 /// Install the PQ signer from a sealed blob bound to `enclave_measurement`.
@@ -209,7 +211,6 @@ mod v1_seal {
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use sha3::{Digest, Sha3_256};
 
-
     const MEAS_DIGEST_DOMAIN: &[u8] = b"2d-hsm-pq-seal-v1-meas";
     const AEAD_KEY_DOMAIN: &[u8] = b"2d-hsm-pq-seal-v1-key";
     const V1_NONCE_LEN: usize = 12;
@@ -265,10 +266,14 @@ mod v1_seal {
         }
         let expected_meas = measurement_digest_v1(enclave_measurement);
         if sealed_blob.len() != pq_seal_v1_expected_blob_len() {
-            return Err(ProtocolError::PqSigningUnavailable("v1 sealed blob length mismatch"));
+            return Err(ProtocolError::PqSigningUnavailable(
+                "v1 sealed blob length mismatch",
+            ));
         }
         if sealed_blob.get(..8) != Some(super::SEALED_BLOB_V1_MAGIC) {
-            return Err(ProtocolError::PqSigningUnavailable("invalid v1 sealed blob magic"));
+            return Err(ProtocolError::PqSigningUnavailable(
+                "invalid v1 sealed blob magic",
+            ));
         }
         if sealed_blob[8] != SEALED_BLOB_V1_VERSION {
             return Err(ProtocolError::PqSigningUnavailable(
@@ -386,8 +391,11 @@ mod v1_seal {
         provisioning_root: &[u8; 32],
     ) -> Result<(), ProtocolError> {
         use zeroize::Zeroizing;
-        let (sk, pk) =
-            unseal_mldsa65_keypair_v1_with_root(sealed_blob, enclave_measurement, provisioning_root)?;
+        let (sk, pk) = unseal_mldsa65_keypair_v1_with_root(
+            sealed_blob,
+            enclave_measurement,
+            provisioning_root,
+        )?;
         let sk = Zeroizing::new(sk);
         let pk = Zeroizing::new(pk);
         MlDsa65Signer::from_verified_key_bytes(sk.as_ref(), pk.as_ref())?;
@@ -402,8 +410,7 @@ pub use v1_seal::{
 };
 #[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]
 pub use v1_seal::{
-    seal_mldsa65_keypair_v1, seal_mldsa65_keypair_v1_with_root,
-    verify_sealed_blob_v1_with_root,
+    seal_mldsa65_keypair_v1, seal_mldsa65_keypair_v1_with_root, verify_sealed_blob_v1_with_root,
 };
 
 // `is_platform_pq_seal_v1_provisioning_root_set` / `is_pq_seal_v1_provisioning_root_configured`
@@ -430,10 +437,7 @@ mod v0_seal {
             counter += 1;
         }
         stream.truncate(data.len());
-        data.iter()
-            .zip(stream.iter())
-            .map(|(a, b)| a ^ b)
-            .collect()
+        data.iter().zip(stream.iter()).map(|(a, b)| a ^ b).collect()
     }
 
     pub fn seal_mldsa65_keypair_v0(
@@ -463,8 +467,9 @@ mod v0_seal {
         material.extend_from_slice(secret_key);
         material.extend_from_slice(public_key);
         let cipher = xor_stream_v0(&material, enclave_measurement);
-        let mut out =
-            Vec::with_capacity(SEALED_BLOB_V0_HEADER_LEN + enclave_measurement.len() + cipher.len());
+        let mut out = Vec::with_capacity(
+            SEALED_BLOB_V0_HEADER_LEN + enclave_measurement.len() + cipher.len(),
+        );
         out.extend_from_slice(SEALED_BLOB_V0_MAGIC);
         out.push(SEALED_BLOB_V0_VERSION);
         out.extend_from_slice(&meas_len.to_be_bytes());
@@ -482,7 +487,9 @@ mod v0_seal {
             return Err(ProtocolError::PqSigningUnavailable("sealed blob too short"));
         }
         if sealed_blob.get(..8) != Some(SEALED_BLOB_V0_MAGIC) {
-            return Err(ProtocolError::PqSigningUnavailable("invalid sealed blob magic"));
+            return Err(ProtocolError::PqSigningUnavailable(
+                "invalid sealed blob magic",
+            ));
         }
         if sealed_blob[8] != SEALED_BLOB_V0_VERSION {
             return Err(ProtocolError::PqSigningUnavailable(
@@ -492,7 +499,9 @@ mod v0_seal {
         let meas_len = u16::from_be_bytes([sealed_blob[9], sealed_blob[10]]) as usize;
         let header = SEALED_BLOB_V0_HEADER_LEN + meas_len;
         if sealed_blob.len() != header + payload_len {
-            return Err(ProtocolError::PqSigningUnavailable("sealed blob length mismatch"));
+            return Err(ProtocolError::PqSigningUnavailable(
+                "sealed blob length mismatch",
+            ));
         }
         let stored_meas = &sealed_blob[11..header];
         if stored_meas != enclave_measurement {
@@ -547,11 +556,13 @@ mod tests {
         reset_installed_pq_signer_for_tests();
         let measurement = b"enclave-measurement-placeholder";
         let sk = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors/mldsa65_reference_sk.bin"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_sk.bin"),
         )
         .unwrap();
         let pk = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors/mldsa65_reference_pk.bin"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_pk.bin"),
         )
         .unwrap();
         let blob = seal_mldsa65_keypair_v1(&sk, &pk, measurement).unwrap();
@@ -586,8 +597,7 @@ mod tests {
         let _guard = SealedSignerTestGuard::acquire();
         reset_installed_pq_signer_for_tests();
         crate::seal_root::reset_pq_seal_v1_provisioning_root_for_tests();
-        let root: [u8; 32] =
-            *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
+        let root: [u8; 32] = *include_bytes!("../testvectors/seal_v1_provisioning_root.bin");
         crate::seal_root::set_pq_seal_v1_provisioning_root(root).unwrap();
         assert!(crate::seal_root::set_pq_seal_v1_provisioning_root(root).is_err());
         assert!(crate::seal_root::is_pq_seal_v1_provisioning_root_configured());
@@ -603,8 +613,7 @@ mod tests {
                 .join("testvectors/mldsa65_reference_pk.bin"),
         )
         .unwrap();
-        let blob =
-            seal_mldsa65_keypair_v1_with_root(&sk, &pk, measurement, &root).unwrap();
+        let blob = seal_mldsa65_keypair_v1_with_root(&sk, &pk, measurement, &root).unwrap();
         verify_sealed_blob_v1_with_root(&blob, measurement, &root).unwrap();
         install_sealed_pq_signer(&blob, measurement).unwrap();
         let hash = [9u8; 32];
@@ -619,11 +628,13 @@ mod tests {
         reset_installed_pq_signer_for_tests();
         let measurement = b"enclave-measurement-placeholder";
         let sk = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors/mldsa65_reference_sk.bin"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_sk.bin"),
         )
         .unwrap();
         let pk = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testvectors/mldsa65_reference_pk.bin"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testvectors/mldsa65_reference_pk.bin"),
         )
         .unwrap();
         let blob = seal_mldsa65_keypair_v1(&sk, &pk, measurement).unwrap();

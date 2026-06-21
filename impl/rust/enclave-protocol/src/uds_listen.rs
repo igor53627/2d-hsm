@@ -10,10 +10,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Creates the parent directory when missing. Tightens the default `private_dir` to `0700`;
 /// custom `TWOD_HSM_ENCLAVE_*_SOCKET` parents are created but not chmod'd (operator responsibility).
-pub fn bind_unix_listener(
-    path: &Path,
-    private_dir: &Path,
-) -> Result<UnixListener, io::Error> {
+pub fn bind_unix_listener(path: &Path, private_dir: &Path) -> Result<UnixListener, io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         if path_parent_is_private_dir(parent, private_dir) {

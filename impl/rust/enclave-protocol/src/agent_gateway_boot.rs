@@ -490,13 +490,20 @@ where
     let mut conn = match accepted {
         Ok(conn) => conn,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "[warn] agent gateway: accept error ({}); skipping", e.kind());
+            let _ = writeln!(
+                std::io::stderr(),
+                "[warn] agent gateway: accept error ({}); skipping",
+                e.kind()
+            );
             std::thread::sleep(crate::enclave_serve::ACCEPT_ERROR_BACKOFF);
             return;
         }
     };
     if let Err(e) = prepare(&mut conn) {
-        let _ = writeln!(std::io::stderr(), "[warn] agent gateway: stream setup failed ({e}); skipping");
+        let _ = writeln!(
+            std::io::stderr(),
+            "[warn] agent gateway: stream setup failed ({e}); skipping"
+        );
         return;
     }
     match crate::enclave_serve::serve_framed_pump(
@@ -505,13 +512,22 @@ where
         crate::enclave_serve::SESSION_IDLE_TIMEOUT,
     ) {
         Ok(()) => {
-            let _ = writeln!(std::io::stderr(), "[info] agent gateway: connection closed cleanly");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[info] agent gateway: connection closed cleanly"
+            );
         }
         Err(e) if is_peer_protocol_reject(&e) => {
-            let _ = writeln!(std::io::stderr(), "[info] agent gateway: closed connection ({e})");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[info] agent gateway: closed connection ({e})"
+            );
         }
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "[warn] agent gateway: connection fault ({e}); closed");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[warn] agent gateway: connection fault ({e}); closed"
+            );
         }
     }
 }
@@ -552,13 +568,21 @@ fn run_agent_serve_loop() -> Result<std::convert::Infallible, ProtocolError> {
     use std::io::Write as _;
     let (cid, port) = crate::vsock_addr::vsock_listen_addr_from_env().map_err(|msg| {
         let _ = writeln!(std::io::stderr(), "[err] agent gateway: {msg}");
-        ProtocolError::PqSigningUnavailable("agent serve: invalid vsock listen addr (see prior log line)")
+        ProtocolError::PqSigningUnavailable(
+            "agent serve: invalid vsock listen addr (see prior log line)",
+        )
     })?;
     let listener = crate::vsock_listen::bind_vsock_listener(cid, port).map_err(|e| {
-        let _ = writeln!(std::io::stderr(), "[err] agent gateway: vsock bind failed: {e}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "[err] agent gateway: vsock bind failed: {e}"
+        );
         ProtocolError::PqSigningUnavailable("agent serve: vsock bind failed (see prior log line)")
     })?;
-    let _ = writeln!(std::io::stderr(), "[info] agent gateway: serving on vsock CID {cid} port {port}");
+    let _ = writeln!(
+        std::io::stderr(),
+        "[info] agent gateway: serving on vsock CID {cid} port {port}"
+    );
     // Per-stream setup seam: arm SO_RCVTIMEO/SO_SNDTIMEO (READ 30s / WRITE 120s) on each accepted stream
     // (the serve loop's idle bound, SESSION_IDLE_TIMEOUT 300s, is separate). A setup failure is logged as a
     // STREAM-SETUP fault (NOT an accept fault) and skipped per-connection by handle_agent_accepted, never
@@ -726,7 +750,9 @@ mod tests {
             _deadline: std::time::Instant,
         ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
             // These wired-boot tests exercise the FRESHNESS path only; the marks leg is unscripted.
-            Err(crate::agent_boot_driver::AnchorTransportError("wired test channel: marks not scripted"))
+            Err(crate::agent_boot_driver::AnchorTransportError(
+                "wired test channel: marks not scripted",
+            ))
         }
     }
 
@@ -811,7 +837,9 @@ mod tests {
             _deadline: std::time::Instant,
         ) -> Result<Vec<u8>, crate::agent_boot_driver::AnchorTransportError> {
             // These wired-boot tests exercise the FRESHNESS path only; the marks leg is unscripted.
-            Err(crate::agent_boot_driver::AnchorTransportError("wired test channel: marks not scripted"))
+            Err(crate::agent_boot_driver::AnchorTransportError(
+                "wired test channel: marks not scripted",
+            ))
         }
     }
 
@@ -954,9 +982,10 @@ mod tests {
             round_trips: Rc::clone(&round_trips),
         };
         let mut events: Vec<AgentBootEvent> = Vec::new();
-        let err =
-            run_boot_handshake_wired(0, t, overall, channel, &mut body, true, &mut |e| events.push(e))
-                .expect_err("max_attempts=0 must refuse at validate");
+        let err = run_boot_handshake_wired(0, t, overall, channel, &mut body, true, &mut |e| {
+            events.push(e)
+        })
+        .expect_err("max_attempts=0 must refuse at validate");
         assert!(
             matches!(
                 err,
@@ -1008,9 +1037,10 @@ mod tests {
             round_trips: Rc::clone(&round_trips),
         };
         let mut events: Vec<AgentBootEvent> = Vec::new();
-        let err =
-            run_boot_handshake_wired(n, t, overall, channel, &mut body, true, &mut |e| events.push(e))
-                .expect_err("burned claim must refuse the wired wrapper");
+        let err = run_boot_handshake_wired(n, t, overall, channel, &mut body, true, &mut |e| {
+            events.push(e)
+        })
+        .expect_err("burned claim must refuse the wired wrapper");
         assert!(
             matches!(
                 err,
@@ -1070,10 +1100,13 @@ mod tests {
             round_trips: Rc::clone(&round_trips),
         };
         let mut events: Vec<AgentBootEvent> = Vec::new();
-        let _ = run_boot_handshake_core(1, t, overall, spawn, channel, &mut body, false, &mut |e| {
-            events.push(e)
-        })
-        .expect_err("always-Err channel fails closed — but zero slack must NOT refuse validation");
+        let _ =
+            run_boot_handshake_core(1, t, overall, spawn, channel, &mut body, false, &mut |e| {
+                events.push(e)
+            })
+            .expect_err(
+                "always-Err channel fails closed — but zero slack must NOT refuse validation",
+            );
         assert_eq!(spawns.get(), 1, "validation PROCEEDED: the quote leg ran");
         assert_eq!(
             round_trips.get(),
@@ -1193,9 +1226,15 @@ mod tests {
     /// Install a minimal agent keystore + active anti-rollback binding — the realistic post-boot state the
     /// serve loop runs in (the wrapper reaches run_agent_serve_loop only after install_agent_keystore).
     fn install_serving_state() {
-        assert!(crate::agent_dispatch::install_agent_keystore(test_body(1, 1), b"agent-meas"));
+        assert!(crate::agent_dispatch::install_agent_keystore(
+            test_body(1, 1),
+            b"agent-meas"
+        ));
         assert!(crate::agent_dispatch::install_anti_rollback_binding(
-            crate::agent_dispatch::AntiRollbackBinding { epoch: 1, active: true }
+            crate::agent_dispatch::AntiRollbackBinding {
+                epoch: 1,
+                active: true
+            }
         ));
     }
 
@@ -1246,7 +1285,11 @@ mod tests {
         )
         .expect("clean close after the reply");
         let reply = read_reply(&mut peer);
-        assert_eq!(reply.msg_type, crate::MessageType::AgentGateway, "reply must be 0x40-typed");
+        assert_eq!(
+            reply.msg_type,
+            crate::MessageType::AgentGateway,
+            "reply must be 0x40-typed"
+        );
         assert!(
             crate::agent_dispatch::decode_agent_error_code(&reply.payload).is_some(),
             "a garbage 0x40 frame must round-trip to an agent error body"
@@ -1270,11 +1313,17 @@ mod tests {
             agent_serve_one_frame,
             crate::enclave_serve::SESSION_IDLE_TIMEOUT,
         );
-        assert!(r.is_err(), "a non-0x40 frame faults the pump (close-silently)");
+        assert!(
+            r.is_err(),
+            "a non-0x40 frame faults the pump (close-silently)"
+        );
         let mut back = Vec::new();
         let _ = peer.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = peer.read_to_end(&mut back);
-        assert!(back.is_empty(), "wrong-type frame: ZERO bytes written back; got {back:?}");
+        assert!(
+            back.is_empty(),
+            "wrong-type frame: ZERO bytes written back; got {back:?}"
+        );
     }
 
     #[test]
@@ -1296,7 +1345,9 @@ mod tests {
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         let (mut relay_side, mut peer) = UnixStream::pair().unwrap();
         // A 4-byte len prefix claiming > MAX_MESSAGE_SIZE, then nothing → MessageTooLarge → break → Ok(()).
-        (&peer).write_all(&(crate::MAX_MESSAGE_SIZE + 1).to_be_bytes()).unwrap();
+        (&peer)
+            .write_all(&(crate::MAX_MESSAGE_SIZE + 1).to_be_bytes())
+            .unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
         crate::enclave_serve::serve_framed_pump(
             &mut relay_side,
@@ -1307,7 +1358,10 @@ mod tests {
         let mut back = Vec::new();
         let _ = peer.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = peer.read_to_end(&mut back);
-        assert!(back.is_empty(), "oversize prefix: nothing written back; got {back:?}");
+        assert!(
+            back.is_empty(),
+            "oversize prefix: nothing written back; got {back:?}"
+        );
     }
 
     #[test]
@@ -1324,8 +1378,14 @@ mod tests {
             crate::enclave_serve::SESSION_IDLE_TIMEOUT,
         )
         .expect("clean close after two replies");
-        assert_eq!(read_reply(&mut peer).msg_type, crate::MessageType::AgentGateway);
-        assert_eq!(read_reply(&mut peer).msg_type, crate::MessageType::AgentGateway);
+        assert_eq!(
+            read_reply(&mut peer).msg_type,
+            crate::MessageType::AgentGateway
+        );
+        assert_eq!(
+            read_reply(&mut peer).msg_type,
+            crate::MessageType::AgentGateway
+        );
     }
 
     #[test]
@@ -1343,7 +1403,10 @@ mod tests {
         (&good_peer).write_all(&agent_frame(&[0xff, 0xff])).unwrap();
         good_peer.shutdown(std::net::Shutdown::Write).unwrap();
         drive_agent_serve_finite(vec![Ok(bad), Ok(good)].into_iter(), no_prepare);
-        assert_eq!(read_reply(&mut good_peer).msg_type, crate::MessageType::AgentGateway);
+        assert_eq!(
+            read_reply(&mut good_peer).msg_type,
+            crate::MessageType::AgentGateway
+        );
     }
 
     #[test]
@@ -1358,7 +1421,10 @@ mod tests {
         let incoming: Vec<std::io::Result<UnixStream>> =
             vec![Err(std::io::Error::from_raw_os_error(24)), Ok(good)];
         drive_agent_serve_finite(incoming.into_iter(), no_prepare);
-        assert_eq!(read_reply(&mut good_peer).msg_type, crate::MessageType::AgentGateway);
+        assert_eq!(
+            read_reply(&mut good_peer).msg_type,
+            crate::MessageType::AgentGateway
+        );
     }
 
     #[test]
@@ -1385,7 +1451,9 @@ mod tests {
         let _g = crate::agent_dispatch::lock_and_reset_agent_process_globals();
         install_serving_state();
         // ERROR reply (a garbage 0x40 → the agent error band `{1:Integer, 2:Text}`) must NOT extend idle.
-        let err_frame = agent_frame(&crate::agent_dispatch::handle_agent_gateway_frame(&[0xff, 0xff]));
+        let err_frame = agent_frame(&crate::agent_dispatch::handle_agent_gateway_frame(&[
+            0xff, 0xff,
+        ]));
         assert!(
             !crate::enclave_serve::reply_resets_idle(&err_frame),
             "an agent-error reply must NOT reset the idle deadline"
@@ -1420,12 +1488,19 @@ mod tests {
         let (mut relay_side, mut peer) = UnixStream::pair().unwrap();
         (&peer).write_all(&agent_frame(&[0xff, 0xff])).unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
-        crate::enclave_serve::serve_framed_pump(&mut relay_side, agent_serve_one_frame, Duration::ZERO)
-            .expect("an exhausted idle budget breaks before reading → Ok(())");
+        crate::enclave_serve::serve_framed_pump(
+            &mut relay_side,
+            agent_serve_one_frame,
+            Duration::ZERO,
+        )
+        .expect("an exhausted idle budget breaks before reading → Ok(())");
         let mut back = Vec::new();
         let _ = peer.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = peer.read_to_end(&mut back);
-        assert!(back.is_empty(), "expired idle: nothing read or replied; got {back:?}");
+        assert!(
+            back.is_empty(),
+            "expired idle: nothing read or replied; got {back:?}"
+        );
     }
 
     /// A per-stream `prepare` (SO_*TIMEO arming) failure on ONE accepted stream is logged as a stream-setup
@@ -1438,18 +1513,25 @@ mod tests {
         install_serving_state();
         let (first, _first_peer) = UnixStream::pair().unwrap();
         let (second, mut second_peer) = UnixStream::pair().unwrap();
-        (&second_peer).write_all(&agent_frame(&[0xff, 0xff])).unwrap();
+        (&second_peer)
+            .write_all(&agent_frame(&[0xff, 0xff]))
+            .unwrap();
         second_peer.shutdown(std::net::Shutdown::Write).unwrap();
         // `prepare` fails for the FIRST accepted stream (a deviceless stand-in for a setsockopt arm failure),
         // then succeeds — the loop must skip the first and still serve the second.
         let mut first_seen = false;
-        drive_agent_serve_finite(vec![Ok(first), Ok(second)].into_iter(), |_: &mut UnixStream| {
-            if !first_seen {
-                first_seen = true;
-                return Err(ProtocolError::WireProtocol("test: forced stream setup failure"));
-            }
-            Ok(())
-        });
+        drive_agent_serve_finite(
+            vec![Ok(first), Ok(second)].into_iter(),
+            |_: &mut UnixStream| {
+                if !first_seen {
+                    first_seen = true;
+                    return Err(ProtocolError::WireProtocol(
+                        "test: forced stream setup failure",
+                    ));
+                }
+                Ok(())
+            },
+        );
         assert_eq!(
             read_reply(&mut second_peer).msg_type,
             crate::MessageType::AgentGateway,
@@ -1463,9 +1545,16 @@ mod tests {
     #[test]
     fn peer_protocol_rejects_are_calm_genuine_faults_are_not() {
         use std::io::{Error as IoError, ErrorKind};
-        assert!(is_peer_protocol_reject(&ProtocolError::WireProtocol("non-0x40")));
-        assert!(is_peer_protocol_reject(&ProtocolError::InvalidVersion { got: 9, expected: 1 }));
-        assert!(is_peer_protocol_reject(&ProtocolError::UnknownMessageType(0x77)));
+        assert!(is_peer_protocol_reject(&ProtocolError::WireProtocol(
+            "non-0x40"
+        )));
+        assert!(is_peer_protocol_reject(&ProtocolError::InvalidVersion {
+            got: 9,
+            expected: 1
+        }));
+        assert!(is_peer_protocol_reject(&ProtocolError::UnknownMessageType(
+            0x77
+        )));
         assert!(is_peer_protocol_reject(&ProtocolError::Io(IoError::new(
             ErrorKind::UnexpectedEof,
             "frame too short"

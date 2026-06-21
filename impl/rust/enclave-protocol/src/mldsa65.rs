@@ -3,9 +3,9 @@
 use crate::{ProtocolError, ML_DSA65_SECRETKEY_LEN, ML_DSA65_SIGNATURE_LEN};
 use pqcrypto_mldsa::mldsa65::{detached_sign, PublicKey, SecretKey};
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey as _, SecretKey as _};
-use zeroize::Zeroizing;
 #[cfg(all(test, feature = "reference-test-key"))]
 use std::sync::OnceLock;
+use zeroize::Zeroizing;
 
 /// Domain-separated message for install-time keypair self-test (not a ticket hash).
 const INSTALL_SELF_TEST_MSG: [u8; 32] = *b"2d-hsm-pq-install-self-test!!!!!";
@@ -37,7 +37,8 @@ impl MlDsa65Signer {
         REFERENCE_SIGNER.get_or_init(|| {
             let sk_bytes = include_bytes!("../testvectors/mldsa65_reference_sk.bin");
             let pk_bytes = include_bytes!("../testvectors/mldsa65_reference_pk.bin");
-            Self::from_verified_key_bytes(sk_bytes, pk_bytes).expect("valid reference ML-DSA-65 keypair")
+            Self::from_verified_key_bytes(sk_bytes, pk_bytes)
+                .expect("valid reference ML-DSA-65 keypair")
         })
     }
 
@@ -46,7 +47,9 @@ impl MlDsa65Signer {
     /// callers that require keypair validation must use [`MlDsa65Signer::from_verified_key_bytes`].
     pub(crate) fn from_key_bytes(sk_bytes: &[u8], pk_bytes: &[u8]) -> Result<Self, ProtocolError> {
         if sk_bytes.len() != ML_DSA65_SECRETKEY_LEN {
-            return Err(ProtocolError::PqSigningUnavailable("invalid ML-DSA-65 secret key"));
+            return Err(ProtocolError::PqSigningUnavailable(
+                "invalid ML-DSA-65 secret key",
+            ));
         }
         let pk = PublicKey::from_bytes(pk_bytes)
             .map_err(|_| ProtocolError::PqSigningUnavailable("invalid ML-DSA-65 public key"))?;
@@ -60,7 +63,10 @@ impl MlDsa65Signer {
     }
 
     /// Parse keys and verify they form a matching pair (mandatory before accepting a provisioned signer).
-    pub fn from_verified_key_bytes(sk_bytes: &[u8], pk_bytes: &[u8]) -> Result<Self, ProtocolError> {
+    pub fn from_verified_key_bytes(
+        sk_bytes: &[u8],
+        pk_bytes: &[u8],
+    ) -> Result<Self, ProtocolError> {
         let signer = Self::from_key_bytes(sk_bytes, pk_bytes)?;
         signer.self_test_keypair()?;
         Ok(signer)
@@ -102,8 +108,9 @@ impl MlDsa65Signer {
     pub fn sign_ticket_hash(&self, ticket_hash: &[u8; 32]) -> Result<Vec<u8>, ProtocolError> {
         // Materialize the pqcrypto SecretKey transiently for this one signature; it is dropped at
         // the end of the call and never stored (the stored secret lives in a Zeroizing buffer).
-        let secret_key = SecretKey::from_bytes(self.secret_key.as_slice())
-            .map_err(|_| ProtocolError::PqSigningUnavailable("stored ML-DSA-65 secret key invalid"))?;
+        let secret_key = SecretKey::from_bytes(self.secret_key.as_slice()).map_err(|_| {
+            ProtocolError::PqSigningUnavailable("stored ML-DSA-65 secret key invalid")
+        })?;
         let sig = detached_sign(ticket_hash, &secret_key);
         let bytes = sig.as_bytes().to_vec();
         if bytes.len() != ML_DSA65_SIGNATURE_LEN {
@@ -120,7 +127,9 @@ impl MlDsa65Signer {
         signature: &[u8],
     ) -> Result<(), ProtocolError> {
         if signature.len() != ML_DSA65_SIGNATURE_LEN {
-            return Err(ProtocolError::PqSignatureInvalid("invalid signature length"));
+            return Err(ProtocolError::PqSignatureInvalid(
+                "invalid signature length",
+            ));
         }
         let sig = DetachedSignature::from_bytes(signature)
             .map_err(|_| ProtocolError::PqSignatureInvalid("invalid signature encoding"))?;

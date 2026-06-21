@@ -41,6 +41,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let runtime = Arc::new(SharedEnclaveRuntime::reference_test());
-    run_incoming_accept_loop(listener.incoming(), runtime, configure_unix_session_timeouts);
+    run_incoming_accept_loop(
+        listener.incoming(),
+        runtime,
+        configure_unix_session_timeouts,
+    );
     Ok(())
 }

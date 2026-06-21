@@ -72,7 +72,13 @@ impl Keypair {
             match SigningKey::from_slice(&secret[..]) {
                 Ok(signing_key) => {
                     let verifying_key = *signing_key.verifying_key();
-                    return Ok((Self { signing_key, verifying_key }, secret));
+                    return Ok((
+                        Self {
+                            signing_key,
+                            verifying_key,
+                        },
+                        secret,
+                    ));
                 }
                 // invalid scalar (zero or >= n) — scrub the rejected draw and retry
                 Err(_) => secret.zeroize(),
@@ -86,7 +92,10 @@ impl Keypair {
         let signing_key =
             SigningKey::from_slice(secret).map_err(|_| Secp256k1Error::InvalidSecret)?;
         let verifying_key = *signing_key.verifying_key();
-        Ok(Self { signing_key, verifying_key })
+        Ok(Self {
+            signing_key,
+            verifying_key,
+        })
     }
 
     /// Uncompressed SEC1 public key: `0x04 || X(32) || Y(32)` (65 bytes).
@@ -257,7 +266,11 @@ mod tests {
                 unhex(e["eth_address"].as_str().unwrap()),
                 "{name} eth"
             );
-            assert_eq!(kp.tron_address(), e["tron_address"].as_str().unwrap(), "{name} tron");
+            assert_eq!(
+                kp.tron_address(),
+                e["tron_address"].as_str().unwrap(),
+                "{name} tron"
+            );
         }
     }
 
@@ -275,7 +288,11 @@ mod tests {
         let s = &o["signature"];
         assert_eq!(sig.r.to_vec(), unhex(s["r"].as_str().unwrap()), "r");
         assert_eq!(sig.s.to_vec(), unhex(s["s"].as_str().unwrap()), "s");
-        assert_eq!(sig.recovery_id as u64, s["recovery_id"].as_u64().unwrap(), "recovery_id");
+        assert_eq!(
+            sig.recovery_id as u64,
+            s["recovery_id"].as_u64().unwrap(),
+            "recovery_id"
+        );
         assert!(is_low_s(&sig.s), "low-S");
         let chain_id = o["chain_id"].as_u64().unwrap();
         assert_eq!(
@@ -306,7 +323,11 @@ mod tests {
         let s = &p["signature"];
         assert_eq!(sig.r.to_vec(), unhex(s["r"].as_str().unwrap()), "id r");
         assert_eq!(sig.s.to_vec(), unhex(s["s"].as_str().unwrap()), "id s");
-        assert_eq!(sig.recovery_id as u64, s["recovery_id"].as_u64().unwrap(), "id rid");
+        assert_eq!(
+            sig.recovery_id as u64,
+            s["recovery_id"].as_u64().unwrap(),
+            "id rid"
+        );
         assert!(is_low_s(&sig.s), "id low-S");
     }
 
@@ -327,7 +348,11 @@ mod tests {
         let sig = kp.sign_prehashed(&h).unwrap();
         assert!(is_low_s(&sig.s));
         let rec = recover_pubkey_uncompressed(&h, &sig).unwrap();
-        assert_eq!(rec.to_vec(), kp.public_key_uncompressed().to_vec(), "recover == signer pubkey");
+        assert_eq!(
+            rec.to_vec(),
+            kp.public_key_uncompressed().to_vec(),
+            "recover == signer pubkey"
+        );
     }
 
     #[test]

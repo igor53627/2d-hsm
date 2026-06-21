@@ -1,11 +1,11 @@
 //! Wire frames for host integration tests (requires `test-support`).
 
+use crate::{build_signed_recent_chain_proof, reference_test_attestation_signing_key};
 use crate::{
     encode_arm_for_production_request, encode_message, encode_sign_authorization_ticket_request,
-    ArmForProductionRequest, AuthorizationTicketPayload, AuthorizedProducerState,
-    MessageType, SignAuthorizationTicketRequest,
+    ArmForProductionRequest, AuthorizationTicketPayload, AuthorizedProducerState, MessageType,
+    SignAuthorizationTicketRequest,
 };
-use crate::{build_signed_recent_chain_proof, reference_test_attestation_signing_key};
 
 /// Pre-built `ARM_FOR_PRODUCTION` framed message for reference tests (placeholder 48-byte PQ).
 pub fn sample_arm_for_production_frame() -> Vec<u8> {
@@ -47,11 +47,7 @@ pub fn sample_second_hardfork_sign_frame() -> Vec<u8> {
     hardfork_sign_frame_at(10_000_200, 2, [0x02; 32])
 }
 
-fn hardfork_sign_frame_at(
-    activation_height: u64,
-    nonce: u64,
-    context_hash: [u8; 32],
-) -> Vec<u8> {
+fn hardfork_sign_frame_at(activation_height: u64, nonce: u64, context_hash: [u8; 32]) -> Vec<u8> {
     let ticket = AuthorizationTicketPayload {
         ticket_type: 1,
         nonce,
@@ -63,8 +59,7 @@ fn hardfork_sign_frame_at(
         new_header_version: Some(3),
     };
     let req = SignAuthorizationTicketRequest { ticket };
-    let payload =
-        encode_sign_authorization_ticket_request(&req).expect("encode sign request");
+    let payload = encode_sign_authorization_ticket_request(&req).expect("encode sign request");
     encode_message(MessageType::SignAuthorizationTicket, &payload).expect("frame sign")
 }
 
@@ -81,7 +76,6 @@ pub fn sample_recovery_sign_frame() -> Vec<u8> {
         new_header_version: None,
     };
     let req = SignAuthorizationTicketRequest { ticket };
-    let payload =
-        encode_sign_authorization_ticket_request(&req).expect("encode sign request");
+    let payload = encode_sign_authorization_ticket_request(&req).expect("encode sign request");
     encode_message(MessageType::SignAuthorizationTicket, &payload).expect("frame sign")
 }

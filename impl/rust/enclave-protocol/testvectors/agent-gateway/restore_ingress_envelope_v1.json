@@ -1,0 +1,17 @@
+{
+  "chain_id": 11565,
+  "description": "TASK-24 restore-ingress ENVELOPE golden vector — the attested second KEM-DEM layer (2d-hsm-agent-restore-ingress-v1). The operator re-wraps the restore_ingress_v1.bin PAYLOAD to the destination TEE's attested EPHEMERAL ML-KEM-1024 key; AAD' binds the dest measurement + chain/env + manifest hash + the agent_backup_v1.bin digest. TEST KEYS ONLY — the dest ephemeral decaps seed is a public test constant (in the live ceremony this key is GENERATED inside the destination TEE, never off-device).",
+  "dest_ephemeral_encaps_key_len": 1568,
+  "dest_ephemeral_encaps_key_sha256": "cab92cf3ced31367a16a7a5d04b97f5fe7d2a5ae5352b33a7b6097fd5b61b8fb",
+  "dest_ephemeral_keypair_seed_hex": "6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c",
+  "dest_measurement_hex": "646573742d7465652d6d6561737572656d656e742d7631",
+  "envelope_len_bytes": 3525,
+  "envelope_sha256": "04dcea3f9110180db51d38aff600284c670ebfe693e5154597d4344e12885ccb",
+  "environment_identifier": "env-prod-0",
+  "ingress_nonce_hex": "000000000000000000000000",
+  "kem_encaps_message_m_hex": "4343434343434343434343434343434343434343434343434343434343434343",
+  "magic": "2DAGRIE\u0000",
+  "manifest_hash_hex": "d8302fae50e6bd78432c0b656650b532134c7af94bfb979fd79e75f8c1bb14d6",
+  "original_backup_digest_hex": "cda9d72db1d4d378a4c6e51356ebbf1ee92062be5425b70645667cce0e07edef",
+  "restore_ingress_envelope_format_version": 1
+}

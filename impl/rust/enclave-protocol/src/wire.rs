@@ -11,7 +11,8 @@ use crate::{
 };
 
 fn require_protocol_version(version: u64) -> Result<(), ProtocolError> {
-    let v = u8::try_from(version).map_err(|_| ProtocolError::WireProtocol("version out of range"))?;
+    let v =
+        u8::try_from(version).map_err(|_| ProtocolError::WireProtocol("version out of range"))?;
     if v != PROTOCOL_VERSION {
         return Err(ProtocolError::InvalidVersion {
             got: v,
@@ -34,14 +35,17 @@ fn decode_value(bytes: &[u8]) -> Result<Value, ProtocolError> {
     let value: Value = ciborium::de::from_reader(&mut cursor).map_err(ProtocolError::from)?;
     let consumed = cursor.position() as usize;
     if consumed != bytes.len() {
-        return Err(ProtocolError::WireProtocol("trailing bytes after CBOR value"));
+        return Err(ProtocolError::WireProtocol(
+            "trailing bytes after CBOR value",
+        ));
     }
     Ok(value)
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: u64) -> Result<&'a Value, ProtocolError> {
-    map_get_opt(map, key)
-        .ok_or(ProtocolError::RecentChainProofValidation("missing required CBOR map key"))
+    map_get_opt(map, key).ok_or(ProtocolError::RecentChainProofValidation(
+        "missing required CBOR map key",
+    ))
 }
 
 /// Optional CBOR map lookup — `None` when the key is absent. Used for additive, backward-compatible
@@ -54,9 +58,8 @@ fn map_get_opt<'a>(map: &'a [(Value, Value)], key: u64) -> Option<&'a Value> {
 
 fn value_to_u64(v: &Value) -> Result<u64, ProtocolError> {
     match v {
-        Value::Integer(i) => u64::try_from(*i).map_err(|_| {
-            ProtocolError::RecentChainProofValidation("integer field out of range")
-        }),
+        Value::Integer(i) => u64::try_from(*i)
+            .map_err(|_| ProtocolError::RecentChainProofValidation("integer field out of range")),
         _ => Err(ProtocolError::RecentChainProofValidation(
             "expected unsigned integer",
         )),
@@ -99,8 +102,14 @@ fn value_to_optional_bytes32(v: &Value) -> Result<Option<[u8; 32]>, ProtocolErro
 
 fn encode_authorized_producer_state(state: &AuthorizedProducerState) -> Value {
     Value::Map(vec![
-        (Value::Integer(1.into()), Value::Bytes(state.pq_pubkey.clone())),
-        (Value::Integer(2.into()), Value::Bytes(state.measurement.clone())),
+        (
+            Value::Integer(1.into()),
+            Value::Bytes(state.pq_pubkey.clone()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(state.measurement.clone()),
+        ),
         (
             Value::Integer(3.into()),
             Value::Integer(state.activated_at_height.into()),
@@ -202,7 +211,9 @@ pub fn decode_wire_error(bytes: &[u8]) -> Result<(i64, String), ProtocolError> {
         return Err(ProtocolError::WireProtocol("wire error must be a CBOR map"));
     };
     if !is_wire_error_map(&map) {
-        return Err(ProtocolError::WireProtocol("payload is a success response, not a wire error"));
+        return Err(ProtocolError::WireProtocol(
+            "payload is a success response, not a wire error",
+        ));
     }
     let code = value_to_u64(map_get(&map, 1)?)? as i64;
     let reason = value_to_text(map_get(&map, 2)?)?;
@@ -228,7 +239,9 @@ fn value_to_u8(v: &Value) -> Result<u8, ProtocolError> {
 }
 
 /// CBOR-encode `GET_MEASUREMENT` request (`{ 1: version }`).
-pub fn encode_get_measurement_request(req: &GetMeasurementRequest) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_get_measurement_request(
+    req: &GetMeasurementRequest,
+) -> Result<Vec<u8>, ProtocolError> {
     let value = Value::Map(vec![(
         Value::Integer(1.into()),
         Value::Integer(req.version.into()),
@@ -237,7 +250,9 @@ pub fn encode_get_measurement_request(req: &GetMeasurementRequest) -> Result<Vec
 }
 
 /// CBOR-decode `GET_MEASUREMENT` request.
-pub fn decode_get_measurement_request(bytes: &[u8]) -> Result<GetMeasurementRequest, ProtocolError> {
+pub fn decode_get_measurement_request(
+    bytes: &[u8],
+) -> Result<GetMeasurementRequest, ProtocolError> {
     let value = decode_value(bytes)?;
     let Value::Map(map) = value else {
         return Err(ProtocolError::WireProtocol(
@@ -265,13 +280,28 @@ pub fn encode_get_measurement_response(
         .map(|t| Value::Integer(u64::from(*t).into()))
         .collect();
     let value = Value::Map(vec![
-        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
-        (Value::Integer(2.into()), Value::Bytes(resp.measurement.clone())),
-        (Value::Integer(3.into()), Value::Bytes(resp.attestation.clone())),
-        (Value::Integer(4.into()), Value::Bytes(resp.pq_pubkey.clone())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(resp.measurement.clone()),
+        ),
+        (
+            Value::Integer(3.into()),
+            Value::Bytes(resp.attestation.clone()),
+        ),
+        (
+            Value::Integer(4.into()),
+            Value::Bytes(resp.pq_pubkey.clone()),
+        ),
         (Value::Integer(5.into()), Value::Array(ticket_types)),
         (Value::Integer(6.into()), Value::Bool(resp.pq_signing_ready)),
-        (Value::Integer(7.into()), Value::Bytes(resp.cert_chain.clone())),
+        (
+            Value::Integer(7.into()),
+            Value::Bytes(resp.cert_chain.clone()),
+        ),
     ]);
     encode_value(&value)
 }
@@ -348,7 +378,10 @@ pub fn decode_get_status_request(bytes: &[u8]) -> Result<GetStatusRequest, Proto
 /// CBOR-encode `GET_STATUS` response (spec keys 1–9).
 pub fn encode_get_status_response(resp: &GetStatusResponse) -> Result<Vec<u8>, ProtocolError> {
     let value = Value::Map(vec![
-        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
         (Value::Integer(2.into()), Value::Bool(resp.armed)),
         (
             Value::Integer(3.into()),
@@ -472,7 +505,10 @@ pub fn encode_arm_for_production_request(
     req: &ArmForProductionRequest,
 ) -> Result<Vec<u8>, ProtocolError> {
     let value = Value::Map(vec![
-        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
         (
             Value::Integer(2.into()),
             encode_authorized_producer_state(&req.authorized_state),
@@ -508,15 +544,18 @@ fn value_to_optional_u32(v: &Value) -> Result<Option<u32>, ProtocolError> {
         Value::Null => Ok(None),
         other => {
             let n = value_to_u64(other)?;
-            u32::try_from(n).map_err(|_| {
-                ProtocolError::RecentChainProofValidation("new_header_version out of range")
-            })
-            .map(Some)
+            u32::try_from(n)
+                .map_err(|_| {
+                    ProtocolError::RecentChainProofValidation("new_header_version out of range")
+                })
+                .map(Some)
         }
     }
 }
 
-fn decode_authorization_ticket_payload(v: &Value) -> Result<AuthorizationTicketPayload, ProtocolError> {
+fn decode_authorization_ticket_payload(
+    v: &Value,
+) -> Result<AuthorizationTicketPayload, ProtocolError> {
     let Value::Map(map) = v else {
         return Err(ProtocolError::RecentChainProofValidation(
             "ticket must be a CBOR map",
@@ -548,18 +587,33 @@ pub fn encode_sign_authorization_ticket_request(
         .map(|v| Value::Integer(v.into()))
         .unwrap_or(Value::Null);
     let ticket_map = vec![
-        (Value::Integer(1.into()), Value::Integer(t.ticket_type.into())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(t.ticket_type.into()),
+        ),
         (Value::Integer(2.into()), Value::Integer(t.nonce.into())),
-        (Value::Integer(3.into()), Value::Bytes(t.context_hash.to_vec())),
-        (Value::Integer(4.into()), Value::Integer(t.activation_height.into())),
-        (Value::Integer(5.into()), Value::Bytes(t.new_measurement.clone())),
+        (
+            Value::Integer(3.into()),
+            Value::Bytes(t.context_hash.to_vec()),
+        ),
+        (
+            Value::Integer(4.into()),
+            Value::Integer(t.activation_height.into()),
+        ),
+        (
+            Value::Integer(5.into()),
+            Value::Bytes(t.new_measurement.clone()),
+        ),
         (Value::Integer(6.into()), Value::Bytes(t.pq_pubkey.clone())),
         (Value::Integer(7.into()), fork),
         (Value::Integer(8.into()), header_ver),
         (Value::Integer(9.into()), Value::Null),
     ];
     let outer = vec![
-        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
         (Value::Integer(2.into()), Value::Map(ticket_map)),
     ];
     encode_value(&Value::Map(outer))
@@ -586,9 +640,18 @@ pub fn encode_sign_authorization_ticket_response(
     resp: &SignAuthorizationTicketResponse,
 ) -> Result<Vec<u8>, ProtocolError> {
     let map = vec![
-        (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
-        (Value::Integer(2.into()), Value::Bytes(resp.signature.clone())),
-        (Value::Integer(3.into()), Value::Bytes(resp.ticket_hash.to_vec())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(resp.signature.clone()),
+        ),
+        (
+            Value::Integer(3.into()),
+            Value::Bytes(resp.ticket_hash.to_vec()),
+        ),
     ];
     encode_value(&Value::Map(map))
 }
@@ -620,7 +683,10 @@ mod tests {
     fn wire_error_with_optional_diagnostic_key3() {
         let map = vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Text("proof stale".to_string())),
+            (
+                Value::Integer(2.into()),
+                Value::Text("proof stale".to_string()),
+            ),
             (Value::Integer(3.into()), Value::Map(vec![])),
         ];
         let bytes = encode_value(&Value::Map(map)).unwrap();
@@ -637,7 +703,10 @@ mod tests {
             reason: None,
         };
         let bytes = encode_arm_for_production_response(&armed).unwrap();
-        assert_eq!(decode_arm_for_production_response(&bytes).unwrap().status, "armed");
+        assert_eq!(
+            decode_arm_for_production_response(&bytes).unwrap().status,
+            "armed"
+        );
 
         let refused = ArmForProductionResponse {
             status: "refused".to_string(),
@@ -679,11 +748,17 @@ mod tests {
     fn get_measurement_response_cert_chain_optional_back_compat() {
         // A peer on the 1–6 schema omits key 7; decode must default cert_chain to empty.
         let value = Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer(PROTOCOL_VERSION.into()),
+            ),
             (Value::Integer(2.into()), Value::Bytes(b"meas".to_vec())),
             (Value::Integer(3.into()), Value::Bytes(b"att".to_vec())),
             (Value::Integer(4.into()), Value::Bytes(vec![0x01])),
-            (Value::Integer(5.into()), Value::Array(vec![Value::Integer(0.into())])),
+            (
+                Value::Integer(5.into()),
+                Value::Array(vec![Value::Integer(0.into())]),
+            ),
             (Value::Integer(6.into()), Value::Bool(true)),
         ]);
         let bytes = encode_value(&value).unwrap();
@@ -696,11 +771,17 @@ mod tests {
     fn get_measurement_response_cert_chain_null_is_empty() {
         // An explicit CBOR null at key 7 means "no chain" — decode to empty, not an error.
         let value = Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(PROTOCOL_VERSION.into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer(PROTOCOL_VERSION.into()),
+            ),
             (Value::Integer(2.into()), Value::Bytes(b"meas".to_vec())),
             (Value::Integer(3.into()), Value::Bytes(b"att".to_vec())),
             (Value::Integer(4.into()), Value::Bytes(vec![0x01])),
-            (Value::Integer(5.into()), Value::Array(vec![Value::Integer(0.into())])),
+            (
+                Value::Integer(5.into()),
+                Value::Array(vec![Value::Integer(0.into())]),
+            ),
             (Value::Integer(6.into()), Value::Bool(false)),
             (Value::Integer(7.into()), Value::Null),
         ]);
@@ -774,10 +855,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_protocol_version() {
-        let value = Value::Map(vec![(
-            Value::Integer(1.into()),
-            Value::Integer(99.into()),
-        )]);
+        let value = Value::Map(vec![(Value::Integer(1.into()), Value::Integer(99.into()))]);
         let bytes = encode_value(&value).unwrap();
         let err = decode_get_status_request(&bytes).unwrap_err();
         assert!(matches!(

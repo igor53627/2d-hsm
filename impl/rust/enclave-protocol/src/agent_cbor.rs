@@ -381,7 +381,9 @@ impl StrictParser<'_> {
         if len > max {
             return Err(());
         }
-        core::str::from_utf8(self.take(len)?).map(|s| s.to_owned()).map_err(|_| ())
+        core::str::from_utf8(self.take(len)?)
+            .map(|s| s.to_owned())
+            .map_err(|_| ())
     }
 }
 
@@ -396,7 +398,11 @@ pub(crate) fn strict_decode_marks_payload(
     bytes: &[u8],
     max_rows: usize,
 ) -> Result<DecodedMarks, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0, max_bstr: MAX_STR_LEN };
+    let mut p = StrictParser {
+        buf: bytes,
+        pos: 0,
+        max_bstr: MAX_STR_LEN,
+    };
     // Top: map(4), keys 1..=4 in canonical ascending order.
     if p.typed_head(5)? != 4 {
         return Err(());
@@ -438,7 +444,12 @@ pub(crate) fn strict_decode_marks_payload(
             }
         }
         prev_key = Some(key);
-        rows.push(DecodedRow { authority, scope_class, scope_target, highest_accepted_counter });
+        rows.push(DecodedRow {
+            authority,
+            scope_class,
+            scope_target,
+            highest_accepted_counter,
+        });
     }
     // key 2 -> cumulative_native_spend (bstr 32); key 3 -> lifetime_spend (bstr 32); key 4 -> strict_recovery_counter (uint)
     if p.uint()? != 2 {
@@ -456,7 +467,12 @@ pub(crate) fn strict_decode_marks_payload(
     if p.pos != bytes.len() {
         return Err(()); // trailing bytes
     }
-    Ok(DecodedMarks { rows, cumulative_native_spend, lifetime_spend, strict_recovery_counter })
+    Ok(DecodedMarks {
+        rows,
+        cumulative_native_spend,
+        lifetime_spend,
+        strict_recovery_counter,
+    })
 }
 
 /// The strict-decoded OUTER fields of an `anchor_root`-signed marks response (5b-2e), keys
@@ -486,7 +502,11 @@ pub(crate) fn strict_decode_marks_response(
     bytes: &[u8],
     max_payload: usize,
 ) -> Result<MarksRespFields, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0, max_bstr: MAX_STR_LEN };
+    let mut p = StrictParser {
+        buf: bytes,
+        pos: 0,
+        max_bstr: MAX_STR_LEN,
+    };
     if p.typed_head(5)? != 7 {
         return Err(()); // map(7): keys {1..=6, 13}
     }
@@ -521,7 +541,15 @@ pub(crate) fn strict_decode_marks_response(
     if p.pos != bytes.len() {
         return Err(()); // trailing bytes
     }
-    Ok(MarksRespFields { version, chain_id, environment_identifier, epoch, nonce, marks_payload, signature })
+    Ok(MarksRespFields {
+        version,
+        chain_id,
+        environment_identifier,
+        epoch,
+        nonce,
+        marks_payload,
+        signature,
+    })
 }
 
 /// Decoded fields of an anti-rollback per-op **commit ACK** (TASK-7.7 slice 6). The crypto/scope/
@@ -553,7 +581,11 @@ pub(crate) fn strict_decode_commit_ack(
     bytes: &[u8],
     max_request_id: usize,
 ) -> Result<CommitAckFields, ()> {
-    let mut p = StrictParser { buf: bytes, pos: 0, max_bstr: MAX_STR_LEN };
+    let mut p = StrictParser {
+        buf: bytes,
+        pos: 0,
+        max_bstr: MAX_STR_LEN,
+    };
     if p.typed_head(5)? != 9 {
         return Err(()); // map(9): keys {1..=8, 13}
     }
@@ -626,7 +658,10 @@ mod tests {
 
     #[test]
     fn map_get_finds_int_keys_only() {
-        let m = vec![(int(1), Value::Integer(7.into())), (int(2), Value::Text("x".into()))];
+        let m = vec![
+            (int(1), Value::Integer(7.into())),
+            (int(2), Value::Text("x".into())),
+        ];
         assert_eq!(as_u64(map_get(&m, 1).unwrap()), Some(7));
         assert!(map_get(&m, 3).is_none());
         // a text key never matches an integer lookup
@@ -644,7 +679,10 @@ mod tests {
 
     #[test]
     fn as_bytes_n_enforces_exact_length() {
-        assert_eq!(as_bytes_n::<4>(&Value::Bytes(vec![1, 2, 3, 4])), Some([1, 2, 3, 4]));
+        assert_eq!(
+            as_bytes_n::<4>(&Value::Bytes(vec![1, 2, 3, 4])),
+            Some([1, 2, 3, 4])
+        );
         assert_eq!(as_bytes_n::<4>(&Value::Bytes(vec![1, 2, 3])), None);
         assert_eq!(as_bytes_n::<4>(&Value::Bytes(vec![1, 2, 3, 4, 5])), None);
         assert_eq!(as_bytes32(&Value::Bytes(vec![0xab; 32])), Some([0xab; 32]));
@@ -661,8 +699,10 @@ mod tests {
         let disp_ok: Vec<(Value, Value)> = (1..=7).map(|k| (int(k), int(0))).collect();
         assert!(check_strict_keys(&disp_ok, |n| (1..=7).contains(&n)));
         // anchor allow-set 1..=9 || 13
-        let anchor_ok: Vec<(Value, Value)> =
-            (1..=9).chain(std::iter::once(13)).map(|k| (int(k), int(0))).collect();
+        let anchor_ok: Vec<(Value, Value)> = (1..=9)
+            .chain(std::iter::once(13))
+            .map(|k| (int(k), int(0)))
+            .collect();
         assert!(check_strict_keys(&anchor_ok, |n| (1..=9).contains(&n) || n == 13));
     }
 
@@ -670,11 +710,20 @@ mod tests {
     fn check_strict_keys_rejects_unknown_dup_and_nonint() {
         let allow = |n: u64| (1..=7).contains(&n);
         // unknown key 8
-        assert!(!check_strict_keys(&[(int(1), int(0)), (int(8), int(0))], allow));
+        assert!(!check_strict_keys(
+            &[(int(1), int(0)), (int(8), int(0))],
+            allow
+        ));
         // duplicate key 1
-        assert!(!check_strict_keys(&[(int(1), int(0)), (int(1), int(0))], allow));
+        assert!(!check_strict_keys(
+            &[(int(1), int(0)), (int(1), int(0))],
+            allow
+        ));
         // non-integer key
-        assert!(!check_strict_keys(&[(Value::Text("1".into()), int(0))], allow));
+        assert!(!check_strict_keys(
+            &[(Value::Text("1".into()), int(0))],
+            allow
+        ));
     }
 
     #[test]
@@ -691,13 +740,19 @@ mod tests {
         // empty bstr = zero
         assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![])), Some(vec![]));
         // minimal non-zero accepted, returned verbatim
-        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x01])), Some(vec![0x01]));
+        assert_eq!(
+            as_u256_minimal_be(&Value::Bytes(vec![0x01])),
+            Some(vec![0x01])
+        );
         assert_eq!(
             as_u256_minimal_be(&Value::Bytes(vec![0xde, 0xad])),
             Some(vec![0xde, 0xad])
         );
         // full 32-byte width accepted (boundary)
-        assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x01; 32])).map(|v| v.len()), Some(32));
+        assert_eq!(
+            as_u256_minimal_be(&Value::Bytes(vec![0x01; 32])).map(|v| v.len()),
+            Some(32)
+        );
         // leading zero (non-minimal) rejected
         assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x00])), None);
         assert_eq!(as_u256_minimal_be(&Value::Bytes(vec![0x00, 0x01])), None);
@@ -717,7 +772,10 @@ mod tests {
         let decoded = strict_decode_map(&enc(&m)).unwrap();
         assert_eq!(decoded.len(), 3);
         assert_eq!(as_u64(map_get(&decoded, 1).unwrap()), Some(7));
-        assert_eq!(as_bytes(map_get(&decoded, 3).unwrap()), Some(&[0xab; 4][..]));
+        assert_eq!(
+            as_bytes(map_get(&decoded, 3).unwrap()),
+            Some(&[0xab; 4][..])
+        );
     }
 
     #[test]
@@ -763,7 +821,7 @@ mod tests {
         assert!(strict_decode_map(&[0xa1, 0x01, 0xf9, 0x3c, 0x00]).is_err()); // float16 1.0
         assert!(strict_decode_map(&[0xa1, 0x01, 0xf6]).is_err()); // null (major 7, unused)
         assert!(strict_decode_map(&[0xa1, 0x01, 0xf7]).is_err()); // undefined (major 7, unused)
-        // booleans ARE part of the wire format (capability is_recovery, key 12).
+                                                                  // booleans ARE part of the wire format (capability is_recovery, key 12).
         let t = strict_decode_map(&[0xa1, 0x01, 0xf5]).unwrap(); // {1: true}
         assert_eq!(map_get(&t, 1), Some(&Value::Bool(true)));
         let f = strict_decode_map(&[0xa1, 0x01, 0xf4]).unwrap(); // {1: false}
@@ -846,14 +904,25 @@ mod tests {
 
         // Multi-row with a 200 scope_class (the 0x18 0xC8 uint case) + a non-empty scope_target.
         let bytes = marks_bytes(
-            &[([0x11; 32], 200, b"target-a", 5), ([0x22; 32], 0, b"", 9_000_000_000)],
+            &[
+                ([0x11; 32], 200, b"target-a", 5),
+                ([0x22; 32], 0, b"", 9_000_000_000),
+            ],
             [0xaa; 32],
             [0xbb; 32],
             42,
         );
         let d = strict_decode_marks_payload(&bytes, ROWS_CAP).unwrap();
         assert_eq!(d.rows.len(), 2);
-        assert_eq!(d.rows[0], DecodedRow { authority: [0x11; 32], scope_class: 200, scope_target: b"target-a".to_vec(), highest_accepted_counter: 5 });
+        assert_eq!(
+            d.rows[0],
+            DecodedRow {
+                authority: [0x11; 32],
+                scope_class: 200,
+                scope_target: b"target-a".to_vec(),
+                highest_accepted_counter: 5
+            }
+        );
         assert_eq!(d.rows[1].highest_accepted_counter, 9_000_000_000);
         assert_eq!(d.cumulative_native_spend, [0xaa; 32]);
         assert_eq!(d.lifetime_spend, [0xbb; 32]);
@@ -893,10 +962,17 @@ mod tests {
 
         // 70 GENUINE rows (> the shared MAX_ARRAY_ENTRIES=64) DECODE — proving the marks reader uses
         // its own larger cap, NOT the shared 64-array bound.
-        let rows: Vec<([u8; 32], u8, &[u8], u64)> =
-            (0..70u16).map(|i| ([i as u8; 32], 0u8, b"x".as_slice(), u64::from(i))).collect();
+        let rows: Vec<([u8; 32], u8, &[u8], u64)> = (0..70u16)
+            .map(|i| ([i as u8; 32], 0u8, b"x".as_slice(), u64::from(i)))
+            .collect();
         let bytes = marks_bytes(&rows, [0; 32], [0; 32], 0);
-        assert_eq!(strict_decode_marks_payload(&bytes, ROWS_CAP).unwrap().rows.len(), 70);
+        assert_eq!(
+            strict_decode_marks_payload(&bytes, ROWS_CAP)
+                .unwrap()
+                .rows
+                .len(),
+            70
+        );
         // ...while the SHARED strict_decode_map still rejects a 65-key map (shared cap intact).
         let mut big_map = Vec::new();
         super::super::agent_capability::put_uint(&mut big_map, 5, 65);
@@ -953,13 +1029,29 @@ mod tests {
         let a1 = [0x11; 32];
         let a2 = [0x22; 32];
         // ascending (a1 < a2) decodes.
-        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"x", 1), (a2, 0, b"y", 2)], [0; 32], [0; 32], 0), ROWS_CAP).is_ok());
+        assert!(strict_decode_marks_payload(
+            &marks_bytes(&[(a1, 0, b"x", 1), (a2, 0, b"y", 2)], [0; 32], [0; 32], 0),
+            ROWS_CAP
+        )
+        .is_ok());
         // out of order (a2 before a1) rejects.
-        assert!(strict_decode_marks_payload(&marks_bytes(&[(a2, 0, b"y", 2), (a1, 0, b"x", 1)], [0; 32], [0; 32], 0), ROWS_CAP).is_err());
+        assert!(strict_decode_marks_payload(
+            &marks_bytes(&[(a2, 0, b"y", 2), (a1, 0, b"x", 1)], [0; 32], [0; 32], 0),
+            ROWS_CAP
+        )
+        .is_err());
         // exact duplicate tuple rejects (not strictly ascending).
-        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"x", 1), (a1, 0, b"x", 9)], [0; 32], [0; 32], 0), ROWS_CAP).is_err());
+        assert!(strict_decode_marks_payload(
+            &marks_bytes(&[(a1, 0, b"x", 1), (a1, 0, b"x", 9)], [0; 32], [0; 32], 0),
+            ROWS_CAP
+        )
+        .is_err());
         // same authority+class, ascending scope_target decodes.
-        assert!(strict_decode_marks_payload(&marks_bytes(&[(a1, 0, b"a", 1), (a1, 0, b"b", 2)], [0; 32], [0; 32], 0), ROWS_CAP).is_ok());
+        assert!(strict_decode_marks_payload(
+            &marks_bytes(&[(a1, 0, b"a", 1), (a1, 0, b"b", 2)], [0; 32], [0; 32], 0),
+            ROWS_CAP
+        )
+        .is_ok());
     }
 
     #[test]
@@ -973,7 +1065,7 @@ mod tests {
         super::super::agent_capability::put_uint(&mut o, 4, 1); // 1 row
         super::super::agent_capability::put_uint(&mut o, 4, 4); // row array(4)
         super::super::agent_capability::put_uint(&mut o, 4, 0); // element 0 is an array(0), NOT a bstr
-        // (the rest is unreachable — decode fails at the first element)
+                                                                // (the rest is unreachable — decode fails at the first element)
         assert!(strict_decode_marks_payload(&o, ROWS_CAP).is_err());
     }
 }

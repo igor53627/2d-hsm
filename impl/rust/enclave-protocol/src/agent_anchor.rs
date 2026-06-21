@@ -143,8 +143,16 @@ fn parse_response(map: &[(Value, Value)]) -> Result<AnchorResponse, AnchorError>
     if !check_strict_keys(map, |n| (1..=9).contains(&n) || n == 13) {
         return Err(AnchorError::Malformed);
     }
-    let req_u64 = |k: u64| map_get(map, k).and_then(as_u64).ok_or(AnchorError::Malformed);
-    let req_digest = |k: u64| map_get(map, k).and_then(as_bytes32).ok_or(AnchorError::Malformed);
+    let req_u64 = |k: u64| {
+        map_get(map, k)
+            .and_then(as_u64)
+            .ok_or(AnchorError::Malformed)
+    };
+    let req_digest = |k: u64| {
+        map_get(map, k)
+            .and_then(as_bytes32)
+            .ok_or(AnchorError::Malformed)
+    };
 
     let version = req_u64(1)?;
     let chain_id = req_u64(2)?;
@@ -169,8 +177,9 @@ fn parse_response(map: &[(Value, Value)]) -> Result<AnchorResponse, AnchorError>
     if chain_height.is_some() != chain_block_hash.is_some() {
         return Err(AnchorError::Malformed);
     }
-    let signature: [u8; 64] =
-        map_get(map, 13).and_then(as_bytes_n::<64>).ok_or(AnchorError::Malformed)?;
+    let signature: [u8; 64] = map_get(map, 13)
+        .and_then(as_bytes_n::<64>)
+        .ok_or(AnchorError::Malformed)?;
 
     Ok(AnchorResponse {
         version,
@@ -251,12 +260,14 @@ pub(crate) fn verify_anchor_response(
         return Err(AnchorError::Malformed);
     }
     // Ed25519 verify against the pinned sealed anchor root.
-    let key = VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| AnchorError::SignatureInvalid)?;
+    let key =
+        VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| AnchorError::SignatureInvalid)?;
     let sig = Signature::from_bytes(&r.signature);
     key.verify_strict(&signed_preimage(&r), &sig)
         .map_err(|_| AnchorError::SignatureInvalid)?;
     // Scope binding: this response is for THIS keystore's chain + environment.
-    if r.chain_id != config.twod_chain_id || r.environment_identifier != config.environment_identifier
+    if r.chain_id != config.twod_chain_id
+        || r.environment_identifier != config.environment_identifier
     {
         return Err(AnchorError::ScopeMismatch);
     }
@@ -324,7 +335,9 @@ pub(crate) fn reconcile(
         // anchor holds those marks); a structural mutation it never held ⇒ restore from backup.
         Ordering::Greater => {
             if anchor.structural_version == local_structural_version {
-                ReconcileDecision::AdoptForward { epoch: anchor.epoch }
+                ReconcileDecision::AdoptForward {
+                    epoch: anchor.epoch,
+                }
             } else {
                 // structural_version ahead (or, defensively, behind while epoch is ahead) ⇒ a gap the
                 // anchor cannot reconstruct.
@@ -385,12 +398,24 @@ pub(crate) fn test_signed_response_bytes(
     let map: Vec<(Value, Value)> = vec![
         (Value::Integer(1.into()), Value::Integer(r.version.into())),
         (Value::Integer(2.into()), Value::Integer(r.chain_id.into())),
-        (Value::Integer(3.into()), Value::Text(r.environment_identifier.clone())),
+        (
+            Value::Integer(3.into()),
+            Value::Text(r.environment_identifier.clone()),
+        ),
         (Value::Integer(4.into()), Value::Integer(r.epoch.into())),
-        (Value::Integer(5.into()), Value::Integer(r.structural_version.into())),
-        (Value::Integer(6.into()), Value::Bytes(r.marks_digest.to_vec())),
+        (
+            Value::Integer(5.into()),
+            Value::Integer(r.structural_version.into()),
+        ),
+        (
+            Value::Integer(6.into()),
+            Value::Bytes(r.marks_digest.to_vec()),
+        ),
         (Value::Integer(7.into()), Value::Bytes(r.nonce.to_vec())),
-        (Value::Integer(13.into()), Value::Bytes(r.signature.to_vec())),
+        (
+            Value::Integer(13.into()),
+            Value::Bytes(r.signature.to_vec()),
+        ),
     ];
     let mut out = Vec::new();
     ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
@@ -460,8 +485,9 @@ pub(crate) enum CommitAckError {
 #[cfg_attr(not(test), allow(dead_code))] // staged 5b-2e commit 2/8
 fn marks_resp_signed_preimage(f: &crate::agent_cbor::MarksRespFields) -> Vec<u8> {
     use crate::agent_capability::{put_bytes, put_text, put_uint};
-    let mut out =
-        Vec::with_capacity(MARKS_RESP_DOMAIN.len() + 96 + f.environment_identifier.len() + f.marks_payload.len());
+    let mut out = Vec::with_capacity(
+        MARKS_RESP_DOMAIN.len() + 96 + f.environment_identifier.len() + f.marks_payload.len(),
+    );
     out.extend_from_slice(MARKS_RESP_DOMAIN);
     put_uint(&mut out, 5, 6); // map(6): keys 1..=6 (key 13 signature excluded)
     put_uint(&mut out, 0, 1);
@@ -499,12 +525,15 @@ pub(crate) fn verify_marks_response_bytes(
         return Err(MarksError::Malformed);
     }
     // Ed25519 verify against the pinned sealed anchor root (verify_strict rejects torsion/small-order).
-    let key = VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| MarksError::SignatureInvalid)?;
+    let key =
+        VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| MarksError::SignatureInvalid)?;
     let sig = Signature::from_bytes(&f.signature);
     key.verify_strict(&marks_resp_signed_preimage(&f), &sig)
         .map_err(|_| MarksError::SignatureInvalid)?;
     // Scope: this marks snapshot is for THIS keystore's chain + environment (the SEALED config).
-    if f.chain_id != config.twod_chain_id || f.environment_identifier != config.environment_identifier {
+    if f.chain_id != config.twod_chain_id
+        || f.environment_identifier != config.environment_identifier
+    {
         return Err(MarksError::ScopeMismatch);
     }
     // Freshness: the anchor must echo the SAME single-use nonce the freshness leg issued this attempt.
@@ -545,11 +574,20 @@ pub(crate) fn test_signed_marks_response_bytes(
     let map: Vec<(Value, Value)> = vec![
         (Value::Integer(1.into()), Value::Integer(f.version.into())),
         (Value::Integer(2.into()), Value::Integer(f.chain_id.into())),
-        (Value::Integer(3.into()), Value::Text(f.environment_identifier.clone())),
+        (
+            Value::Integer(3.into()),
+            Value::Text(f.environment_identifier.clone()),
+        ),
         (Value::Integer(4.into()), Value::Integer(f.epoch.into())),
         (Value::Integer(5.into()), Value::Bytes(f.nonce.to_vec())),
-        (Value::Integer(6.into()), Value::Bytes(f.marks_payload.clone())),
-        (Value::Integer(13.into()), Value::Bytes(f.signature.to_vec())),
+        (
+            Value::Integer(6.into()),
+            Value::Bytes(f.marks_payload.clone()),
+        ),
+        (
+            Value::Integer(13.into()),
+            Value::Bytes(f.signature.to_vec()),
+        ),
     ];
     let mut out = Vec::new();
     ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
@@ -616,20 +654,24 @@ pub(crate) fn verify_commit_ack_bytes(
     expected: &ExpectedCommitAck,
     config: &KeystoreConfig,
 ) -> Result<(), CommitAckError> {
-    let f =
-        crate::agent_cbor::strict_decode_commit_ack(bytes, crate::agent_dispatch::MAX_REQUEST_ID_LEN)
-            .map_err(|_| CommitAckError::Malformed)?;
+    let f = crate::agent_cbor::strict_decode_commit_ack(
+        bytes,
+        crate::agent_dispatch::MAX_REQUEST_ID_LEN,
+    )
+    .map_err(|_| CommitAckError::Malformed)?;
     if f.version != COMMIT_ACK_VERSION {
         return Err(CommitAckError::Malformed);
     }
     // Ed25519 verify against the pinned sealed anchor root (verify_strict rejects torsion/small-order).
-    let key =
-        VerifyingKey::from_bytes(&config.anchor_root).map_err(|_| CommitAckError::SignatureInvalid)?;
+    let key = VerifyingKey::from_bytes(&config.anchor_root)
+        .map_err(|_| CommitAckError::SignatureInvalid)?;
     let sig = Signature::from_bytes(&f.signature);
     key.verify_strict(&commit_ack_signed_preimage(&f), &sig)
         .map_err(|_| CommitAckError::SignatureInvalid)?;
     // Scope: this ack is for THIS keystore's chain + environment (the SEALED config).
-    if f.chain_id != config.twod_chain_id || f.environment_identifier != config.environment_identifier {
+    if f.chain_id != config.twod_chain_id
+        || f.environment_identifier != config.environment_identifier
+    {
         return Err(CommitAckError::ScopeMismatch);
     }
     // Anti-replay: the ack must echo the SAME fresh per-op nonce this commit drew.
@@ -665,7 +707,11 @@ pub(crate) fn verify_commit_ack_bytes(
     feature = "lab-agent-smoke",
     all(
         feature = "agent-contract-server",
-        any(feature = "agent-keygen-exec-preview", feature = "agent-configure-treasury-preview", feature = "agent-sign-faucet-preview")
+        any(
+            feature = "agent-keygen-exec-preview",
+            feature = "agent-configure-treasury-preview",
+            feature = "agent-sign-faucet-preview"
+        )
     )
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -695,13 +741,25 @@ pub(crate) fn test_signed_commit_ack_bytes(
     let map: Vec<(Value, Value)> = vec![
         (Value::Integer(1.into()), Value::Integer(f.version.into())),
         (Value::Integer(2.into()), Value::Integer(f.chain_id.into())),
-        (Value::Integer(3.into()), Value::Text(f.environment_identifier.clone())),
+        (
+            Value::Integer(3.into()),
+            Value::Text(f.environment_identifier.clone()),
+        ),
         (Value::Integer(4.into()), Value::Integer(f.epoch.into())),
-        (Value::Integer(5.into()), Value::Integer(f.structural_version.into())),
-        (Value::Integer(6.into()), Value::Bytes(f.marks_digest.to_vec())),
+        (
+            Value::Integer(5.into()),
+            Value::Integer(f.structural_version.into()),
+        ),
+        (
+            Value::Integer(6.into()),
+            Value::Bytes(f.marks_digest.to_vec()),
+        ),
         (Value::Integer(7.into()), Value::Bytes(f.nonce.to_vec())),
         (Value::Integer(8.into()), Value::Bytes(f.request_id.clone())),
-        (Value::Integer(13.into()), Value::Bytes(f.signature.to_vec())),
+        (
+            Value::Integer(13.into()),
+            Value::Bytes(f.signature.to_vec()),
+        ),
     ];
     let mut out = Vec::new();
     ciborium::ser::into_writer(&Value::Map(map), &mut out).unwrap();
@@ -765,17 +823,29 @@ mod tests {
         let mut m: Vec<(Value, Value)> = vec![
             (Value::Integer(1.into()), Value::Integer(r.version.into())),
             (Value::Integer(2.into()), Value::Integer(r.chain_id.into())),
-            (Value::Integer(3.into()), Value::Text(r.environment_identifier.clone())),
+            (
+                Value::Integer(3.into()),
+                Value::Text(r.environment_identifier.clone()),
+            ),
             (Value::Integer(4.into()), Value::Integer(r.epoch.into())),
-            (Value::Integer(5.into()), Value::Integer(r.structural_version.into())),
-            (Value::Integer(6.into()), Value::Bytes(r.marks_digest.to_vec())),
+            (
+                Value::Integer(5.into()),
+                Value::Integer(r.structural_version.into()),
+            ),
+            (
+                Value::Integer(6.into()),
+                Value::Bytes(r.marks_digest.to_vec()),
+            ),
             (Value::Integer(7.into()), Value::Bytes(r.nonce.to_vec())),
         ];
         if let (Some(h), Some(bh)) = (r.chain_height, r.chain_block_hash) {
             m.push((Value::Integer(8.into()), Value::Integer(h.into())));
             m.push((Value::Integer(9.into()), Value::Bytes(bh.to_vec())));
         }
-        m.push((Value::Integer(13.into()), Value::Bytes(r.signature.to_vec())));
+        m.push((
+            Value::Integer(13.into()),
+            Value::Bytes(r.signature.to_vec()),
+        ));
         m
     }
 
@@ -794,28 +864,51 @@ mod tests {
     fn wrong_anchor_key_rejected() {
         let cfg = test_config();
         let nonce = [0x33u8; 32];
-        let resp = signed_response(&SigningKey::from_bytes(&[9u8; 32]), TEST_CHAIN, TEST_ENV, 7, 2, [0xab; 32], nonce);
-        assert_eq!(verify_anchor_response(&resp, &nonce, &cfg), Err(AnchorError::SignatureInvalid));
+        let resp = signed_response(
+            &SigningKey::from_bytes(&[9u8; 32]),
+            TEST_CHAIN,
+            TEST_ENV,
+            7,
+            2,
+            [0xab; 32],
+            nonce,
+        );
+        assert_eq!(
+            verify_anchor_response(&resp, &nonce, &cfg),
+            Err(AnchorError::SignatureInvalid)
+        );
     }
 
     #[test]
     fn tampered_field_breaks_signature() {
         let cfg = test_config();
         let nonce = [0x33u8; 32];
-        let mut resp = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, 7, 2, [0xab; 32], nonce);
+        let mut resp =
+            signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, 7, 2, [0xab; 32], nonce);
         // bump epoch (key 4) after signing ⇒ preimage no longer matches.
         for (k, v) in resp.iter_mut() {
             if matches!(k, Value::Integer(i) if u64::try_from(*i).ok() == Some(4)) {
                 *v = Value::Integer(8.into());
             }
         }
-        assert_eq!(verify_anchor_response(&resp, &nonce, &cfg), Err(AnchorError::SignatureInvalid));
+        assert_eq!(
+            verify_anchor_response(&resp, &nonce, &cfg),
+            Err(AnchorError::SignatureInvalid)
+        );
     }
 
     #[test]
     fn stale_nonce_rejected() {
         let cfg = test_config();
-        let resp = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, 7, 2, [0xab; 32], [0x11; 32]);
+        let resp = signed_response(
+            &anchor_key(),
+            TEST_CHAIN,
+            TEST_ENV,
+            7,
+            2,
+            [0xab; 32],
+            [0x11; 32],
+        );
         assert_eq!(
             verify_anchor_response(&resp, &[0x22; 32], &cfg),
             Err(AnchorError::NonceMismatch)
@@ -831,7 +924,15 @@ mod tests {
             verify_anchor_response(&resp, &nonce, &test_config()),
             Err(AnchorError::ScopeMismatch)
         );
-        let resp2 = signed_response(&anchor_key(), TEST_CHAIN, "other-env", 7, 2, [0xab; 32], nonce);
+        let resp2 = signed_response(
+            &anchor_key(),
+            TEST_CHAIN,
+            "other-env",
+            7,
+            2,
+            [0xab; 32],
+            nonce,
+        );
         assert_eq!(
             verify_anchor_response(&resp2, &nonce, &test_config()),
             Err(AnchorError::ScopeMismatch)
@@ -855,7 +956,10 @@ mod tests {
             signature: [0u8; 64],
         };
         r.signature = anchor_key().sign(&signed_preimage(&r)).to_bytes();
-        assert_eq!(verify_anchor_response(&cap_to_map(&r), &nonce, &cfg), Err(AnchorError::Malformed));
+        assert_eq!(
+            verify_anchor_response(&cap_to_map(&r), &nonce, &cfg),
+            Err(AnchorError::Malformed)
+        );
     }
 
     #[test]
@@ -897,7 +1001,10 @@ mod tests {
             (Value::Integer(8.into()), Value::Integer(123.into())), // height, no key 9
             (Value::Integer(13.into()), Value::Bytes(vec![0u8; 64])),
         ];
-        assert_eq!(verify_anchor_response(&map, &nonce, &cfg), Err(AnchorError::Malformed));
+        assert_eq!(
+            verify_anchor_response(&map, &nonce, &cfg),
+            Err(AnchorError::Malformed)
+        );
     }
 
     #[test]
@@ -911,7 +1018,10 @@ mod tests {
             chain_block_hash: None,
         };
         // Same epoch + matching marks/structural ⇒ Fresh.
-        assert_eq!(reconcile(5, 2, &marks, &anchor(5, 2, marks)), ReconcileDecision::Fresh);
+        assert_eq!(
+            reconcile(5, 2, &marks, &anchor(5, 2, marks)),
+            ReconcileDecision::Fresh
+        );
         // Same epoch but differing marks ⇒ Inconsistent.
         assert_eq!(
             reconcile(5, 2, &marks, &anchor(5, 2, [0x00; 32])),
@@ -959,8 +1069,14 @@ mod tests {
         let b = anchor_handshake_report_data(TEST_CHAIN, TEST_ENV, &n);
         assert_eq!(a, b);
         // A different nonce / chain / env changes the binding.
-        assert_ne!(a, anchor_handshake_report_data(TEST_CHAIN, TEST_ENV, &[0x34; 32]));
-        assert_ne!(a, anchor_handshake_report_data(TEST_CHAIN + 1, TEST_ENV, &n));
+        assert_ne!(
+            a,
+            anchor_handshake_report_data(TEST_CHAIN, TEST_ENV, &[0x34; 32])
+        );
+        assert_ne!(
+            a,
+            anchor_handshake_report_data(TEST_CHAIN + 1, TEST_ENV, &n)
+        );
         assert_ne!(a, anchor_handshake_report_data(TEST_CHAIN, "other", &n));
     }
 
@@ -1056,7 +1172,10 @@ mod tests {
                 }
             }
         }
-        assert!(found, "expected at least one invalid Ed25519 point encoding");
+        assert!(
+            found,
+            "expected at least one invalid Ed25519 point encoding"
+        );
         let mut cfg = test_config();
         cfg.anchor_root = bad;
         let nonce = [0x33u8; 32];
@@ -1184,7 +1303,10 @@ mod tests {
         let bytes = good_marks_response(&payload);
         let got = verify_marks_response_bytes(&bytes, &TEST_NONCE, TEST_EPOCH, &test_config())
             .expect("conformant marks response verifies");
-        assert_eq!(got, payload, "the authenticated marks_payload is returned verbatim");
+        assert_eq!(
+            got, payload,
+            "the authenticated marks_payload is returned verbatim"
+        );
     }
 
     #[test]
@@ -1206,7 +1328,12 @@ mod tests {
         let payload = marks_payload_bytes();
         // wrong chain_id → ScopeMismatch
         let bad_chain = test_signed_marks_response_bytes(
-            &anchor_key(), TEST_CHAIN + 1, TEST_ENV, TEST_EPOCH, TEST_NONCE, payload.clone(),
+            &anchor_key(),
+            TEST_CHAIN + 1,
+            TEST_ENV,
+            TEST_EPOCH,
+            TEST_NONCE,
+            payload.clone(),
         );
         assert_eq!(
             verify_marks_response_bytes(&bad_chain, &TEST_NONCE, TEST_EPOCH, &test_config()),
@@ -1214,7 +1341,12 @@ mod tests {
         );
         // wrong env → ScopeMismatch
         let bad_env = test_signed_marks_response_bytes(
-            &anchor_key(), TEST_CHAIN, "other-env", TEST_EPOCH, TEST_NONCE, payload.clone(),
+            &anchor_key(),
+            TEST_CHAIN,
+            "other-env",
+            TEST_EPOCH,
+            TEST_NONCE,
+            payload.clone(),
         );
         assert_eq!(
             verify_marks_response_bytes(&bad_env, &TEST_NONCE, TEST_EPOCH, &test_config()),
@@ -1237,7 +1369,9 @@ mod tests {
     fn marks_response_rejects_noncanonical_outer_and_trailing() {
         let good = good_marks_response(&marks_payload_bytes());
         // canonical verifies
-        assert!(verify_marks_response_bytes(&good, &TEST_NONCE, TEST_EPOCH, &test_config()).is_ok());
+        assert!(
+            verify_marks_response_bytes(&good, &TEST_NONCE, TEST_EPOCH, &test_config()).is_ok()
+        );
         // trailing byte → Malformed (strict outer decode rejects)
         let mut trailing = good.clone();
         trailing.push(0x00);
@@ -1252,11 +1386,22 @@ mod tests {
         // A FRESHNESS response (ANCHOR_DOMAIN) must NOT verify as a marks response, and vice-versa —
         // the distinct MARKS_RESP_DOMAIN makes a cross-protocol signature substitution unrepresentable.
         let cfg = test_config();
-        let freshness_map = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, TEST_EPOCH, 1, [0; 32], TEST_NONCE);
+        let freshness_map = signed_response(
+            &anchor_key(),
+            TEST_CHAIN,
+            TEST_ENV,
+            TEST_EPOCH,
+            1,
+            [0; 32],
+            TEST_NONCE,
+        );
         let mut freshness_bytes = Vec::new();
-        ciborium::ser::into_writer(&Value::Map(freshness_map.clone()), &mut freshness_bytes).unwrap();
+        ciborium::ser::into_writer(&Value::Map(freshness_map.clone()), &mut freshness_bytes)
+            .unwrap();
         // freshness bytes decode to the wrong key-set/shape for the marks parser → never Ok.
-        assert!(verify_marks_response_bytes(&freshness_bytes, &TEST_NONCE, TEST_EPOCH, &cfg).is_err());
+        assert!(
+            verify_marks_response_bytes(&freshness_bytes, &TEST_NONCE, TEST_EPOCH, &cfg).is_err()
+        );
         // The freshness response itself still verifies through ITS own path (sanity — no collateral break).
         assert!(verify_anchor_response(&freshness_map, &TEST_NONCE, &cfg).is_ok());
         // A marks response must not verify through the freshness path either: its key 6 is a bstr (the
@@ -1308,8 +1453,14 @@ mod tests {
     fn commit_ack_rejects_wrong_signer() {
         let other = SigningKey::from_bytes(&[9u8; 32]);
         let bytes = test_signed_commit_ack_bytes(
-            &other, TEST_CHAIN, TEST_ENV, TEST_EPOCH, TEST_STRUCTURAL,
-            TEST_MARKS_DIGEST, TEST_NONCE, TEST_REQUEST_ID.to_vec(),
+            &other,
+            TEST_CHAIN,
+            TEST_ENV,
+            TEST_EPOCH,
+            TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST,
+            TEST_NONCE,
+            TEST_REQUEST_ID.to_vec(),
         );
         assert_eq!(
             verify_commit_ack_bytes(&bytes, &commit_expected(), &test_config()),
@@ -1320,16 +1471,28 @@ mod tests {
     #[test]
     fn commit_ack_rejects_scope_mismatch() {
         let bad_chain = test_signed_commit_ack_bytes(
-            &anchor_key(), TEST_CHAIN + 1, TEST_ENV, TEST_EPOCH, TEST_STRUCTURAL,
-            TEST_MARKS_DIGEST, TEST_NONCE, TEST_REQUEST_ID.to_vec(),
+            &anchor_key(),
+            TEST_CHAIN + 1,
+            TEST_ENV,
+            TEST_EPOCH,
+            TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST,
+            TEST_NONCE,
+            TEST_REQUEST_ID.to_vec(),
         );
         assert_eq!(
             verify_commit_ack_bytes(&bad_chain, &commit_expected(), &test_config()),
             Err(CommitAckError::ScopeMismatch)
         );
         let bad_env = test_signed_commit_ack_bytes(
-            &anchor_key(), TEST_CHAIN, "other-env", TEST_EPOCH, TEST_STRUCTURAL,
-            TEST_MARKS_DIGEST, TEST_NONCE, TEST_REQUEST_ID.to_vec(),
+            &anchor_key(),
+            TEST_CHAIN,
+            "other-env",
+            TEST_EPOCH,
+            TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST,
+            TEST_NONCE,
+            TEST_REQUEST_ID.to_vec(),
         );
         assert_eq!(
             verify_commit_ack_bytes(&bad_env, &commit_expected(), &test_config()),
@@ -1345,23 +1508,58 @@ mod tests {
         let good = good_commit_ack();
         let zero = [0x00u8; 32];
         assert_eq!(
-            verify_commit_ack_bytes(&good, &ExpectedCommitAck { nonce: &zero, ..commit_expected() }, &cfg),
+            verify_commit_ack_bytes(
+                &good,
+                &ExpectedCommitAck {
+                    nonce: &zero,
+                    ..commit_expected()
+                },
+                &cfg
+            ),
             Err(CommitAckError::NonceMismatch)
         );
         assert_eq!(
-            verify_commit_ack_bytes(&good, &ExpectedCommitAck { epoch: TEST_EPOCH + 1, ..commit_expected() }, &cfg),
+            verify_commit_ack_bytes(
+                &good,
+                &ExpectedCommitAck {
+                    epoch: TEST_EPOCH + 1,
+                    ..commit_expected()
+                },
+                &cfg
+            ),
             Err(CommitAckError::EpochMismatch)
         );
         assert_eq!(
-            verify_commit_ack_bytes(&good, &ExpectedCommitAck { structural_version: TEST_STRUCTURAL + 1, ..commit_expected() }, &cfg),
+            verify_commit_ack_bytes(
+                &good,
+                &ExpectedCommitAck {
+                    structural_version: TEST_STRUCTURAL + 1,
+                    ..commit_expected()
+                },
+                &cfg
+            ),
             Err(CommitAckError::StructuralMismatch)
         );
         assert_eq!(
-            verify_commit_ack_bytes(&good, &ExpectedCommitAck { marks_digest: &zero, ..commit_expected() }, &cfg),
+            verify_commit_ack_bytes(
+                &good,
+                &ExpectedCommitAck {
+                    marks_digest: &zero,
+                    ..commit_expected()
+                },
+                &cfg
+            ),
             Err(CommitAckError::MarksMismatch)
         );
         assert_eq!(
-            verify_commit_ack_bytes(&good, &ExpectedCommitAck { request_id: b"other-op", ..commit_expected() }, &cfg),
+            verify_commit_ack_bytes(
+                &good,
+                &ExpectedCommitAck {
+                    request_id: b"other-op",
+                    ..commit_expected()
+                },
+                &cfg
+            ),
             Err(CommitAckError::RequestIdMismatch)
         );
     }
@@ -1370,18 +1568,33 @@ mod tests {
     fn commit_ack_rejects_noncanonical_trailing_and_over_cap_request_id() {
         let cfg = test_config();
         let good = good_commit_ack();
-        assert_eq!(verify_commit_ack_bytes(&good, &commit_expected(), &cfg), Ok(()));
+        assert_eq!(
+            verify_commit_ack_bytes(&good, &commit_expected(), &cfg),
+            Ok(())
+        );
         // trailing byte → Malformed (strict outer decode rejects)
         let mut trailing = good.clone();
         trailing.push(0x00);
-        assert_eq!(verify_commit_ack_bytes(&trailing, &commit_expected(), &cfg), Err(CommitAckError::Malformed));
+        assert_eq!(
+            verify_commit_ack_bytes(&trailing, &commit_expected(), &cfg),
+            Err(CommitAckError::Malformed)
+        );
         // request_id over the 64-byte cap → Malformed at decode, BEFORE any field-echo check
         let big_id = vec![0x41u8; crate::agent_dispatch::MAX_REQUEST_ID_LEN + 1];
         let over = test_signed_commit_ack_bytes(
-            &anchor_key(), TEST_CHAIN, TEST_ENV, TEST_EPOCH, TEST_STRUCTURAL,
-            TEST_MARKS_DIGEST, TEST_NONCE, big_id,
+            &anchor_key(),
+            TEST_CHAIN,
+            TEST_ENV,
+            TEST_EPOCH,
+            TEST_STRUCTURAL,
+            TEST_MARKS_DIGEST,
+            TEST_NONCE,
+            big_id,
         );
-        assert_eq!(verify_commit_ack_bytes(&over, &commit_expected(), &cfg), Err(CommitAckError::Malformed));
+        assert_eq!(
+            verify_commit_ack_bytes(&over, &commit_expected(), &cfg),
+            Err(CommitAckError::Malformed)
+        );
     }
 
     #[test]
@@ -1398,7 +1611,15 @@ mod tests {
         let marks = good_marks_response(&marks_payload_bytes());
         assert!(verify_commit_ack_bytes(&marks, &commit_expected(), &cfg).is_err());
         // a freshness response does not verify as a commit ack
-        let freshness_map = signed_response(&anchor_key(), TEST_CHAIN, TEST_ENV, TEST_EPOCH, 1, [0; 32], TEST_NONCE);
+        let freshness_map = signed_response(
+            &anchor_key(),
+            TEST_CHAIN,
+            TEST_ENV,
+            TEST_EPOCH,
+            1,
+            [0; 32],
+            TEST_NONCE,
+        );
         let mut freshness_bytes = Vec::new();
         ciborium::ser::into_writer(&Value::Map(freshness_map), &mut freshness_bytes).unwrap();
         assert!(verify_commit_ack_bytes(&freshness_bytes, &commit_expected(), &cfg).is_err());

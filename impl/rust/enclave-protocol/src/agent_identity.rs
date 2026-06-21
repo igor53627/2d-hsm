@@ -18,8 +18,8 @@
 
 use crate::agent_keystore::{KeyEntry, KeyPurpose, KeystoreBody};
 use crate::secp256k1::{
-    eth_address_from_uncompressed, keccak256, tron_address_from_body, Keypair, RecoverableSignature,
-    Secp256k1Error,
+    eth_address_from_uncompressed, keccak256, tron_address_from_body, Keypair,
+    RecoverableSignature, Secp256k1Error,
 };
 
 /// EIP-191 non-transaction domain byte. Structurally disjoint from eth RLP (`≥0xc0`) and TRON
@@ -72,8 +72,7 @@ pub fn identity_proof_preimage(
     if !crate::agent_keystore::is_valid_environment_identifier(environment_identifier) {
         return Err(IdentityProofError::InvalidEnvironmentId);
     }
-    let mut out =
-        Vec::with_capacity(1 + 1 + label.len() + 8 + 1 + env.len() + 32 + 65 + 20 + 32);
+    let mut out = Vec::with_capacity(1 + 1 + label.len() + 8 + 1 + env.len() + 32 + 65 + 20 + 32);
     out.push(EIP191_DOMAIN);
     out.push(label.len() as u8);
     out.extend_from_slice(label);
@@ -118,7 +117,12 @@ pub fn sign_identity_proof(
     )?;
     let signing_hash = keccak256(&preimage);
     let signature = keypair.sign_prehashed(&signing_hash)?;
-    Ok(IdentityProof { signature, pubkey_uncompressed, address, signing_hash })
+    Ok(IdentityProof {
+        signature,
+        pubkey_uncompressed,
+        address,
+        signing_hash,
+    })
 }
 
 /// Agent Gateway backend version reported with the public identity (TASK-7.1 §10).
@@ -203,14 +207,23 @@ mod tests {
             f["chain_id"].as_u64().unwrap(),
             f["environment_identifier"].as_str().unwrap(),
             &arr32(f["key_ref"].as_str().unwrap()),
-            &unhex(f["pubkey_uncompressed"].as_str().unwrap()).try_into().unwrap(),
+            &unhex(f["pubkey_uncompressed"].as_str().unwrap())
+                .try_into()
+                .unwrap(),
             &unhex(f["address"].as_str().unwrap()).try_into().unwrap(),
             &arr32(f["verifier_nonce"].as_str().unwrap()),
         )
         .unwrap();
         assert_eq!(pre[0], EIP191_DOMAIN, "EIP-191 domain byte");
-        assert_eq!(pre, PREIMAGE_BIN, "preimage must be byte-exact vs identity_proof_v1.preimage.bin");
-        assert_eq!(keccak256(&pre).as_slice(), SIGNING_HASH_BIN, "signing hash byte-exact");
+        assert_eq!(
+            pre, PREIMAGE_BIN,
+            "preimage must be byte-exact vs identity_proof_v1.preimage.bin"
+        );
+        assert_eq!(
+            keccak256(&pre).as_slice(),
+            SIGNING_HASH_BIN,
+            "signing hash byte-exact"
+        );
     }
 
     #[test]
@@ -227,18 +240,34 @@ mod tests {
         .unwrap();
 
         // The proof binds the signer's own derived address/pubkey (not caller-supplied).
-        assert_eq!(proof.address.to_vec(), unhex(f["address"].as_str().unwrap()), "bound address");
+        assert_eq!(
+            proof.address.to_vec(),
+            unhex(f["address"].as_str().unwrap()),
+            "bound address"
+        );
         assert_eq!(
             proof.pubkey_uncompressed.to_vec(),
             unhex(f["pubkey_uncompressed"].as_str().unwrap()),
             "bound pubkey"
         );
-        assert_eq!(proof.signing_hash.as_slice(), SIGNING_HASH_BIN, "signing hash");
+        assert_eq!(
+            proof.signing_hash.as_slice(),
+            SIGNING_HASH_BIN,
+            "signing hash"
+        );
 
         // Signature byte-exact vs the frozen golden signature, and low-S.
         let sig = &serde_json::from_str::<Value>(IDP).unwrap()["signature"];
-        assert_eq!(proof.signature.r.to_vec(), unhex(sig["r"].as_str().unwrap()), "r");
-        assert_eq!(proof.signature.s.to_vec(), unhex(sig["s"].as_str().unwrap()), "s");
+        assert_eq!(
+            proof.signature.r.to_vec(),
+            unhex(sig["r"].as_str().unwrap()),
+            "r"
+        );
+        assert_eq!(
+            proof.signature.s.to_vec(),
+            unhex(sig["s"].as_str().unwrap()),
+            "s"
+        );
         assert_eq!(
             proof.signature.recovery_id as u64,
             sig["recovery_id"].as_u64().unwrap(),
@@ -249,7 +278,10 @@ mod tests {
         let recovered =
             crate::secp256k1::recover_pubkey_uncompressed(&proof.signing_hash, &proof.signature)
                 .unwrap();
-        assert_eq!(recovered, proof.pubkey_uncompressed, "recovered == bound pubkey");
+        assert_eq!(
+            recovered, proof.pubkey_uncompressed,
+            "recovered == bound pubkey"
+        );
     }
 
     #[test]
@@ -270,9 +302,19 @@ mod tests {
 
     #[test]
     fn invalid_env_id_rejected() {
-        let (key_ref, pubkey, address, nonce) = ([0x01u8; 32], [0x04u8; 65], [0x02u8; 20], [0x03u8; 32]);
+        let (key_ref, pubkey, address, nonce) =
+            ([0x01u8; 32], [0x04u8; 65], [0x02u8; 20], [0x03u8; 32]);
         let too_long = "a".repeat(65);
-        for bad in ["", "Main", "x_y", "-x", "x-", "a--b", "под", too_long.as_str()] {
+        for bad in [
+            "",
+            "Main",
+            "x_y",
+            "-x",
+            "x-",
+            "a--b",
+            "под",
+            too_long.as_str(),
+        ] {
             assert_eq!(
                 identity_proof_preimage(1, bad, &key_ref, &pubkey, &address, &nonce),
                 Err(IdentityProofError::InvalidEnvironmentId),
@@ -293,7 +335,11 @@ mod tests {
             algorithm: KeyAlgorithm::Secp256k1,
             public_identity: unhex(k[name]["pubkey_uncompressed_sec1"].as_str().unwrap()),
             secret_scalar: zeroize::Zeroizing::new(vec![0u8; 32]), // unused by PUBLIC_IDENTITY
-            creation_metadata: CreationMetadata { config_version: 1, counter_snapshot: 0, batch_id: 1 },
+            creation_metadata: CreationMetadata {
+                config_version: 1,
+                counter_snapshot: 0,
+                batch_id: 1,
+            },
             backup_export_metadata: BackupExportMetadata::default(),
         }
     }
@@ -317,7 +363,11 @@ mod tests {
                 k[name]["eth_address"].as_str().unwrap(),
                 "{name} eth address"
             );
-            assert_eq!(id.tron_address, k[name]["tron_address"].as_str().unwrap(), "{name} TRON address");
+            assert_eq!(
+                id.tron_address,
+                k[name]["tron_address"].as_str().unwrap(),
+                "{name} TRON address"
+            );
             assert_eq!(id.key_purpose, purpose, "{name} purpose");
             assert_eq!(id.agent_version, AGENT_GATEWAY_VERSION);
         }
@@ -341,7 +391,11 @@ mod tests {
             },
             entries: vec![
                 entry_from_keys("transfer_key", KeyPurpose::AgentTransferK1, [0x11; 32]),
-                entry_from_keys("treasury_key", KeyPurpose::AgentFaucetTreasuryK1, [0x22; 32]),
+                entry_from_keys(
+                    "treasury_key",
+                    KeyPurpose::AgentFaucetTreasuryK1,
+                    [0x22; 32],
+                ),
             ],
             counters: vec![],
             faucet: FaucetState {
@@ -353,13 +407,27 @@ mod tests {
                 circuit_breaker_threshold: None,
                 cumulative_signing_budget: [0; 32],
             },
-            audit: AuditRing { records: vec![], capacity: 0, last_exported_seq: 0, next_seq: 0 },
+            audit: AuditRing {
+                records: vec![],
+                capacity: 0,
+                last_exported_seq: 0,
+                next_seq: 0,
+            },
             freshness_epoch: 0,
             structural_version: 1,
             strict_recovery_counter: 0,
         };
-        assert_eq!(find_entry(&body, &[0x11; 32]).unwrap().purpose, KeyPurpose::AgentTransferK1);
-        assert_eq!(find_entry(&body, &[0x22; 32]).unwrap().purpose, KeyPurpose::AgentFaucetTreasuryK1);
-        assert!(find_entry(&body, &[0xff; 32]).is_none(), "unknown key_ref ⇒ None");
+        assert_eq!(
+            find_entry(&body, &[0x11; 32]).unwrap().purpose,
+            KeyPurpose::AgentTransferK1
+        );
+        assert_eq!(
+            find_entry(&body, &[0x22; 32]).unwrap().purpose,
+            KeyPurpose::AgentFaucetTreasuryK1
+        );
+        assert!(
+            find_entry(&body, &[0xff; 32]).is_none(),
+            "unknown key_ref ⇒ None"
+        );
     }
 }

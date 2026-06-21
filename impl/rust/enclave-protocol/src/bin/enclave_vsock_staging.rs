@@ -20,10 +20,10 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use enclave_protocol::enclave_serve::{run_incoming_accept_loop, SharedEnclaveRuntime};
-    use enclave_protocol::{is_sealed_signer_installed, pq_signing_ready, ProtocolError};
     use enclave_protocol::vsock_listen::{
         bind_vsock_listener, configure_vsock_session_timeouts, vsock_listen_addr_from_env,
     };
+    use enclave_protocol::{is_sealed_signer_installed, pq_signing_ready, ProtocolError};
     use std::sync::Arc;
 
     let (cid, port) = vsock_listen_addr_from_env()

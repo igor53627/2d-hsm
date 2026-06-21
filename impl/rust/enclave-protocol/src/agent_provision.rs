@@ -31,11 +31,11 @@
 //! (RFC 8949 §4.2.1) via [`crate::agent_cbor`], so a non-canonical or oversized input fails closed
 //! with a distinguishable [`ProvisionError`] rather than reaching the crypto.
 
+use crate::agent_capability::{put_bytes, put_text, put_uint};
 use crate::agent_cbor::{
     as_bytes, as_bytes32, as_bytes_n, as_u64, check_strict_keys, map_get, strict_decode_map,
     strict_decode_map_capped,
 };
-use crate::agent_capability::{put_bytes, put_text, put_uint};
 use crate::agent_keystore::{
     is_valid_environment_identifier, MAX_KEYSTORE_BLOB_SIZE, ML_KEM_1024_ENCAPS_KEY_LEN,
 };
@@ -470,11 +470,10 @@ pub(crate) fn decode_config_map(bytes: &[u8]) -> Result<ProvisionConfig, Provisi
     }
     let twod_chain_id = as_u64(map_get(&map, 1).ok_or(ProvisionError::Malformed)?)
         .ok_or(ProvisionError::Malformed)?;
-    let environment_identifier =
-        match map_get(&map, 2).ok_or(ProvisionError::Malformed)? {
-            ciborium::Value::Text(s) => s.clone(),
-            _ => return Err(ProvisionError::Malformed),
-        };
+    let environment_identifier = match map_get(&map, 2).ok_or(ProvisionError::Malformed)? {
+        ciborium::Value::Text(s) => s.clone(),
+        _ => return Err(ProvisionError::Malformed),
+    };
     if !is_valid_environment_identifier(&environment_identifier) {
         return Err(ProvisionError::Malformed);
     }
@@ -745,9 +744,16 @@ pub(crate) fn sig_prov_signed_bytes(
     n_e: &[u8; NONCE_LEN],
     report_hash: &[u8; DIGEST_LEN],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PROVISION_DOMAIN.len() + 4 * 4 + NONCE_LEN * 2 + DIGEST_LEN + config_map_bytes.len());
+    let mut out = Vec::with_capacity(
+        PROVISION_DOMAIN.len() + 4 * 4 + NONCE_LEN * 2 + DIGEST_LEN + config_map_bytes.len(),
+    );
     out.extend_from_slice(PROVISION_DOMAIN);
-    out.extend_from_slice(&transcript_canonical(config_map_bytes, n_p, n_e, report_hash));
+    out.extend_from_slice(&transcript_canonical(
+        config_map_bytes,
+        n_p,
+        n_e,
+        report_hash,
+    ));
     out
 }
 
@@ -782,12 +788,7 @@ pub(crate) fn verify_m3_transcript_and_sig(
     }
 
     // Step 4: Sig_PROV over PROVISION_DOMAIN ‖ canonical-CBOR({1: config_map_bytes, 2..=4 ...}).
-    let signed = sig_prov_signed_bytes(
-        &m3.config_map_bytes,
-        &m3.n_p,
-        &m3.n_e,
-        &m3.report_hash,
-    );
+    let signed = sig_prov_signed_bytes(&m3.config_map_bytes, &m3.n_p, &m3.n_e, &m3.report_hash);
     let sig = Signature::from_bytes(&m3.sig_prov);
     prov_pub
         .verify_strict(&signed, &sig)
@@ -824,7 +825,13 @@ pub(crate) fn verify_m3_in_order(
     // §6 step 2: cert chain (single-level leaf ← pinned root + role EKU).
     let prov_pub = verify_provisioner_cert(&m3.provisioner_cert, pinned_root)?;
     // §6 steps 3+4: transcript reconstruction (byte-compare to the live session) + Sig_PROV verify.
-    verify_m3_transcript_and_sig(&m3, &prov_pub, session_n_p, session_n_e, session_report_hash)?;
+    verify_m3_transcript_and_sig(
+        &m3,
+        &prov_pub,
+        session_n_p,
+        session_n_e,
+        session_report_hash,
+    )?;
     // §6 step 5: config re-decode (post-signature: the config bytes are now Sig_PROV-bound).
     let config = decode_config_map(&m3.config_map_bytes)?;
     Ok((config, prov_pub))
@@ -833,7 +840,9 @@ pub(crate) fn verify_m3_in_order(
 // Mint + seal (slice 25-2b-iv) — the in-TEE enclave_scope_id provenance + the sealed M4 blob
 // ════════════════════════════════════════════════════════════════════════════════
 
-use crate::agent_keystore::{seal_body, AuditRing, FaucetState, KeystoreBody, KeystoreConfig, KeystoreError};
+use crate::agent_keystore::{
+    seal_body, AuditRing, FaucetState, KeystoreBody, KeystoreConfig, KeystoreError,
+};
 
 /// Mint the per-enclave `enclave_scope_id` (AC#3/#4 — the load-bearing host-uncontrollable
 /// provenance): a RANDOM 32-byte id drawn from the platform CSPRNG (`getrandom`), in-TEE, exactly
@@ -892,7 +901,7 @@ pub(crate) fn build_provisioned_keystore_body(
             recovery_authority_pk: config.recovery_authority_pk,
             backup_recovery_wrapping_pubkey: config.backup_recovery_wrapping_pubkey.clone(),
             monotonic_treasury_config_version: 1, // basket C init (§5.1)
-            authority_epoch: 0, // basket C init (§5.1)
+            authority_epoch: 0,                   // basket C init (§5.1)
             anchor_root: config.anchor_root,
             enclave_scope_id,
             fleet_scope_id: config.fleet_scope_id,
@@ -1040,7 +1049,11 @@ impl ProvisionSession {
                 seal_provisioned_keystore(&config, scope_id, &self.seal_root, &self.measurement)?;
             Ok((config, sealed))
         })();
-        self.state = if outcome.is_ok() { SessionState::Done } else { SessionState::Failed };
+        self.state = if outcome.is_ok() {
+            SessionState::Done
+        } else {
+            SessionState::Failed
+        };
         outcome
     }
 
@@ -1074,7 +1087,10 @@ mod tests {
 
     #[test]
     fn frozen_domains_and_magic_literals() {
-        assert_eq!(PROVISION_MAGIC, [0x32, 0x44, 0x41, 0x47, 0x50, 0x52, 0x56, 0x00]);
+        assert_eq!(
+            PROVISION_MAGIC,
+            [0x32, 0x44, 0x41, 0x47, 0x50, 0x52, 0x56, 0x00]
+        );
         assert_eq!(PROVISION_WIRE_VERSION, 1);
         assert_eq!(PROVISION_DOMAIN, b"2d-hsm/agent-provision/v1\0");
         assert_eq!(PROVISION_DOMAIN.len(), 26);
@@ -1132,7 +1148,10 @@ mod tests {
         // skip 1568 backup bytes; key 6 = bytes(32): 06 58 20
         assert_eq!(&bytes[87 + 1568..87 + 1568 + 3], &[0x06, 0x58, 0x20]);
         // skip 32 anchor bytes; key 7 = bytes(32): 07 58 20
-        assert_eq!(&bytes[87 + 1568 + 35..87 + 1568 + 35 + 3], &[0x07, 0x58, 0x20]);
+        assert_eq!(
+            &bytes[87 + 1568 + 35..87 + 1568 + 35 + 3],
+            &[0x07, 0x58, 0x20]
+        );
 
         // round-trips
         let dec = decode_config_map(&bytes).unwrap();
@@ -1153,7 +1172,11 @@ mod tests {
         for v in [0u8, 2, 0xFF] {
             let mut bad = encode_envelope(MSG_M1_CHALLENGE, &encode_m1(&[0x11; 32]));
             bad[8] = v;
-            assert_eq!(decode_envelope(&bad), Err(ProvisionError::UnsupportedVersion), "v={v}");
+            assert_eq!(
+                decode_envelope(&bad),
+                Err(ProvisionError::UnsupportedVersion),
+                "v={v}"
+            );
         }
     }
 
@@ -1162,7 +1185,11 @@ mod tests {
         for t in [0u8, 5, 0xFF] {
             let mut bad = encode_envelope(MSG_M1_CHALLENGE, &encode_m1(&[0x11; 32]));
             bad[9] = t;
-            assert_eq!(decode_envelope(&bad), Err(ProvisionError::Malformed), "t={t}");
+            assert_eq!(
+                decode_envelope(&bad),
+                Err(ProvisionError::Malformed),
+                "t={t}"
+            );
         }
     }
 
@@ -1201,17 +1228,44 @@ mod tests {
     #[test]
     fn direction_wrong_role_or_state_is_malformed() {
         // enclave receiving M2/M4, or M3 before M1
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM1, MSG_M2_ATTEST), Err(ProvisionError::Malformed));
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM1, MSG_M4_SEALED), Err(ProvisionError::Malformed));
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM1, MSG_M3_CONFIG), Err(ProvisionError::Malformed));
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM3, MSG_M1_CHALLENGE), Err(ProvisionError::Malformed));
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM1, MSG_M2_ATTEST),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM1, MSG_M4_SEALED),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM1, MSG_M3_CONFIG),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM3, MSG_M1_CHALLENGE),
+            Err(ProvisionError::Malformed)
+        );
         // provisioner receiving M1/M3, or M4 before M2
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM2, MSG_M1_CHALLENGE), Err(ProvisionError::Malformed));
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM2, MSG_M3_CONFIG), Err(ProvisionError::Malformed));
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM2, MSG_M4_SEALED), Err(ProvisionError::Malformed));
-        assert_eq!(validate_inbound(HandshakeStep::AwaitingM4, MSG_M2_ATTEST), Err(ProvisionError::Malformed));
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM2, MSG_M1_CHALLENGE),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM2, MSG_M3_CONFIG),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM2, MSG_M4_SEALED),
+            Err(ProvisionError::Malformed)
+        );
+        assert_eq!(
+            validate_inbound(HandshakeStep::AwaitingM4, MSG_M2_ATTEST),
+            Err(ProvisionError::Malformed)
+        );
         // terminal state rejects everything
-        assert_eq!(validate_inbound(HandshakeStep::Done, MSG_M1_CHALLENGE), Err(ProvisionError::Malformed));
+        assert_eq!(
+            validate_inbound(HandshakeStep::Done, MSG_M1_CHALLENGE),
+            Err(ProvisionError::Malformed)
+        );
     }
 
     // ── §9 M1 structural negatives ──────────────────────────────────────────────
@@ -1489,13 +1543,13 @@ mod tests {
     /// A cert malformation for the [`mint_cert_malform`] negative fixtures (each exercises one
     /// `Malformed` branch of [`verify_provisioner_cert`]).
     enum Malform {
-        V1,               // version 1 (no extensions) — exercises the v3 gate
-        WrongSpkiAlg,     // SPKI algorithm = Ed448, not Ed25519
+        V1,                // version 1 (no extensions) — exercises the v3 gate
+        WrongSpkiAlg,      // SPKI algorithm = Ed448, not Ed25519
         SpkiParamsPresent, // SPKI algorithm carries NULL params (RFC 8410 forbids them)
-        WrongPubkeyLen,   // SPKI subjectPublicKey = 31 bytes (not 32)
-        WrongSigAlg,      // BOTH signature AlgorithmIdentifiers = Ed448 (SPKI stays Ed25519)
-        WrongSigAlgInner, // only tbs.signature (inner) = Ed448; outer stays Ed25519
-        WrongSigAlgOuter, // only cert.signature_algorithm (outer) = Ed448; inner stays Ed25519
+        WrongPubkeyLen,    // SPKI subjectPublicKey = 31 bytes (not 32)
+        WrongSigAlg,       // BOTH signature AlgorithmIdentifiers = Ed448 (SPKI stays Ed25519)
+        WrongSigAlgInner,  // only tbs.signature (inner) = Ed448; outer stays Ed25519
+        WrongSigAlgOuter,  // only cert.signature_algorithm (outer) = Ed448; inner stays Ed25519
     }
 
     /// `mint_cert` + an optional single [`Malform`]. Each malformation is applied independently and
@@ -1506,18 +1560,18 @@ mod tests {
         ekus: Option<&[x509_cert::der::asn1::ObjectIdentifier]>,
         malform: Option<Malform>,
     ) -> Vec<u8> {
+        use ed25519_dalek::Signer;
         use std::str::FromStr;
         use std::time::Duration;
         use x509_cert::der::asn1::{Any, BitString, OctetString};
         use x509_cert::der::{Encode, Tag};
-        use x509_cert::ext::Extension;
         use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::ext::Extension;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
         use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
         use x509_cert::time::Validity;
         use x509_cert::{Certificate, TbsCertificate, Version};
-        use ed25519_dalek::Signer;
 
         let ed448 = || ObjectIdentifier::new_unwrap("1.3.101.113");
         let ed25519 = || AlgorithmIdentifierOwned {
@@ -1602,8 +1656,8 @@ mod tests {
     /// `ca_sk`, so its DER is byte-deterministic (unlike `mint_cert`'s `Validity::from_now`). The
     /// §10.4 byte-exact cert golden is frozen from this (its SHA3-256 hash).
     fn golden_provisioner_cert(ca_sk: &SigningKey, prov_pub: &VerifyingKey) -> Vec<u8> {
-        use std::str::FromStr;
         use ed25519_dalek::Signer;
+        use std::str::FromStr;
         use x509_cert::der::asn1::{BitString, OctetString, UtcTime};
         use x509_cert::der::{DateTime, Encode};
         use x509_cert::ext::pkix::ExtendedKeyUsage;
@@ -1624,13 +1678,18 @@ mod tests {
         };
         let nb = UtcTime::from_date_time(DateTime::new(2025, 1, 1, 0, 0, 0).unwrap()).unwrap();
         let na = UtcTime::from_date_time(DateTime::new(2035, 1, 1, 0, 0, 0).unwrap()).unwrap();
-        let eku_der = ExtendedKeyUsage(vec![PROVISIONER_EKU_OID]).to_der().unwrap();
+        let eku_der = ExtendedKeyUsage(vec![PROVISIONER_EKU_OID])
+            .to_der()
+            .unwrap();
         let tbs = TbsCertificate {
             version: Version::V3,
             serial_number: SerialNumber::from(1u32),
             signature: alg.clone(),
             issuer: Name::from_str("CN=test-operator-ca").unwrap(),
-            validity: Validity { not_before: nb.into(), not_after: na.into() },
+            validity: Validity {
+                not_before: nb.into(),
+                not_after: na.into(),
+            },
             subject: Name::from_str("CN=test-provisioner").unwrap(),
             subject_public_key_info: spki,
             issuer_unique_id: None,
@@ -1656,7 +1715,6 @@ mod tests {
         SigningKey::from_bytes(&[0xC1; 32])
     }
 
-
     #[test]
     fn cert_valid_verifies_and_returns_provisioner_pubkey() {
         let ca = test_ca();
@@ -1664,7 +1722,10 @@ mod tests {
         let prov_vk = prov.verifying_key();
         let cert = mint_cert(&prov_vk, &ca, Some(&[eku_oid()]));
         // Verifies against the pinned CA root and returns the provisioner's pubkey.
-        assert_eq!(verify_provisioner_cert(&cert, &ca.verifying_key()), Ok(prov_vk));
+        assert_eq!(
+            verify_provisioner_cert(&cert, &ca.verifying_key()),
+            Ok(prov_vk)
+        );
     }
 
     #[test]
@@ -1697,8 +1758,7 @@ mod tests {
         // it chains to the root but lacks the provisioning role marker.
         let ca = test_ca();
         let prov = SigningKey::from_bytes(&[0x70; 32]);
-        let other_oid =
-            x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2"); // id-kp-clientAuth
+        let other_oid = x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2"); // id-kp-clientAuth
         let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[other_oid]));
         assert_eq!(
             verify_provisioner_cert(&cert, &ca.verifying_key()),
@@ -1866,8 +1926,8 @@ mod tests {
         // map(4), keys 1..=4 ascending, each value a bstr.
         assert_eq!(t[0], 0xA4); // map(4)
         assert_eq!(&t[1..3], &[0x01, 0x4A]); // key 1 + bytes(10) (major 2 | 10)
-        // (the rest is canonical bstr encoding of the fixed-width fields)
-        // round-trip via strict_decode_map_capped to confirm it's canonical
+                                             // (the rest is canonical bstr encoding of the fixed-width fields)
+                                             // round-trip via strict_decode_map_capped to confirm it's canonical
         use crate::agent_cbor::strict_decode_map_capped;
         assert!(strict_decode_map_capped(&t, MAX_PROV_PAYLOAD_LEN as u64).is_ok());
     }
@@ -1917,7 +1977,15 @@ mod tests {
     }
 
     /// A valid M3 + the session it was signed for + the provisioner keypair + the pinned root.
-    fn valid_m3_and_session() -> (SigningKey, SigningKey, Vec<u8>, [u8; 32], [u8; 32], [u8; 32], Vec<u8>) {
+    fn valid_m3_and_session() -> (
+        SigningKey,
+        SigningKey,
+        Vec<u8>,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+        Vec<u8>,
+    ) {
         let ca = test_ca();
         let prov = SigningKey::from_bytes(&[0x70; 32]);
         let cert = mint_cert(&prov.verifying_key(), &ca, Some(&[eku_oid()]));
@@ -1944,7 +2012,13 @@ mod tests {
         let other_n_e = [0x99u8; 32];
         let other_report_hash = [0x88u8; 32];
         assert_eq!(
-            verify_m3_in_order(&m3, &ca.verifying_key(), &n_p, &other_n_e, &other_report_hash),
+            verify_m3_in_order(
+                &m3,
+                &ca.verifying_key(),
+                &n_p,
+                &other_n_e,
+                &other_report_hash
+            ),
             Err(ProvisionError::TranscriptMismatch)
         );
     }
@@ -2075,7 +2149,10 @@ mod tests {
         let b = mint_enclave_scope_id().unwrap();
         assert_ne!(a, [0u8; 32], "minted scope id must not be all-zero");
         assert_ne!(a, [0xe1u8; 32], "must NOT be the test sentinel");
-        assert_ne!(a, b, "two mints must differ (host-uncontrollable randomness)");
+        assert_ne!(
+            a, b,
+            "two mints must differ (host-uncontrollable randomness)"
+        );
     }
 
     #[test]
@@ -2085,7 +2162,10 @@ mod tests {
         let body = build_provisioned_keystore_body(&cfg, scope_id);
         // basket B (provisioner config) carried through.
         assert_eq!(body.config.twod_chain_id, cfg.twod_chain_id);
-        assert_eq!(body.config.environment_identifier, cfg.environment_identifier);
+        assert_eq!(
+            body.config.environment_identifier,
+            cfg.environment_identifier
+        );
         assert_eq!(body.config.admin_authority_pk, cfg.admin_authority_pk);
         assert_eq!(body.config.anchor_root, cfg.anchor_root);
         assert_eq!(body.config.fleet_scope_id, cfg.fleet_scope_id);
@@ -2194,10 +2274,7 @@ mod tests {
         );
         // double on_m1 ⇒ Malformed.
         let _ = session.on_m1([0x11; 32]).unwrap();
-        assert_eq!(
-            session.on_m1([0x12; 32]),
-            Err(ProvisionError::Malformed)
-        );
+        assert_eq!(session.on_m1([0x12; 32]), Err(ProvisionError::Malformed));
     }
 
     #[test]
@@ -2206,16 +2283,25 @@ mod tests {
         let meas = b"test-measurement";
         let (mut session, _prov, m3, report, _n_p) = session_at_awaiting_m3(root, meas);
         let _ = session.on_m3(&m3, &report).unwrap(); // → Done
-        // A second on_m3 (re-provision attempt) ⇒ Malformed (terminal state).
+                                                      // A second on_m3 (re-provision attempt) ⇒ Malformed (terminal state).
         assert_eq!(session.on_m3(&m3, &report), Err(ProvisionError::Malformed));
     }
 
     #[test]
     fn validate_minted_scope_id_rejects_degenerate_and_sentinels() {
         // AC#4: the known reproducible ids a clone could use to defeat the 18-2 byte-compare.
-        assert_eq!(validate_minted_scope_id(&[0u8; 32]), Err(ProvisionError::Csprng));
-        assert_eq!(validate_minted_scope_id(&[0xe1u8; 32]), Err(ProvisionError::Csprng));
-        assert_eq!(validate_minted_scope_id(&[0xf1u8; 32]), Err(ProvisionError::Csprng));
+        assert_eq!(
+            validate_minted_scope_id(&[0u8; 32]),
+            Err(ProvisionError::Csprng)
+        );
+        assert_eq!(
+            validate_minted_scope_id(&[0xe1u8; 32]),
+            Err(ProvisionError::Csprng)
+        );
+        assert_eq!(
+            validate_minted_scope_id(&[0xf1u8; 32]),
+            Err(ProvisionError::Csprng)
+        );
         // A genuine random id passes.
         assert_eq!(validate_minted_scope_id(&[0x5cu8; 32]), Ok(()));
     }
@@ -2226,7 +2312,10 @@ mod tests {
         // fleet-scoped caps and misclassify as SealFailed downstream via KeystoreBody::validate).
         let mut cfg = sample_config();
         cfg.fleet_scope_id = [0u8; 32];
-        assert_eq!(decode_config_map(&encode_config_map(&cfg)), Err(ProvisionError::Malformed));
+        assert_eq!(
+            decode_config_map(&encode_config_map(&cfg)),
+            Err(ProvisionError::Malformed)
+        );
     }
 
     #[test]
@@ -2235,7 +2324,10 @@ mod tests {
         // it (instead of taking the fleet id from the authenticated provisioner) is caught at decode.
         let mut cfg = sample_config();
         cfg.fleet_scope_id = [0xf1u8; 32];
-        assert_eq!(decode_config_map(&encode_config_map(&cfg)), Err(ProvisionError::Malformed));
+        assert_eq!(
+            decode_config_map(&encode_config_map(&cfg)),
+            Err(ProvisionError::Malformed)
+        );
     }
 
     #[test]
@@ -2330,12 +2422,29 @@ mod tests {
         let cfg = encode_config_map(&sample_config());
         let sig = hex::decode(GOLDEN_SIG_PROV).unwrap();
         let sig: [u8; SIG_PROV_LEN] = sig.try_into().unwrap();
-        let m3 = build_m3_message(&cfg, &GOLDEN_N_P, &GOLDEN_N_E, &GOLDEN_REPORT_HASH, &sig, &cert);
+        let m3 = build_m3_message(
+            &cfg,
+            &GOLDEN_N_P,
+            &GOLDEN_N_E,
+            &GOLDEN_REPORT_HASH,
+            &sig,
+            &cert,
+        );
         // The full §6 verify order accepts the golden M3 against the golden session + pinned CA root.
-        let (config, prov_pub) = verify_m3_in_order(&m3, &ca.verifying_key(), &GOLDEN_N_P, &GOLDEN_N_E, &GOLDEN_REPORT_HASH)
-            .expect("the golden M3 MUST pass the full §6 verify order");
+        let (config, prov_pub) = verify_m3_in_order(
+            &m3,
+            &ca.verifying_key(),
+            &GOLDEN_N_P,
+            &GOLDEN_N_E,
+            &GOLDEN_REPORT_HASH,
+        )
+        .expect("the golden M3 MUST pass the full §6 verify order");
         assert_eq!(config, sample_config(), "the decoded golden config matches");
-        assert_eq!(prov_pub, prov.verifying_key(), "the authenticated provisioner pubkey matches");
+        assert_eq!(
+            prov_pub,
+            prov.verifying_key(),
+            "the authenticated provisioner pubkey matches"
+        );
         // `verify_m3_in_order` returning Ok IS the §10.4 proof: the golden M3 passes the full §6 order
         // (envelope → cert → transcript → Sig_PROV → config re-decode) and the verifier reaches the
         // mint+seal precondition (the Ok config + pubkey are exactly what seal_provisioned_keystore +
@@ -2416,5 +2525,4 @@ mod tests {
         assert_eq!(sealed_blob, m4.sealed_blob);
         assert_eq!(decoded_config, sample_config());
     }
-
 }

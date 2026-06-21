@@ -46,7 +46,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::agent_anchor::{
-    anchor_handshake_report_data, verify_anchor_response_bytes, AnchorError, AnchorState, DIGEST_LEN,
+    anchor_handshake_report_data, verify_anchor_response_bytes, AnchorError, AnchorState,
+    DIGEST_LEN,
 };
 use crate::agent_keystore::KeystoreConfig;
 use std::sync::Mutex;
@@ -270,13 +271,20 @@ mod tests {
         let nonce = *c.nonce();
         // A valid anchor response echoing the issued nonce → Ok(AnchorState) AND the challenge is
         // retired (the same take()-before-verify path as the failure case).
-        let resp =
-            crate::agent_anchor::test_signed_response_bytes(&key, CHAIN, ENV, 7, 2, [0xab; 32], nonce);
+        let resp = crate::agent_anchor::test_signed_response_bytes(
+            &key, CHAIN, ENV, 7, 2, [0xab; 32], nonce,
+        );
         let (st, ret_nonce) =
             verify_outstanding_response(&resp, &cfg).expect("a valid signed response verifies");
         assert_eq!(st.epoch, 7);
-        assert_eq!(ret_nonce, nonce, "the primitive returns the consumed nonce VALUE it verified against");
-        assert!(!has_outstanding_challenge(), "challenge consumed on success");
+        assert_eq!(
+            ret_nonce, nonce,
+            "the primitive returns the consumed nonce VALUE it verified against"
+        );
+        assert!(
+            !has_outstanding_challenge(),
+            "challenge consumed on success"
+        );
         // a replay of the (now-retired) valid response finds no outstanding challenge
         assert_eq!(
             verify_outstanding_response(&resp, &cfg),
@@ -293,7 +301,10 @@ mod tests {
         // regardless of the verify result (structural single-use).
         let r = verify_outstanding_response(&[0xff, 0xff, 0xff], &cfg);
         assert!(matches!(r, Err(ChallengeVerifyError::Anchor(_))));
-        assert!(!has_outstanding_challenge(), "challenge consumed even on verify failure");
+        assert!(
+            !has_outstanding_challenge(),
+            "challenge consumed even on verify failure"
+        );
         // a replay now finds no outstanding challenge
         assert_eq!(
             verify_outstanding_response(&[0xff, 0xff, 0xff], &cfg),
@@ -321,7 +332,11 @@ mod tests {
         let n1 = *issue_challenge(CHAIN, ENV).unwrap().nonce();
         let n2 = *issue_challenge(CHAIN, ENV).unwrap().nonce();
         let taken = consume_outstanding_challenge().unwrap();
-        assert_eq!(taken.nonce(), &n2, "consume takes the newest (overwrite) challenge");
+        assert_eq!(
+            taken.nonce(),
+            &n2,
+            "consume takes the newest (overwrite) challenge"
+        );
         assert_ne!(taken.nonce(), &n1);
         assert!(!has_outstanding_challenge());
     }
@@ -330,7 +345,10 @@ mod tests {
     fn single_use_replay_after_consume_is_none() {
         let _g = test_lock();
         issue_challenge(CHAIN, ENV).unwrap();
-        assert!(consume_outstanding_challenge().is_some(), "first consume retires it");
+        assert!(
+            consume_outstanding_challenge().is_some(),
+            "first consume retires it"
+        );
         assert!(
             consume_outstanding_challenge().is_none(),
             "a replayed (nonce,response) finds an empty slot"
@@ -349,6 +367,9 @@ mod tests {
         let _g = test_lock();
         let c = issue_challenge(CHAIN, ENV).unwrap();
         // The one stored draw flows to BOTH report_data (SNP quote) and (later) verify's expected_nonce.
-        assert_eq!(c.report_data(), anchor_handshake_report_data(CHAIN, ENV, c.nonce()));
+        assert_eq!(
+            c.report_data(),
+            anchor_handshake_report_data(CHAIN, ENV, c.nonce())
+        );
     }
 }

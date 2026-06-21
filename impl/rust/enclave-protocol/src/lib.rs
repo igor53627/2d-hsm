@@ -13,7 +13,6 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-
 // В Phase 1 мы оставляем часть публичных полей без документации,
 // чтобы не раздувать скелет. На более поздних фазах документацию нужно будет довести до высокого уровня.
 #![allow(missing_docs)]
@@ -54,9 +53,7 @@ compile_error!(
         feature = "lab-pq-seal-from-file"
     )
 ))]
-compile_error!(
-    "lab file provisioning features are for debug/integration builds only, not release"
-);
+compile_error!("lab file provisioning features are for debug/integration builds only, not release");
 
 // TASK-7.7 5b-2d: the agent sealed-keystore FILE loader + agent file provisioning root are lab/integration
 // surfaces only — they accept the sealed keystore + provisioning root from operator-supplied files, which
@@ -167,28 +164,29 @@ mod boot_input;
 pub mod boot_lab_pq_seal;
 pub use boot_lab_pq_seal::LAB_PROD_MEASUREMENT as PRODUCTION_PLACEHOLDER_MEASUREMENT;
 mod chain_proof_crypto;
-pub mod env_config;
 pub mod enclave_serve;
+pub mod env_config;
 // Reference agent keystore for the deviceless contract-test server (TASK-23). Compiled only for the
 // contract-server bin or tests, and only when `agent-gateway` provides the keystore types.
-#[cfg(all(feature = "agent-gateway", any(test, feature = "agent-contract-server")))]
+#[cfg(all(
+    feature = "agent-gateway",
+    any(test, feature = "agent-contract-server")
+))]
 pub mod reference_keystore;
 // Deviceless cross-platform 0x40 serve loop for the contract-test server (TASK-23). UDS-only, so
 // `unix`-gated (it uses std::os::unix UnixListener / UnixStream); the crate's targets are Linux + macOS.
-#[cfg(all(unix, feature = "agent-gateway", any(test, feature = "agent-contract-server")))]
-pub mod contract_server;
-#[cfg(feature = "ml-dsa-65")]
-pub mod platform_provisioning_boot;
-mod uds_listen;
-/// AF_VSOCK address/port resolution + validation (pure, gate-free so it is CI-tested without the
-/// Linux-only `vsock` crate). The socket-binding leaf is the gated [`vsock_listen`] module.
-pub mod vsock_addr;
-#[cfg(feature = "vsock-transport")]
-pub mod vsock_listen;
 /// Shared cancellable-boundary primitives (deadline-bounded `poll`) for the agent boot-relay hard bounds
 /// (TASK-7.7 5b-2b-ii (a')/(d)). Linux + vsock-transport gated (backed by `nix::poll`).
 #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 mod cancellable_boundary;
+#[cfg(all(
+    unix,
+    feature = "agent-gateway",
+    any(test, feature = "agent-contract-server")
+))]
+pub mod contract_server;
+#[cfg(feature = "ml-dsa-65")]
+pub mod platform_provisioning_boot;
 /// Killable-subprocess hard bound for the SNP quote fetch (TASK-7.7 5b-2b-ii(d) — invariants/design in
 /// the module header + §8). Triple-gated: needs nix (vsock-transport) AND the quote/boot types
 /// (agent-gateway). Also home of `HardBoundedQuoteProducer` — the (d-ii)/2 structural serve-gate
@@ -197,41 +195,79 @@ mod cancellable_boundary;
 /// vsock builds where this type does not, so a link THERE breaks `cargo doc`; HERE the doc is an
 /// attribute of the triple-gated item itself and is compiled out with it, so a link could never
 /// dangle — the uniform rule just keeps the next editor from copying a link to a site where it does).
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 mod quote_subprocess;
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+mod uds_listen;
+/// AF_VSOCK address/port resolution + validation (pure, gate-free so it is CI-tested without the
+/// Linux-only `vsock` crate). The socket-binding leaf is the gated [`vsock_listen`] module.
+pub mod vsock_addr;
+#[cfg(feature = "vsock-transport")]
+pub mod vsock_listen;
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 pub use quote_subprocess::agent_quote_child_dispatch;
 // Agent Gateway (4b) boot wiring (TASK-7.7 5b-2b-ii (d-ii)/4b): the wired boot-handshake composition
 // (`run_boot_handshake_wired`) + the typed boot-event seam. Triple-gated like `quote_subprocess` — the
 // cfg intersection of its dependencies (`ValidatedBootBudget`/`HardBoundedQuoteProducer`), never wider
 // (§8 hard rule). (5b-2c) NOW EXPORTS the sole `pub` boot bridge `run_agent_gateway_boot` — every other
 // wired type stays `pub(crate)`; the bin reaches ONLY this entrypoint.
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 mod agent_gateway_boot;
 // (5b-2c) The agent-gateway serve-bin boot entrypoint — MUST live in-crate (the wired types it composes
 // are crate-private) and stay under the SAME triple gate, NEVER wider; require_real hardcodes
 // cfg!(release_build) (THIS crate's build.rs cfg — a copy out-of-crate fails OPEN).
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 pub use agent_gateway_boot::run_agent_gateway_boot;
 // (4c) in-guest quote smoke (TASK-7.7 5b-2b-ii (d-ii)/4c). QUADRUPLE-gated: the triple gate of the
 // consumed items (`quote_subprocess`/`agent_boot_relay` vsock leaves) ∩ the bare `lab-quote-smoke`
 // marker — narrower than every consumed item, never wider (§8 hard rule). NOT the 5b-2c serve
 // wrapper: no handshake, no `decide_serve`, no listener; `agent_gateway_boot` stays crate-private
 // and unexported (the pin above is untouched) — live serve remains gated on 5b-2c.
-#[cfg(all(target_os = "linux", feature = "vsock-transport",
-          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway",
+    feature = "lab-quote-smoke"
+))]
 mod quote_smoke;
-#[cfg(all(target_os = "linux", feature = "vsock-transport",
-          feature = "agent-gateway", feature = "lab-quote-smoke"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway",
+    feature = "lab-quote-smoke"
+))]
 pub use quote_smoke::run_quote_smoke;
 /// (b) host-relay daemon (TASK-7.7 5b-2b-ii(b)) — untrusted host process bridging the SNP guest to the
 /// external anchor over TCP. Triple-gated: the cfg-INTERSECTION of the vsock leaf
 /// (`linux`+`vsock-transport`) and the agent-gateway cores (`relay_forward_once` lives in the
 /// agent-gateway-gated `agent_boot_relay`). NEVER wider. Same intersection-gate discipline as
 /// `quote_subprocess`/`agent_gateway_boot`.
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 mod host_anchor_relay;
-#[cfg(all(target_os = "linux", feature = "vsock-transport", feature = "agent-gateway"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "vsock-transport",
+    feature = "agent-gateway"
+))]
 pub use host_anchor_relay::run_host_anchor_relay;
 #[cfg(any(
     feature = "test-support",
@@ -409,50 +445,49 @@ pub use host_test_fixtures::{
     sample_arm_for_production_frame, sample_arm_for_production_frame_with_pubkey,
     sample_hardfork_sign_frame, sample_recovery_sign_frame, sample_second_hardfork_sign_frame,
 };
-pub use wire::{
-    decode_arm_for_production_request, decode_arm_for_production_response,
-    decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
-    decode_get_status_response, decode_sign_authorization_ticket_request,
-    decode_sign_authorization_ticket_response, decode_wire_error, encode_arm_for_production_request,
-    encode_arm_for_production_response, encode_get_measurement_request,
-    encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
-    encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
-    encode_wire_error, is_wire_error_payload,
-};
 #[cfg(feature = "ml-dsa-65")]
 pub use mldsa65::MlDsa65Signer;
+#[cfg(feature = "ml-dsa-65")]
+pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
 pub use pq_signer::{
     install_sealed_pq_signer, is_sealed_signer_installed, ML_DSA65_SECRETKEY_LEN,
     SEALED_BLOB_V0_VERSION,
 };
-#[cfg(feature = "ml-dsa-65")]
-pub use platform_provisioning_boot::boot_configure_pq_seal_v1_platform_root;
 pub use uds_listen::{bind_unix_listener, default_dev_socket_dir};
+pub use wire::{
+    decode_arm_for_production_request, decode_arm_for_production_response,
+    decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
+    decode_get_status_response, decode_sign_authorization_ticket_request,
+    decode_sign_authorization_ticket_response, decode_wire_error,
+    encode_arm_for_production_request, encode_arm_for_production_response,
+    encode_get_measurement_request, encode_get_measurement_response, encode_get_status_request,
+    encode_get_status_response, encode_sign_authorization_ticket_request,
+    encode_sign_authorization_ticket_response, encode_wire_error, is_wire_error_payload,
+};
 // Shared provisioning-root API — available to both the producer and the agent profile so each can
 // set/check the platform root at boot (the secret + KDFs stay role-separated; see `seal_root`).
+#[cfg(feature = "ml-dsa-65")]
+pub use pq_signer::{
+    pq_seal_v1_expected_blob_len, pq_seal_v1_measurement_digest, SEALED_BLOB_V1_HEADER_LEN,
+    SEALED_BLOB_V1_MAGIC, SEALED_BLOB_V1_VERSION,
+};
+#[cfg(all(feature = "ml-dsa-65", test))]
+pub use pq_signer::{seal_mldsa65_keypair_v0, unseal_mldsa65_keypair_v0};
+#[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]
+pub use pq_signer::{
+    seal_mldsa65_keypair_v1, seal_mldsa65_keypair_v1_with_root, verify_sealed_blob_v1_with_root,
+};
 #[cfg(any(feature = "ml-dsa-65", feature = "agent-gateway"))]
 pub use seal_root::{
     is_platform_pq_seal_v1_provisioning_root_set, is_pq_seal_v1_provisioning_root_configured,
     set_pq_seal_v1_provisioning_root,
 };
-#[cfg(feature = "ml-dsa-65")]
-pub use pq_signer::{
-    pq_seal_v1_expected_blob_len, pq_seal_v1_measurement_digest, SEALED_BLOB_V1_MAGIC,
-    SEALED_BLOB_V1_HEADER_LEN, SEALED_BLOB_V1_VERSION,
-};
-#[cfg(all(feature = "ml-dsa-65", any(test, feature = "pq-seal-provisioning")))]
-pub use pq_signer::{
-    seal_mldsa65_keypair_v1, seal_mldsa65_keypair_v1_with_root,
-    verify_sealed_blob_v1_with_root,
-};
-#[cfg(all(feature = "ml-dsa-65", test))]
-pub use pq_signer::{seal_mldsa65_keypair_v0, unseal_mldsa65_keypair_v0};
 
 /// Protocol version (bumped on breaking changes to the framing or core messages).
 pub const PROTOCOL_VERSION: u8 = 1;
 
 /// Maximum allowed message size (1 MiB).
-/// 
+///
 /// Reduced from 64 MiB after Gemini security review on 2026-06-05:
 /// In a TEE (Nitro Enclaves / SEV-SNP) memory is strictly limited.
 /// A 64 MiB limit allows an untrusted host to force large allocations
@@ -797,7 +832,10 @@ fn resolve_measurement_and_attestation() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     }
 }
 
-#[cfg(all(test, not(any(feature = "staging-host", feature = "reference-test-key"))))]
+#[cfg(all(
+    test,
+    not(any(feature = "staging-host", feature = "reference-test-key"))
+))]
 mod measurement_wiring_tests {
     use super::*;
 
@@ -878,7 +916,7 @@ pub struct SignAuthorizationTicketRequest {
 /// This must exactly match what the on-chain precompile will validate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorizationTicketPayload {
-    pub ticket_type: u8,           // 0 = Recovery, 1 = HardFork
+    pub ticket_type: u8, // 0 = Recovery, 1 = HardFork
     pub nonce: u64,
     pub context_hash: [u8; 32],
     pub activation_height: u64,
@@ -893,7 +931,7 @@ pub struct AuthorizationTicketPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignAuthorizationTicketResponse {
     pub signature: Vec<u8>,
-    pub ticket_hash: [u8; 32],   // The exact canonical hash that was signed
+    pub ticket_hash: [u8; 32], // The exact canonical hash that was signed
 }
 
 // -----------------------------------------------------------------------------
@@ -990,7 +1028,7 @@ pub struct AuthorizedProducerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmForProductionResponse {
-    pub status: String,   // "armed" or "refused"
+    pub status: String, // "armed" or "refused"
     pub reason: Option<String>,
 }
 
@@ -1388,9 +1426,11 @@ pub fn validate_ticket_payload(payload: &AuthorizationTicketPayload) -> Result<(
                     "Hard-fork fork_spec_hash must be non-zero",
                 ));
             }
-            let header_version = payload.new_header_version.ok_or(ProtocolError::InvalidTicket(
-                "Hard-fork tickets must include new_header_version",
-            ))?;
+            let header_version = payload
+                .new_header_version
+                .ok_or(ProtocolError::InvalidTicket(
+                    "Hard-fork tickets must include new_header_version",
+                ))?;
             if header_version == 0 {
                 return Err(ProtocolError::InvalidTicket(
                     "Hard-fork new_header_version must be non-zero",
@@ -1469,15 +1509,8 @@ fn produce_pq_signature(ticket_hash: &[u8; 32], nonce: u64) -> Result<Vec<u8>, P
     }
 }
 
-#[cfg(all(
-    not(feature = "ml-dsa-65"),
-    not(feature = "test-support"),
-    not(test)
-))]
-fn produce_pq_signature(
-    _ticket_hash: &[u8; 32],
-    _nonce: u64,
-) -> Result<Vec<u8>, ProtocolError> {
+#[cfg(all(not(feature = "ml-dsa-65"), not(feature = "test-support"), not(test)))]
+fn produce_pq_signature(_ticket_hash: &[u8; 32], _nonce: u64) -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
         "ML-DSA-65 signing disabled (build with ml-dsa-65 and install sealed key at boot)",
     ))
@@ -1673,9 +1706,9 @@ pub fn install_reference_sealed_signer_staging() -> Result<(), ProtocolError> {
 
 fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command, ProtocolError> {
     match msg_type {
-        MessageType::GetMeasurement => {
-            Ok(Command::GetMeasurement(decode_get_measurement_request(payload)?))
-        }
+        MessageType::GetMeasurement => Ok(Command::GetMeasurement(decode_get_measurement_request(
+            payload,
+        )?)),
         MessageType::SignAuthorizationTicket => Ok(Command::SignAuthorizationTicket(
             decode_sign_authorization_ticket_request(payload)?,
         )),
@@ -1711,7 +1744,10 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
     }
 }
 
-fn encode_wire_response(msg_type: MessageType, response: &Response) -> Result<Vec<u8>, ProtocolError> {
+fn encode_wire_response(
+    msg_type: MessageType,
+    response: &Response,
+) -> Result<Vec<u8>, ProtocolError> {
     match (msg_type, response) {
         (MessageType::GetMeasurement, Response::GetMeasurement(r)) => {
             encode_get_measurement_response(r)
@@ -1729,7 +1765,10 @@ fn encode_wire_response(msg_type: MessageType, response: &Response) -> Result<Ve
         (_, Response::Error(msg)) => encode_wire_error(1, msg),
         (expected, other) => encode_wire_error(
             1,
-            &format!("unexpected response {:?} for message type {:?}", other, expected),
+            &format!(
+                "unexpected response {:?} for message type {:?}",
+                other, expected
+            ),
         ),
     }
 }
@@ -1755,9 +1794,10 @@ pub fn peek_msg_type_from_frame(frame: &[u8]) -> Option<MessageType> {
 fn protocol_error_to_wire_body(e: &ProtocolError) -> Result<Vec<u8>, ProtocolError> {
     let (code, reason) = match e {
         ProtocolError::MessageTooLarge(n) => (1, format!("message too large: {n}")),
-        ProtocolError::InvalidVersion { got, expected } => {
-            (1, format!("invalid version: got {got}, expected {expected}"))
-        }
+        ProtocolError::InvalidVersion { got, expected } => (
+            1,
+            format!("invalid version: got {got}, expected {expected}"),
+        ),
         ProtocolError::UnknownMessageType(b) => (1, format!("unknown message type: {b}")),
         ProtocolError::WireProtocol(s) => (1, (*s).to_string()),
         ProtocolError::InvalidTicket(s) => (2, (*s).to_string()),
@@ -1793,7 +1833,10 @@ pub(crate) fn encode_wire_error_frame_for_frame(
     // Call-site invariant: only reached after `decode_message` accepted the 6-byte framing
     // prefix — sub-6-byte frames surface as Io errors the callers propagate before here.
     // Make the layered invariant self-checking in debug/test builds (no release impact).
-    debug_assert!(frame.len() >= 6, "error-frame echo expects the 6-byte framing prefix");
+    debug_assert!(
+        frame.len() >= 6,
+        "error-frame echo expects the 6-byte framing prefix"
+    );
     match peek_msg_type_from_frame(frame) {
         Some(t) => encode_wire_error_frame(t, e),
         None => {
@@ -1866,12 +1909,13 @@ fn try_process_framed_bytes(frame: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let body = match dispatch_command(Command::GetMeasurement(req)) {
         Response::GetMeasurement(resp) => encode_get_measurement_response(&resp)?,
         Response::Error(msg) => encode_wire_error(1, &msg)?,
-        other => {
-            encode_wire_error(
-                1,
-                &format!("unexpected dispatch response for GET_MEASUREMENT: {:?}", other),
-            )?
-        }
+        other => encode_wire_error(
+            1,
+            &format!(
+                "unexpected dispatch response for GET_MEASUREMENT: {:?}",
+                other
+            ),
+        )?,
     };
     encode_message(MessageType::GetMeasurement, &body)
 }
@@ -2012,21 +2056,19 @@ pub fn dispatch_command_with_state(
             }
         }
         Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
-        Command::ArmForProduction(req) => {
-            match arm_for_production(state, req, attestation_trust) {
-                Ok(new_state) => {
-                    *state = new_state;
-                    Response::ArmForProduction(ArmForProductionResponse {
-                        status: "armed".to_string(),
-                        reason: None,
-                    })
-                }
-                Err(e) => Response::ArmForProduction(ArmForProductionResponse {
-                    status: "refused".to_string(),
-                    reason: Some(e.to_string()),
-                }),
+        Command::ArmForProduction(req) => match arm_for_production(state, req, attestation_trust) {
+            Ok(new_state) => {
+                *state = new_state;
+                Response::ArmForProduction(ArmForProductionResponse {
+                    status: "armed".to_string(),
+                    reason: None,
+                })
             }
-        }
+            Err(e) => Response::ArmForProduction(ArmForProductionResponse {
+                status: "refused".to_string(),
+                reason: Some(e.to_string()),
+            }),
+        },
         Command::GetStatus(_req) => Response::GetStatus(build_get_status_response(state)),
         #[cfg(feature = "agent-gateway")]
         Command::AgentGateway(payload) => {
@@ -2212,7 +2254,8 @@ mod tests {
         let _guard = pq_signer::SealedSignerTestGuard::acquire();
         #[cfg(feature = "ml-dsa-65")]
         pq_signer::reset_installed_pq_signer_for_tests();
-        let req_payload = encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
+        let req_payload =
+            encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
         let request_frame = encode_message(MessageType::GetMeasurement, &req_payload).unwrap();
         let response_frame = process_framed_bytes(&request_frame).unwrap();
         let decoded = decode_message(&response_frame).unwrap();
@@ -2227,7 +2270,8 @@ mod tests {
     #[test]
     fn process_framed_with_session_returns_wire_error_on_unknown_msg_type() {
         let mut session = HostSession::reference_test();
-        let payload = encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
+        let payload =
+            encode_get_measurement_request(&GetMeasurementRequest { version: 1 }).unwrap();
         let mut bad_frame = encode_message(MessageType::GetMeasurement, &payload).unwrap();
         bad_frame[5] = 0xFF;
         let resp = process_framed_with_session(&bad_frame, &mut session).unwrap();
@@ -2265,12 +2309,9 @@ mod tests {
         let arm_body = decode_arm_for_production_response(&arm_decoded.payload).unwrap();
         assert_eq!(arm_body.status, "refused");
 
-        let status_payload =
-            encode_get_status_request(&GetStatusRequest { version: 1 }).unwrap();
-        let status_frame =
-            encode_message(MessageType::GetStatus, &status_payload).unwrap();
-        let status_resp_frame =
-            process_framed_with_session(&status_frame, &mut session).unwrap();
+        let status_payload = encode_get_status_request(&GetStatusRequest { version: 1 }).unwrap();
+        let status_frame = encode_message(MessageType::GetStatus, &status_payload).unwrap();
+        let status_resp_frame = process_framed_with_session(&status_frame, &mut session).unwrap();
         let status_decoded = decode_message(&status_resp_frame).unwrap();
         let status = decode_get_status_response(&status_decoded.payload).unwrap();
         assert!(!status.armed);
@@ -2329,10 +2370,10 @@ mod tests {
         use crate::host_test_fixtures::sample_arm_for_production_frame_with_pubkey;
         use crate::{
             decode_arm_for_production_response, decode_get_status_response,
-            decode_sign_authorization_ticket_response, decode_wire_error, encode_get_status_request,
-            encode_message, encode_sign_authorization_ticket_request, is_wire_error_payload,
-            peek_msg_type_from_frame, AuthorizationTicketPayload, MessageType,
-            SignAuthorizationTicketRequest,
+            decode_sign_authorization_ticket_response, decode_wire_error,
+            encode_get_status_request, encode_message, encode_sign_authorization_ticket_request,
+            is_wire_error_payload, peek_msg_type_from_frame, AuthorizationTicketPayload,
+            MessageType, SignAuthorizationTicketRequest,
         };
         use std::sync::{Arc, Mutex};
 
@@ -2344,8 +2385,7 @@ mod tests {
         let arm_frame = sample_arm_for_production_frame_with_pubkey(pk.clone());
         {
             let mut guard = state.lock().unwrap();
-            let arm_resp =
-                process_framed_with_shared_state(&arm_frame, &mut guard, trust).unwrap();
+            let arm_resp = process_framed_with_shared_state(&arm_frame, &mut guard, trust).unwrap();
             let arm_decoded = decode_message(&arm_resp).unwrap();
             let arm_body = decode_arm_for_production_response(&arm_decoded.payload).unwrap();
             assert_eq!(arm_body.status, "armed");
@@ -2360,10 +2400,8 @@ mod tests {
             .unwrap();
             let status_resp =
                 process_framed_with_shared_state(&status_frame, &mut guard, trust).unwrap();
-            let status = decode_get_status_response(
-                &decode_message(&status_resp).unwrap().payload,
-            )
-            .unwrap();
+            let status =
+                decode_get_status_response(&decode_message(&status_resp).unwrap().payload).unwrap();
             assert!(status.armed);
             assert_eq!(status.proof_finalized_height, Some(10_000_050));
         }
@@ -2392,8 +2430,7 @@ mod tests {
             let resp = process_framed_with_shared_state(&first_frame, &mut guard, trust).unwrap();
             let decoded = decode_message(&resp).unwrap();
             assert!(!is_wire_error_payload(&decoded.payload));
-            let sign =
-                decode_sign_authorization_ticket_response(&decoded.payload).unwrap();
+            let sign = decode_sign_authorization_ticket_response(&decoded.payload).unwrap();
             assert_eq!(sign.signature.len(), ML_DSA65_SIGNATURE_LEN);
         }
 
@@ -2418,14 +2455,16 @@ mod tests {
 
         {
             let mut guard = state.lock().unwrap();
-            let resp =
-                process_framed_with_shared_state(&second_frame, &mut guard, trust).unwrap();
+            let resp = process_framed_with_shared_state(&second_frame, &mut guard, trust).unwrap();
             let decoded = decode_message(&resp).unwrap();
             assert!(is_wire_error_payload(&decoded.payload));
             let (code, reason) = decode_wire_error(&decoded.payload).unwrap();
             assert_eq!(code, 1);
             assert!(reason.contains("only one HARD_FORK_ACTIVATION"));
-            assert_eq!(peek_msg_type_from_frame(&resp), Some(MessageType::SignAuthorizationTicket));
+            assert_eq!(
+                peek_msg_type_from_frame(&resp),
+                Some(MessageType::SignAuthorizationTicket)
+            );
         }
     }
 
@@ -2438,11 +2477,7 @@ mod tests {
 
         let mut state = EnclaveState::Unarmed;
         dispatch_command_with_state(
-            Command::ArmForProduction(sample_arm_request(
-                vec![0xDE; 48],
-                10_000_000,
-                10_000_050,
-            )),
+            Command::ArmForProduction(sample_arm_request(vec![0xDE; 48], 10_000_000, 10_000_050)),
             &mut state,
             test_attestation_trust(),
         );
@@ -2469,8 +2504,9 @@ mod tests {
     fn shared_enclave_state_across_connections_rejects_second_hardfork() {
         use crate::{
             decode_sign_authorization_ticket_response, decode_wire_error, encode_message,
-            encode_sign_authorization_ticket_request, is_wire_error_payload, peek_msg_type_from_frame,
-            AuthorizationTicketPayload, MessageType, SignAuthorizationTicketRequest,
+            encode_sign_authorization_ticket_request, is_wire_error_payload,
+            peek_msg_type_from_frame, AuthorizationTicketPayload, MessageType,
+            SignAuthorizationTicketRequest,
         };
         use std::sync::{Arc, Mutex};
 
@@ -2482,12 +2518,8 @@ mod tests {
             activated_at_height: 100,
             source_ticket_hash: [0xAA; 32],
         };
-        let proof = signed_recent_chain_proof(
-            10_000_050,
-            [0xFE; 32],
-            vec![[0xAA; 32]],
-            &authorized,
-        );
+        let proof =
+            signed_recent_chain_proof(10_000_050, [0xFE; 32], vec![[0xAA; 32]], &authorized);
         // demo-mock-sign cannot ARM over the wire (pq_signing_ready is false); seed armed state
         // directly to exercise second hard-fork rejection while "armed".
         let state = Arc::new(Mutex::new(EnclaveState::Armed(EnclaveArmedState {
@@ -2523,8 +2555,7 @@ mod tests {
             let resp = process_framed_with_shared_state(&first_frame, &mut guard, trust).unwrap();
             let decoded = decode_message(&resp).unwrap();
             assert!(!is_wire_error_payload(&decoded.payload));
-            let sign =
-                decode_sign_authorization_ticket_response(&decoded.payload).unwrap();
+            let sign = decode_sign_authorization_ticket_response(&decoded.payload).unwrap();
             assert_eq!(sign.signature.len(), 64);
         }
 
@@ -2549,14 +2580,16 @@ mod tests {
 
         {
             let mut guard = state.lock().unwrap();
-            let resp =
-                process_framed_with_shared_state(&second_frame, &mut guard, trust).unwrap();
+            let resp = process_framed_with_shared_state(&second_frame, &mut guard, trust).unwrap();
             let decoded = decode_message(&resp).unwrap();
             assert!(is_wire_error_payload(&decoded.payload));
             let (code, reason) = decode_wire_error(&decoded.payload).unwrap();
             assert_eq!(code, 1);
             assert!(reason.contains("only one HARD_FORK_ACTIVATION"));
-            assert_eq!(peek_msg_type_from_frame(&resp), Some(MessageType::SignAuthorizationTicket));
+            assert_eq!(
+                peek_msg_type_from_frame(&resp),
+                Some(MessageType::SignAuthorizationTicket)
+            );
         }
     }
 
@@ -2754,10 +2787,7 @@ mod tests {
             test_attestation_trust(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ProtocolError::RecentChainProofValidation(_)
-        ));
+        assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
     #[test]
@@ -2794,10 +2824,7 @@ mod tests {
             test_attestation_trust(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ProtocolError::RecentChainProofValidation(_)
-        ));
+        assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
 
         let fresher = signed_recent_chain_proof(250, [0x33; 32], vec![[0xAA; 32]], &authorized);
         assert!(arm_for_production(
@@ -2857,10 +2884,7 @@ mod tests {
             test_attestation_trust(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ProtocolError::PqSigningUnavailable(_)
-        ));
+        assert!(matches!(err, ProtocolError::PqSigningUnavailable(_)));
     }
 
     #[test]
@@ -2888,7 +2912,8 @@ mod tests {
             ),
         };
 
-        let new_state = arm_for_production(&initial, req, test_attestation_trust()).expect("arming should succeed");
+        let new_state = arm_for_production(&initial, req, test_attestation_trust())
+            .expect("arming should succeed");
 
         match new_state {
             EnclaveState::Armed(s) => {
@@ -2937,7 +2962,11 @@ mod tests {
         assert!(matches!(state, EnclaveState::Armed(_)));
 
         // Also verify via GetStatus
-        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state, test_attestation_trust()) {
+        let status = match dispatch_command_with_state(
+            Command::GetStatus(GetStatusRequest { version: 1 }),
+            &mut state,
+            test_attestation_trust(),
+        ) {
             Response::GetStatus(r) => r,
             _ => panic!("expected GetStatus"),
         };
@@ -2971,9 +3000,17 @@ mod tests {
             ),
         };
 
-        let _ = dispatch_command_with_state(Command::ArmForProduction(req), &mut state, test_attestation_trust());
+        let _ = dispatch_command_with_state(
+            Command::ArmForProduction(req),
+            &mut state,
+            test_attestation_trust(),
+        );
 
-        let status_resp = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state, test_attestation_trust()) {
+        let status_resp = match dispatch_command_with_state(
+            Command::GetStatus(GetStatusRequest { version: 1 }),
+            &mut state,
+            test_attestation_trust(),
+        ) {
             Response::GetStatus(r) => r,
             _ => panic!("expected GetStatus"),
         };
@@ -3013,7 +3050,11 @@ mod tests {
             },
         };
 
-        let resp = dispatch_command_with_state(Command::ArmForProduction(bad_req), &mut state, test_attestation_trust());
+        let resp = dispatch_command_with_state(
+            Command::ArmForProduction(bad_req),
+            &mut state,
+            test_attestation_trust(),
+        );
 
         match resp {
             Response::ArmForProduction(r) => {
@@ -3041,18 +3082,24 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
 
         let first = sample_hardfork_ticket(pq.clone(), 10_000_100);
         let ok = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: first }),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
         assert!(matches!(ok, Response::SignAuthorizationTicket(_)));
 
         let second = sample_hardfork_ticket(pq, 10_000_200);
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: second }),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
         match resp {
             Response::Error(msg) => assert!(msg.contains("only one HARD_FORK_ACTIVATION")),
             _ => panic!("expected refusal of second hard-fork sign"),
@@ -3097,7 +3144,8 @@ mod tests {
             signature_from_recent_producer: Some(vec![0u8; 64]),
         };
 
-        let err = validate_recent_chain_proof(&stale, &state, &test_attestation_trust()).unwrap_err();
+        let err =
+            validate_recent_chain_proof(&stale, &state, &test_attestation_trust()).unwrap_err();
         assert!(matches!(err, ProtocolError::RecentChainProofValidation(_)));
     }
 
@@ -3173,7 +3221,9 @@ mod tests {
             new_header_version: None,
         };
 
-        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload.clone() });
+        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest {
+            ticket: payload.clone(),
+        });
 
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&cmd, &mut bytes).unwrap();
@@ -3215,7 +3265,10 @@ mod tests {
         }
     }
 
-    fn sample_hardfork_ticket(pq_pubkey: Vec<u8>, activation_height: u64) -> AuthorizationTicketPayload {
+    fn sample_hardfork_ticket(
+        pq_pubkey: Vec<u8>,
+        activation_height: u64,
+    ) -> AuthorizationTicketPayload {
         AuthorizationTicketPayload {
             ticket_type: 1,
             nonce: 42,
@@ -3242,7 +3295,8 @@ mod tests {
             new_header_version: Some(3),
         };
 
-        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload });
+        let cmd =
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload });
 
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&cmd, &mut bytes).unwrap();
@@ -3271,7 +3325,9 @@ mod tests {
 
         let arm_resp = dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
         match arm_resp {
             Response::ArmForProduction(r) => assert_eq!(r.status, "armed"),
             _ => panic!("expected arm success"),
@@ -3279,8 +3335,12 @@ mod tests {
 
         let ticket = sample_hardfork_ticket(pq, 10_000_100);
         let sign_resp = dispatch_command_with_state(
-            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: ticket.clone() }),
-            &mut state, test_attestation_trust());
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest {
+                ticket: ticket.clone(),
+            }),
+            &mut state,
+            test_attestation_trust(),
+        );
 
         match sign_resp {
             Response::SignAuthorizationTicket(r) => {
@@ -3298,7 +3358,11 @@ mod tests {
             other => panic!("expected sign success, got {:?}", other),
         }
 
-        let status = match dispatch_command_with_state(Command::GetStatus(GetStatusRequest { version: 1 }), &mut state, test_attestation_trust()) {
+        let status = match dispatch_command_with_state(
+            Command::GetStatus(GetStatusRequest { version: 1 }),
+            &mut state,
+            test_attestation_trust(),
+        ) {
             Response::GetStatus(s) => s,
             _ => panic!("expected GetStatus"),
         };
@@ -3313,7 +3377,9 @@ mod tests {
 
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
 
         match resp {
             Response::Error(msg) => assert!(msg.contains("requires the enclave to be armed")),
@@ -3358,16 +3424,22 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 10_000_000, 10_000_050)),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
 
         // activation_height not strictly above proof.finalized_height
         let ticket = sample_hardfork_ticket(pq, 10_000_050);
         let resp = dispatch_command_with_state(
             Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket }),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
 
         match resp {
-            Response::Error(msg) => assert!(msg.contains("activation_height must be strictly greater")),
+            Response::Error(msg) => {
+                assert!(msg.contains("activation_height must be strictly greater"))
+            }
             _ => panic!("expected stale activation_height error"),
         }
     }
@@ -3382,10 +3454,14 @@ mod tests {
 
         dispatch_command_with_state(
             Command::ArmForProduction(sample_arm_request(pq.clone(), 100, 500)),
-            &mut state, test_attestation_trust());
+            &mut state,
+            test_attestation_trust(),
+        );
 
         let payload = sample_hardfork_ticket(pq, 600);
-        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: payload.clone() });
+        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest {
+            ticket: payload.clone(),
+        });
 
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&cmd, &mut bytes).unwrap();
@@ -3405,7 +3481,11 @@ mod tests {
     #[test]
     fn stateful_get_measurement_lists_hardfork_type() {
         let mut state = EnclaveState::Unarmed;
-        let resp = dispatch_command_with_state(Command::GetMeasurement(GetMeasurementRequest { version: 1 }), &mut state, test_attestation_trust());
+        let resp = dispatch_command_with_state(
+            Command::GetMeasurement(GetMeasurementRequest { version: 1 }),
+            &mut state,
+            test_attestation_trust(),
+        );
         match resp {
             Response::GetMeasurement(r) => {
                 assert!(r.supported_ticket_types.contains(&0));
@@ -3450,7 +3530,8 @@ mod tests {
             new_header_version: Some(1),
         };
 
-        let cmd = Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: polluted });
+        let cmd =
+            Command::SignAuthorizationTicket(SignAuthorizationTicketRequest { ticket: polluted });
         let resp = dispatch_command(cmd);
 
         match resp {
@@ -3480,10 +3561,7 @@ mod tests {
             test_attestation_trust(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ProtocolError::PqSigningUnavailable(_)
-        ));
+        assert!(matches!(err, ProtocolError::PqSigningUnavailable(_)));
     }
 
     #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
@@ -3499,7 +3577,9 @@ mod tests {
     fn sealed_signer_sets_pq_signing_ready_and_measurement_pubkey() {
         let _guard = install_reference_sealed_signer_for_tests();
         assert!(pq_signing_ready());
-        let resp = dispatch_command(Command::GetMeasurement(GetMeasurementRequest { version: 1 }));
+        let resp = dispatch_command(Command::GetMeasurement(GetMeasurementRequest {
+            version: 1,
+        }));
         match resp {
             Response::GetMeasurement(r) => {
                 assert!(r.pq_signing_ready);
@@ -3523,7 +3603,8 @@ mod tests {
             fork_spec_hash: None,
             new_header_version: None,
         };
-        let err = handle_sign_authorization_ticket(SignAuthorizationTicketRequest { ticket }).unwrap_err();
+        let err = handle_sign_authorization_ticket(SignAuthorizationTicketRequest { ticket })
+            .unwrap_err();
         assert!(matches!(err, ProtocolError::InvalidTicket(_)));
     }
 
@@ -3542,7 +3623,8 @@ mod tests {
             fork_spec_hash: None,
             new_header_version: None,
         };
-        let resp = handle_sign_authorization_ticket(SignAuthorizationTicketRequest { ticket }).unwrap();
+        let resp =
+            handle_sign_authorization_ticket(SignAuthorizationTicketRequest { ticket }).unwrap();
         assert_eq!(resp.signature.len(), ML_DSA65_SIGNATURE_LEN);
     }
 
@@ -3601,7 +3683,7 @@ mod tests {
             activation_height: 100,
             new_measurement: vec![],
             pq_pubkey: vec![],
-            fork_spec_hash: None,           // missing!
+            fork_spec_hash: None, // missing!
             new_header_version: None,
         };
 
@@ -3638,7 +3720,7 @@ mod tests {
     #[test]
     fn unknown_ticket_type_is_rejected() {
         let unknown = AuthorizationTicketPayload {
-            ticket_type: 42,  // undefined type
+            ticket_type: 42, // undefined type
             nonce: 1,
             context_hash: [0u8; 32],
             activation_height: 100,
@@ -3672,7 +3754,10 @@ mod tests {
 
         let h2 = compute_canonical_ticket_hash(&modified);
 
-        assert_ne!(h1, h2, "Changing even one byte in the payload must change the canonical hash");
+        assert_ne!(
+            h1, h2,
+            "Changing even one byte in the payload must change the canonical hash"
+        );
     }
 
     #[test]
@@ -3684,7 +3769,7 @@ mod tests {
             activation_height: 5_000_000,
             new_measurement: vec![9, 9, 9],
             pq_pubkey: vec![8; 48],
-            fork_spec_hash: None,           // deliberately missing
+            fork_spec_hash: None, // deliberately missing
             new_header_version: None,
         };
 
@@ -3701,7 +3786,7 @@ mod tests {
             activation_height: 5_000_001,
             new_measurement: vec![1],
             pq_pubkey: vec![2],
-            fork_spec_hash: Some([3; 32]),  // should not be present
+            fork_spec_hash: Some([3; 32]), // should not be present
             new_header_version: Some(2),
         };
 
@@ -3814,7 +3899,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "recovery ticket (original reference vector)");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "recovery ticket (original reference vector)",
+        );
     }
 
     #[test]
@@ -3832,7 +3921,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "hard-fork ticket (original reference vector)");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "hard-fork ticket (original reference vector)",
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -3855,7 +3948,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "recovery ticket — empty new_measurement (0 bytes)");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "recovery ticket — empty new_measurement (0 bytes)",
+        );
     }
 
     #[test]
@@ -3874,7 +3971,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "recovery ticket — exactly 32-byte new_measurement");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "recovery ticket — exactly 32-byte new_measurement",
+        );
     }
 
     #[test]
@@ -3893,7 +3994,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "hard-fork ticket — 33-byte new_measurement (padding boundary)");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "hard-fork ticket — 33-byte new_measurement (padding boundary)",
+        );
     }
 
     #[test]
@@ -3913,7 +4018,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "recovery ticket — large (200-byte) new_measurement");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "recovery ticket — large (200-byte) new_measurement",
+        );
     }
 
     #[test]
@@ -3932,7 +4041,11 @@ mod tests {
 
         let solidity_hash = compute_hash_via_forge(&payload);
         let rust_hash = compute_canonical_ticket_hash(&payload);
-        handle_forge_result(solidity_hash, rust_hash, "recovery ticket — activation_height=0 and nonce=u64::MAX");
+        handle_forge_result(
+            solidity_hash,
+            rust_hash,
+            "recovery ticket — activation_height=0 and nonce=u64::MAX",
+        );
     }
 
     /// Calls the Foundry script via JSON exchange to get the ground-truth hash
@@ -3949,9 +4062,7 @@ mod tests {
     /// If forge or the required files are missing, returns None (the caller
     /// then decides skip vs panic according to the policy in
     /// `handle_forge_result`).
-    fn compute_hash_via_forge(
-        payload: &AuthorizationTicketPayload,
-    ) -> Option<[u8; 32]> {
+    fn compute_hash_via_forge(payload: &AuthorizationTicketPayload) -> Option<[u8; 32]> {
         use std::fs;
         use std::path::PathBuf;
         use std::process::Command;
@@ -3961,10 +4072,7 @@ mod tests {
 
         // Locate repo root
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .ancestors()
-            .nth(3)
-            .unwrap_or(&manifest_dir);
+        let repo_root = manifest_dir.ancestors().nth(3).unwrap_or(&manifest_dir);
 
         let solidity_dir = repo_root.join("impl/solidity");
         let script_path = solidity_dir.join("CanonicalTicketHash.s.sol");
@@ -4016,7 +4124,13 @@ mod tests {
 
         hex::decode(hash_hex.trim_start_matches("0x"))
             .ok()
-            .and_then(|b| if b.len() == 32 { Some(b.try_into().unwrap()) } else { None })
+            .and_then(|b| {
+                if b.len() == 32 {
+                    Some(b.try_into().unwrap())
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -4043,14 +4157,29 @@ mod agent_gateway_framing_tests {
     #[test]
     fn peek_classifies_agent_gateway_and_fails_closed_on_unknown() {
         let mk = |type_byte: u8| [0u8, 0, 0, 2, PROTOCOL_VERSION, type_byte];
-        assert_eq!(peek_msg_type_from_frame(&mk(0x01)), Some(MessageType::GetMeasurement));
-        assert_eq!(peek_msg_type_from_frame(&mk(0x40)), Some(MessageType::AgentGateway));
+        assert_eq!(
+            peek_msg_type_from_frame(&mk(0x01)),
+            Some(MessageType::GetMeasurement)
+        );
+        assert_eq!(
+            peek_msg_type_from_frame(&mk(0x40)),
+            Some(MessageType::AgentGateway)
+        );
         // 0x41 = AGENT_BOOT_RELAY (TASK-7.7 5b-2, enclave-initiated boot handshake frame).
-        assert_eq!(peek_msg_type_from_frame(&mk(0x41)), Some(MessageType::AgentBootRelay));
+        assert_eq!(
+            peek_msg_type_from_frame(&mk(0x41)),
+            Some(MessageType::AgentBootRelay)
+        );
         // 0x44 = AGENT_ANCHOR_MARKS_RELAY (TASK-7.7 5b-2e, enclave-initiated AdoptForward marks fetch).
-        assert_eq!(peek_msg_type_from_frame(&mk(0x44)), Some(MessageType::AgentAnchorMarksRelay));
+        assert_eq!(
+            peek_msg_type_from_frame(&mk(0x44)),
+            Some(MessageType::AgentAnchorMarksRelay)
+        );
         // 0x45 = AGENT_ANCHOR_COMMIT_RELAY (TASK-7.7 slice 6, enclave-initiated per-op commit).
-        assert_eq!(peek_msg_type_from_frame(&mk(0x45)), Some(MessageType::AgentAnchorCommitRelay));
+        assert_eq!(
+            peek_msg_type_from_frame(&mk(0x45)),
+            Some(MessageType::AgentAnchorCommitRelay)
+        );
         // Unknown bytes still fail closed (None) — must NOT fall back to a producer type (the old bug).
         // 0x42/0x43 are inner AgentError CODES, NOT outer MessageType bytes → still None.
         assert_eq!(peek_msg_type_from_frame(&mk(0x42)), None);
@@ -4102,7 +4231,10 @@ mod agent_gateway_framing_tests {
         assert_eq!(decoded.msg_type, MessageType::AgentGateway);
         let cmd = decode_wire_command(decoded.msg_type, &decoded.payload);
         #[cfg(feature = "agent-gateway")]
-        assert!(matches!(cmd, Ok(Command::AgentGateway(_))), "0x40 decodes under agent-gateway");
+        assert!(
+            matches!(cmd, Ok(Command::AgentGateway(_))),
+            "0x40 decodes under agent-gateway"
+        );
         #[cfg(not(feature = "agent-gateway"))]
         assert!(
             matches!(cmd, Err(ProtocolError::WireProtocol(_))),
@@ -4116,10 +4248,16 @@ mod agent_gateway_framing_tests {
     fn error_frames_echo_their_own_type_byte_not_a_producer_type() {
         let unknown = encode_message_raw(0x77, &[0xA0]).unwrap();
         let resp = process_framed_bytes(&unknown).unwrap();
-        assert_eq!(resp[5], 0x77, "unknown type must be echoed, not defaulted to 0x01");
+        assert_eq!(
+            resp[5], 0x77,
+            "unknown type must be echoed, not defaulted to 0x01"
+        );
 
         let agent = encode_message(MessageType::AgentGateway, &[0xA0]).unwrap();
         let resp = process_framed_bytes(&agent).unwrap();
-        assert_eq!(resp[5], 0x40, "agent gateway error must echo 0x40, not 0x01");
+        assert_eq!(
+            resp[5], 0x40,
+            "agent gateway error must echo 0x40, not 0x01"
+        );
     }
 }

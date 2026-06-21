@@ -126,7 +126,12 @@ pub(crate) fn smoke_body() -> KeystoreBody {
             circuit_breaker_threshold: None,
             cumulative_signing_budget: [0; 32],
         },
-        audit: AuditRing { records: vec![], capacity: 256, last_exported_seq: 0, next_seq: 1 },
+        audit: AuditRing {
+            records: vec![],
+            capacity: 256,
+            last_exported_seq: 0,
+            next_seq: 1,
+        },
         freshness_epoch: 1,
         structural_version: 1,
         strict_recovery_counter: 0,
@@ -301,7 +306,12 @@ fn lab_anchor_freshness_reply<S: std::io::Read + std::io::Write>(
         req.nonce,
     );
     let wire = crate::agent_boot_relay::frame_anchor_response(&response)?;
-    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before response write")?;
+    crate::agent_boot_relay::deadline_guarded_write(
+        conn,
+        &wire,
+        deadline,
+        "lab anchor: deadline before response write",
+    )?;
     let mut nonce8 = [0u8; 8];
     nonce8.copy_from_slice(&req.nonce[..8]);
     Ok(nonce8)
@@ -340,7 +350,12 @@ fn lab_anchor_marks_reply<S: std::io::Read + std::io::Write>(
         &response,
         crate::agent_boot_relay::MAX_MARKS_RESPONSE_LEN,
     )?;
-    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before marks response write")?;
+    crate::agent_boot_relay::deadline_guarded_write(
+        conn,
+        &wire,
+        deadline,
+        "lab anchor: deadline before marks response write",
+    )?;
     let mut nonce8 = [0u8; 8];
     nonce8.copy_from_slice(&req.nonce[..8]);
     Ok(nonce8)
@@ -382,7 +397,12 @@ fn lab_anchor_commit_reply<S: std::io::Read + std::io::Write>(
         &response,
         crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN,
     )?;
-    crate::agent_boot_relay::deadline_guarded_write(conn, &wire, deadline, "lab anchor: deadline before commit ack write")?;
+    crate::agent_boot_relay::deadline_guarded_write(
+        conn,
+        &wire,
+        deadline,
+        "lab anchor: deadline before commit ack write",
+    )?;
     Ok(nonce8)
 }
 
@@ -418,7 +438,8 @@ pub(crate) fn lab_commit_ack_for_request(
                  (epoch, structural_version, marks_digest)",
             ));
         }
-        Some(_) => { /* idempotent retry: durable record UNCHANGED; re-sign with the current nonce below */ }
+        Some(_) => { /* idempotent retry: durable record UNCHANGED; re-sign with the current nonce below */
+        }
         None => {
             ledger.insert(key, proposed);
         }
@@ -455,12 +476,13 @@ pub fn run_lab_anchor_stub() -> Result<std::convert::Infallible, crate::Protocol
             ))
         }
     };
-    let require_path = |var: &str, missing: &'static str| -> Result<std::path::PathBuf, crate::ProtocolError> {
-        match std::env::var_os(var) {
-            Some(v) => Ok(std::path::PathBuf::from(v)),
-            None => Err(crate::ProtocolError::PqSigningUnavailable(missing)),
-        }
-    };
+    let require_path =
+        |var: &str, missing: &'static str| -> Result<std::path::PathBuf, crate::ProtocolError> {
+            match std::env::var_os(var) {
+                Some(v) => Ok(std::path::PathBuf::from(v)),
+                None => Err(crate::ProtocolError::PqSigningUnavailable(missing)),
+            }
+        };
     let root_path = require_path(
         TWOD_HSM_LAB_ANCHOR_SEAL_ROOT_FILE,
         "lab anchor: TWOD_HSM_LAB_ANCHOR_SEAL_ROOT_FILE is required (no default)",
@@ -497,7 +519,9 @@ pub fn run_lab_anchor_stub() -> Result<std::convert::Infallible, crate::Protocol
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED);
     let listener = std::net::TcpListener::bind(&listen).map_err(|e| {
         stub_log(format_args!("bind {listen} failed: {e}"));
-        crate::ProtocolError::PqSigningUnavailable("lab anchor: TCP bind failed (see prior log line)")
+        crate::ProtocolError::PqSigningUnavailable(
+            "lab anchor: TCP bind failed (see prior log line)",
+        )
     })?;
     stub_log(format_args!("listening on {listen}"));
     // slice 6-5: ONE durable commit ledger across all connections — the anchor's idempotency/conflict
@@ -572,7 +596,11 @@ fn smoke_envelope(opcode: u8, request_id: &[u8], key_ref: Option<&[u8; 32]>) -> 
     let mut p = Vec::with_capacity(96);
     put_uint(&mut p, 5, if key_ref.is_some() { 5 } else { 4 });
     put_uint(&mut p, 0, 1);
-    put_uint(&mut p, 0, u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION));
+    put_uint(
+        &mut p,
+        0,
+        u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION),
+    );
     put_uint(&mut p, 0, 2);
     put_uint(&mut p, 0, u64::from(opcode));
     put_uint(&mut p, 0, 3);
@@ -594,13 +622,18 @@ fn smoke_round_trip<S: std::io::Read + std::io::Write>(
 ) -> Result<Vec<(ciborium::value::Value, ciborium::value::Value)>, String> {
     let frame = crate::encode_message(crate::MessageType::AgentGateway, envelope)
         .map_err(|e| format!("encode: {e}"))?;
-    conn.write_all(&frame).and_then(|()| conn.flush()).map_err(|e| format!("write: {e}"))?;
+    conn.write_all(&frame)
+        .and_then(|()| conn.flush())
+        .map_err(|e| format!("write: {e}"))?;
     let deadline = std::time::Instant::now() + SMOKE_REPLY_DEADLINE;
     let reply = crate::read_framed_message_with_idle_deadline(conn, Some(deadline))
         .map_err(|e| format!("read reply: {e}"))?;
     let decoded = crate::decode_message(&reply).map_err(|e| format!("decode reply: {e}"))?;
     if decoded.msg_type != crate::MessageType::AgentGateway {
-        return Err(format!("reply type {:?} is not AgentGateway", decoded.msg_type));
+        return Err(format!(
+            "reply type {:?} is not AgentGateway",
+            decoded.msg_type
+        ));
     }
     let mut cursor = std::io::Cursor::new(decoded.payload.as_slice());
     let value: ciborium::value::Value =
@@ -668,7 +701,11 @@ fn read_expect_silent_eof<S: std::io::Read>(conn: &mut S) -> Result<std::time::D
     loop {
         match conn.read(&mut buf) {
             Ok(0) => return Ok(start.elapsed()),
-            Ok(n) => return Err(format!("expected silent close, received {n} unexpected bytes")),
+            Ok(n) => {
+                return Err(format!(
+                    "expected silent close, received {n} unexpected bytes"
+                ))
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::WouldBlock =>
@@ -742,7 +779,9 @@ where
             &smoke_envelope(OPCODE_PUBLIC_IDENTITY, b"smoke-c2", Some(&unknown)),
         )?;
         match (map_u64(&m, 1), map_get_text(&m, 2)) {
-            (Some(code), Some(reason)) if code == EXPECTED_UNKNOWN_KEYREF_CODE && reason.starts_with("agent: ") => {
+            (Some(code), Some(reason))
+                if code == EXPECTED_UNKNOWN_KEYREF_CODE && reason.starts_with("agent: ") =>
+            {
                 Ok(format!("code=0x{code:02x}"))
             }
             (code, reason) => Err(format!(
@@ -756,9 +795,14 @@ where
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let probe = crate::encode_message(crate::MessageType::GetMeasurement, &[])
             .map_err(|e| format!("encode probe: {e}"))?;
-        conn.write_all(&probe).and_then(|()| conn.flush()).map_err(|e| format!("write: {e}"))?;
+        conn.write_all(&probe)
+            .and_then(|()| conn.flush())
+            .map_err(|e| format!("write: {e}"))?;
         let elapsed = read_expect_silent_eof(&mut conn)?;
-        Ok(format!("silent close after {} ms, zero bytes", elapsed.as_millis()))
+        Ok(format!(
+            "silent close after {} ms, zero bytes",
+            elapsed.as_millis()
+        ))
     });
 
     // C4: the real 300 s wall-clock idle expiry (the checklisted acceptance item deviceless tests
@@ -809,10 +853,7 @@ where
     true
 }
 
-fn map_get_text(
-    m: &[(ciborium::value::Value, ciborium::value::Value)],
-    key: u64,
-) -> Option<&str> {
+fn map_get_text(m: &[(ciborium::value::Value, ciborium::value::Value)], key: u64) -> Option<&str> {
     match crate::agent_cbor::map_get(m, key) {
         Some(ciborium::value::Value::Text(t)) => Some(t.as_str()),
         _ => None,
@@ -884,7 +925,10 @@ fn smoke_generate_keys_envelope(
         SMOKE_ENCLAVE_SCOPE_ID,
     );
     let payload = vec![
-        (Value::Integer(1.into()), Value::Integer(SMOKE_KEYGEN_PURPOSE.into())),
+        (
+            Value::Integer(1.into()),
+            Value::Integer(SMOKE_KEYGEN_PURPOSE.into()),
+        ),
         (Value::Integer(2.into()), Value::Integer(count.into())),
     ];
     let m = vec![
@@ -892,8 +936,14 @@ fn smoke_generate_keys_envelope(
             Value::Integer(1.into()),
             Value::Integer(u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION).into()),
         ),
-        (Value::Integer(2.into()), Value::Integer(u64::from(OPCODE_GENERATE_KEYS).into())),
-        (Value::Integer(3.into()), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
+        (
+            Value::Integer(2.into()),
+            Value::Integer(u64::from(OPCODE_GENERATE_KEYS).into()),
+        ),
+        (
+            Value::Integer(3.into()),
+            Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string()),
+        ),
         (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
         (Value::Integer(5.into()), Value::Map(cap)),
         (Value::Integer(7.into()), Value::Map(payload)),
@@ -930,15 +980,25 @@ fn assert_generate_keys_success(
         };
         match map_get(em, 1) {
             Some(Value::Bytes(b)) if b.len() == 32 => minted_refs.push(b.clone()),
-            _ => return Err(format!("minted key {i}: key_ref (entry key 1) is not 32 bytes")),
+            _ => {
+                return Err(format!(
+                    "minted key {i}: key_ref (entry key 1) is not 32 bytes"
+                ))
+            }
         }
         match map_get(em, 2) {
             Some(Value::Bytes(b)) if b.len() == 65 && b.first() == Some(&0x04) => {}
-            _ => return Err(format!("minted key {i}: pubkey (entry key 2) is not 65B uncompressed")),
+            _ => {
+                return Err(format!(
+                    "minted key {i}: pubkey (entry key 2) is not 65B uncompressed"
+                ))
+            }
         }
         let purpose = map_get(em, 5).and_then(crate::agent_cbor::as_u64);
         if purpose != Some(SMOKE_KEYGEN_PURPOSE) {
-            return Err(format!("minted key {i}: purpose (entry key 5) != transfer (got {purpose:?})"));
+            return Err(format!(
+                "minted key {i}: purpose (entry key 5) != transfer (got {purpose:?})"
+            ));
         }
     }
     // The minted key_refs must be mutually DISTINCT and distinct from the seeded SMOKE_KEY_REF — else a
@@ -949,7 +1009,10 @@ fn assert_generate_keys_success(
     if uniq.len() != minted_refs.len() {
         return Err("minted key_refs are not mutually distinct".to_string());
     }
-    if minted_refs.iter().any(|r| r.as_slice() == SMOKE_KEY_REF.as_slice()) {
+    if minted_refs
+        .iter()
+        .any(|r| r.as_slice() == SMOKE_KEY_REF.as_slice())
+    {
         return Err("a minted key_ref collides with the seeded SMOKE_KEY_REF".to_string());
     }
     let blob = match map_get(m, 2) {
@@ -961,7 +1024,9 @@ fn assert_generate_keys_success(
         SMOKE_SEAL_ROOT,
         AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
     )
-    .map_err(|e| format!("returned blob does NOT unseal under the smoke root/measurement: {e:?}"))?;
+    .map_err(|e| {
+        format!("returned blob does NOT unseal under the smoke root/measurement: {e:?}")
+    })?;
     let base = smoke_body();
     if resealed.entries.len() != base.entries.len() + count {
         return Err(format!(
@@ -973,7 +1038,9 @@ fn assert_generate_keys_success(
     // The pre-existing seeded entry MUST survive the swap (the op APPENDS; a regression that clobbered or
     // dropped it while minting an extra key would still hit the count above — pin it explicitly).
     if !resealed.entries.iter().any(|e| e.key_ref == SMOKE_KEY_REF) {
-        return Err("the seeded SMOKE_KEY_REF entry did not survive the GENERATE_KEYS swap".to_string());
+        return Err(
+            "the seeded SMOKE_KEY_REF entry did not survive the GENERATE_KEYS swap".to_string(),
+        );
     }
     // 6-4: GENERATE_KEYS is a Structural op ⇒ the ATOMIC per-op bump advances structural_version AND
     // freshness_epoch together by exactly +1, regardless of `count`.
@@ -1037,9 +1104,11 @@ where
         let env = smoke_generate_keys_envelope(b"keygen-smoke-w1", 1, 2, &admin);
         let m = smoke_round_trip(&mut conn, &env)?;
         assert_generate_keys_success(&m, 2)?;
-        Ok("2 transfer keys minted; resealed blob unseals with entries+2, structural+1, epoch+1 \
+        Ok(
+            "2 transfer keys minted; resealed blob unseals with entries+2, structural+1, epoch+1 \
             (one Structural op; seal→commit→ack→swap→emit held)"
-            .to_string())
+                .to_string(),
+        )
     });
 
     // W2: the auth gate stays live-pinned — a cap signed by the WRONG key is rejected 0x43 BEFORE any
@@ -1136,8 +1205,14 @@ mod faucet {
                 Value::Integer(1.into()),
                 Value::Integer(u64::from(crate::agent_identity::AGENT_GATEWAY_VERSION).into()),
             ),
-            (Value::Integer(2.into()), Value::Integer(u64::from(opcode).into())),
-            (Value::Integer(3.into()), Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string())),
+            (
+                Value::Integer(2.into()),
+                Value::Integer(u64::from(opcode).into()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Text(crate::agent_dispatch::COMMAND_DOMAIN.to_string()),
+            ),
             (Value::Integer(4.into()), Value::Bytes(request_id.to_vec())),
         ];
         if let Some(c) = cap {
@@ -1148,12 +1223,17 @@ mod faucet {
         }
         m.push((Value::Integer(7.into()), Value::Map(payload)));
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&Value::Map(m), &mut buf).expect("faucet smoke envelope encodes");
+        ciborium::ser::into_writer(&Value::Map(m), &mut buf)
+            .expect("faucet smoke envelope encodes");
         buf
     }
 
     /// GENERATE_KEYS(purpose=2 treasury, count=1) for the faucet smoke (its own counter lane).
-    pub(super) fn treasury_keygen_envelope(request_id: &[u8], counter: u64, signer: &SigningKey) -> Vec<u8> {
+    pub(super) fn treasury_keygen_envelope(
+        request_id: &[u8],
+        counter: u64,
+        signer: &SigningKey,
+    ) -> Vec<u8> {
         let pb = crate::agent_capability::payload_binding(
             OPCODE_GENERATE_KEYS,
             None,
@@ -1161,8 +1241,18 @@ mod faucet {
             &crate::agent_dispatch::generate_keys_canonical_params(FAUCET_TREASURY_PURPOSE, 1),
         );
         let cap = crate::agent_capability::test_signed_capability(
-            signer, OPCODE_GENERATE_KEYS, request_id, counter, false, SMOKE_CHAIN_ID, SMOKE_ENVIRONMENT,
-            0, GENFAUCET_SCOPE_TARGET, FAUCET_TREASURY_PURPOSE as u8, pb, SMOKE_ENCLAVE_SCOPE_ID,
+            signer,
+            OPCODE_GENERATE_KEYS,
+            request_id,
+            counter,
+            false,
+            SMOKE_CHAIN_ID,
+            SMOKE_ENVIRONMENT,
+            0,
+            GENFAUCET_SCOPE_TARGET,
+            FAUCET_TREASURY_PURPOSE as u8,
+            pb,
+            SMOKE_ENCLAVE_SCOPE_ID,
         );
         envelope(
             OPCODE_GENERATE_KEYS,
@@ -1170,7 +1260,10 @@ mod faucet {
             None,
             Some(cap),
             vec![
-                (Value::Integer(1.into()), Value::Integer(FAUCET_TREASURY_PURPOSE.into())),
+                (
+                    Value::Integer(1.into()),
+                    Value::Integer(FAUCET_TREASURY_PURPOSE.into()),
+                ),
                 (Value::Integer(2.into()), Value::Integer(1.into())),
             ],
         )
@@ -1185,21 +1278,50 @@ mod faucet {
         set_limits_gas: Option<(u64, u64)>,
         signer: &SigningKey,
     ) -> Vec<u8> {
-        let cp = crate::agent_dispatch::configure_treasury_canonical_params(sub_op, field2_min, set_limits_gas);
-        let pb = crate::agent_capability::payload_binding(OPCODE_CONFIGURE_TREASURY, Some(sub_op), request_id, &cp);
+        let cp = crate::agent_dispatch::configure_treasury_canonical_params(
+            sub_op,
+            field2_min,
+            set_limits_gas,
+        );
+        let pb = crate::agent_capability::payload_binding(
+            OPCODE_CONFIGURE_TREASURY,
+            Some(sub_op),
+            request_id,
+            &cp,
+        );
         let cap = crate::agent_capability::test_signed_capability_with_sub_op(
-            signer, OPCODE_CONFIGURE_TREASURY, Some(sub_op), request_id, counter, false, SMOKE_CHAIN_ID,
-            SMOKE_ENVIRONMENT, 0, CONFIGURE_SCOPE_TARGET, 2, pb, SMOKE_ENCLAVE_SCOPE_ID,
+            signer,
+            OPCODE_CONFIGURE_TREASURY,
+            Some(sub_op),
+            request_id,
+            counter,
+            false,
+            SMOKE_CHAIN_ID,
+            SMOKE_ENVIRONMENT,
+            0,
+            CONFIGURE_SCOPE_TARGET,
+            2,
+            pb,
+            SMOKE_ENCLAVE_SCOPE_ID,
         );
         let mut payload = vec![
-            (Value::Integer(1.into()), Value::Integer(u64::from(sub_op).into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer(u64::from(sub_op).into()),
+            ),
             (Value::Integer(2.into()), Value::Bytes(field2_min.to_vec())),
         ];
         if let Some((gl, fr)) = set_limits_gas {
             payload.push((Value::Integer(3.into()), Value::Integer(gl.into())));
             payload.push((Value::Integer(4.into()), Value::Integer(fr.into())));
         }
-        envelope(OPCODE_CONFIGURE_TREASURY, request_id, None, Some(cap), payload)
+        envelope(
+            OPCODE_CONFIGURE_TREASURY,
+            request_id,
+            None,
+            Some(cap),
+            payload,
+        )
     }
 
     /// SIGN_FAUCET_DISPENSE — NO cap (runtime op); the strict 8-field EIP-155 payload + key_ref(6).
@@ -1218,13 +1340,22 @@ mod faucet {
             Some(treasury_key_ref),
             None,
             vec![
-                (Value::Integer(1.into()), Value::Integer(SMOKE_CHAIN_ID.into())),
+                (
+                    Value::Integer(1.into()),
+                    Value::Integer(SMOKE_CHAIN_ID.into()),
+                ),
                 (Value::Integer(2.into()), Value::Bytes(from.to_vec())),
                 (Value::Integer(3.into()), Value::Bytes(to.to_vec())),
                 (Value::Integer(4.into()), Value::Bytes(amount_min.to_vec())),
                 (Value::Integer(5.into()), Value::Integer(0.into())), // nonce
-                (Value::Integer(6.into()), Value::Integer(DISPENSE_GAS_LIMIT.into())),
-                (Value::Integer(7.into()), Value::Bytes(gas_price_min.to_vec())),
+                (
+                    Value::Integer(6.into()),
+                    Value::Integer(DISPENSE_GAS_LIMIT.into()),
+                ),
+                (
+                    Value::Integer(7.into()),
+                    Value::Bytes(gas_price_min.to_vec()),
+                ),
                 (Value::Integer(8.into()), Value::Bytes(vec![])), // data MUST be empty
             ],
         )
@@ -1238,7 +1369,11 @@ mod faucet {
         use crate::agent_cbor::map_get;
         let list = match map_get(m, 1) {
             Some(Value::Array(a)) if a.len() == 1 => a,
-            other => return Err(format!("treasury keygen: key 1 is not a 1-element array: {other:?}")),
+            other => {
+                return Err(format!(
+                    "treasury keygen: key 1 is not a 1-element array: {other:?}"
+                ))
+            }
         };
         let km = match &list[0] {
             Value::Map(km) => km.as_slice(),
@@ -1248,11 +1383,17 @@ mod faucet {
             return Err("treasury keygen: minted purpose != faucet treasury".into());
         }
         let key_ref: [u8; 32] = match map_get(km, 1) {
-            Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| "key_ref not 32B".to_string())?,
+            Some(Value::Bytes(b)) => b
+                .as_slice()
+                .try_into()
+                .map_err(|_| "key_ref not 32B".to_string())?,
             _ => return Err("treasury keygen: key_ref (entry key 1) missing".into()),
         };
         let eth: [u8; 20] = match map_get(km, 3) {
-            Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| "eth not 20B".to_string())?,
+            Some(Value::Bytes(b)) => b
+                .as_slice()
+                .try_into()
+                .map_err(|_| "eth not 20B".to_string())?,
             _ => return Err("treasury keygen: eth_address (entry key 3) missing".into()),
         };
         Ok((key_ref, eth))
@@ -1275,18 +1416,28 @@ mod faucet {
         use crate::agent_cbor::map_get;
         match map_get(m, 1) {
             Some(Value::Bytes(b)) if !b.is_empty() => {}
-            other => return Err(format!("dispense: key 1 (signed_rlp) missing/empty: {other:?}")),
+            other => {
+                return Err(format!(
+                    "dispense: key 1 (signed_rlp) missing/empty: {other:?}"
+                ))
+            }
         }
         match map_get(m, 7) {
             Some(Value::Bytes(b)) if b.as_slice() == treasury_from.as_slice() => {}
-            other => return Err(format!("dispense: key 7 (from) != treasury address: {other:?}")),
+            other => {
+                return Err(format!(
+                    "dispense: key 7 (from) != treasury address: {other:?}"
+                ))
+            }
         }
         let blob = match map_get(m, 8) {
             Some(Value::Bytes(b)) => b.as_slice(),
             _ => return Err("dispense: key 8 (resealed blob) missing".into()),
         };
         let resealed = crate::agent_keystore::unseal_body(
-            blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+            blob,
+            SMOKE_SEAL_ROOT,
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
         )
         .map_err(|e| format!("dispense: resealed blob does NOT unseal: {e:?}"))?;
         let wc = u256_be(worst_case());
@@ -1314,10 +1465,18 @@ mod faucet {
         use crate::agent_cbor::map_get;
         let blob = match map_get(m, 1) {
             Some(Value::Bytes(b)) if !b.is_empty() => b.as_slice(),
-            other => return Err(format!("configure: key 1 (sealed blob) missing/empty: {other:?}")),
+            other => {
+                return Err(format!(
+                    "configure: key 1 (sealed blob) missing/empty: {other:?}"
+                ))
+            }
         };
-        crate::agent_keystore::unseal_body(blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
-            .map_err(|e| format!("configure: resealed blob does NOT unseal: {e:?}"))
+        crate::agent_keystore::unseal_body(
+            blob,
+            SMOKE_SEAL_ROOT,
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+        )
+        .map_err(|e| format!("configure: resealed blob does NOT unseal: {e:?}"))
     }
 
     /// The expected u256 (big-endian `[u8; 32]`) of a u64 — for content-validating sealed faucet caps.
@@ -1350,10 +1509,16 @@ mod faucet {
             ));
         }
         if b.structural_version != structural_version {
-            return Err(format!("structural_version {} != expected {structural_version}", b.structural_version));
+            return Err(format!(
+                "structural_version {} != expected {structural_version}",
+                b.structural_version
+            ));
         }
         if b.freshness_epoch != freshness_epoch {
-            return Err(format!("freshness_epoch {} != expected {freshness_epoch}", b.freshness_epoch));
+            return Err(format!(
+                "freshness_epoch {} != expected {freshness_epoch}",
+                b.freshness_epoch
+            ));
         }
         // The configure lane's capability counter high-water advances once per accepted CONFIGURE: a row
         // keyed by the FULL replay-protection tuple `(authority, environment, scope_class, scope_target)`
@@ -1362,8 +1527,9 @@ mod faucet {
         // CONFIGURE_SCOPE_TARGET would leave the actual admin configure lane replayable yet still pass a
         // scope_target-only check. The admin authority is the verifying key of SMOKE_ADMIN_SEED (the cap
         // signer); the lane is enclave-scoped (scope_class 0) in SMOKE_ENVIRONMENT.
-        let admin_authority =
-            ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED).verifying_key().to_bytes();
+        let admin_authority = ed25519_dalek::SigningKey::from_bytes(&SMOKE_ADMIN_SEED)
+            .verifying_key()
+            .to_bytes();
         let lane = b
             .counters
             .iter()
@@ -1454,14 +1620,24 @@ where
     phase!("configure-set-limits", {
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let env = configure_envelope(
-            b"faucet-smoke-f2", 1, 0, &min_be(PER_DISPENSE_MAX), Some((MAX_GAS_LIMIT, MAX_FEE_RATE)), &admin,
+            b"faucet-smoke-f2",
+            1,
+            0,
+            &min_be(PER_DISPENSE_MAX),
+            Some((MAX_GAS_LIMIT, MAX_FEE_RATE)),
+            &admin,
         );
         let m = smoke_round_trip(&mut conn, &env)?;
         let b = unseal_configure_reply(&m)?;
         if b.faucet.per_dispense_max_amount != u256_of(PER_DISPENSE_MAX) {
-            return Err(format!("set_limits: per_dispense_max not applied ({:?})", b.faucet.per_dispense_max_amount));
+            return Err(format!(
+                "set_limits: per_dispense_max not applied ({:?})",
+                b.faucet.per_dispense_max_amount
+            ));
         }
-        if b.faucet.max_gas_limit != MAX_GAS_LIMIT || b.faucet.max_effective_gas_fee_rate != MAX_FEE_RATE {
+        if b.faucet.max_gas_limit != MAX_GAS_LIMIT
+            || b.faucet.max_effective_gas_fee_rate != MAX_FEE_RATE
+        {
             return Err(format!(
                 "set_limits: gas caps not applied (gas_limit={}, fee_rate={})",
                 b.faucet.max_gas_limit, b.faucet.max_effective_gas_fee_rate
@@ -1482,10 +1658,16 @@ where
         let m = smoke_round_trip(&mut conn, &env)?;
         let b = unseal_configure_reply(&m)?;
         if b.faucet.cumulative_signing_budget != u256_of(BUDGET) {
-            return Err(format!("refill_budget: budget not applied ({:?})", b.faucet.cumulative_signing_budget));
+            return Err(format!(
+                "refill_budget: budget not applied ({:?})",
+                b.faucet.cumulative_signing_budget
+            ));
         }
         if b.faucet.cumulative_native_spend != [0u8; 32] {
-            return Err("refill_budget: cumulative_native_spend not reset to 0 (the fresh refill window)".to_string());
+            return Err(
+                "refill_budget: cumulative_native_spend not reset to 0 (the fresh refill window)"
+                    .to_string(),
+            );
         }
         // Rollback-artifact METADATA: SECOND CONFIGURE ⇒ config_version=2, epoch=4 / structural=4, lane=2.
         assert_configure_metadata(&b, 2, 4, 4, 2)?;
@@ -1497,11 +1679,19 @@ where
         let (kr, from) = treasury.ok_or("dispense: F1 did not record the treasury key")?;
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let env = dispense_envelope(
-            b"faucet-smoke-f4", &kr, &from, &recipient, &min_be(DISPENSE_AMOUNT), &min_be(DISPENSE_GAS_PRICE),
+            b"faucet-smoke-f4",
+            &kr,
+            &from,
+            &recipient,
+            &min_be(DISPENSE_AMOUNT),
+            &min_be(DISPENSE_GAS_PRICE),
         );
         let m = smoke_round_trip(&mut conn, &env)?;
         assert_dispense_success(&m, &from)?;
-        Ok(format!("dispensed; both spend counters debited by worst_case={}", worst_case()))
+        Ok(format!(
+            "dispensed; both spend counters debited by worst_case={}",
+            worst_case()
+        ))
     });
 
     // F5 (fail-closed gate): a dispense to a STRANGER (not a stored transfer key) → 0x42, proving the
@@ -1510,12 +1700,21 @@ where
         let (kr, from) = treasury.ok_or("F1 did not record the treasury key")?;
         let mut conn = connect().map_err(|e| format!("connect: {e}"))?;
         let env = dispense_envelope(
-            b"faucet-smoke-f5", &kr, &from, &[0xab; 20], &min_be(DISPENSE_AMOUNT), &min_be(DISPENSE_GAS_PRICE),
+            b"faucet-smoke-f5",
+            &kr,
+            &from,
+            &[0xab; 20],
+            &min_be(DISPENSE_AMOUNT),
+            &min_be(DISPENSE_GAS_PRICE),
         );
         let m = smoke_round_trip(&mut conn, &env)?;
         match (map_u64(&m, 1), map_get_text(&m, 2)) {
-            (Some(0x42), Some(reason)) if reason.starts_with("agent: ") => Ok("stranger recipient → 0x42".to_string()),
-            (code, reason) => Err(format!("expected {{1:0x42, 2:\"agent: …\"}}, got code={code:?} reason={reason:?}")),
+            (Some(0x42), Some(reason)) if reason.starts_with("agent: ") => {
+                Ok("stranger recipient → 0x42".to_string())
+            }
+            (code, reason) => Err(format!(
+                "expected {{1:0x42, 2:\"agent: …\"}}, got code={code:?} reason={reason:?}"
+            )),
         }
     });
 
@@ -1540,13 +1739,24 @@ mod tests {
     #[test]
     fn smoke_body_validates_and_round_trips() {
         let body = smoke_body();
-        body.validate().expect("smoke body passes structural validation");
+        body.validate()
+            .expect("smoke body passes structural validation");
         let blob = smoke_sealed_blob();
-        assert_eq!(&blob[8..10], &[0x00, 0x04], "format_version 4 in the header");
-        assert!(blob.len() <= MAX_KEYSTORE_BLOB_SIZE, "smoke blob is re-installable");
-        let unsealed =
-            unseal_body(&blob, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
-                .expect("smoke blob unseals");
+        assert_eq!(
+            &blob[8..10],
+            &[0x00, 0x04],
+            "format_version 4 in the header"
+        );
+        assert!(
+            blob.len() <= MAX_KEYSTORE_BLOB_SIZE,
+            "smoke blob is re-installable"
+        );
+        let unsealed = unseal_body(
+            &blob,
+            SMOKE_SEAL_ROOT,
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+        )
+        .expect("smoke blob unseals");
         assert_eq!(unsealed, body);
     }
 
@@ -1594,9 +1804,12 @@ mod tests {
              via `regen_agent_smoke_golden_vector` (it re-mints the .json sidecar too) in the same \
              commit"
         );
-        let body =
-            unseal_body(committed, SMOKE_SEAL_ROOT, AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT)
-                .expect("committed smoke golden unseals");
+        let body = unseal_body(
+            committed,
+            SMOKE_SEAL_ROOT,
+            AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT,
+        )
+        .expect("committed smoke golden unseals");
         assert_eq!(body, smoke_body());
     }
 
@@ -1613,13 +1826,21 @@ mod tests {
             serde_json::from_str(sidecar).expect("smoke sidecar must be valid JSON");
         let body = smoke_body();
         let keypair = crate::secp256k1::Keypair::from_secret_bytes(&SMOKE_SECRET_SCALAR).unwrap();
-        assert_eq!(v["warning"].as_str(), Some("TEST KEYS ONLY"), "sidecar warning banner");
+        assert_eq!(
+            v["warning"].as_str(),
+            Some("TEST KEYS ONLY"),
+            "sidecar warning banner"
+        );
         assert_eq!(
             v["blob_sha256"].as_str(),
             Some(hex(&Sha256::digest(blob)).as_str()),
             "sidecar blob_sha256 drift — re-run the regen test (it re-mints both files)"
         );
-        assert_eq!(v["blob_len_bytes"].as_u64(), Some(blob.len() as u64), "blob_len_bytes drift");
+        assert_eq!(
+            v["blob_len_bytes"].as_u64(),
+            Some(blob.len() as u64),
+            "blob_len_bytes drift"
+        );
         // Couple the sidecar's documented format version to BOTH the const AND the actual header bytes
         // [8],[9] (big-endian) — a 3->4-style bump that re-mints the blob but leaves the sidecar string
         // stale (or vice versa) fails here, the gap that previously let a v3 label ship on a v4 blob.
@@ -1710,10 +1931,15 @@ mod tests {
         let (mut stub_end, mut peer_end) =
             std::os::unix::net::UnixStream::pair().expect("socketpair");
         for s in [&stub_end, &peer_end] {
-            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-            s.set_write_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
         }
-        peer_end.write_all(request_frame).and_then(|()| peer_end.flush()).expect("write request");
+        peer_end
+            .write_all(request_frame)
+            .and_then(|()| peer_end.flush())
+            .expect("write request");
         let key = ed25519_dalek::SigningKey::from_bytes(&LAB_ANCHOR_TEST_SEED);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let outcome = lab_anchor_pump_one(&mut stub_end, body, &key, deadline, ledger);
@@ -1739,9 +1965,8 @@ mod tests {
         )
         .expect("stub framed the response with the shared 4-byte BE prefix writer");
         assert!(raw.len() <= crate::agent_boot_relay::MAX_ANCHOR_RESPONSE_LEN);
-        let state =
-            crate::agent_anchor::verify_anchor_response_bytes(&raw, &nonce, &body.config)
-                .expect("stub response passes the REAL guest verify path");
+        let state = crate::agent_anchor::verify_anchor_response_bytes(&raw, &nonce, &body.config)
+            .expect("stub response passes the REAL guest verify path");
         assert_eq!(
             crate::agent_anchor::reconcile(
                 body.freshness_epoch,
@@ -1782,8 +2007,9 @@ mod tests {
         )
         .expect("stub framed the marks response with the shared writer");
         // The guest verifies the marks message (sig/scope/nonce/epoch) and returns the payload.
-        let payload = crate::agent_anchor::verify_marks_response_bytes(&raw, &nonce, epoch, &body.config)
-            .expect("stub marks reply passes the REAL guest marks-verify path");
+        let payload =
+            crate::agent_anchor::verify_marks_response_bytes(&raw, &nonce, epoch, &body.config)
+                .expect("stub marks reply passes the REAL guest marks-verify path");
         // And the whole execute_adopt_forward gate accepts it (the marks hash the freshness-committed
         // digest at this epoch), producing a candidate that reconciles Fresh.
         let state = crate::agent_anchor::AnchorState {
@@ -1914,31 +2140,49 @@ mod tests {
                 &body.config,
             )
         };
-        let expect_rejected = |o: Result<[u8; 8], crate::ProtocolError>, w: Vec<u8>, ledger: &LabCommitLedger, why: &str| {
+        let expect_rejected = |o: Result<[u8; 8], crate::ProtocolError>,
+                               w: Vec<u8>,
+                               ledger: &LabCommitLedger,
+                               why: &str| {
             assert!(o.is_err(), "{why}: conflict must be rejected");
-            assert!(w.is_empty(), "{why}: a rejected conflict writes NO ack (the enclave then fails closed)");
-            assert_eq!(ledger.len(), 1, "{why}: a rejected conflict does NOT alter the durable record");
+            assert!(
+                w.is_empty(),
+                "{why}: a rejected conflict writes NO ack (the enclave then fails closed)"
+            );
+            assert_eq!(
+                ledger.len(),
+                1,
+                "{why}: a rejected conflict does NOT alter the durable record"
+            );
         };
 
         let mut ledger = LabCommitLedger::new();
         let (n_a, n_b) = ([0xa1_u8; 32], [0xb2_u8; 32]);
         // (1) First commit (nonce A) → first-seen: recorded + signed; verifies for A.
-        let (o1, w1) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch, marks, n_a), &mut ledger);
+        let (o1, w1) =
+            drive_stub_pump_with_ledger(&body, &commit_frame(epoch, marks, n_a), &mut ledger);
         o1.expect("first commit ok");
         verify(w1, &n_a, &marks).expect("first ack verifies for nonce A");
         // (2) RETRY same op (same request_id + same {epoch,structural,marks}) with FRESH nonce B →
         //     idempotent: re-signed for B, durable record UNCHANGED.
-        let (o2, w2) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch, marks, n_b), &mut ledger);
+        let (o2, w2) =
+            drive_stub_pump_with_ledger(&body, &commit_frame(epoch, marks, n_b), &mut ledger);
         o2.expect("idempotent retry ok");
         verify(w2, &n_b, &marks).expect("retry ack is re-signed for the CURRENT nonce B");
-        assert_eq!(ledger.len(), 1, "an idempotent retry does NOT add a second durable record");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "an idempotent retry does NOT add a second durable record"
+        );
         // (3) CONFLICT — same request_id, same epoch, DIFFERENT marks ⇒ reject.
-        let (o3, w3) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch, [0xcc; 32], n_a), &mut ledger);
+        let (o3, w3) =
+            drive_stub_pump_with_ledger(&body, &commit_frame(epoch, [0xcc; 32], n_a), &mut ledger);
         expect_rejected(o3, w3, &ledger, "different marks under the same request_id");
         // (4) CONFLICT — same request_id, DIFFERENT epoch ⇒ reject. THIS is the cross-crash double-advance
         //     a post-AdoptForward re-issue of the SAME logical op would attempt; keying by request_id
         //     ALONE (not (request_id, epoch)) catches it, so the same op cannot commit twice.
-        let (o4, w4) = drive_stub_pump_with_ledger(&body, &commit_frame(epoch + 1, marks, n_a), &mut ledger);
+        let (o4, w4) =
+            drive_stub_pump_with_ledger(&body, &commit_frame(epoch + 1, marks, n_a), &mut ledger);
         expect_rejected(o4, w4, &ledger, "different epoch under the same request_id");
     }
 
@@ -1959,8 +2203,13 @@ mod tests {
             .unwrap();
             raws.push(raw);
         }
-        assert_ne!(raws[0], raws[1], "distinct nonces must produce distinct signed responses");
-        assert!(crate::agent_anchor::verify_anchor_response_bytes(&raws[0], &n1, &body.config).is_ok());
+        assert_ne!(
+            raws[0], raws[1],
+            "distinct nonces must produce distinct signed responses"
+        );
+        assert!(
+            crate::agent_anchor::verify_anchor_response_bytes(&raws[0], &n1, &body.config).is_ok()
+        );
         assert!(matches!(
             crate::agent_anchor::verify_anchor_response_bytes(&raws[0], &n2, &body.config),
             Err(crate::agent_anchor::AnchorError::NonceMismatch)
@@ -1972,13 +2221,15 @@ mod tests {
         // Fail-closed close-silently: every reject path returns Err BEFORE any write.
         let body = smoke_body();
         // A well-formed frame of the WRONG type (0x40).
-        let wrong_type =
-            crate::encode_message(crate::MessageType::AgentGateway, &[0x01]).unwrap();
+        let wrong_type = crate::encode_message(crate::MessageType::AgentGateway, &[0x01]).unwrap();
         // A short/garbage byte string (sub-header).
         let garbage = vec![0x00, 0x01, 0x02];
         for bad in [wrong_type, garbage] {
             let (outcome, written_back) = drive_stub_pump(&body, &bad);
-            assert!(outcome.is_err(), "stub must reject the malformed/misrouted frame");
+            assert!(
+                outcome.is_err(),
+                "stub must reject the malformed/misrouted frame"
+            );
             assert!(
                 written_back.is_empty(),
                 "reject must write ZERO bytes back (close-silently)"
@@ -1993,7 +2244,9 @@ mod tests {
         let body = smoke_body();
         let frame = smoke_request_frame_for_scope(9999, "some-other-env", [0xcd_u8; 32], None);
         let (outcome, written_back) = drive_stub_pump(&body, &frame);
-        assert!(matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("scope")));
+        assert!(
+            matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("scope"))
+        );
         assert!(written_back.is_empty());
     }
 
@@ -2009,7 +2262,9 @@ mod tests {
             Some(vec![0u8; 0x90]), // embedded report_data = zeros ≠ the key-5 binding
         );
         let (outcome, written_back) = drive_stub_pump(&body, &frame);
-        assert!(matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("report_data")));
+        assert!(
+            matches!(outcome, Err(crate::ProtocolError::WireProtocol(m)) if m.contains("report_data"))
+        );
         assert!(written_back.is_empty());
     }
 
@@ -2035,7 +2290,10 @@ mod tests {
         // the whole window so a socket timeout can never masquerade as the close.
         let idle_ms = crate::enclave_serve::SESSION_IDLE_TIMEOUT.as_millis();
         let read_arm_ms = crate::enclave_serve::READ_TIMEOUT.as_millis();
-        assert!(IDLE_EXPIRY_FLOOR_MS < idle_ms, "floor must be strictly below the idle timeout");
+        assert!(
+            IDLE_EXPIRY_FLOOR_MS < idle_ms,
+            "floor must be strictly below the idle timeout"
+        );
         assert!(
             idle_ms - IDLE_EXPIRY_FLOOR_MS >= 1_000,
             "floor slop must be a real margin, not an exact floor"
@@ -2116,12 +2374,24 @@ mod tests {
     fn client_phases_pass_against_replica_router() {
         let (ok, log) = run_client_against_router(replica_agent_serve_one_frame);
         assert!(ok, "client phases failed:\n{log}");
-        assert!(log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"), "log:\n{log}");
+        assert!(
+            log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"),
+            "log:\n{log}"
+        );
         assert!(log.contains("PHASE public-identity PASS"), "log:\n{log}");
-        assert!(log.contains("PHASE identity-unknown-keyref PASS"), "log:\n{log}");
+        assert!(
+            log.contains("PHASE identity-unknown-keyref PASS"),
+            "log:\n{log}"
+        );
         assert!(log.contains("PHASE non-agent-close PASS"), "log:\n{log}");
-        assert!(log.contains("PHASE post-expiry-liveness PASS"), "log:\n{log}");
-        assert!(!log.contains("RESULT PASS phases="), "PASS-DEV must not match the official token");
+        assert!(
+            log.contains("PHASE post-expiry-liveness PASS"),
+            "log:\n{log}"
+        );
+        assert!(
+            !log.contains("RESULT PASS phases="),
+            "PASS-DEV must not match the official token"
+        );
     }
 
     /// The BINDING cross-validation: the client core against the SHIPPED 0x40 type-guard + reframe
@@ -2131,10 +2401,12 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
     #[test]
     fn client_phases_pass_against_shipped_serve_glue() {
-        let (ok, log) =
-            run_client_against_router(crate::agent_gateway_boot::agent_serve_one_frame);
+        let (ok, log) = run_client_against_router(crate::agent_gateway_boot::agent_serve_one_frame);
         assert!(ok, "client phases failed against the SHIPPED glue:\n{log}");
-        assert!(log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"), "log:\n{log}");
+        assert!(
+            log.contains("twod-hsm-agent-smoke: RESULT PASS-DEV phases=4"),
+            "log:\n{log}"
+        );
     }
 
     // ---- slice 6-7b WRITE-PATH cross-validation (deviceless; proves seal→commit→swap→emit in-process
@@ -2176,7 +2448,8 @@ mod tests {
             // Return the UNFRAMED signed ACK (what the enclave's `run_anchor_commit` expects back); any
             // local failure maps to the coarse always-retryable transport error ⇒ the enclave fails the
             // op CLOSED (it never reaches swap/emit), matching the production channel contract.
-            match lab_commit_ack_for_request(frame, &self.body, &self.signing_key, &mut self.ledger) {
+            match lab_commit_ack_for_request(frame, &self.body, &self.signing_key, &mut self.ledger)
+            {
                 Ok((ack, _nonce8)) => Ok(ack),
                 Err(_) => Err(crate::agent_boot_driver::AnchorTransportError(
                     "lab commit channel: ack computation failed",
@@ -2221,9 +2494,14 @@ mod tests {
             AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT
         ));
         assert!(crate::agent_dispatch::install_anti_rollback_binding(
-            crate::agent_dispatch::AntiRollbackBinding { epoch: 1, active: true }
+            crate::agent_dispatch::AntiRollbackBinding {
+                epoch: 1,
+                active: true
+            }
         ));
-        assert!(crate::agent_dispatch::install_commit_channel(Box::new(LabCommitChannel::new())));
+        assert!(crate::agent_dispatch::install_commit_channel(Box::new(
+            LabCommitChannel::new()
+        )));
         let connect = move || -> std::io::Result<std::os::unix::net::UnixStream> {
             let (client, mut server) = std::os::unix::net::UnixStream::pair()?;
             client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -2312,9 +2590,14 @@ mod tests {
             AGENT_KEYSTORE_BOOT_PLACEHOLDER_MEASUREMENT
         ));
         assert!(crate::agent_dispatch::install_anti_rollback_binding(
-            crate::agent_dispatch::AntiRollbackBinding { epoch: 1, active: true }
+            crate::agent_dispatch::AntiRollbackBinding {
+                epoch: 1,
+                active: true
+            }
         ));
-        assert!(crate::agent_dispatch::install_commit_channel(Box::new(LabCommitChannel::new())));
+        assert!(crate::agent_dispatch::install_commit_channel(Box::new(
+            LabCommitChannel::new()
+        )));
         let connect = move || -> std::io::Result<std::os::unix::net::UnixStream> {
             let (client, mut server) = std::os::unix::net::UnixStream::pair()?;
             client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -2347,7 +2630,13 @@ mod tests {
     fn faucet_client_drives_combined_flow_against_replica_router() {
         let (ok, log) = run_faucet_client_against_router(replica_agent_serve_one_frame);
         assert!(ok, "faucet client phases failed:\n{log}");
-        for ph in ["mint-treasury", "configure-set-limits", "configure-refill-budget", "dispense", "dispense-stranger-rejected"] {
+        for ph in [
+            "mint-treasury",
+            "configure-set-limits",
+            "configure-refill-budget",
+            "dispense",
+            "dispense-stranger-rejected",
+        ] {
             assert!(
                 log.contains(&format!("twod-hsm-agent-faucet-smoke: PHASE {ph} PASS")),
                 "phase {ph} did not pass:\n{log}"
@@ -2448,6 +2737,9 @@ mod tests {
         );
         let pretty = serde_json::to_string_pretty(&sidecar).expect("sidecar serializes");
         std::fs::write(json_path, pretty + "\n").expect("write smoke keystore sidecar");
-        eprintln!("wrote {} bytes -> {bin_path}\nwrote sidecar -> {json_path}", blob.len());
+        eprintln!(
+            "wrote {} bytes -> {bin_path}\nwrote sidecar -> {json_path}",
+            blob.len()
+        );
     }
 }

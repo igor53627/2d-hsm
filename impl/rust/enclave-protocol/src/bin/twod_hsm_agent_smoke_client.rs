@@ -34,7 +34,10 @@ fn run() -> Result<bool, String> {
     // NotPresent → default; NotUnicode / parse failure → fail closed naming the var.
     let parse_u32 = |var: &str, default: u32| -> Result<u32, String> {
         match std::env::var(var) {
-            Ok(s) => s.trim().parse::<u32>().map_err(|_| format!("{var} must be a u32")),
+            Ok(s) => s
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("{var} must be a u32")),
             Err(std::env::VarError::NotPresent) => Ok(default),
             Err(std::env::VarError::NotUnicode(_)) => Err(format!("{var} is not valid UTF-8")),
         }
@@ -44,7 +47,11 @@ fn run() -> Result<bool, String> {
     let skip_idle = match std::env::var("TWOD_HSM_AGENT_SMOKE_SKIP_IDLE") {
         Ok(s) if s == "1" => true,
         Ok(s) if s == "0" || s.is_empty() => false,
-        Ok(s) => return Err(format!("TWOD_HSM_AGENT_SMOKE_SKIP_IDLE must be 0/1, got {s:?}")),
+        Ok(s) => {
+            return Err(format!(
+                "TWOD_HSM_AGENT_SMOKE_SKIP_IDLE must be 0/1, got {s:?}"
+            ))
+        }
         Err(std::env::VarError::NotPresent) => false,
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err("TWOD_HSM_AGENT_SMOKE_SKIP_IDLE is not valid UTF-8".to_string())
@@ -59,5 +66,9 @@ fn run() -> Result<bool, String> {
         stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
         Ok(stream)
     };
-    Ok(enclave_protocol::run_agent_smoke_client(connect, skip_idle, &mut std::io::stderr()))
+    Ok(enclave_protocol::run_agent_smoke_client(
+        connect,
+        skip_idle,
+        &mut std::io::stderr(),
+    ))
 }
