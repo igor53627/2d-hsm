@@ -876,6 +876,87 @@ pub(crate) fn open_restore_ingress_envelope(
     })
 }
 
+/// Fail-closed errors for [`apply_restore_to_body`] (never a partial/silent apply).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestoreApplyError {
+    /// AC#7: the RESTORE-time `audit_capacity` is smaller than the restored `audit_records.len()` —
+    /// refuse, NEVER truncate the restored reviewable history.
+    AuditCapacityOverflow,
+    /// AC#6: `strict_recovery_counter` forward-only advance (`max(local, backup) + 1`) overflows `u64`.
+    MonotonicOverflow,
+}
+
+/// TASK-24 AC#3/#7 (+ AC#6 strict_recovery): apply a decoded [`RestoreIngressData`] to a keystore body —
+/// wholesale-REPLACE the restorable state, reconstruct the EXCLUDED audit cursors enclave-locally, and
+/// advance `strict_recovery_counter` forward-only. Pure transform (no I/O, no validate — the handler
+/// validates + seals). EVERY error path returns `Err` with NO partial mutation (the capacity gate runs
+/// before any field write).
+///
+/// **Wholesale-replaces** (AC#3): the config-IDENTITY subset (`twod_chain_id`/`environment_identifier`/
+/// `admin_authority_pk`/`recovery_authority_pk`/`monotonic_treasury_config_version`/`authority_epoch`) +
+/// `entries` (incl. the secret scalars — the point of the backup) + `counters` + `faucet` + audit RECORDS
+/// + `strict_recovery_counter` (advanced, AC#6). **Never touches the EXCLUDED surfaces**: `anchor_root`,
+/// `backup_recovery_wrapping_pubkey`, `enclave_scope_id`, `fleet_scope_id` (enclave-local identity — the
+/// payload carries none), and `freshness_epoch`/`structural_version` (enclave-relative; the handler's
+/// `advance_commit_epoch(true)` bumps them — AC#4, the `local+1` strategy).
+///
+/// **Audit cursors** (AC#7): reconstructed enclave-locally — `next_seq = max(record.seq)+1` (or 1 if
+/// none), `last_exported_seq = next_seq-1` (the restored ring starts FULLY drained), `capacity` from the
+/// RESTORE-time policy arg (NOT the backup). `capacity < records.len()` ⇒ `AuditCapacityOverflow` (fail
+/// closed, never truncate — AC#14).
+///
+/// **AC#6 NOTE**: this installs the backup's `counters` + `faucet` as the AC#3 base. The handler's AC#6
+/// gate (the authenticated-high-water seeding via the 5b-2e raw-marks channel) OVERRIDES/VALIDATES the
+/// spend/counter high-water BEFORE commit — it never trusts the possibly-stale backup alone for those
+/// marks. `strict_recovery_counter` IS advanced forward-only here (the clear part of AC#6): the new value
+/// is strictly `> max(local, backup)` — a fresh TEE (local 0) restores to `backup+1`, a re-restore to
+/// `max(local, backup)+1`.
+pub(crate) fn apply_restore_to_body(
+    body: &mut crate::agent_keystore::KeystoreBody,
+    data: &RestoreIngressData,
+    audit_capacity: u32,
+) -> Result<(), RestoreApplyError> {
+    // AC#7: capacity gate FIRST (before any write) — fail closed, NEVER truncate restored records.
+    if (audit_capacity as usize) < data.audit_records.len() {
+        return Err(RestoreApplyError::AuditCapacityOverflow);
+    }
+    // AC#7: reconstruct the EXCLUDED cursors enclave-locally (the payload carries records, not cursors).
+    let next_seq = data
+        .audit_records
+        .iter()
+        .map(|r| r.seq)
+        .max()
+ .map(|m| m.saturating_add(1))
+        .unwrap_or(1);
+    let last_exported_seq = next_seq - 1; // restored ring starts fully drained (next_seq >= 1 ⇒ no underflow)
+
+    // AC#3: wholesale-replace the config-IDENTITY subset. The enclave-local identity fields
+    // (anchor_root / backup_recovery_wrapping_pubkey / enclave_scope_id / fleet_scope_id) are EXCLUDED —
+    // the payload carries none; they stay the restoring enclave's own.
+    body.config.twod_chain_id = data.config.twod_chain_id;
+    body.config.environment_identifier = data.config.environment_identifier.clone();
+    body.config.admin_authority_pk = data.config.admin_authority_pk;
+    body.config.recovery_authority_pk = data.config.recovery_authority_pk;
+    body.config.monotonic_treasury_config_version = data.config.monotonic_treasury_config_version;
+    body.config.authority_epoch = data.config.authority_epoch;
+
+    body.entries = data.entries.clone();
+    body.counters = data.counters.clone();
+    body.faucet = data.faucet.clone();
+    body.audit.records = data.audit_records.clone();
+    body.audit.capacity = audit_capacity;
+    body.audit.next_seq = next_seq;
+    body.audit.last_exported_seq = last_exported_seq;
+
+    // AC#6 (strict_recovery): forward-only advance — strictly > the current highest of (local, backup).
+    let highest = body.strict_recovery_counter.max(data.strict_recovery_counter);
+    body.strict_recovery_counter = highest
+        .checked_add(1)
+        .ok_or(RestoreApplyError::MonotonicOverflow)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2405,5 +2486,120 @@ mod tests {
             "wrote restore-ingress ENVELOPE golden ({}-byte envelope) + dest-ephemeral keypair fixtures + sidecar -> {dir}",
             envelope.len()
         );
+    }
+
+    // ─── TASK-24 AC#3/#7/#6: apply_restore_to_body (the wholesale-replace + cursor reconstruction) ───
+
+    /// A restore target body with DELIBERATELY distinct EXCLUDED sentinels (`anchor_root=[0xCC;32]`,
+    /// `enclave_scope_id=[0xce;32]`, `fleet_scope_id=[0xcf;32]`, `backup_recovery_wrapping_pubkey=[0xd0;…]`,
+    /// `freshness_epoch=100`, `structural_version=50`, `strict_recovery_counter=10`) so the exclusion +
+    /// forward-only + untouched-anchor-state assertions are non-vacuous.
+    fn restore_target_body() -> crate::agent_keystore::KeystoreBody {
+        use crate::agent_keystore::*;
+        let mut body = body_with_two_keys(); // baseline (will be wholesale-replaced)
+        body.config.anchor_root = [0xCC; 32]; // EXCLUDED — must survive the restore
+        body.config.enclave_scope_id = [0xCE; 32]; // EXCLUDED
+        body.config.fleet_scope_id = [0xCF; 32]; // EXCLUDED
+        body.config.backup_recovery_wrapping_pubkey = vec![0xD0; ML_KEM_1024_ENCAPS_KEY_LEN]; // EXCLUDED
+        body.freshness_epoch = 100; // EXCLUDED (handler's advance_commit_epoch bumps it)
+        body.structural_version = 50; // EXCLUDED (local+1 handler bump)
+        body.strict_recovery_counter = 10; // the LOCAL high-water (AC#6 forward-only gate)
+        body
+    }
+
+    /// A RestoreIngressData round-tripped through the frozen payload format (realistic — not hand-built).
+    fn sample_restore_data() -> RestoreIngressData {
+        let body = body_with_two_keys(); // source body (chain 11565, env "testnet", 2 keys, 1 audit rec)
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        let payload = build_restore_ingress_payload(&body, &refs).unwrap();
+        parse_restore_ingress(&payload).unwrap()
+    }
+
+    /// AC#3: wholesale-replace entries/config-identity/counters/faucet/audit-records; the EXCLUDED
+    /// enclave-local identity (anchor_root/scope_ids/wrapping pubkey) + freshness/structural are PRESERVED
+    /// (the restoring enclave's own — the payload carries none).
+    #[test]
+    fn apply_restore_wholesale_replaces_and_preserves_excluded() {
+        let mut target = restore_target_body();
+        let data = sample_restore_data();
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        // Replaced: config-identity subset + entries + counters + faucet.
+        assert_eq!(target.config.twod_chain_id, 11565);
+        assert_eq!(target.config.environment_identifier, "testnet");
+        assert_eq!(target.entries.len(), 2, "entries replaced");
+        assert_eq!(target.entries[0].key_ref, [0x11; 32]);
+        assert_eq!(&target.entries[0].secret_scalar[..], &[0x77; 32], "secret scalar restored");
+        assert_eq!(target.counters, data.counters, "counters replaced");
+        assert_eq!(target.faucet, data.faucet, "faucet replaced");
+        assert_eq!(target.audit.records, data.audit_records, "audit records replaced");
+        // PRESERVED (excluded — the restoring enclave's own identity, never in the payload).
+        assert_eq!(target.config.anchor_root, [0xCC; 32], "anchor_root preserved (excluded)");
+        assert_eq!(target.config.enclave_scope_id, [0xCE; 32], "enclave_scope_id preserved");
+        assert_eq!(target.config.fleet_scope_id, [0xCF; 32], "fleet_scope_id preserved");
+        assert_eq!(
+            target.config.backup_recovery_wrapping_pubkey,
+            vec![0xD0; crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN],
+            "wrapping pubkey preserved"
+        );
+        assert_eq!(target.freshness_epoch, 100, "freshness_epoch untouched (handler bumps it)");
+        assert_eq!(target.structural_version, 50, "structural_version untouched (local+1 handler bump)");
+    }
+
+    /// AC#7: audit cursors reconstructed enclave-locally — next_seq=max(seq)+1, last_exported_seq=
+    /// next_seq-1 (fully drained), capacity from the RESTORE-time policy (NOT the backup).
+    #[test]
+    fn apply_restore_reconstructs_audit_cursors() {
+        let mut target = restore_target_body();
+        let data = sample_restore_data();
+        // body_with_two_keys has ONE audit record (seq=1) ⇒ next_seq=2, last_exported_seq=1.
+        apply_restore_to_body(&mut target, &data, 128).unwrap();
+        assert_eq!(target.audit.capacity, 128, "capacity from restore-time policy, not the backup");
+        let max_seq = data.audit_records.iter().map(|r| r.seq).max().unwrap();
+        assert_eq!(target.audit.next_seq, max_seq + 1, "next_seq = max(record.seq)+1");
+        assert_eq!(target.audit.last_exported_seq, target.audit.next_seq - 1, "fully drained");
+    }
+
+    /// AC#6 (strict_recovery): forward-only — new = max(local, backup)+1. Local high-water (10) vs the
+    /// backup's value ⇒ strictly past both.
+    #[test]
+    fn apply_restore_strict_recovery_advances_forward_only() {
+        let mut target = restore_target_body(); // local strict_recovery_counter = 10
+        let mut data = sample_restore_data();
+        // Case 1: backup (4) < local (10) ⇒ new = 11 (local + 1).
+        data.strict_recovery_counter = 4;
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        assert_eq!(target.strict_recovery_counter, 11, "local(10) > backup(4) ⇒ new = 11");
+        // Case 2: a re-restore where the backup now exceeds local — new = max(local, backup)+1.
+        target.strict_recovery_counter = 3;
+        data.strict_recovery_counter = 8;
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        assert_eq!(target.strict_recovery_counter, 9, "max(3,8)+1 = 9 (strictly past both)");
+    }
+
+    /// AC#7/#14: capacity < records.len() ⇒ AuditCapacityOverflow, fail closed, NO partial mutation.
+    #[test]
+    fn apply_restore_capacity_overflow_fails_closed_no_truncation() {
+        let mut target = restore_target_body();
+        let pre = target.clone();
+        let data = sample_restore_data(); // 1 audit record
+        // capacity 0 < 1 record ⇒ overflow.
+        assert_eq!(
+            apply_restore_to_body(&mut target, &data, 0),
+            Err(RestoreApplyError::AuditCapacityOverflow),
+            "capacity overflow ⇒ fail closed"
+        );
+        assert_eq!(target, pre, "NO partial mutation on the capacity-overflow path");
+    }
+
+    /// AC#7 edge: an empty audit-records backup ⇒ next_seq=1, last_exported_seq=0 (a fresh ring).
+    #[test]
+    fn apply_restore_empty_audit_records_yields_fresh_cursors() {
+        let mut target = restore_target_body();
+        let mut data = sample_restore_data();
+        data.audit_records.clear();
+        apply_restore_to_body(&mut target, &data, 64).unwrap();
+        assert!(target.audit.records.is_empty());
+        assert_eq!(target.audit.next_seq, 1, "empty ⇒ next_seq=1");
+        assert_eq!(target.audit.last_exported_seq, 0, "empty ⇒ last_exported_seq=0");
     }
 }
