@@ -1729,20 +1729,34 @@ fn handle_restore_backup(
         .map_err(|_| AgentError::SealFailed)?;
     // (9) AC#6 adopt: raise the candidate's counters/spend to the authenticated high-water (the current state).
     adopt_ac6_high_water(&mut candidate, &authenticated);
-    // (9b) Advance the capability counter (anti-replay) — the restore cap's counter is durably recorded
-    //      in the restored body's counter table. Mirrors GENERATE_KEYS / EXPORT. After adopt (which set the
-    //      counters from the authenticated marks), this records the ceremony's cap usage.
-    candidate
-        .advance_counter(
-            &verified.authority,
-            verified.scope_class,
-            &verified.scope_target,
-            verified.counter,
-        )
-        .map_err(|e| match e {
-            crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
-            _ => AgentError::SealFailed,
-        })?;
+    // (9b) HIGH #2 (compact 9516): record the cap counter for anti-replay. advance_counter would REJECT
+    //      (CounterRegression) if the backup/adopted marks already carry the recovery/"restore_backup"
+    //      counter tuple at a higher value than the cap's counter. RESTORE must use max (not strict >):
+    //      the candidate's counters were wholesale-replaced from the source + adopted from the authenticated
+    //      marks, so a source-history row at a higher value is EXPECTED, not a replay.
+    {
+        let env_id = candidate.config.environment_identifier.clone();
+        if let Some(c) = candidate.counters.iter_mut().find(|c| {
+            &c.authority == &verified.authority
+                && c.environment_identifier == env_id
+                && c.scope_class == verified.scope_class
+                && c.scope_target == verified.scope_target
+        }) {
+            c.highest_accepted_counter = c.highest_accepted_counter.max(verified.counter);
+        } else if candidate.counters.len() >= crate::agent_keystore::MAX_COUNTER_ENTRIES {
+            return Err(AgentError::CapExceeded);
+        } else {
+            candidate
+                .counters
+                .push(crate::agent_keystore::CounterEntry {
+                    authority: verified.authority,
+                    environment_identifier: env_id,
+                    scope_class: verified.scope_class,
+                    scope_target: verified.scope_target.clone(),
+                    highest_accepted_counter: verified.counter,
+                });
+        }
+    }
     // (10) Enclave-local structural_version = local+1 (AC#4, the `local+1` strategy; Structural commit class).
     candidate
         .advance_commit_epoch(true)
