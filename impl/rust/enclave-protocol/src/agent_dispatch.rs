@@ -1638,6 +1638,24 @@ fn handle_export_backup(
     })
 }
 
+/// Canonical CBOR of the RESTORE_BACKUP request params — the exact bytes hashed into `payload_binding`
+/// (HIGH #1, compact 9499). `{1: requested_refs(array<32B bstr>), 2: backup_digest(32B bstr)}` — binds
+/// the cap to the key selector + the exact backup the recovery authority authorized.
+#[cfg(feature = "agent-backup-export-preview")]
+fn restore_canonical_params(requested_refs: &[[u8; 32]], backup_digest: &[u8; 32]) -> Vec<u8> {
+    use crate::agent_capability::{put_bytes, put_uint};
+    let mut out = Vec::new();
+    put_uint(&mut out, 0xA0, 2); // map(2)
+    put_uint(&mut out, 0, 1); // key 1: requested_refs
+    put_uint(&mut out, 0x80, requested_refs.len() as u64); // array(n)
+    for r in requested_refs {
+        put_bytes(&mut out, r);
+    }
+    put_uint(&mut out, 0, 2); // key 2: backup_digest
+    put_bytes(&mut out, backup_digest);
+    out
+}
+
 /// RESTORE_BACKUP(8) handler (TASK-24): the recovery ceremony — reconstitute the agent keystore inside
 /// this enclave from an attested ingress envelope (the operator's re-wrap of a DR backup to this TEE's
 /// ephemeral key), gated by the AC#6 authenticated high-water. Pure COMPOSITION of the tested primitives
@@ -1651,7 +1669,7 @@ fn handle_export_backup(
 fn handle_restore_backup(
     env: &AgentEnvelope,
     keystore: &KeystoreBody,
-    _verified: &VerifiedCapability,
+    verified: &VerifiedCapability,
     measurement: &[u8],
 ) -> Result<AgentResponse, AgentError> {
     use crate::agent_backup::{
@@ -1684,6 +1702,14 @@ fn handle_restore_backup(
         keystore.config.environment_identifier.as_bytes(),
     )
     .map_err(|_| AgentError::SealFailed)?;
+    // (5b) HIGH #1 (compact 9499): payload_binding — bind the cap to THIS restore's params (the key
+    //      selector + the backup digest). A cap issued for one restore cannot authorize a different one.
+    let canonical = restore_canonical_params(&req.requested_refs, &opened.original_backup_digest);
+    let expected_binding =
+        crate::agent_capability::payload_binding(8, None, &env.request_id, &canonical);
+    if expected_binding != verified.payload_binding {
+        return Err(AgentError::CapabilityRejected);
+    }
     // (6) Verify the recovery-authority-signed high-water (AC#6 source (a): signature vs recovery_authority_pk
     //     + strict-decode the marks, bound to this ceremony's request_id).
     let authenticated = verify_recovery_high_water(
@@ -1703,6 +1729,20 @@ fn handle_restore_backup(
         .map_err(|_| AgentError::SealFailed)?;
     // (9) AC#6 adopt: raise the candidate's counters/spend to the authenticated high-water (the current state).
     adopt_ac6_high_water(&mut candidate, &authenticated);
+    // (9b) Advance the capability counter (anti-replay) — the restore cap's counter is durably recorded
+    //      in the restored body's counter table. Mirrors GENERATE_KEYS / EXPORT. After adopt (which set the
+    //      counters from the authenticated marks), this records the ceremony's cap usage.
+    candidate
+        .advance_counter(
+            &verified.authority,
+            verified.scope_class,
+            &verified.scope_target,
+            verified.counter,
+        )
+        .map_err(|e| match e {
+            crate::agent_keystore::KeystoreError::CapacityExceeded => AgentError::CapExceeded,
+            _ => AgentError::SealFailed,
+        })?;
     // (10) Enclave-local structural_version = local+1 (AC#4, the `local+1` strategy; Structural commit class).
     candidate
         .advance_commit_epoch(true)
@@ -7197,8 +7237,14 @@ mod tests {
                     ]),
                 ),
             ];
-            // Recovery-tier cap (opcode 8, is_recovery=true). payload_binding is a placeholder — the
-            // handler does not yet enforce it (a 2c refinement; the high-water signature binds the request).
+            // Compute the REAL payload_binding (HIGH #1) — the cap is bound to THIS restore's key
+            // selector + the backup digest, not a placeholder.
+            let pb = crate::agent_capability::payload_binding(
+                8,
+                None,
+                request_id,
+                &restore_canonical_params(&refs, &backup_digest),
+            );
             let cap = crate::agent_capability::test_signed_capability(
                 cap_signer,
                 8,
@@ -7210,7 +7256,7 @@ mod tests {
                 0,
                 RSCOPE,
                 1,
-                [0xab; 32],
+                pb,
                 [0xe1; 32],
             );
             (
