@@ -560,7 +560,7 @@ pub(crate) fn derive_recovery_key_id(recovery_encaps_key: &[u8]) -> Vec<u8> {
 // destination's EPHEMERAL key and with a STRONGER, ceremony-specific AAD' that binds the re-wrap to the
 // destination's attested identity + the original backup's authenticated manifest/digest:
 //   (ingress_kem_ct, ss') = ML-KEM-1024.Encaps(dest_ephemeral_encaps_key)
-//   ingress_key          = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ ss')
+//   ingress_key          = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ 0x00 ‖ ss')
 //   dem_ct               = ChaCha20Poly1305(ingress_key, ingress_nonce, restore_ingress_payload, AAD')
 //   AAD'                 = magic ‖ version ‖ lp16(dest_measurement) ‖ chain_id ‖ lp16(env) ‖
 //                          manifest_hash(32) ‖ original_backup_digest(32) ‖ ingress_kem_ct(1568) ‖
@@ -596,10 +596,11 @@ pub(crate) fn derive_recovery_key_id(recovery_encaps_key: &[u8]) -> Vec<u8> {
 const RESTORE_INGRESS_ENVELOPE_MAGIC: &[u8; 8] = b"2DAGRIE\0";
 /// Versioned INDEPENDENTLY of the backup envelope, the restore-ingress payload, and the keystore.
 const RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION: u16 = 1;
-/// DEM-key KDF domain for the ingress envelope — the EXACT label from the spec's ceremony definition
-/// (`ingress_key = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ ss')`). DISTINCT from the backup DEM
-/// domain (`2d-hsm-agent-backup-v1-key`), so an `ss'` shared secret can never derive a valid key for the
-/// other layer (domain separation between the two KEM-DEM wraps).
+/// DEM-key KDF domain for the ingress envelope — the label from the spec's ceremony definition
+/// (`ingress_key = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ 0x00 ‖ ss')`; the `0x00` is the prefix-free
+/// separator added by [`hash_domain_tag`]). DISTINCT from the backup DEM domain
+/// (`2d-hsm-agent-backup-v1-key`), so an `ss'` shared secret can never derive a valid key for the other
+/// layer (domain separation between the two KEM-DEM wraps).
 const RESTORE_INGRESS_KDF_DOMAIN: &[u8] = b"2d-hsm-agent-restore-ingress-v1";
 /// Domain for the key-refs manifest hash carried in AAD'. Domain-separated so a manifest hash can never
 /// collide with a backup digest or a KDF output for the same input bytes.
@@ -1836,6 +1837,37 @@ mod tests {
             manifest_hash_of_ss,
             backup_digest_of_ss,
             "manifest-hash domain ≠ backup-digest domain for the same bytes"
+        );
+        // CRAFTED-INPUT regression for the prefix-free separator (claude-code + compact-codex round-2
+        // Low): the same-input assertions above pass even WITHOUT the 0x00 separator (distinct domain
+        // strings alone separate them), so they do not pin the prefix-free property. These crafted inputs
+        // construct the EXACT byte-stream collision a missing separator would create:
+        //   WITHOUT 0x00: derive_ingress_key("-manifest-hash" ‖ x) hashes "...v1" ‖ "-manifest-hash" ‖ x,
+        //   == compute_manifest_hash(x) hashing "...v1-manifest-hash" ‖ x — a COLLISION. WITH the 0x00
+        //   separator the transcripts diverge (the 0x00 lands between "...v1" and the suffix). So these
+        //   assertions FAIL if someone removes `hash_domain_tag`'s separator — a true regression guard.
+        let x = [0xbb; 16];
+        let mut crafted_manifest = b"-manifest-hash".to_vec();
+        crafted_manifest.extend_from_slice(&x);
+        let mut crafted_digest = b"-backup-digest".to_vec();
+        crafted_digest.extend_from_slice(&x);
+        assert_ne!(
+            derive_ingress_key(&crafted_manifest).as_ref(),
+            &compute_manifest_hash(&x)[..],
+            "prefix-free: ingress KDF over '-manifest-hash'‖x ≠ manifest hash over x (would collide without 0x00)"
+        );
+        assert_ne!(
+            derive_ingress_key(&crafted_digest).as_ref(),
+            &compute_original_backup_digest(&x)[..],
+            "prefix-free: ingress KDF over '-backup-digest'‖x ≠ backup digest over x (would collide without 0x00)"
+        );
+        // And the symmetric craft: compute_manifest_hash over the backup-digest suffix vs the backup digest.
+        let mut crafted_digest_via_manifest = b"-backup-digest".to_vec();
+        crafted_digest_via_manifest.extend_from_slice(&x);
+        assert_ne!(
+            compute_manifest_hash(&crafted_digest_via_manifest),
+            compute_original_backup_digest(&x),
+            "prefix-free: manifest hash over '-backup-digest'‖x ≠ backup digest over x"
         );
     }
 
