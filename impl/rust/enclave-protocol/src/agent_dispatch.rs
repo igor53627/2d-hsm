@@ -1688,6 +1688,8 @@ fn handle_restore_backup(
     //     + strict-decode the marks, bound to this ceremony's request_id).
     let authenticated = verify_recovery_high_water(
         &req.recovery_high_water,
+        keystore.config.twod_chain_id,
+        &keystore.config.environment_identifier,
         &env.request_id,
         &keystore.config.recovery_authority_pk,
     )
@@ -7117,19 +7119,19 @@ mod tests {
             body
         }
 
-        /// Sign the recovery-authority high-water over the source's marks_payload (the EXACT preimage
-        /// verify_recovery_high_water expects: domain ‖ request_id ‖ marks_payload).
+        /// Sign the recovery-authority high-water using the SAME self-delimiting scoped preimage
+        /// verify_recovery_high_water expects (via recovery_high_water_preimage — single source).
         fn signed_high_water(
             recovery: &SigningKey,
             request_id: &[u8],
             marks_payload: &[u8],
         ) -> RecoveryHighWater {
-            let mut preimage = Vec::with_capacity(
-                RECOVERY_HIGH_WATER_DOMAIN.len() + request_id.len() + marks_payload.len(),
+            let preimage = crate::agent_backup::recovery_high_water_preimage(
+                11565,
+                "testnet",
+                request_id,
+                marks_payload,
             );
-            preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
-            preimage.extend_from_slice(request_id);
-            preimage.extend_from_slice(marks_payload);
             RecoveryHighWater {
                 marks_payload: marks_payload.to_vec(),
                 signature: recovery.sign(&preimage).to_bytes(),

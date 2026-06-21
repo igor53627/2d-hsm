@@ -1018,6 +1018,16 @@ pub(crate) fn verify_restore_ingress(
     if opened.environment_identifier != own_env {
         return Err(RestoreVerifyError::EnvironmentMismatch);
     }
+    // (b') HIGH (compact #2): the PAYLOAD's config-identity must ALSO match — the dest ephemeral pubkey
+    // is public, so a host can re-wrap attacker-chosen RestoreIngressData (with a different config env)
+    // into a valid envelope. The AAD' check above only verifies the ENVELOPE's chain/env; the PAYLOAD's
+    // config-identity (which gets wholesale-replaced by apply_restore_to_body) must independently match.
+    if data.config.twod_chain_id != own_chain_id {
+        return Err(RestoreVerifyError::ChainMismatch);
+    }
+    if data.config.environment_identifier.as_bytes() != own_env {
+        return Err(RestoreVerifyError::EnvironmentMismatch);
+    }
     // (c) AC#1: the original-backup digest — the envelope was re-wrapped over the EXACT backup the recovery
     // authority authorized; a re-wrap of a different backup fails here.
     if opened.original_backup_digest != compute_original_backup_digest(original_backup_blob) {
@@ -1283,27 +1293,55 @@ pub(crate) enum RecoveryHighWaterError {
     MalformedMarks,
 }
 
+/// The self-delimiting, scope-bound preimage the recovery authority signs for the high-water attestation
+/// (HIGH #3 fix — compact 9499). SELF-DELIMITING: every variable-length field is length-prefixed so the
+/// boundary between request_id and marks_payload is unambiguous. SCOPE-BOUND: chain_id + env are included,
+/// so an attestation for one environment CANNOT be replayed on another that shares the recovery key.
+/// Layout: `DOMAIN ‖ chain_id(u64 BE) ‖ lp16(env) ‖ env ‖ lp16(request_id) ‖ request_id ‖ lp32(marks) ‖ marks`.
+pub(crate) fn recovery_high_water_preimage(
+    chain_id: u64,
+    env: &str,
+    request_id: &[u8],
+    marks_payload: &[u8],
+) -> Vec<u8> {
+    let env_bytes = env.as_bytes();
+    let mut p = Vec::with_capacity(
+        RECOVERY_HIGH_WATER_DOMAIN.len()
+            + 8
+            + 2
+            + env_bytes.len()
+            + 2
+            + request_id.len()
+            + 4
+            + marks_payload.len(),
+    );
+    p.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
+    p.extend_from_slice(&chain_id.to_be_bytes());
+    p.extend_from_slice(&(env_bytes.len() as u16).to_be_bytes());
+    p.extend_from_slice(env_bytes);
+    p.extend_from_slice(&(request_id.len() as u16).to_be_bytes());
+    p.extend_from_slice(request_id);
+    p.extend_from_slice(&(marks_payload.len() as u32).to_be_bytes());
+    p.extend_from_slice(marks_payload);
+    p
+}
+
 /// Verify the recovery-authority-signed high-water (AC#6 source (a)): `verify_strict` the Ed25519
-/// signature over `RECOVERY_HIGH_WATER_DOMAIN ‖ request_id ‖ marks_payload` against the sealed
-/// `recovery_authority_pk`, then strict-decode the marks. The `request_id` binding ties this attestation
-/// to THIS restore ceremony (the cap's request_id) — anti-replay: the operator cannot reuse one
-/// high-water attestation across restores with different caps. Returns the authenticated [`DecodedMarks`]
-/// for [`verify_ac6_high_water`]. `verify_strict` rejects torsion/small-order keys (the same surface as
-/// every other Ed25519 verify in the crate). EVERY failure ⇒ a distinct error (fail closed).
+/// signature over the SELF-DELIMITING, SCOPE-BOUND preimage ([`recovery_high_water_preimage`]) against the
+/// sealed `recovery_authority_pk`, then strict-decode the marks. The `chain_id` + `env` scope the
+/// attestation to this environment (anti-cross-env replay); the `request_id` ties it to THIS ceremony.
+/// Returns the authenticated [`DecodedMarks`] for [`verify_ac6_high_water`]. EVERY failure ⇒ fail closed.
 pub(crate) fn verify_recovery_high_water(
     hwm: &RecoveryHighWater,
+    chain_id: u64,
+    env: &str,
     request_id: &[u8],
     recovery_authority_pk: &[u8; 32],
 ) -> Result<crate::agent_cbor::DecodedMarks, RecoveryHighWaterError> {
     use ed25519_dalek::{Signature, VerifyingKey};
     let key = VerifyingKey::from_bytes(recovery_authority_pk)
         .map_err(|_| RecoveryHighWaterError::SignatureInvalid)?;
-    let mut preimage = Vec::with_capacity(
-        RECOVERY_HIGH_WATER_DOMAIN.len() + request_id.len() + hwm.marks_payload.len(),
-    );
-    preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
-    preimage.extend_from_slice(request_id);
-    preimage.extend_from_slice(&hwm.marks_payload);
+    let preimage = recovery_high_water_preimage(chain_id, env, request_id, &hwm.marks_payload);
     let sig = Signature::from_bytes(&hwm.signature);
     key.verify_strict(&preimage, &sig)
         .map_err(|_| RecoveryHighWaterError::SignatureInvalid)?;
@@ -3065,7 +3103,7 @@ mod tests {
             &dest_encaps,
             DEST_MEASUREMENT,
             CHAIN,
-            ENV,
+            "testnet",
             &manifest_hash,
             &backup_digest,
             &payload,
@@ -3080,7 +3118,7 @@ mod tests {
             refs,
             DEST_MEASUREMENT.to_vec(),
             CHAIN,
-            ENV.as_bytes().to_vec(),
+            b"testnet".to_vec(),
         )
     }
 
@@ -3403,10 +3441,7 @@ mod tests {
         use ed25519_dalek::Signer;
         let marks_payload =
             marks_payload.unwrap_or_else(|| body_with_two_keys().encode_marks_payload());
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(RECOVERY_HIGH_WATER_DOMAIN);
-        preimage.extend_from_slice(request_id);
-        preimage.extend_from_slice(&marks_payload);
+        let preimage = recovery_high_water_preimage(11565, "testnet", request_id, &marks_payload);
         let signature = recovery.sign(&preimage).to_bytes();
         RecoveryHighWater {
             marks_payload,
@@ -3420,7 +3455,8 @@ mod tests {
         let pk = recovery.verifying_key().to_bytes();
         let rid = b"req-restore-1";
         let hwm = signed_high_water(rid, &recovery, None);
-        let marks = verify_recovery_high_water(&hwm, rid, &pk).expect("valid signature verifies");
+        let marks = verify_recovery_high_water(&hwm, 11565, "testnet", rid, &pk)
+            .expect("valid signature verifies");
         // The decoded marks match body_with_two_keys' counters (1 row, HAC=1).
         assert_eq!(marks.rows.len(), 1);
         assert_eq!(marks.rows[0].highest_accepted_counter, 1);
@@ -3434,7 +3470,7 @@ mod tests {
         let rid = b"req-restore-1";
         let hwm = signed_high_water(rid, &recovery, None); // signed by [9;32]
         assert_eq!(
-            verify_recovery_high_water(&hwm, rid, &other_pk),
+            verify_recovery_high_water(&hwm, 11565, "testnet", rid, &other_pk),
             Err(RecoveryHighWaterError::SignatureInvalid),
             "a high-water signed by a different key than the sealed recovery_authority_pk is rejected"
         );
@@ -3448,7 +3484,7 @@ mod tests {
         let pk = recovery.verifying_key().to_bytes();
         let hwm = signed_high_water(b"req-restore-1", &recovery, None);
         assert_eq!(
-            verify_recovery_high_water(&hwm, b"req-DIFFERENT", &pk),
+            verify_recovery_high_water(&hwm, 11565, "testnet", b"req-DIFFERENT", &pk),
             Err(RecoveryHighWaterError::SignatureInvalid),
             "request_id mismatch ⇒ signature invalid (ceremony binding)"
         );
@@ -3463,7 +3499,7 @@ mod tests {
         let rid = b"req-restore-1";
         let hwm = signed_high_water(rid, &recovery, Some(vec![0xFF, 0xFF, 0xFF])); // garbage marks
         assert_eq!(
-            verify_recovery_high_water(&hwm, rid, &pk),
+            verify_recovery_high_water(&hwm, 11565, "testnet", rid, &pk),
             Err(RecoveryHighWaterError::MalformedMarks),
             "a valid signature over non-canonical marks ⇒ MalformedMarks"
         );
