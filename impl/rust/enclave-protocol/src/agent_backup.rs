@@ -959,6 +959,93 @@ pub(crate) fn apply_restore_to_body(
     Ok(())
 }
 
+/// Fail-closed errors for [`verify_restore_ingress`] (the AAD' semantic checks + AC#9 set-match). Each
+/// names a DISTINCT rejection cause so the handler can collapse them to the right §10.9 wire code.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestoreVerifyError {
+    /// AC#1(a): the envelope's `dest_measurement` != THIS enclave's own (a re-wrap for a different TEE).
+    MeasurementMismatch,
+    /// AC#1(b): the envelope's `chain_id` != the sealed config (cross-chain restore).
+    ChainMismatch,
+    /// AC#1(b): the envelope's `environment_identifier` != the sealed config (e.g. testnet→mainnet).
+    EnvironmentMismatch,
+    /// AC#1(c): the envelope's `original_backup_digest` != the digest of the submitted original backup.
+    BackupDigestMismatch,
+    /// AC#1(c): the authenticated `manifest_hash` != the manifest recomputed from the payload's entries
+    /// (the envelope was re-wrapped over a DIFFERENT payload than the one it now carries — tamper/forgery).
+    ManifestMismatch,
+    /// AC#9: the request's key_refs selector SET != the payload's entry-ref SET (order/multiplicity-
+    /// insensitive; a `[A,A]`/out-of-order selector matches `[A]`/body-order, but a selector naming a ref
+    /// the payload does not carry — or omitting one it does — is rejected).
+    SelectorSetMismatch,
+    /// The manifest CBOR encode failed (a malformed entry-ref shape — internal invariant break).
+    ManifestEncode,
+}
+
+/// TASK-24 AC#1 AAD' semantic checks + AC#9 set-match: verify an opened restore-ingress envelope against
+/// the restoring enclave's OWN state + the parsed payload + the request's key_refs selector. The envelope
+/// AEAD already authenticated the AAD' fields (they're in the header); this compares those authenticated
+/// values against the enclave's own identity + recomputes the manifest/digest over the submitted material.
+/// Pure (no I/O); EVERY mismatch ⇒ a distinct `RestoreVerifyError` (fail closed, no partial import).
+///
+/// **Order** (fail-fast on the cheapest checks): (a) `dest_measurement == OWN` (AC#1 — a re-wrap for a
+/// different TEE); (b) `chain_id` + `environment_identifier == sealed config` (AC#1 — cross-chain / cross-
+/// environment restore fails closed); (c) `original_backup_digest` matches the submitted original backup
+/// (AC#1 — the re-wrap is of the EXACT backup the recovery authority authorized); (d) `manifest_hash`
+/// matches the manifest recomputed from the PAYLOAD's entries in body order (AC#1 — manifest↔payload
+/// consistency, the authenticated manifest binds THIS payload); (e) the request's selector SET equals the
+/// payload's entry-ref SET (AC#9 — order/multiplicity-insensitive set-match).
+pub(crate) fn verify_restore_ingress(
+    opened: &OpenedRestoreIngress,
+    data: &RestoreIngressData,
+    original_backup_blob: &[u8],
+    requested_refs: &[[u8; 32]],
+    own_measurement: &[u8],
+    own_chain_id: u64,
+    own_env: &[u8],
+) -> Result<(), RestoreVerifyError> {
+    // (a) AC#1: the attestation/measurement in AAD' is THIS enclave's own (defense-in-depth — the PRIMARY
+    // anti-substitution control is the operator verifying the attestation binds the ephemeral key to the
+    // measurement out-of-band, AC#12; `== OWN` catches a re-wrap made for a DIFFERENT attested TEE).
+    if opened.dest_measurement != own_measurement {
+        return Err(RestoreVerifyError::MeasurementMismatch);
+    }
+    // (b) AC#1: chain_id + environment_identifier equal the sealed config (cross-environment restore fails
+    // closed — a testnet blob into a mainnet enclave is rejected here).
+    if opened.chain_id != own_chain_id {
+        return Err(RestoreVerifyError::ChainMismatch);
+    }
+    if opened.environment_identifier != own_env {
+        return Err(RestoreVerifyError::EnvironmentMismatch);
+    }
+    // (c) AC#1: the original-backup digest — the envelope was re-wrapped over the EXACT backup the recovery
+    // authority authorized; a re-wrap of a different backup fails here.
+    if opened.original_backup_digest != compute_original_backup_digest(original_backup_blob) {
+        return Err(RestoreVerifyError::BackupDigestMismatch);
+    }
+    // (d) AC#1: manifest↔payload consistency — the authenticated manifest hash must equal the manifest
+    // recomputed from the PAYLOAD's entries in body order. Binds the envelope to the payload it carries.
+    let payload_refs: Vec<[u8; 32]> = data.entries.iter().map(|e| e.key_ref).collect();
+    let manifest =
+        build_key_refs_manifest(&payload_refs).map_err(|_| RestoreVerifyError::ManifestEncode)?;
+    if opened.manifest_hash != compute_manifest_hash(&manifest) {
+        return Err(RestoreVerifyError::ManifestMismatch);
+    }
+    // (e) AC#9 set-match: the request's selector (order/multiplicity-INSENSITIVE) == the payload's entry
+    // refs as a SET. A `[A,A]` or non-body-order selector is the same export as `[A]`/body-order and MUST
+    // NOT be rejected; a selector naming a ref the payload lacks (or omitting one it carries) IS rejected.
+    let mut req_set: Vec<[u8; 32]> = requested_refs.to_vec();
+    req_set.sort_unstable();
+    req_set.dedup();
+    let mut pay_set = payload_refs;
+    pay_set.sort_unstable();
+    pay_set.dedup();
+    if req_set != pay_set {
+        return Err(RestoreVerifyError::SelectorSetMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2647,6 +2734,153 @@ mod tests {
         assert_eq!(
             target.audit.last_exported_seq, 0,
             "empty ⇒ last_exported_seq=0"
+        );
+    }
+
+    // ─── TASK-24 AC#1 AAD' semantic checks + AC#9 set-match: verify_restore_ingress ───
+
+    /// Build a fully-valid (opened, data, original_backup, request_refs, own_measurement, own_chain,
+    /// own_env) tuple via the test-only seal+open+parse, so each negative test tweaks ONE field.
+    fn valid_restore_inputs() -> (
+        OpenedRestoreIngress,
+        RestoreIngressData,
+        Vec<u8>,
+        Vec<[u8; 32]>,
+        Vec<u8>,
+        u64,
+        Vec<u8>,
+    ) {
+        let body = body_with_two_keys();
+        let refs = selected_key_refs(&body, &[[0x11; 32], [0x22; 32]]);
+        let payload = build_restore_ingress_payload(&body, &refs)
+            .unwrap()
+            .to_vec();
+        let data = parse_restore_ingress(&payload).unwrap();
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let manifest_hash = compute_manifest_hash(&manifest);
+        let original_backup_blob = b"test-original-backup-blob-v1".to_vec();
+        let backup_digest = compute_original_backup_digest(&original_backup_blob);
+        let (dest_encaps, dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let envelope = seal_restore_ingress_envelope_with_m(
+            &dest_encaps,
+            DEST_MEASUREMENT,
+            CHAIN,
+            ENV,
+            &manifest_hash,
+            &backup_digest,
+            &payload,
+            &INGRESS_M,
+        )
+        .unwrap();
+        let opened = open_restore_ingress_envelope(&dest_dk, &envelope).unwrap();
+        (
+            opened,
+            data,
+            original_backup_blob,
+            refs,
+            DEST_MEASUREMENT.to_vec(),
+            CHAIN,
+            ENV.as_bytes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn verify_restore_ingress_accepts_valid() {
+        let (opened, data, backup, refs, meas, chain, env) = valid_restore_inputs();
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &refs, &meas, chain, &env),
+            Ok(()),
+            "a fully-consistent restore verifies"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_measurement_mismatch() {
+        let (opened, data, backup, refs, _meas, chain, env) = valid_restore_inputs();
+        assert_eq!(
+            verify_restore_ingress(
+                &opened,
+                &data,
+                &backup,
+                &refs,
+                b"OTHER-TEE-measurement",
+                chain,
+                &env
+            ),
+            Err(RestoreVerifyError::MeasurementMismatch),
+            "a re-wrap for a different TEE is rejected (AC#1a)"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_chain_and_environment_mismatch() {
+        let (opened, data, backup, refs, meas, _chain, _env) = valid_restore_inputs();
+        // cross-chain
+        assert_eq!(
+            verify_restore_ingress(
+                &opened,
+                &data,
+                &backup,
+                &refs,
+                &meas,
+                99999,
+                &ENV.as_bytes()
+            ),
+            Err(RestoreVerifyError::ChainMismatch),
+            "cross-chain restore fails closed (AC#1b)"
+        );
+        // cross-environment (testnet blob into a mainnet enclave)
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &refs, &meas, CHAIN, b"mainnet"),
+            Err(RestoreVerifyError::EnvironmentMismatch),
+            "cross-environment restore fails closed (AC#1b)"
+        );
+    }
+
+    #[test]
+    fn verify_restore_ingress_rejects_backup_digest_mismatch() {
+        let (opened, data, _backup, refs, meas, chain, env) = valid_restore_inputs();
+        assert_eq!(
+            verify_restore_ingress(
+                &opened,
+                &data,
+                b"a-DIFFERENT-backup-blob",
+                &refs,
+                &meas,
+                chain,
+                &env
+            ),
+            Err(RestoreVerifyError::BackupDigestMismatch),
+            "a re-wrap of a different backup than authorized is rejected (AC#1c)"
+        );
+    }
+
+    /// AC#9 set-match is ORDER/multiplicity-INSENSITIVE: a `[A,A]` or non-body-order selector is the same
+    /// export as `[A]`/body-order and MUST NOT be rejected. The full `[0x11,0x22]` set in reversed order
+    /// + with a duplicate verifies; a selector naming a ref the payload lacks is rejected.
+    #[test]
+    fn verify_restore_ingress_set_match_is_order_multiplicity_insensitive() {
+        let (opened, data, backup, _refs, meas, chain, env) = valid_restore_inputs();
+        // reversed order + a duplicate 0x11 ⇒ same SET as the body-order [0x11,0x22] payload.
+        let reordered = vec![[0x22; 32], [0x11; 32], [0x11; 32]];
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &reordered, &meas, chain, &env),
+            Ok(()),
+            "AC#9: [A,A]/non-body-order selector == [A]/body-order export"
+        );
+        // a selector naming a ref NOT in the payload ⇒ set mismatch.
+        let extra = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &extra, &meas, chain, &env),
+            Err(RestoreVerifyError::SelectorSetMismatch),
+            "a selector naming a ref the payload lacks is rejected (AC#9)"
+        );
+        // a selector OMITTING a ref the payload carries ⇒ set mismatch.
+        let partial = vec![[0x11; 32]];
+        assert_eq!(
+            verify_restore_ingress(&opened, &data, &backup, &partial, &meas, chain, &env),
+            Err(RestoreVerifyError::SelectorSetMismatch),
+            "a selector omitting a payload ref is rejected (AC#9)"
         );
     }
 }
