@@ -1134,6 +1134,89 @@ fn as_ref_array(v: &ciborium::value::Value) -> Result<Vec<[u8; 32]>, BackupError
         .collect()
 }
 
+/// Fail-closed errors for [`verify_ac6_high_water`] (the AC#6 forward-only gate).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Ac6Error {
+    /// The authenticated high-water does NOT dominate the backup (authenticated < backup for some counter
+    /// row or spend) — the recovery material does not vouch the backup as current; the backup is STALE.
+    StaleBackup,
+    /// The authenticated high-water does NOT dominate the destination's PRE-restore state — adopting it
+    /// would LOWER a high-water the destination already holds (AC#6: "restore that would lower a high-water
+    /// is rejected"). E.g. a re-restore of an older backup onto a destination that has since advanced.
+    WouldLower,
+}
+
+/// Whether the `high` (authenticated) high-water DOMINATES a target counter/spend set: every target
+/// counter row has a `high` match (by authority + scope_class + scope_target) with `>=` highest_accepted
+/// counter, AND `high`'s `cumulative_native_spend` + `lifetime_spend` are `>=` the target's. The spends
+/// are 32-byte big-endian magnitudes, so lexicographic `>=` (the `[u8;32]` `Ord` impl) IS numeric `>=`
+/// — the SAME comparison [`crate::agent_boot::marks_dominate_local`] uses. Pure, no allocation beyond the
+/// row scan.
+fn high_water_dominates(
+    high: &crate::agent_cbor::DecodedMarks,
+    target_counters: &[crate::agent_keystore::CounterEntry],
+    target_cumulative_native_spend: &[u8; 32],
+    target_lifetime_spend: &[u8; 32],
+) -> bool {
+    for tc in target_counters {
+        match high.rows.iter().find(|r| {
+            r.authority == tc.authority
+                && r.scope_class == tc.scope_class
+                && r.scope_target == tc.scope_target
+        }) {
+            Some(r) if r.highest_accepted_counter >= tc.highest_accepted_counter => {}
+            _ => return false, // `high` is missing the row, or its counter is LOWER
+        }
+    }
+    high.cumulative_native_spend >= *target_cumulative_native_spend
+        && high.lifetime_spend >= *target_lifetime_spend
+}
+
+/// TASK-24 AC#6 forward-only gate: verify an AUTHENTICATED high-water (a [`crate::agent_cbor::DecodedMarks`]
+/// the recovery authority attests is the CURRENT high-water) against the backup the restore carries + the
+/// destination's PRE-restore state. The candidate ADOPTS the authenticated (the current authoritative
+/// state, `>=` the stale backup); this gate ensures that adoption NEVER lowers a high-water + that the
+/// backup is not stale. Pure (no mutation); EVERY violation ⇒ a distinct [`Ac6Error`] (fail closed).
+///
+/// **(1) StaleBackup** — the authenticated must dominate the BACKUP (`>=` per counter row + both spends):
+/// the recovery material vouches the backup is current. A backup whose counters/spend exceed the
+/// authenticated is stale (the source advanced past the snapshot after export) ⇒ reject.
+///
+/// **(2) WouldLower** — the authenticated must dominate the DESTINATION's pre-restore state: adopting it
+/// never lowers a high-water the destination already holds. A re-restore of an older backup onto a
+/// destination that has since advanced fails here (AC#6: "restore that would lower a high-water is
+/// rejected"). On a FRESH TEE (empty pre-restore counters, zero spends) this is vacuously satisfied — the
+/// gate does NOT reject a fresh TEE that HAS an authenticated source (the "no authenticated source ⇒
+/// reject" rule is the HANDLER's `None`-source check, not this fn).
+///
+/// The fresh-TEE `strict_recovery_counter` advance (AC#6's other half) is handled by
+/// [`apply_restore_to_body`] (`max(local, backup) + 1`); this gate covers the COUNTERS/SPEND half.
+pub(crate) fn verify_ac6_high_water(
+    destination_pre_restore: &crate::agent_keystore::KeystoreBody,
+    data: &RestoreIngressData,
+    authenticated: &crate::agent_cbor::DecodedMarks,
+) -> Result<(), Ac6Error> {
+    // (1) authenticated >= backup (the recovery material vouches the backup is current, not stale).
+    if !high_water_dominates(
+        authenticated,
+        &data.counters,
+        &data.faucet.cumulative_native_spend,
+        &data.faucet.lifetime_spend,
+    ) {
+        return Err(Ac6Error::StaleBackup);
+    }
+    // (2) authenticated >= destination-pre-restore (adopting it never lowers a held high-water).
+    if !high_water_dominates(
+        authenticated,
+        &destination_pre_restore.counters,
+        &destination_pre_restore.faucet.cumulative_native_spend,
+        &destination_pre_restore.faucet.lifetime_spend,
+    ) {
+        return Err(Ac6Error::WouldLower);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3072,6 +3155,103 @@ mod tests {
             decode_restore_request(&trailing),
             Err(BackupError::Truncated),
             "trailing bytes"
+        );
+    }
+
+    // ─── TASK-24 AC#6 forward-only gate: verify_ac6_high_water ───
+
+    /// A DecodedMarks with ONE counter row (authority [0xa1;32], scope_class 0, scope_target
+    /// b"generate_transfer" — matching body_with_two_keys' counter) + uniform spend bytes. `hac` sets the
+    /// row's highest_accepted_counter; `spend_byte` sets both 32-byte spends.
+    fn ac6_marks(hac: u64, spend_byte: u8) -> crate::agent_cbor::DecodedMarks {
+        crate::agent_cbor::DecodedMarks {
+            rows: vec![crate::agent_cbor::DecodedRow {
+                authority: [0xa1; 32],
+                scope_class: 0,
+                scope_target: b"generate_transfer".to_vec(),
+                highest_accepted_counter: hac,
+            }],
+            cumulative_native_spend: [spend_byte; 32],
+            lifetime_spend: [spend_byte; 32],
+            strict_recovery_counter: 0,
+        }
+    }
+
+    /// A FRESH restore-target body: empty counters + zero spends (the common fresh-TEE case).
+    fn fresh_destination_body() -> crate::agent_keystore::KeystoreBody {
+        let mut b = restore_target_body();
+        b.counters.clear();
+        b.faucet.cumulative_native_spend = [0; 32];
+        b.faucet.lifetime_spend = [0; 32];
+        b
+    }
+
+    #[test]
+    fn verify_ac6_accepts_fresh_tee_with_authentic_source() {
+        // Fresh TEE (empty counters, zero spends) + an authenticated high-water that dominates the backup
+        // (the recovery material vouches the backup is current) ⇒ ACCEPT. This is the common fresh-TEE
+        // restore WITH an authenticated source (AC#6: the "no source ⇒ reject" rule is the handler's
+        // None-source check, not this fn).
+        let dest = fresh_destination_body();
+        let data = sample_restore_data(); // backup: counter HAC=1, zero spends
+        let authenticated = ac6_marks(1, 0x00); // >= backup (HAC 1 >= 1, spends 0 >= 0)
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &authenticated),
+            Ok(()),
+            "fresh TEE + authentic source ⇒ accept"
+        );
+    }
+
+    #[test]
+    fn verify_ac6_rejects_stale_backup() {
+        // The authenticated high-water's counter (HAC 0) < the backup's (HAC 1) ⇒ the recovery material
+        // does NOT vouch the backup as current ⇒ STALE BACKUP ⇒ reject.
+        let dest = fresh_destination_body();
+        let data = sample_restore_data(); // backup counter HAC=1
+        let stale = ac6_marks(0, 0x00); // HAC 0 < backup's 1
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &stale),
+            Err(Ac6Error::StaleBackup),
+            "authenticated < backup ⇒ stale backup ⇒ reject"
+        );
+    }
+
+    #[test]
+    fn verify_ac6_rejects_restore_that_would_lower() {
+        // A re-restore: the destination ALREADY holds a counter (HAC 5) higher than the authenticated
+        // (HAC 1) ⇒ adopting the authenticated would LOWER the destination's high-water ⇒ reject.
+        let mut dest = fresh_destination_body();
+        dest.counters.push(crate::agent_keystore::CounterEntry {
+            authority: [0xa1; 32],
+            environment_identifier: "testnet".to_string(),
+            scope_class: 0,
+            scope_target: b"generate_transfer".to_vec(),
+            highest_accepted_counter: 5, // the destination has already advanced past the backup
+        });
+        let data = sample_restore_data(); // backup counter HAC=1
+        let authenticated = ac6_marks(1, 0x00); // >= backup, but < destination's 5
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &authenticated),
+            Err(Ac6Error::WouldLower),
+            "authenticated < destination-pre-restore ⇒ would-lower ⇒ reject"
+        );
+    }
+
+    #[test]
+    fn verify_ac6_spend_dominance_is_numeric_big_endian() {
+        // The 32-byte spends are big-endian magnitudes ⇒ lexicographic >= is numeric >=. A higher spend
+        // byte dominates; the authenticated's higher cumulative spend accepts even with a matching HAC.
+        let dest = fresh_destination_body();
+        let mut data = sample_restore_data();
+        data.faucet.cumulative_native_spend = [0x10; 32]; // backup spend > the default zero
+        let authenticated = ac6_marks(1, 0x20); // spend 0x20 > backup's 0x10 ⇒ dominates
+        assert_eq!(verify_ac6_high_water(&dest, &data, &authenticated), Ok(()));
+        // authenticated spend < backup spend ⇒ stale.
+        let lower = ac6_marks(1, 0x00);
+        assert_eq!(
+            verify_ac6_high_water(&dest, &data, &lower),
+            Err(Ac6Error::StaleBackup),
+            "authenticated spend < backup spend ⇒ stale"
         );
     }
 }
