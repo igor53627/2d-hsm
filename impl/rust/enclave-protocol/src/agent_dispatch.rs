@@ -542,7 +542,9 @@ pub(crate) fn dispatch_agent(
             #[cfg(feature = "agent-backup-export-preview")]
             AgentOpcode::ExportBackup => handle_export_backup(&env, keystore, &verified),
             #[cfg(feature = "agent-backup-export-preview")]
-            AgentOpcode::RestoreBackup => handle_restore_backup(&env, keystore, &verified, measurement),
+            AgentOpcode::RestoreBackup => {
+                handle_restore_backup(&env, keystore, &verified, measurement)
+            }
             // CONFIGURE_TREASURY (without its preview) / EXPORT_BACKUP (without its preview) / RESTORE_BACKUP
             // (and GENERATE_KEYS without its preview) verify here but their execution lands in later slices /
             // is deferred ⇒ fail closed.
@@ -1653,8 +1655,9 @@ fn handle_restore_backup(
     measurement: &[u8],
 ) -> Result<AgentResponse, AgentError> {
     use crate::agent_backup::{
-        adopt_ac6_high_water, apply_restore_to_body, decode_restore_request, open_restore_ingress_envelope,
-        parse_restore_ingress, verify_ac6_high_water, verify_recovery_high_water, verify_restore_ingress,
+        adopt_ac6_high_water, apply_restore_to_body, decode_restore_request,
+        open_restore_ingress_envelope, parse_restore_ingress, verify_ac6_high_water,
+        verify_recovery_high_water, verify_restore_ingress,
     };
     use ml_kem::{DecapsulationKey, MlKem1024};
 
@@ -1666,7 +1669,8 @@ fn handle_restore_backup(
     let snap = snapshot_restore_ephemeral().ok_or(AgentError::NotConfigured)?;
     let dest_dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*snap.decaps_seed));
     // (3) Open the attested ingress envelope (AC#1: decap with the ephemeral private key + AEAD-tag verify over AAD').
-    let opened = open_restore_ingress_envelope(&dest_dk, &req.ingress_envelope).map_err(|_| AgentError::SealFailed)?;
+    let opened = open_restore_ingress_envelope(&dest_dk, &req.ingress_envelope)
+        .map_err(|_| AgentError::SealFailed)?;
     // (4) Parse the restore-ingress payload (AC#2: magic/version/strict-CBOR).
     let data = parse_restore_ingress(&opened.payload).map_err(|_| AgentError::Malformed)?;
     // (5) AAD' semantic checks + AC#9 set-match (AC#1: measurement==OWN, chain/env==sealed, manifest/backup-digest match).
@@ -1698,7 +1702,9 @@ fn handle_restore_backup(
     // (9) AC#6 adopt: raise the candidate's counters/spend to the authenticated high-water (the current state).
     adopt_ac6_high_water(&mut candidate, &authenticated);
     // (10) Enclave-local structural_version = local+1 (AC#4, the `local+1` strategy; Structural commit class).
-    candidate.advance_commit_epoch(true).map_err(|_| AgentError::SealFailed)?;
+    candidate
+        .advance_commit_epoch(true)
+        .map_err(|_| AgentError::SealFailed)?;
     // (11) Return the candidate; the frame layer seals → commits → swaps → emits → retires the ephemeral.
     Ok(AgentResponse::RestoreBackup {
         candidate: Box::new(candidate),
@@ -1857,6 +1863,39 @@ pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEph
     *guard = Some(InstalledRestoreEphemeral {
         encaps_key,
         decaps_seed: seed,
+        measurement: measurement.to_vec(),
+    });
+    Some(pub_info)
+}
+
+/// Test-only: install a DETERMINISTIC restore-ephemeral keypair from an explicit 64-byte `seed` (the
+/// production [`install_restore_ephemeral`] draws from the CSPRNG). Enables the end-to-end RESTORE_BACKUP
+/// dispatch test to install the GOLDEN dest-ephemeral keypair (seed `[0x6c;64]`, matching the frozen
+/// `restore_ingress_envelope_v1.bin`) so the test's ingress envelope — sealed to that known pubkey —
+/// decapsulates inside the handler. Same install-once + empty-measurement-reject semantics.
+#[cfg(all(test, feature = "agent-backup-export-preview"))]
+#[allow(dead_code)] // forward enabler for the 2c end-to-end RESTORE_BACKUP dispatch test (lands next)
+pub(crate) fn install_restore_ephemeral_with_seed(
+    measurement: &[u8],
+    seed: &[u8; 64],
+) -> Option<RestoreEphemeralPub> {
+    use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
+    if measurement.is_empty() {
+        return None;
+    }
+    let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*seed));
+    let encaps_key = dk.encapsulation_key().to_bytes().as_slice().to_vec();
+    let pub_info = RestoreEphemeralPub {
+        encaps_key: encaps_key.clone(),
+        measurement: measurement.to_vec(),
+    };
+    let mut guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
+    if guard.is_some() {
+        return None;
+    }
+    *guard = Some(InstalledRestoreEphemeral {
+        encaps_key,
+        decaps_seed: zeroize::Zeroizing::new(*seed),
         measurement: measurement.to_vec(),
     });
     Some(pub_info)
@@ -2303,7 +2342,10 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                 move |sealed| encode_export_backup_response(&backup_blob, sealed),
             )
         }
-        Ok(AgentResponse::RestoreBackup { candidate, request_id }) => {
+        Ok(AgentResponse::RestoreBackup {
+            candidate,
+            request_id,
+        }) => {
             // RESTORE_BACKUP (rollback-sensitive; Structural — wholesale-replaced body + local+1 structural
             // bump) goes through the SAME shared seal-before-emit seam. After the commit succeeds the
             // restore-ephemeral key is RETIRED (single-use: a second restore must re-fetch GET_RESTORE_PUBKEY
@@ -2313,9 +2355,10 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             // conservative single-use choice (the ephemeral is NEVER reused); the retry-cost (re-fetch +
             // re-wrap) is the accepted tradeoff vs threading a success signal out of the seam.
             #[cfg(feature = "agent-backup-export-preview")]
-            let body = commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
-                encode_restore_backup_response(sealed)
-            });
+            let body =
+                commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
+                    encode_restore_backup_response(sealed)
+                });
             #[cfg(feature = "agent-backup-export-preview")]
             retire_restore_ephemeral();
             #[cfg(not(feature = "agent-backup-export-preview"))]
@@ -2549,7 +2592,10 @@ fn encode_export_backup_response(backup_blob: &[u8], sealed_blob: &[u8]) -> Vec<
 /// ONLY after the anchor commit succeeds, so a restore success is reported iff the post-restore state is
 /// durably committed.
 fn encode_restore_backup_response(sealed_blob: &[u8]) -> Vec<u8> {
-    encode_body(vec![(Value::Integer(1.into()), Value::Bytes(sealed_blob.to_vec()))])
+    encode_body(vec![(
+        Value::Integer(1.into()),
+        Value::Bytes(sealed_blob.to_vec()),
+    )])
 }
 
 /// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
