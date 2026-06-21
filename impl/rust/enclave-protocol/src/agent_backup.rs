@@ -926,7 +926,7 @@ pub(crate) fn apply_restore_to_body(
         .iter()
         .map(|r| r.seq)
         .max()
- .map(|m| m.saturating_add(1))
+        .map(|m| m.saturating_add(1))
         .unwrap_or(1);
     let last_exported_seq = next_seq - 1; // restored ring starts fully drained (next_seq >= 1 ⇒ no underflow)
 
@@ -949,7 +949,9 @@ pub(crate) fn apply_restore_to_body(
     body.audit.last_exported_seq = last_exported_seq;
 
     // AC#6 (strict_recovery): forward-only advance — strictly > the current highest of (local, backup).
-    let highest = body.strict_recovery_counter.max(data.strict_recovery_counter);
+    let highest = body
+        .strict_recovery_counter
+        .max(data.strict_recovery_counter);
     body.strict_recovery_counter = highest
         .checked_add(1)
         .ok_or(RestoreApplyError::MonotonicOverflow)?;
@@ -2528,21 +2530,43 @@ mod tests {
         assert_eq!(target.config.environment_identifier, "testnet");
         assert_eq!(target.entries.len(), 2, "entries replaced");
         assert_eq!(target.entries[0].key_ref, [0x11; 32]);
-        assert_eq!(&target.entries[0].secret_scalar[..], &[0x77; 32], "secret scalar restored");
+        assert_eq!(
+            &target.entries[0].secret_scalar[..],
+            &[0x77; 32],
+            "secret scalar restored"
+        );
         assert_eq!(target.counters, data.counters, "counters replaced");
         assert_eq!(target.faucet, data.faucet, "faucet replaced");
-        assert_eq!(target.audit.records, data.audit_records, "audit records replaced");
+        assert_eq!(
+            target.audit.records, data.audit_records,
+            "audit records replaced"
+        );
         // PRESERVED (excluded — the restoring enclave's own identity, never in the payload).
-        assert_eq!(target.config.anchor_root, [0xCC; 32], "anchor_root preserved (excluded)");
-        assert_eq!(target.config.enclave_scope_id, [0xCE; 32], "enclave_scope_id preserved");
-        assert_eq!(target.config.fleet_scope_id, [0xCF; 32], "fleet_scope_id preserved");
+        assert_eq!(
+            target.config.anchor_root, [0xCC; 32],
+            "anchor_root preserved (excluded)"
+        );
+        assert_eq!(
+            target.config.enclave_scope_id, [0xCE; 32],
+            "enclave_scope_id preserved"
+        );
+        assert_eq!(
+            target.config.fleet_scope_id, [0xCF; 32],
+            "fleet_scope_id preserved"
+        );
         assert_eq!(
             target.config.backup_recovery_wrapping_pubkey,
             vec![0xD0; crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN],
             "wrapping pubkey preserved"
         );
-        assert_eq!(target.freshness_epoch, 100, "freshness_epoch untouched (handler bumps it)");
-        assert_eq!(target.structural_version, 50, "structural_version untouched (local+1 handler bump)");
+        assert_eq!(
+            target.freshness_epoch, 100,
+            "freshness_epoch untouched (handler bumps it)"
+        );
+        assert_eq!(
+            target.structural_version, 50,
+            "structural_version untouched (local+1 handler bump)"
+        );
     }
 
     /// AC#7: audit cursors reconstructed enclave-locally — next_seq=max(seq)+1, last_exported_seq=
@@ -2553,10 +2577,21 @@ mod tests {
         let data = sample_restore_data();
         // body_with_two_keys has ONE audit record (seq=1) ⇒ next_seq=2, last_exported_seq=1.
         apply_restore_to_body(&mut target, &data, 128).unwrap();
-        assert_eq!(target.audit.capacity, 128, "capacity from restore-time policy, not the backup");
+        assert_eq!(
+            target.audit.capacity, 128,
+            "capacity from restore-time policy, not the backup"
+        );
         let max_seq = data.audit_records.iter().map(|r| r.seq).max().unwrap();
-        assert_eq!(target.audit.next_seq, max_seq + 1, "next_seq = max(record.seq)+1");
-        assert_eq!(target.audit.last_exported_seq, target.audit.next_seq - 1, "fully drained");
+        assert_eq!(
+            target.audit.next_seq,
+            max_seq + 1,
+            "next_seq = max(record.seq)+1"
+        );
+        assert_eq!(
+            target.audit.last_exported_seq,
+            target.audit.next_seq - 1,
+            "fully drained"
+        );
     }
 
     /// AC#6 (strict_recovery): forward-only — new = max(local, backup)+1. Local high-water (10) vs the
@@ -2568,12 +2603,18 @@ mod tests {
         // Case 1: backup (4) < local (10) ⇒ new = 11 (local + 1).
         data.strict_recovery_counter = 4;
         apply_restore_to_body(&mut target, &data, 64).unwrap();
-        assert_eq!(target.strict_recovery_counter, 11, "local(10) > backup(4) ⇒ new = 11");
+        assert_eq!(
+            target.strict_recovery_counter, 11,
+            "local(10) > backup(4) ⇒ new = 11"
+        );
         // Case 2: a re-restore where the backup now exceeds local — new = max(local, backup)+1.
         target.strict_recovery_counter = 3;
         data.strict_recovery_counter = 8;
         apply_restore_to_body(&mut target, &data, 64).unwrap();
-        assert_eq!(target.strict_recovery_counter, 9, "max(3,8)+1 = 9 (strictly past both)");
+        assert_eq!(
+            target.strict_recovery_counter, 9,
+            "max(3,8)+1 = 9 (strictly past both)"
+        );
     }
 
     /// AC#7/#14: capacity < records.len() ⇒ AuditCapacityOverflow, fail closed, NO partial mutation.
@@ -2582,13 +2623,16 @@ mod tests {
         let mut target = restore_target_body();
         let pre = target.clone();
         let data = sample_restore_data(); // 1 audit record
-        // capacity 0 < 1 record ⇒ overflow.
+                                          // capacity 0 < 1 record ⇒ overflow.
         assert_eq!(
             apply_restore_to_body(&mut target, &data, 0),
             Err(RestoreApplyError::AuditCapacityOverflow),
             "capacity overflow ⇒ fail closed"
         );
-        assert_eq!(target, pre, "NO partial mutation on the capacity-overflow path");
+        assert_eq!(
+            target, pre,
+            "NO partial mutation on the capacity-overflow path"
+        );
     }
 
     /// AC#7 edge: an empty audit-records backup ⇒ next_seq=1, last_exported_seq=0 (a fresh ring).
@@ -2600,6 +2644,9 @@ mod tests {
         apply_restore_to_body(&mut target, &data, 64).unwrap();
         assert!(target.audit.records.is_empty());
         assert_eq!(target.audit.next_seq, 1, "empty ⇒ next_seq=1");
-        assert_eq!(target.audit.last_exported_seq, 0, "empty ⇒ last_exported_seq=0");
+        assert_eq!(
+            target.audit.last_exported_seq, 0,
+            "empty ⇒ last_exported_seq=0"
+        );
     }
 }
