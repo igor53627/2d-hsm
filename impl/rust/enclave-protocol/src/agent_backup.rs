@@ -37,7 +37,8 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
-use ml_kem::{EncapsulationKey, MlKem1024};
+use ml_kem::kem::Decapsulate as _;
+use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem1024};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use zeroize::{Zeroize, Zeroizing};
@@ -548,10 +549,276 @@ pub(crate) fn derive_recovery_key_id(recovery_encaps_key: &[u8]) -> Vec<u8> {
     h.finalize()[..RECOVERY_KEY_ID_LEN].to_vec()
 }
 
+// ===========================================================================================
+// restore-ingress ENVELOPE — `2d-hsm-agent-restore-ingress-v1` (TASK-24 / AC#1). The SECOND KEM-DEM
+// layer of the DR recovery ceremony: the operator's offline environment re-wraps the (offline-decrypted)
+// restore-ingress-v1 PAYLOAD to the DESTINATION TEE's ATTESTED EPHEMERAL ML-KEM-1024 public key, so the
+// plaintext agent scalars exist ONLY inside the attested destination TEE and never touch the untrusted
+// host (ceremony steps (iii)/(iv), keystore-backup-format §"Fresh / newly-provisioned TEE").
+//
+// This is the SAME KEM-DEM construction as the backup ENVELOPE ([`seal_backup_blob`]), but to the
+// destination's EPHEMERAL key and with a STRONGER, ceremony-specific AAD' that binds the re-wrap to the
+// destination's attested identity + the original backup's authenticated manifest/digest:
+//   (ingress_kem_ct, ss') = ML-KEM-1024.Encaps(dest_ephemeral_encaps_key)
+//   ingress_key          = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ ss')
+//   dem_ct               = ChaCha20Poly1305(ingress_key, ingress_nonce, restore_ingress_payload, AAD')
+//   AAD'                 = magic ‖ version ‖ lp16(dest_measurement) ‖ chain_id ‖ lp16(env) ‖
+//                          manifest_hash(32) ‖ original_backup_digest(32) ‖ ingress_kem_ct(1568) ‖
+//                          ingress_nonce(12)
+//
+// AAD' is the EXACT serialized header bytes (length prefixes + nonce INCLUDED) — the SAME CWE-347
+// discipline as the backup envelope ([`build_header`]): because the lengths are authenticated, a host
+// cannot re-partition the same authenticated byte string into a different `chain_id`/`env`/`measurement`
+// by mutating only the on-disk length prefixes. The spec's AAD' field LIST is the SEMANTIC content; the
+// authenticated ENCODING is the full header (a deliberate, stricter-than-literal-spec choice that matches
+// the backup envelope so the two cannot diverge in discipline).
+//
+// Nonce safety: `ingress_nonce` is fixed-zero, safe ONLY because `ss'` is fresh per `Encaps` (the
+// operator draws a fresh encaps message `m'` per re-wrap), so the DEM key is unique per ingress envelope
+// — the SAME one-message-per-key argument as [`seal_backup_blob_with_m`]. Reusing one `m'` across two
+// different payloads would reuse `(ingress_key, nonce=0)` → catastrophic ChaCha20Poly1305 keystream
+// reuse; the production re-wrap draws `m'` from the operator HSM's CSPRNG, and the golden path uses a
+// fixed `m'` with a FIXED payload (reproduces the identical envelope, not a new plaintext under the key).
+//
+// SCOPE (TASK-24 AC#12): the operator-side OFFLINE re-wrap (ML-KEM private-key custody + the re-encrypt
+// step) is EXPLICITLY OUT of scope — it lives in the operator HSM, never in a production TEE. This slice
+// ships the DESTINATION-side [`open_restore_ingress_envelope`] (the production path the RESTORE_BACKUP
+// handler calls) + a TEST-ONLY [`seal_restore_ingress_envelope_with_m`] (gated to `mod tests`) for the
+// golden round-trip + the AAD' tamper tests — the same primitive-ahead-of-consumer shape as slice-1
+// [`seal_backup_blob`]. The handler (Slice 2) does the SEMANTIC AAD' checks: `dest_measurement == OWN`,
+// `chain_id`/`env == sealed config`, `manifest_hash`/`backup_digest == recomputed`.
+// ===========================================================================================
+
+/// Magic for the restore-ingress ENVELOPE — distinct from the backup envelope (`2DAGTBK\0`), the
+/// restore-ingress PAYLOAD (`2DRIGV1\0`), the keystore (`2DAGTKS\0`), and the producer (`2DHSMV1\0`).
+/// The envelope WRAPS the `2DRIGV1\0` payload in a second KEM-DEM layer; a distinct magic means an
+/// ingress envelope can never be cross-parsed as the payload it wraps or as a backup blob.
+const RESTORE_INGRESS_ENVELOPE_MAGIC: &[u8; 8] = b"2DAGRIE\0";
+/// Versioned INDEPENDENTLY of the backup envelope, the restore-ingress payload, and the keystore.
+const RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION: u16 = 1;
+/// DEM-key KDF domain for the ingress envelope — the EXACT label from the spec's ceremony definition
+/// (`ingress_key = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ ss')`). DISTINCT from the backup DEM
+/// domain (`2d-hsm-agent-backup-v1-key`), so an `ss'` shared secret can never derive a valid key for the
+/// other layer (domain separation between the two KEM-DEM wraps).
+const RESTORE_INGRESS_KDF_DOMAIN: &[u8] = b"2d-hsm-agent-restore-ingress-v1";
+/// Domain for the key-refs manifest hash carried in AAD'. Domain-separated so a manifest hash can never
+/// collide with a backup digest or a KDF output for the same input bytes.
+const MANIFEST_HASH_DOMAIN: &[u8] = b"2d-hsm-agent-restore-ingress-v1-manifest-hash";
+/// Domain for the original-backup digest carried in AAD'. Binds "this is the exact `pq-agent-backup-v1`
+/// blob the operator decapsulated" into the authenticated header, so the destination can refuse a re-wrap
+/// of a DIFFERENT backup than the one the recovery authority authorized.
+const BACKUP_DIGEST_DOMAIN: &[u8] = b"2d-hsm-agent-restore-ingress-v1-backup-digest";
+/// SHA3-256 output length (the manifest hash + the backup digest are fixed-width, no length prefix).
+const SHA3_256_LEN: usize = 32;
+/// ChaCha20Poly1305 ingress-nonce length (96-bit). Fixed-zero is safe — see the nonce-safety note above.
+const INGRESS_NONCE_LEN: usize = 12;
+
+/// Derive the ingress DEM key `SHA3-256(domain ‖ ss')` into a pre-zeroed `Zeroizing` buffer — the ingress
+/// twin of [`derive_payload_key`] (different domain ⇒ different key for the same `ss`, so the two KEM-DEM
+/// layers are cryptographically disjoint). Scrubs the `finalize()` temporary after the copy.
+fn derive_ingress_key(ss: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut hasher = Sha3_256::new();
+    hasher.update(RESTORE_INGRESS_KDF_DOMAIN);
+    hasher.update(ss);
+    let mut digest = hasher.finalize();
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
+    key
+}
+
+/// The authenticated key-refs manifest hash: `SHA3-256(MANIFEST_HASH_DOMAIN ‖ manifest)`. Domain-
+/// separated so the destination can match the envelope's authenticated manifest against the request's
+/// manifest set-wise without confusing it with the backup digest. `pub(crate)` so the Slice-2 handler
+/// recomputes the EXPECTED hash from the request's canonical manifest for the AAD' semantic check.
+pub(crate) fn compute_manifest_hash(manifest: &[u8]) -> [u8; SHA3_256_LEN] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(MANIFEST_HASH_DOMAIN);
+    hasher.update(manifest);
+    let mut out = [0u8; SHA3_256_LEN];
+    out.copy_from_slice(hasher.finalize().as_slice());
+    out
+}
+
+/// The authenticated original-backup digest: `SHA3-256(BACKUP_DIGEST_DOMAIN ‖ original_backup_blob)`.
+/// `original_backup_blob` is the FULL `pq-agent-backup-v1` bytes (magic `2DAGTBK\0` …) the operator
+/// decapsulated offline; binding its digest into AAD' ties the ingress re-wrap to the EXACT backup the
+/// recovery authority authorized, so a re-wrap of a different backup under the same ceremony fails the
+/// destination's semantic check. `pub(crate)` so the Slice-2 handler recomputes the EXPECTED digest.
+pub(crate) fn compute_original_backup_digest(original_backup_blob: &[u8]) -> [u8; SHA3_256_LEN] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(BACKUP_DIGEST_DOMAIN);
+    hasher.update(original_backup_blob);
+    let mut out = [0u8; SHA3_256_LEN];
+    out.copy_from_slice(hasher.finalize().as_slice());
+    out
+}
+
+/// Build the authenticated ingress header (IS the AEAD AAD'): `magic ‖ version ‖ lp16(dest_measurement)
+/// ‖ chain_id(u64) ‖ lp16(environment_identifier) ‖ manifest_hash(32) ‖ original_backup_digest(32) ‖
+/// ingress_kem_ct(1568) ‖ ingress_nonce(12)`. The on-disk prefix of the envelope AND the AAD, so seal
+/// and open cannot diverge (mirrors [`build_header`]).
+#[allow(clippy::too_many_arguments)]
+fn build_ingress_header(
+    dest_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &str,
+    manifest_hash: &[u8; SHA3_256_LEN],
+    original_backup_digest: &[u8; SHA3_256_LEN],
+    ingress_kem_ct: &[u8],
+    ingress_nonce: &[u8; INGRESS_NONCE_LEN],
+) -> Result<Vec<u8>, BackupError> {
+    let mut h = Vec::with_capacity(
+        RESTORE_INGRESS_ENVELOPE_MAGIC.len()
+            + 2
+            + 2
+            + dest_measurement.len()
+            + 8
+            + 2
+            + environment_identifier.len()
+            + SHA3_256_LEN
+            + SHA3_256_LEN
+            + ingress_kem_ct.len()
+            + INGRESS_NONCE_LEN,
+    );
+    h.extend_from_slice(RESTORE_INGRESS_ENVELOPE_MAGIC);
+    h.extend_from_slice(&RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION.to_be_bytes());
+    put_lp16(&mut h, dest_measurement)?;
+    h.extend_from_slice(&chain_id.to_be_bytes());
+    put_lp16(&mut h, environment_identifier.as_bytes())?;
+    h.extend_from_slice(manifest_hash);
+    h.extend_from_slice(original_backup_digest);
+    h.extend_from_slice(ingress_kem_ct);
+    h.extend_from_slice(ingress_nonce);
+    Ok(h)
+}
+
+/// A strictly-parsed ingress envelope — all slices borrow `blob`. `header` is `blob[..header_end]` (AAD').
+struct ParsedIngressEnvelope<'a> {
+    dest_measurement: &'a [u8],
+    chain_id: u64,
+    environment_identifier: &'a [u8],
+    manifest_hash: &'a [u8; SHA3_256_LEN],
+    original_backup_digest: &'a [u8; SHA3_256_LEN],
+    ingress_kem_ct: &'a [u8],
+    ingress_nonce: &'a [u8],
+    /// `blob[..header_end]` — the exact bytes used as the AEAD AAD' (lengths + nonce included).
+    header: &'a [u8],
+    dem_ct: &'a [u8],
+}
+
+/// Strict full parse of a `restore-ingress-v1` ENVELOPE: rejects wrong magic / unknown version BEFORE
+/// walking the body, walks every framed field, and requires the cursor to land EXACTLY at `blob.len()`.
+/// Pure framing — no decapsulation/decrypt. BOTH the seal self-check and the first half of the open, so
+/// the two cannot diverge (mirrors [`strict_parse`]).
+fn strict_parse_ingress_envelope(blob: &[u8]) -> Result<ParsedIngressEnvelope<'_>, BackupError> {
+    if blob.len() < RESTORE_INGRESS_ENVELOPE_MAGIC.len() + 2 {
+        return Err(BackupError::Truncated);
+    }
+    if &blob[..RESTORE_INGRESS_ENVELOPE_MAGIC.len()] != RESTORE_INGRESS_ENVELOPE_MAGIC.as_slice() {
+        return Err(BackupError::BadMagic);
+    }
+    let ver_off = RESTORE_INGRESS_ENVELOPE_MAGIC.len();
+    let version = u16::from_be_bytes([blob[ver_off], blob[ver_off + 1]]);
+    if version != RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION {
+        return Err(BackupError::UnsupportedVersion);
+    }
+    let mut r = Reader { buf: blob, pos: 0 };
+    let _magic = r.take(RESTORE_INGRESS_ENVELOPE_MAGIC.len())?;
+    let _version = r.take_u16()?;
+    let dest_measurement = r.take_lp16()?;
+    let chain_id = r.take_u64()?;
+    let environment_identifier = r.take_lp16()?;
+    let manifest_hash: &[u8; SHA3_256_LEN] =
+        r.take(SHA3_256_LEN)?.try_into().map_err(|_| BackupError::Truncated)?;
+    let original_backup_digest: &[u8; SHA3_256_LEN] =
+        r.take(SHA3_256_LEN)?.try_into().map_err(|_| BackupError::Truncated)?;
+    let ingress_kem_ct = r.take(ML_KEM_1024_CIPHERTEXT_LEN)?;
+    let ingress_nonce = r.take(INGRESS_NONCE_LEN)?;
+    let header_end = r.pos;
+    let dem_ct = r.take_lp32()?;
+    if r.pos != blob.len() {
+        return Err(BackupError::Truncated); // trailing bytes ⇒ not strictly canonical
+    }
+    Ok(ParsedIngressEnvelope {
+        dest_measurement,
+        chain_id,
+        environment_identifier,
+        manifest_hash,
+        original_backup_digest,
+        ingress_kem_ct,
+        ingress_nonce,
+        header: &blob[..header_end],
+        dem_ct,
+    })
+}
+
+/// The result of opening a `restore-ingress-v1` envelope: the decrypted `restore-ingress-v1` PAYLOAD
+/// (the plaintext agent scalars + restorable state, in a scrubbed-on-drop buffer) PLUS the authenticated
+/// AAD' fields the Slice-2 handler semantically checks (measurement/chain/env identity + manifest/digest
+/// match). Every field here was authenticated by the AEAD tag (it is in the AAD' header), so a host
+/// tamper of any field either fails the tag or fails strict-parse — the handler can trust these values
+/// as the operator's authenticated intent and need only compare them against its OWN state.
+pub(crate) struct OpenedRestoreIngress {
+    /// The `restore-ingress-v1` payload (magic `2DRIGV1\0` …); feed to [`parse_restore_ingress`].
+    pub payload: Zeroizing<Vec<u8>>,
+    /// The destination attestation/measurement bound into AAD' (handler checks `== OWN`).
+    pub dest_measurement: Vec<u8>,
+    /// The `chain_id` bound into AAD' (handler checks `== sealed config`).
+    pub chain_id: u64,
+    /// The `environment_identifier` bound into AAD' (handler checks `== sealed config`).
+    pub environment_identifier: Vec<u8>,
+    /// The key-refs manifest hash bound into AAD' (handler checks `== compute_manifest_hash(own)`).
+    pub manifest_hash: [u8; SHA3_256_LEN],
+    /// The original-backup digest bound into AAD' (handler checks `== compute_original_backup_digest`).
+    pub original_backup_digest: [u8; SHA3_256_LEN],
+}
+
+/// The DESTINATION-Tee production path (TASK-24 AC#1 ceremony step (iv)): strict-parse the
+/// `2d-hsm-agent-restore-ingress-v1` envelope, decapsulate `ingress_kem_ct` with the destination's
+/// EPHEMERAL private key, re-derive the ingress DEM key, and ChaCha20Poly1305-open the payload using the
+/// parsed `header` slice as AAD' (the SAME bytes the seal authenticated — no recompute, so no divergence).
+/// Returns the plaintext payload + the authenticated AAD' fields for the handler's semantic checks.
+///
+/// The ephemeral `dk` is the destination enclave's attested keypair (generated + bound to the enclave's
+/// attestation at boot/provisioning — the lifecycle is the Slice-2 handler's concern; this primitive takes
+/// it as a parameter, mirroring how [`seal_backup_blob`] takes the recovery encaps key). ML-KEM
+/// decapsulation is infallible (implicit rejection yields a pseudo-random `ss'` on a bad ct), so a wrong
+/// ephemeral key / mutated `ingress_kem_ct` surfaces as the AEAD tag failure below, never a silent
+/// success. EVERY failure (framing, decap-then-tag) returns `Err` — the handler fails the op closed with
+/// NO partial import. Consumed by the Slice-2 `handle_restore_backup`; `allow(dead_code)` until then.
+#[allow(dead_code)]
+pub(crate) fn open_restore_ingress_envelope(
+    dk: &DecapsulationKey<MlKem1024>,
+    blob: &[u8],
+) -> Result<OpenedRestoreIngress, BackupError> {
+    let parsed = strict_parse_ingress_envelope(blob)?;
+    let ct_arr: ml_kem::Ciphertext<MlKem1024> = parsed
+        .ingress_kem_ct
+        .try_into()
+        .map_err(|_| BackupError::Truncated)?;
+    // Infallible ML-KEM decap (implicit rejection on a bad ct ⇒ pseudo-random ss' ⇒ tag fails below).
+    let ss_prime = dk.decapsulate(&ct_arr);
+    let ingress_key = derive_ingress_key(ss_prime.as_slice());
+    let nonce: [u8; INGRESS_NONCE_LEN] =
+        parsed.ingress_nonce.try_into().map_err(|_| BackupError::Truncated)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Decrypt)?;
+    let payload_bytes = cipher
+        .decrypt(Nonce::from_slice(&nonce), Payload { msg: parsed.dem_ct, aad: parsed.header })
+        .map_err(|_| BackupError::Decrypt)?;
+    Ok(OpenedRestoreIngress {
+        payload: Zeroizing::new(payload_bytes),
+        dest_measurement: parsed.dest_measurement.to_vec(),
+        chain_id: parsed.chain_id,
+        environment_identifier: parsed.environment_identifier.to_vec(),
+        manifest_hash: *parsed.manifest_hash,
+        original_backup_digest: *parsed.original_backup_digest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ml_kem::kem::Decapsulate as _;
     use ml_kem::{DecapsulationKey, KeyExport as _};
 
     /// Test-only deterministic ML-KEM-1024 recovery keypair from a 64-byte seed. The DECAPSULATION key is
@@ -1217,5 +1484,521 @@ mod tests {
         )
         .unwrap();
         eprintln!("wrote restore-ingress golden ({}-byte payload) + sidecar -> {dir}", payload.len());
+    }
+
+    // ─── TASK-24 / AC#1: restore-ingress ENVELOPE (the attested second KEM-DEM layer) ───
+    // The ceremony re-wrap of the restore-ingress-v1 PAYLOAD to the destination's attested EPHEMERAL
+    // ML-KEM-1024 key. The operator-side seal is OUT of scope (AC#12); this TEST-ONLY seal exists to
+    // drive the golden round-trip + the AAD' tamper tests (mirroring `open_backup_blob_offline`). The
+    // production path is the destination-side `open_restore_ingress_envelope` (above).
+
+    /// Destination ephemeral keypair seed — DISTINCT from the recovery `SEED` so the two ceremony roles
+    /// (offline recovery decap key vs attested destination ephemeral key) never share test material.
+    /// `recovery_keypair` is a generic ML-KEM-1024 keypair-from-seed; reused here for the ephemeral role.
+    const DEST_EPHEMERAL_SEED: [u8; 64] = [0x6c; 64];
+    /// The operator's encaps message `m'` for the ingress re-wrap — DISTINCT from the backup `M` so the
+    /// two KEM-DEM layers draw different shared secrets even over identical key material.
+    const INGRESS_M: [u8; 32] = [0x43; 32];
+    /// The destination TEE's attested measurement bound into AAD' (a test stand-in for the real 48-byte
+    /// SNP launch measurement; non-empty + variable-length to exercise the lp16 framing).
+    const DEST_MEASUREMENT: &[u8] = b"dest-tee-measurement-v1";
+
+    /// TEST-ONLY deterministic seal of a `restore-ingress-v1` ENVELOPE to the destination ephemeral key
+    /// (the operator's offline re-wrap, ceremony step (iii)). Mirrors [`seal_backup_blob_with_m`]:
+    /// `(ingress_kem_ct, ss') = Encaps(dest_ephemeral_encaps_key, m')`, then ChaCha20Poly1305 with AAD' =
+    /// the full header. Self-checks a strict re-parse. The encapsulation reuses [`encapsulate_to_recovery_key`]
+    /// — it is the GENERIC ML-KEM Encaps-to-a-public-key (the "recovery" in the name is the backup role;
+    /// the operation is key-independent), so a separate copy would be pure duplication.
+    #[allow(clippy::too_many_arguments)]
+    fn seal_restore_ingress_envelope_with_m(
+        dest_ephemeral_encaps_key: &[u8],
+        dest_measurement: &[u8],
+        chain_id: u64,
+        environment_identifier: &str,
+        manifest_hash: &[u8; SHA3_256_LEN],
+        original_backup_digest: &[u8; SHA3_256_LEN],
+        payload: &[u8],
+        m: &[u8; 32],
+    ) -> Result<Vec<u8>, BackupError> {
+        let (ingress_kem_ct, ss_prime) = encapsulate_to_recovery_key(dest_ephemeral_encaps_key, m)?;
+        let ingress_key = derive_ingress_key(&ss_prime[..]);
+        let ingress_nonce = [0u8; INGRESS_NONCE_LEN];
+        let header = build_ingress_header(
+            dest_measurement,
+            chain_id,
+            environment_identifier,
+            manifest_hash,
+            original_backup_digest,
+            &ingress_kem_ct,
+            &ingress_nonce,
+        )?;
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Encrypt)?;
+        let dem_ct = cipher
+            .encrypt(Nonce::from_slice(&ingress_nonce), Payload { msg: payload, aad: &header })
+            .map_err(|_| BackupError::Encrypt)?;
+        let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
+        blob.extend_from_slice(&header);
+        put_lp32(&mut blob, &dem_ct)?;
+        // Self-check: the just-minted envelope must STRICTLY re-parse before hand-back (mirrors
+        // `seal_backup_blob_with_m`'s `strict_parse(&blob)?` self-check).
+        strict_parse_ingress_envelope(&blob)?;
+        Ok(blob)
+    }
+
+    /// Build the golden ingress envelope: the frozen `restore_ingress_v1.bin` PAYLOAD re-wrapped to the
+    /// fixed destination ephemeral key, with AAD' binding the frozen `agent_backup_v1.bin` digest + the
+    /// payload's own manifest hash. Cross-references BOTH prior goldens (payload + backup envelope) so the
+    /// ceremony path is one coherent frozen artifact, not three independent ones.
+    fn golden_restore_ingress_envelope() -> Vec<u8> {
+        let (dest_encaps, _dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let manifest_hash = compute_manifest_hash(&manifest);
+        let backup_digest = compute_original_backup_digest(backup_blob);
+        seal_restore_ingress_envelope_with_m(
+            &dest_encaps,
+            DEST_MEASUREMENT,
+            CHAIN,
+            ENV,
+            &manifest_hash,
+            &backup_digest,
+            payload,
+            &INGRESS_M,
+        )
+        .unwrap()
+    }
+
+    /// (a) Ceremony KEM-DEM round-trip: seal (operator re-wrap) → open (destination decap) recovers the
+    /// restore-ingress-v1 payload byte-exact AND surfaces every authenticated AAD' field for the handler.
+    #[test]
+    fn ingress_envelope_round_trips_and_surfaces_aad_fields() {
+        let (dest_encaps, dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let manifest_hash = compute_manifest_hash(&manifest);
+        let backup_digest = compute_original_backup_digest(backup_blob);
+        let envelope = seal_restore_ingress_envelope_with_m(
+            &dest_encaps,
+            DEST_MEASUREMENT,
+            CHAIN,
+            ENV,
+            &manifest_hash,
+            &backup_digest,
+            payload,
+            &INGRESS_M,
+        )
+        .unwrap();
+        let opened = open_restore_ingress_envelope(&dest_dk, &envelope).unwrap();
+        assert_eq!(opened.payload.as_slice(), payload, "payload recovered byte-exact");
+        assert_eq!(opened.dest_measurement, DEST_MEASUREMENT, "measurement surfaced");
+        assert_eq!(opened.chain_id, CHAIN, "chain_id surfaced");
+        assert_eq!(opened.environment_identifier, ENV.as_bytes(), "env surfaced");
+        assert_eq!(opened.manifest_hash, manifest_hash, "manifest hash surfaced");
+        assert_eq!(opened.original_backup_digest, backup_digest, "backup digest surfaced");
+    }
+
+    /// (b) AC#7 no-plaintext-leak at the ENVELOPE layer. The envelope wraps an OPAQUE payload, so this
+    /// feeds it a RAW payload carrying a known contiguous 32-byte secret (mirroring `no_plaintext_secret_
+    /// in_blob` for the backup envelope) — NOT the CBOR `restore_ingress_v1.bin`, whose `Vec<u8>` scalars
+    /// serialize as CBOR integer-arrays (`0x18 0x77` per byte — see agent_keystore.rs ~line 272) and so
+    /// are never a contiguous `[0x77;32]` run. The raw payload makes the non-vacuous assertion possible;
+    /// the AEAD ciphertext hides the secret from the envelope either way.
+    #[test]
+    fn ingress_envelope_no_plaintext_secret_leak() {
+        let (dest_encaps, _dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let secret = [0x77; 32];
+        let mut raw_payload = b"restore-ingress-test-payload:".to_vec();
+        raw_payload.extend_from_slice(&secret);
+        let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let manifest_hash = compute_manifest_hash(b"test-manifest");
+        let backup_digest = compute_original_backup_digest(backup_blob);
+        let envelope = seal_restore_ingress_envelope_with_m(
+            &dest_encaps,
+            DEST_MEASUREMENT,
+            CHAIN,
+            ENV,
+            &manifest_hash,
+            &backup_digest,
+            &raw_payload,
+            &INGRESS_M,
+        )
+        .unwrap();
+        assert!(
+            raw_payload.windows(secret.len()).any(|w| w == secret),
+            "test payload must contain the contiguous secret (non-vacuous)"
+        );
+        assert!(
+            !envelope.windows(secret.len()).any(|w| w == secret),
+            "the contiguous secret must not appear in the opaque ingress envelope (AC#7)"
+        );
+    }
+
+    /// (c) Wrong destination ephemeral key ⇒ decap yields a pseudo-random ss' ⇒ the AEAD tag fails
+    /// (ML-KEM implicit rejection never errors; the wrong-key surface is ALWAYS the tag failure).
+    #[test]
+    fn ingress_envelope_wrong_ephemeral_key_fails() {
+        let envelope = golden_restore_ingress_envelope();
+        let (_other_encaps, other_dk) = recovery_keypair(&[0x99; 64]);
+        assert_eq!(
+            open_restore_ingress_envelope(&other_dk, &envelope).err(),
+            Some(BackupError::Decrypt),
+            "an envelope sealed to one ephemeral key must not open with another"
+        );
+    }
+
+    /// (d) Cross-magic: a `2DAGTBK\0` backup ENVELOPE and a `2DRIGV1\0` PAYLOAD are both rejected by the
+    /// ingress envelope parser on magic BEFORE any decap (format-level separation, AC#2). Likewise a bare
+    /// ingress envelope fed to the backup parser fails on magic.
+    #[test]
+    fn ingress_envelope_cross_magic_rejected_before_decap() {
+        let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        assert_eq!(
+            strict_parse_ingress_envelope(backup_blob).err(),
+            Some(BackupError::BadMagic),
+            "a backup envelope is not an ingress envelope"
+        );
+        assert_eq!(
+            strict_parse_ingress_envelope(payload).err(),
+            Some(BackupError::BadMagic),
+            "a restore-ingress PAYLOAD is not an ingress envelope"
+        );
+        let envelope = golden_restore_ingress_envelope();
+        assert_eq!(
+            strict_parse(&envelope).err(),
+            Some(BackupError::BadMagic),
+            "an ingress envelope is not a backup envelope (symmetric separation)"
+        );
+    }
+
+    /// (e) Unknown version rejected BEFORE any decap (parallel to the backup envelope). Version != 1 has
+    /// no migration window (the payload format's hard-reject rule carries to the envelope).
+    #[test]
+    fn ingress_envelope_unknown_version_rejected_before_decap() {
+        let mut envelope = golden_restore_ingress_envelope();
+        envelope[RESTORE_INGRESS_ENVELOPE_MAGIC.len() + 1] = 0xFF;
+        assert_eq!(
+            strict_parse_ingress_envelope(&envelope).err(),
+            Some(BackupError::UnsupportedVersion)
+        );
+    }
+
+    /// (f) AAD'-binding for EVERY authenticated header field: flipping one byte of dest_measurement /
+    /// chain_id / env / manifest_hash / backup_digest / ingress_kem_ct / ingress_nonce each break the open
+    /// (the header IS the AAD', so any mutation that survives strict-parse changes the recomputed AAD' →
+    /// the tag fails; a mutation that breaks framing fails strict-parse). Offsets computed from the layout.
+    #[test]
+    fn every_ingress_aad_field_is_bound() {
+        let (dest_encaps, dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let manifest_hash = compute_manifest_hash(&manifest);
+        let backup_digest =
+            compute_original_backup_digest(include_bytes!(
+                "../testvectors/agent-gateway/agent_backup_v1.bin"
+            ));
+        let envelope = seal_restore_ingress_envelope_with_m(
+            &dest_encaps,
+            DEST_MEASUREMENT,
+            CHAIN,
+            ENV,
+            &manifest_hash,
+            &backup_digest,
+            payload,
+            &INGRESS_M,
+        )
+        .unwrap();
+        // Layout offsets (big-endian; lp16/lp32 = u16/u32 length-prefix):
+        // magic(8) ver(2) lp16_meas(2) meas[..] chain(8) lp16_env(2) env[..] manifest(32) digest(32)
+        // kem_ct(1568) nonce(12) [header end] lp32_dem(4) dem[..]
+        let o_meas = 8 + 2 + 2; // first dest_measurement byte (after magic+ver+lp16)
+        let o_chain = o_meas + DEST_MEASUREMENT.len();
+        let o_env = o_chain + 8 + 2; // first env byte (after chain_id + lp16)
+        let o_manifest = o_env + ENV.len();
+        let o_digest = o_manifest + SHA3_256_LEN;
+        let o_kemct = o_digest + SHA3_256_LEN;
+        let o_nonce = o_kemct + ML_KEM_1024_CIPHERTEXT_LEN;
+        for (label, off) in [
+            ("dest_measurement", o_meas),
+            ("chain_id", o_chain),
+            ("env", o_env),
+            ("manifest_hash", o_manifest),
+            ("backup_digest", o_digest),
+            ("ingress_kem_ct", o_kemct),
+            ("ingress_nonce", o_nonce),
+        ] {
+            let mut tampered = envelope.clone();
+            tampered[off] ^= 0x01;
+            assert!(
+                open_restore_ingress_envelope(&dest_dk, &tampered).is_err(),
+                "tampering AAD' field {label} (offset {off}) must break the open"
+            );
+        }
+    }
+
+    /// (f') CWE-347 re-partition: mutating ONLY the lp16(dest_measurement) length prefix to re-partition
+    /// the same authenticated bytes into a different measurement/chain_id must never open successfully.
+    /// The strict canonical parse catches it (the shifted framing misaligns the fixed-width chain_id +
+    /// 1568-byte kem_ct) — the SAME two-layer defense as the backup envelope (`length_prefix_repartition_
+    /// breaks_open`): strict-parse first, AAD'-tag second.
+    #[test]
+    fn ingress_length_prefix_repartition_breaks_open() {
+        let envelope = golden_restore_ingress_envelope();
+        let mut t = envelope.clone();
+        // lp16(dest_measurement) prefix is at bytes [10,11] (after magic(8)+ver(2)); bump its low byte +1.
+        let new_len = (DEST_MEASUREMENT.len() as u16) + 1;
+        t[10..12].copy_from_slice(&new_len.to_be_bytes());
+        assert!(
+            open_restore_ingress_envelope(&recovery_keypair(&DEST_EPHEMERAL_SEED).1, &t).is_err(),
+            "re-partitioning via the length prefix must not open successfully"
+        );
+        assert!(
+            strict_parse_ingress_envelope(&t).is_err(),
+            "re-partition misaligns the fixed-width framing ⇒ strict_parse rejects"
+        );
+    }
+
+    /// (g) Trailing bytes / truncation after the declared framing ⇒ `Truncated` (strict canonical parse).
+    #[test]
+    fn ingress_envelope_trailing_and_truncated_rejected() {
+        let envelope = golden_restore_ingress_envelope();
+        let mut trailing = envelope.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            strict_parse_ingress_envelope(&trailing).err(),
+            Some(BackupError::Truncated),
+            "trailing byte rejected"
+        );
+        assert_eq!(
+            strict_parse_ingress_envelope(&envelope[..12]).err(),
+            Some(BackupError::Truncated),
+            "truncated header rejected"
+        );
+    }
+
+    /// (h) The ingress KDF domain is DISJOINT from the backup DEM domain: an `ss` that derives a valid
+    /// backup DEM key does NOT derive a valid ingress key (and vice versa). Proves the two KEM-DEM layers
+    /// are cryptographically disjoint — a shared secret from one layer cannot decrypt the other.
+    #[test]
+    fn ingress_kdf_domain_disjoint_from_backup_domain() {
+        let ss = [0xaa; 32]; // arbitrary shared secret
+        let backup_key = derive_payload_key(&ss);
+        let ingress_key = derive_ingress_key(&ss);
+        assert_ne!(
+            backup_key.as_ref(),
+            ingress_key.as_ref(),
+            "the two KDF domains must yield distinct keys for the same ss"
+        );
+    }
+
+    /// (i) Deterministic mint with a fixed `m'` is byte-stable (precondition for the frozen golden).
+    #[test]
+    fn ingress_envelope_deterministic_mint_is_byte_stable() {
+        let a = golden_restore_ingress_envelope();
+        let b = golden_restore_ingress_envelope();
+        assert_eq!(a, b, "fixed m' + fixed keypair ⇒ byte-identical envelope");
+    }
+
+    // ── frozen restore-ingress ENVELOPE golden vector (AC#1) ──
+    // The committed envelope (`restore_ingress_envelope_v1.bin`) pins the byte-exact ENVELOPE wire format
+    // for the ceremony path; the dest-ephemeral keypair fixtures (`..._dest_ephemeral_keypair_v1.{encaps,
+    // decaps}.bin`) let a consumer open it offline + verify the ceremony round-trip. Cross-references the
+    // restore_ingress_v1.bin PAYLOAD (the wrapped plaintext) + agent_backup_v1.bin (the digested backup).
+    // ALL TEST KEYS ONLY.
+
+    #[test]
+    fn restore_ingress_envelope_v1_golden_is_byte_exact() {
+        let committed: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/restore_ingress_envelope_v1.bin");
+        assert_eq!(
+            golden_restore_ingress_envelope().as_slice(),
+            committed,
+            "ingress envelope golden drifted; if intentional, regen via \
+             `regen_restore_ingress_envelope_golden_vector -- --ignored` and re-mint the .json + keypair \
+             fixtures in the same commit",
+        );
+        assert_eq!(
+            &committed[..RESTORE_INGRESS_ENVELOPE_MAGIC.len()],
+            RESTORE_INGRESS_ENVELOPE_MAGIC.as_slice(),
+            "magic 2DAGRIE\\0"
+        );
+        assert_eq!(
+            &committed[RESTORE_INGRESS_ENVELOPE_MAGIC.len()..RESTORE_INGRESS_ENVELOPE_MAGIC.len() + 2],
+            &[0x00, 0x01],
+            "restore_ingress_envelope_format_version 1 (literal BE u16)"
+        );
+        // The committed envelope opens with the committed dest ephemeral key + recovers the committed
+        // payload byte-exact (the full ceremony round-trip over frozen artifacts).
+        let (_dest_encaps, dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let opened = open_restore_ingress_envelope(&dest_dk, committed).unwrap();
+        let payload: &[u8] = include_bytes!("../testvectors/agent-gateway/restore_ingress_v1.bin");
+        assert_eq!(opened.payload.as_slice(), payload, "committed envelope opens to the committed payload");
+        assert_eq!(opened.dest_measurement, DEST_MEASUREMENT, "committed measurement");
+        assert_eq!(opened.chain_id, CHAIN, "committed chain_id");
+    }
+
+    #[test]
+    fn restore_ingress_envelope_dest_ephemeral_keypair_fixtures_consistent() {
+        // `decaps.bin` = the 64-byte dest ephemeral keypair seed (the OFFLINE-equivalent test secret —
+        // in the live ceremony this key is GENERATED inside the destination TEE, never off-device; the
+        // fixture exists only so a consumer can open the golden envelope). `encaps.bin` = the 1568-byte
+        // attested ephemeral public key the operator re-wraps to.
+        let committed_encaps: &[u8] = include_bytes!(
+            "../testvectors/agent-gateway/restore_ingress_dest_ephemeral_keypair_v1.encaps.bin"
+        );
+        let committed_decaps: &[u8] = include_bytes!(
+            "../testvectors/agent-gateway/restore_ingress_dest_ephemeral_keypair_v1.decaps.bin"
+        );
+        assert_eq!(committed_decaps, DEST_EPHEMERAL_SEED, "decaps fixture is the dest ephemeral seed");
+        assert_eq!(committed_encaps.len(), ML_KEM_1024_ENCAPS_KEY_LEN, "encaps key is 1568 bytes");
+        let (encaps, _dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        assert_eq!(committed_encaps, encaps.as_slice(), "encaps fixture == keypair-from-seed encaps key");
+        let seed: [u8; 64] = committed_decaps.try_into().expect("decaps fixture is 64 bytes");
+        let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(seed));
+        assert_eq!(
+            dk.encapsulation_key().to_bytes().as_slice(),
+            committed_encaps,
+            "the committed decaps seed reconstructs a key whose public half == the committed encaps fixture",
+        );
+    }
+
+    #[test]
+    fn restore_ingress_envelope_v1_sidecar_matches() {
+        use sha2::{Digest, Sha256};
+        let envelope: &[u8] =
+            include_bytes!("../testvectors/agent-gateway/restore_ingress_envelope_v1.bin");
+        let dest_encaps: &[u8] = include_bytes!(
+            "../testvectors/agent-gateway/restore_ingress_dest_ephemeral_keypair_v1.encaps.bin"
+        );
+        let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let sidecar =
+            include_str!("../testvectors/agent-gateway/restore_ingress_envelope_v1.json");
+        let v: serde_json::Value =
+            serde_json::from_str(sidecar).expect("ingress envelope sidecar must be valid JSON");
+        assert_eq!(
+            v["envelope_sha256"].as_str(),
+            Some(hex(&Sha256::digest(envelope)).as_str()),
+            "sidecar envelope_sha256 drift"
+        );
+        assert_eq!(v["envelope_len_bytes"].as_u64(), Some(envelope.len() as u64), "sidecar len drift");
+        assert_eq!(
+            v["restore_ingress_envelope_format_version"].as_u64(),
+            Some(u64::from(RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION)),
+            "sidecar version drift"
+        );
+        assert_eq!(
+            v["magic"].as_str().map(str::as_bytes),
+            Some(RESTORE_INGRESS_ENVELOPE_MAGIC.as_slice()),
+            "sidecar magic drift"
+        );
+        assert_eq!(v["chain_id"].as_u64(), Some(CHAIN), "sidecar chain_id drift");
+        assert_eq!(v["environment_identifier"].as_str(), Some(ENV), "sidecar env drift");
+        assert_eq!(
+            v["dest_measurement_hex"].as_str(),
+            Some(hex(DEST_MEASUREMENT).as_str()),
+            "sidecar dest_measurement drift"
+        );
+        assert_eq!(
+            v["ingress_nonce_hex"].as_str(),
+            Some(hex(&[0u8; INGRESS_NONCE_LEN]).as_str()),
+            "sidecar nonce drift"
+        );
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        assert_eq!(
+            v["manifest_hash_hex"].as_str(),
+            Some(hex(&compute_manifest_hash(&manifest)).as_str()),
+            "sidecar manifest_hash drift"
+        );
+        assert_eq!(
+            v["original_backup_digest_hex"].as_str(),
+            Some(hex(&compute_original_backup_digest(backup_blob)).as_str()),
+            "sidecar backup_digest drift"
+        );
+        assert_eq!(
+            v["dest_ephemeral_keypair_seed_hex"].as_str(),
+            Some(hex(&DEST_EPHEMERAL_SEED).as_str()),
+            "sidecar dest ephemeral seed drift"
+        );
+        assert_eq!(
+            v["kem_encaps_message_m_hex"].as_str(),
+            Some(hex(&INGRESS_M).as_str()),
+            "sidecar encaps-message m' drift"
+        );
+        assert_eq!(
+            v["dest_ephemeral_encaps_key_len"].as_u64(),
+            Some(dest_encaps.len() as u64),
+            "sidecar dest encaps_key_len drift"
+        );
+        assert_eq!(
+            v["dest_ephemeral_encaps_key_sha256"].as_str(),
+            Some(hex(&Sha256::digest(dest_encaps)).as_str()),
+            "sidecar dest encaps_key_sha256 drift"
+        );
+    }
+
+    /// REGEN (manual): `cargo test --features agent-backup-export-preview \
+    /// regen_restore_ingress_envelope_golden_vector -- --ignored --nocapture`, then commit the 4 testvector
+    /// files (envelope .bin + .json + the dest-ephemeral keypair .encaps/.decaps). A deliberate envelope-
+    /// format / version change re-mints all four in the same commit.
+    #[test]
+    #[ignore]
+    fn regen_restore_ingress_envelope_golden_vector() {
+        use sha2::{Digest, Sha256};
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testvectors/agent-gateway/");
+        let (dest_encaps, _dest_dk) = recovery_keypair(&DEST_EPHEMERAL_SEED);
+        let envelope = golden_restore_ingress_envelope();
+        std::fs::write(
+            format!("{dir}restore_ingress_dest_ephemeral_keypair_v1.encaps.bin"),
+            &dest_encaps,
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{dir}restore_ingress_dest_ephemeral_keypair_v1.decaps.bin"),
+            DEST_EPHEMERAL_SEED,
+        )
+        .unwrap();
+        std::fs::write(format!("{dir}restore_ingress_envelope_v1.bin"), &envelope).unwrap();
+        let backup_blob: &[u8] = include_bytes!("../testvectors/agent-gateway/agent_backup_v1.bin");
+        let refs = selected_key_refs(&body_with_two_keys(), &[[0x11; 32], [0x22; 32]]);
+        let manifest = build_key_refs_manifest(&refs).unwrap();
+        let sidecar = serde_json::json!({
+            "description": "TASK-24 restore-ingress ENVELOPE golden vector — the attested second KEM-DEM \
+                            layer (2d-hsm-agent-restore-ingress-v1). The operator re-wraps the \
+                            restore_ingress_v1.bin PAYLOAD to the destination TEE's attested EPHEMERAL \
+                            ML-KEM-1024 key; AAD' binds the dest measurement + chain/env + manifest hash + \
+                            the agent_backup_v1.bin digest. TEST KEYS ONLY — the dest ephemeral decaps \
+                            seed is a public test constant (in the live ceremony this key is GENERATED \
+                            inside the destination TEE, never off-device).",
+            "envelope_sha256": hex(&Sha256::digest(&envelope)),
+            "envelope_len_bytes": envelope.len(),
+            "restore_ingress_envelope_format_version": RESTORE_INGRESS_ENVELOPE_FORMAT_VERSION,
+            "magic": "2DAGRIE\u{0000}",
+            "chain_id": CHAIN,
+            "environment_identifier": ENV,
+            "dest_measurement_hex": hex(DEST_MEASUREMENT),
+            "manifest_hash_hex": hex(&compute_manifest_hash(&manifest)),
+            "original_backup_digest_hex": hex(&compute_original_backup_digest(backup_blob)),
+            "ingress_nonce_hex": hex(&[0u8; INGRESS_NONCE_LEN]),
+            "dest_ephemeral_keypair_seed_hex": hex(&DEST_EPHEMERAL_SEED),
+            "kem_encaps_message_m_hex": hex(&INGRESS_M),
+            "dest_ephemeral_encaps_key_len": dest_encaps.len(),
+            "dest_ephemeral_encaps_key_sha256": hex(&Sha256::digest(&dest_encaps)),
+        });
+        std::fs::write(
+            format!("{dir}restore_ingress_envelope_v1.json"),
+            serde_json::to_string_pretty(&sidecar).unwrap() + "\n",
+        )
+        .unwrap();
+        eprintln!(
+            "wrote restore-ingress ENVELOPE golden ({}-byte envelope) + dest-ephemeral keypair fixtures + sidecar -> {dir}",
+            envelope.len()
+        );
     }
 }

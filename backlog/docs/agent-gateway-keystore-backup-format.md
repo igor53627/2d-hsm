@@ -285,6 +285,23 @@ Three keying assumptions, stated separately:
    - `ChaCha20Poly1305(ingress_key, ingress_nonce, payload, AAD')`, with
      `AAD' = dest_attestation/measurement ‖ chain_id ‖ environment_identifier ‖
      key-ref-manifest-hash ‖ original-backup-digest ‖ ingress_kem_ct`.
+     **AAD' encoding (frozen, TASK-24 AC#1):** the semantic field list above is authenticated as the
+     EXACT serialized header bytes — `magic ‖ version ‖ lp16(dest_measurement) ‖ chain_id(u64) ‖
+     lp16(env) ‖ manifest_hash(32) ‖ original_backup_digest(32) ‖ ingress_kem_ct(1568) ‖
+     ingress_nonce(12)` — INCLUDING the length prefixes and the nonce. This is the SAME CWE-347 discipline
+     as the backup envelope (`AAD` = the full header): because the lengths are authenticated, a host cannot
+     re-partition the same authenticated byte string into a different `chain_id`/`env`/`measurement` by
+     mutating only the on-disk length prefixes. The seal and the open use the IDENTICAL header bytes as
+     AAD', so they cannot diverge. `manifest_hash = SHA3-256("2d-hsm-agent-restore-ingress-v1-manifest-hash"
+     ‖ manifest)` and `original_backup_digest = SHA3-256("2d-hsm-agent-restore-ingress-v1-backup-digest" ‖
+     original_backup_blob)` — both domain-separated so neither collides with the other or with the DEM key.
+     `ingress_nonce` is fixed-zero, safe ONLY because `ss'` is fresh per `Encaps` (the operator draws a
+     fresh encaps message `m'` per re-wrap), so the DEM key is unique per ingress envelope — the same
+     one-message-per-key argument as the backup envelope's fixed-zero `payload_nonce`. Magic
+     `2DAGRIE\0` (distinct from `2DAGTBK\0`/`2DRIGV1\0`/`2DAGTKS\0`/`2DHSMV1\0`); `restore_ingress_envelope
+     _format_version = 1` (independent of the backup envelope + payload + keystore versions). Frozen golden:
+     `testvectors/agent-gateway/restore_ingress_envelope_v1.{bin,json}` + the dest-ephemeral keypair
+     fixtures `restore_ingress_dest_ephemeral_keypair_v1.{encaps,decaps}.bin`.
 
    (iv) the destination TEE decapsulates with its ephemeral private key and, **before
    importing**, verifies that the attestation/measurement in `AAD'` is its own, that
@@ -386,7 +403,9 @@ the format is implemented):
 - **Restore ingress envelope:** ingress KEM-DEM round-trip to the destination ephemeral key
   recovers the payload; mutating any `AAD'` field (dest attestation/measurement, `chain_id`,
   `environment_identifier`, manifest hash, original-backup digest, `ingress_kem_ct`) fails
-  decapsulation/import. (Ceremony path; full vectors land with TASK-7.6.)
+  decapsulation/import. Vectors FROZEN in TASK-24 AC#1 (`restore_ingress_envelope_v1.{bin,json}` +
+  dest-ephemeral keypair fixtures); the live handler (cross-environment rejection, counter seeding)
+  lands in the TASK-24 handler slice.
 - **Cross-environment restore fails:** a backup carrying `environment_identifier=testnet`
   (and/or a different `chain_id`) is rejected by a `mainnet` enclave (AAD mismatch).
 - **Recovery-auth vs wrapping-key separation** (AC#13): a restore authorized by the Ed25519
