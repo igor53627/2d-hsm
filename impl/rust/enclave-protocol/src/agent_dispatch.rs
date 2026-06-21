@@ -176,24 +176,32 @@ impl AgentOpcode {
             // marks-covered. ACCEPTED RESIDUAL: Structural means a dropped/crashed EXPORT seal forces a
             // next-boot StructuralGap⇒restore (an availability cost for a routinely-run op), traded for
             // audit completeness.
-            // RESTORE_BACKUP (TASK-13b slice 2; handler deferred): wholesale-REPLACES the keystore body —
-            // entries / config / audit / `structural_version` — from the backup. Those are non-marks,
-            // non-AdoptForward-reconstructable surfaces the seeder (`seed_marks_forward`) silently drops, so
-            // EpochOnly would be UNSAFE: a dropped/crashed RESTORE seal would AdoptForward and SILENTLY LOSE
-            // the restore (the enclave stays in the pre-restore state while the `strict_recovery_counter`
-            // already burned), and a successful RESTORE installs the backup's `structural_version` which,
-            // un-bumped on the anchor under EpochOnly, would mismatch next boot. Structural ⇒ a dropped seal
-            // triggers StructuralGap⇒restore (re-attempt, never a silent rollback). The earlier "EpochOnly
-            // because `strict_recovery_counter` is marks-covered" reasoning was INCOMPLETE — it covered only
-            // the counter, not the body replace (gemini PR #93). OPEN for the handler slice: RESTORE is the
-            // ONE committed op whose `structural_version` is SET from the backup (a non-monotone transition —
-            // it can be lower OR higher than the running enclave's), NOT a plain monotone `++`; the handler
-            // slice MUST define the post-restore anchor structural value (backup vs backup+1 vs local+1) +
-            // the reconcile rule that ADMITS a restored value not equal to `local+1` — almost certainly a
-            // DISTINCT recovery-ceremony path tied to `strict_recovery_counter` AC#11/#12, NOT this ordinary
-            // Structural `advance_commit_epoch(true)` `++`. Classing RESTORE Structural is the fail-closed-safe
-            // forward-declaration (a dropped seal can't silently regress); the exact structural mechanism is
-            // deferred with the handler.
+            // RESTORE_BACKUP (TASK-13b slice 2; handler deferred → TASK-24): wholesale-REPLACES the
+            // keystore body — entries / config-identity / counters / faucet / audit RECORDS — from the
+            // restore-ingress payload, and sets enclave-local `structural_version` + `freshness_epoch`
+            // (the payload carries NEITHER — AC#4). Those replaced surfaces are non-marks,
+            // non-AdoptForward-reconstructable (the seeder `seed_marks_forward` overwrites ONLY counters/
+            // spend/strict_recovery_counter), so EpochOnly would be UNSAFE: a dropped/crashed RESTORE seal
+            // would AdoptForward over a same-structural gap and SILENTLY LOSE the restore (the enclave stays
+            // in the pre-restore body while the `strict_recovery_counter` already burned). Structural ⇒ a
+            // dropped seal triggers StructuralGap⇒restore (re-attempt, never a silent rollback).
+            // DECISION (TASK-24 AC#4/#5, the `local+1` structural_version strategy): RESTORE stays
+            // `Structural` — it bumps `structural_version = local+1` via the ordinary
+            // `advance_commit_epoch(true)` `++`, NOT a backup-seeded or strict_recovery_counter-seeded value
+            // (the payload carries no structural_version; AC#4 sets it enclave-locally). The AC#5 invariant
+            // — "a dropped/crashed RESTORE seal ⇒ StructuralGap→restore-retry, never a silent rollback" — is
+            // SATISFIED by Structural + local+1: the anchor records structural+1 while a dropped seal leaves
+            // the local body at the pre-restore structural, so next-boot reconcile sees anchor-structural >
+            // local-structural ⇒ StructuralGap (AdoptForward fires ONLY on a same-structural_version gap —
+            // `boot_reconcile_anti_rollback`; verified by the agent_boot reconcile tests). The wholesale body
+            // replace touches non-marks surfaces (entries/config/audit) that AdoptForward can't reconstruct,
+            // which is EXACTLY why Structural (not EpochOnly) is correct. A distinct
+            // `CommitBumpClass::RestoreCeremony` is RESERVED as the extension point for a future non-local+1
+            // structural_version (e.g. backup-seeded), where the reconcile would need to admit a restored
+            // value != local+1; under local+1 that capability is unused, so the class is YAGNI for now. The
+            // RESTORE handler's RECOVERY-SPECIFIC mutation (vs a normal Structural op) is the forward-only
+            // `strict_recovery_counter` advance (AC#6, a marks surface) + the AC#11/#12 seeding gate — both
+            // handler-side, before the commit; they do NOT require a distinct commit class.
             Self::GenerateKeys | Self::ConfigureTreasury | Self::ExportBackup | Self::RestoreBackup => {
                 CommitBumpClass::Structural
             }
