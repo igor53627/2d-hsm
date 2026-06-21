@@ -1046,6 +1046,94 @@ pub(crate) fn verify_restore_ingress(
     Ok(())
 }
 
+/// The decoded RESTORE_BACKUP(8) request body (envelope key 7). Carries the attested ingress envelope
+/// blob (the operator's re-wrap), the ORIGINAL `pq-agent-backup-v1` blob (so the handler can verify the
+/// AAD' `original_backup_digest`), and the request's `key_refs` selector (for the AC#9 set-match against
+/// the payload's entry refs). The ingress envelope + original backup are OPAQUE byte strings here — the
+/// handler opens/decapsulates the envelope + hashes the backup; this struct only frames them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestoreRequest {
+    /// The `2d-hsm-agent-restore-ingress-v1` blob (magic `2DAGRIE\0`) — the attested re-wrap to dest.
+    pub ingress_envelope: Vec<u8>,
+    /// The full original `pq-agent-backup-v1` blob (magic `2DAGTBK\0`) the operator decapsulated offline.
+    pub original_backup: Vec<u8>,
+    /// The request's key_refs selector — a SET (AC#9 order/multiplicity-insensitive) the handler matches
+    /// against the payload's entry refs.
+    pub requested_refs: Vec<[u8; 32]>,
+}
+
+/// Strict decode of the RESTORE_BACKUP(8) request body (envelope key 7). Exactly the canonical CBOR map
+/// `{1: ingress_envelope(bstr), 2: original_backup(bstr), 3: requested_refs(array<32B bstr>)}`, keys
+/// ascending, deny-unknown-fields. EVERY deviation ⇒ `Err` (fail closed): wrong types, unknown keys, a
+/// ref that is not exactly 32 bytes, or an empty selector (a restore with no refs is malformed). Mirrors
+/// the strict-canonical discipline of [`parse_restore_ingress`].
+pub(crate) fn decode_restore_request(payload: &[u8]) -> Result<RestoreRequest, BackupError> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let v: ciborium::value::Value =
+        ciborium::de::from_reader(&mut cursor).map_err(|_| BackupError::Serialization)?;
+    if cursor.position() as usize != payload.len() {
+        return Err(BackupError::Truncated); // trailing bytes after the one CBOR value
+    }
+    let map = match v {
+        ciborium::value::Value::Map(m) => m,
+        _ => return Err(BackupError::Serialization),
+    };
+    let mut ingress_envelope = None;
+    let mut original_backup = None;
+    let mut requested_refs = None;
+    for (k, val) in map.into_iter() {
+        match k {
+            ciborium::value::Value::Integer(i) if i == 1.into() => {
+                ingress_envelope = Some(as_bytes(&val)?);
+            }
+            ciborium::value::Value::Integer(i) if i == 2.into() => {
+                original_backup = Some(as_bytes(&val)?);
+            }
+            ciborium::value::Value::Integer(i) if i == 3.into() => {
+                requested_refs = Some(as_ref_array(&val)?);
+            }
+            _ => return Err(BackupError::Serialization), // deny unknown fields
+        }
+    }
+    let ingress_envelope = ingress_envelope.ok_or(BackupError::Serialization)?;
+    let original_backup = original_backup.ok_or(BackupError::Serialization)?;
+    let requested_refs = requested_refs.ok_or(BackupError::Serialization)?;
+    if requested_refs.is_empty() {
+        return Err(BackupError::Truncated); // a restore with no refs is malformed (no-op restore)
+    }
+    Ok(RestoreRequest {
+        ingress_envelope,
+        original_backup,
+        requested_refs,
+    })
+}
+
+/// Extract a CBOR byte string (`Value::Bytes`) or fail closed.
+fn as_bytes(v: &ciborium::value::Value) -> Result<Vec<u8>, BackupError> {
+    match v {
+        ciborium::value::Value::Bytes(b) => Ok(b.clone()),
+        _ => Err(BackupError::Serialization),
+    }
+}
+
+/// Extract a CBOR array of EXACTLY-32-byte byte strings (`Vec<[u8; 32]>`) or fail closed.
+fn as_ref_array(v: &ciborium::value::Value) -> Result<Vec<[u8; 32]>, BackupError> {
+    let arr = match v {
+        ciborium::value::Value::Array(a) => a,
+        _ => return Err(BackupError::Serialization),
+    };
+    arr.iter()
+        .map(|e| match e {
+            ciborium::value::Value::Bytes(b) if b.len() == 32 => {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(b);
+                Ok(r)
+            }
+            _ => Err(BackupError::Serialization),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2881,6 +2969,109 @@ mod tests {
             verify_restore_ingress(&opened, &data, &backup, &partial, &meas, chain, &env),
             Err(RestoreVerifyError::SelectorSetMismatch),
             "a selector omitting a payload ref is rejected (AC#9)"
+        );
+    }
+
+    // ─── TASK-24: RESTORE_BACKUP request body decode (decode_restore_request) ───
+
+    /// Encode a request body map (the canonical shape decode_restore_request expects).
+    fn encode_restore_request(req: &RestoreRequest) -> Vec<u8> {
+        let map = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Integer(1.into()),
+                ciborium::value::Value::Bytes(req.ingress_envelope.clone()),
+            ),
+            (
+                ciborium::value::Value::Integer(2.into()),
+                ciborium::value::Value::Bytes(req.original_backup.clone()),
+            ),
+            (
+                ciborium::value::Value::Integer(3.into()),
+                ciborium::value::Value::Array(
+                    req.requested_refs
+                        .iter()
+                        .map(|r| ciborium::value::Value::Bytes(r.to_vec()))
+                        .collect(),
+                ),
+            ),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&map, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn decode_restore_request_round_trips() {
+        let req = RestoreRequest {
+            ingress_envelope: vec![0xAB; 10],
+            original_backup: vec![0xCD; 20],
+            requested_refs: vec![[0x11; 32], [0x22; 32]],
+        };
+        let bytes = encode_restore_request(&req);
+        let decoded = decode_restore_request(&bytes).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn decode_restore_request_rejects_empty_selector() {
+        let req = RestoreRequest {
+            ingress_envelope: vec![0xAB; 10],
+            original_backup: vec![0xCD; 20],
+            requested_refs: vec![],
+        };
+        assert_eq!(
+            decode_restore_request(&encode_restore_request(&req)),
+            Err(BackupError::Truncated),
+            "an empty selector (no-op restore) is malformed"
+        );
+    }
+
+    #[test]
+    fn decode_restore_request_rejects_wrong_ref_length_and_unknown_field_and_trailing() {
+        // wrong ref length (31 bytes, not 32)
+        let mut bad_refs = encode_restore_request(&RestoreRequest {
+            ingress_envelope: vec![0xAB; 10],
+            original_backup: vec![0xCD; 20],
+            requested_refs: vec![[0x11; 32]],
+        });
+        let bad_ref_map = ciborium::value::Value::Map(vec![(
+            ciborium::value::Value::Integer(3.into()),
+            ciborium::value::Value::Array(vec![ciborium::value::Value::Bytes(vec![0x11; 31])]),
+        )]);
+        let mut bad = Vec::new();
+        ciborium::ser::into_writer(&bad_ref_map, &mut bad).unwrap();
+        assert_eq!(
+            decode_restore_request(&bad),
+            Err(BackupError::Serialization),
+            "wrong ref length"
+        );
+        let _ = &bad_refs; // (keep the helper-built map referenced)
+
+        // unknown field (key 4) ⇒ rejected (deny unknown)
+        let unknown = ciborium::value::Value::Map(vec![(
+            ciborium::value::Value::Integer(4.into()),
+            ciborium::value::Value::Bytes(vec![0xFF]),
+        )]);
+        let mut unk = Vec::new();
+        ciborium::ser::into_writer(&unknown, &mut unk).unwrap();
+        assert_eq!(
+            decode_restore_request(&unk),
+            Err(BackupError::Serialization),
+            "unknown field"
+        );
+
+        // trailing bytes after the one CBOR value ⇒ rejected
+        let req = RestoreRequest {
+            ingress_envelope: vec![0xAB; 10],
+            original_backup: vec![0xCD; 20],
+            requested_refs: vec![[0x11; 32]],
+        };
+        let mut trailing = encode_restore_request(&req);
+        trailing.push(0x00);
+        assert_eq!(
+            decode_restore_request(&trailing),
+            Err(BackupError::Truncated),
+            "trailing bytes"
         );
     }
 }
