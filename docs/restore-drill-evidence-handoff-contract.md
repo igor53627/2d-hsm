@@ -28,7 +28,7 @@ The 2D node's `RestoreWriter.verify_completion/2` expects the ceremony to have r
 | `backup_batch.artifact_sha256` | `operator.agent_key_backup_batches.artifact_sha256` | Verified by the ceremony's AAD' `original_backup_digest` check |
 | `backup_batch.artifact_size_bytes` | `operator.agent_key_backup_batches.artifact_size_bytes` | Verified by the ceremony's envelope parser (trailing-bytes rejection) |
 | `attempt_started.id` | 2D audit row | The ceremony's `request_id` — binds this ceremony to this specific attempt |
-| `attempt_started.attempt_challenge` | 2D audit row (32-byte nonce) | Consumed as the cap's `payload_binding` nonce (prevents replay against a different attempt) |
+| `attempt_started.attempt_challenge` | 2D audit row (32-byte nonce) | Used by 2D as the `attempt_started` high-entropy nonce; the ceremony's `request_id` (= `attempt_started.id`) is the value bound into the cap's `payload_binding` (NOT the challenge itself) |
 | `attempt_started.baseline_snapshot_sha256` | 2D audit row | Verified post-restore: the restored identity-set hash must match the baseline recorded when the batch reached `identity_verified` |
 
 ### Ceremony dispatch
@@ -109,7 +109,7 @@ The ceremony's restored `KeystoreBody.entries` (type `KeyEntry`) maps to the 2D 
 | `algorithm` | `KeyEntry.algorithm` | `Secp256k1` → `"secp256k1"` |
 | `key_ref` | `KeyEntry.key_ref` | Hex-encode the 32-byte opaque handle |
 | `status` | (not in KeyEntry) | Derived from the 2D batch's key-row status at baseline time (the ceremony restores the entries; the status is a 2D-side lifecycle field, not an enclave property) |
-| `address` | `KeyEntry.public_identity` | Derive the 20-byte Ethereum address from the 65-byte uncompressed SEC1 public key: `keccak256(pubkey[1..65])[0..20]` |
+| `address` | `KeyEntry.public_identity` | Derive the 20-byte Ethereum address from the 65-byte uncompressed SEC1 public key: `keccak256(pubkey[1..65])[12..32]` (standard Ethereum derivation — the LAST 20 bytes of the 32-byte hash, matching `secp256k1.rs:address_from_uncompressed_xy`) |
 
 The restored identity-set SHA-256 hash is computed over the canonical JSON of this entry set (sorted by `(source_table, row_id)`, lowercase strings, explicit nulls — same canonicalization as 2D's `RestoreCanonical.identity_set_hash/1`).
 
@@ -158,8 +158,8 @@ The restored identity-set SHA-256 hash is computed over the canonical JSON of th
 - `is_production == true` (fixture bundles set false)
 - `ceremony.restore_ingress_format_version == 1`
 - `ceremony.restore_ingress_envelope_format_version == 1`
-- Every batch entry has `identity_match == true` (or a documented `remediation_status`)
-- Every batch has `expected_identity_set_sha256 == restored_identity_set_sha256`
+- Every batch entry has `identity_match == true`. A batch that FAILED the identity check must NOT appear in `batches[]` — instead it is documented in a separate `remediation_log[]` array with its `backup_batch_id` + `remediation_status`. The linked 2D rows for remediated batches MUST be disabled/retired before enforcement.
+- Every batch in `batches[]` has `expected_identity_set_sha256 == restored_identity_set_sha256`
 - `sign_off` has both fields non-empty
 
 ## 6. Production coverage rule (AC#6)
