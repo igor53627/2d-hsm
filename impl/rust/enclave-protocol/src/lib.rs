@@ -83,13 +83,9 @@ compile_error!(
      debug/lab builds only, never release"
 );
 
-// AGENT_K1_PROVE_IDENTITY signing is non-collision-unproven against EIP-2718 typed txs until the
-// 2D type-0x19 reservation merges (2D PR #144 / vsock spec §10.8). Hard-ban it from release builds.
-#[cfg(all(release_build, feature = "agent-prove-identity-preview"))]
-compile_error!(
-    "`agent-prove-identity-preview` (AGENT_K1_PROVE_IDENTITY signing) must not be enabled in \
-     release builds until the 2D EIP-2718 type-0x19 reservation merges (vsock spec §10.8)"
-);
+// AGENT_K1_PROVE_IDENTITY signing — UN-GATED. 2D PR #144 (type-0x19 reservation) MERGED
+// (commit f3908deb in 2D main, 2026-06). The collision concern is resolved; the compile_error! ban
+// is REMOVED.
 
 // Live AGENT_K1_GENERATE_KEYS execution — UN-GATED (TASK-18 18-6, 2026-06-22). The three prerequisites
 // are ALL DONE + reviewed: (1) anti-rollback durable commit (TASK-7.7 commit_before_emit seal→anchor→swap);

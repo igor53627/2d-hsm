@@ -23,7 +23,7 @@ let
     else if labProd then [ "lab-production-vsock" ]
     else if quoteSmoke then [ "agent-gateway" "vsock-transport" "lab-quote-smoke" ]
     else if agentGatewayRelease then
-      [ "agent-gateway" "vsock-transport" "agent-keygen-exec-preview" "agent-configure-treasury-preview" "agent-sign-faucet-preview" "agent-sign-transfer-preview" "agent-backup-export-preview" ]
+      [ "agent-gateway" "vsock-transport" "agent-keygen-exec-preview" "agent-configure-treasury-preview" "agent-sign-faucet-preview" "agent-sign-transfer-preview" "agent-backup-export-preview" "agent-prove-identity-preview" ]
     else if agentGatewayKeygen then
       [ "agent-gateway" "vsock-transport" "lab-agent-keystore-from-file" "agent-keygen-exec-preview" ]
     else if agentGatewayFaucet then
