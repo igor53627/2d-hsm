@@ -7139,7 +7139,8 @@ mod tests {
         /// The full dispatch envelope for a RESTORE_BACKUP request: a recovery-tier cap (key 5) + the
         /// key-7 restore-request map {1: ingress envelope, 2: original backup, 3: refs, 4: high-water}.
         fn restore_env(
-            recovery: &SigningKey,
+            signer: &SigningKey,
+            is_recovery: bool,
             request_id: &[u8],
             counter: u64,
             n_keys: usize,
@@ -7170,7 +7171,7 @@ mod tests {
             )
             .unwrap();
             // Signed high-water over the source's marks_payload.
-            let hwm = signed_high_water(recovery, request_id, &src.encode_marks_payload());
+            let hwm = signed_high_water(signer, request_id, &src.encode_marks_payload());
             // Key-7 restore-request map.
             let req_map = vec![
                 (Value::Integer(1.into()), Value::Bytes(envelope_blob)),
@@ -7196,7 +7197,17 @@ mod tests {
             // Recovery-tier cap (opcode 8, is_recovery=true). payload_binding is a placeholder — the
             // handler does not yet enforce it (a 2c refinement; the high-water signature binds the request).
             let cap = crate::agent_capability::test_signed_capability(
-                recovery, 8, request_id, counter, true, 11565, "testnet", 0, RSCOPE, 1, [0xab; 32],
+                signer,
+                8,
+                request_id,
+                counter,
+                is_recovery,
+                11565,
+                "testnet",
+                0,
+                RSCOPE,
+                1,
+                [0xab; 32],
                 [0xe1; 32],
             );
             envelope_rid(
@@ -7221,7 +7232,7 @@ mod tests {
                                         // The cap + high-water signatures both verify against the sealed recovery_authority_pk — set it
                                         // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let env = restore_env(&recovery, &[0x11; 16], 1, 2);
+            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2);
             let resp = dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).unwrap();
             match resp {
                 AgentResponse::RestoreBackup { candidate, .. } => {
@@ -7248,6 +7259,59 @@ mod tests {
                 }
                 _ => panic!("expected RestoreBackup"),
             }
+        }
+
+        /// AC#11 fail-closed: no ephemeral published (GET_RESTORE_PUBKEY not run / retired) ⇒ the
+        /// handler cannot decap ⇒ NotConfigured (the operator must publish one first). No partial import.
+        #[test]
+        fn restore_backup_no_ephemeral_fails_closed() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2); // builds + installs the ephemeral
+            retire_restore_ephemeral(); // …then retire it ⇒ the handler finds no ephemeral
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::NotConfigured),
+                "no published ephemeral ⇒ fail closed (NotConfigured)"
+            );
+        }
+
+        /// AC#11 fail-closed: the envelope's AAD' `dest_measurement` != THIS enclave's measurement (a
+        /// re-wrap for a DIFFERENT TEE) ⇒ the AAD' semantic check rejects ⇒ SealFailed. No partial import.
+        #[test]
+        fn restore_backup_measurement_mismatch_fails_closed() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2); // envelope AAD' measurement = DEST_MEAS
+                                                                       // Dispatch claiming a DIFFERENT measurement ⇒ opened.dest_measurement != OWN ⇒ SealFailed.
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, b"OTHER-tee-measurement").err(),
+                Some(AgentError::SealFailed),
+                "dest_measurement mismatch ⇒ fail closed (SealFailed)"
+            );
+        }
+
+        /// AC#11 fail-closed: an ADMIN-tier cap (is_recovery=false) on a RESTORE_BACKUP opcode ⇒ the
+        /// capability tier check rejects (AC#10: an admin authority cannot authorize a restore) ⇒
+        /// CapabilityRejected, BEFORE any handler logic runs. No partial import.
+        #[test]
+        fn restore_backup_admin_cap_rejected() {
+            let _g = gate_configured();
+            let admin = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
+            let mut dest = base_body();
+            dest.config.admin_authority_pk = admin.verifying_key().to_bytes();
+            dest.config.recovery_authority_pk = recovery_key().verifying_key().to_bytes();
+            // An ADMIN-signed cap (is_recovery=false) for opcode 8 — tier-mismatch.
+            let env = restore_env(&admin, false, &[0x11; 16], 1, 2);
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::CapabilityRejected),
+                "an admin cap on RESTORE_BACKUP ⇒ tier-rejected (AC#10)"
+            );
         }
     }
 
