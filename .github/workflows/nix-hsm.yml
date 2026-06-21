@@ -39,6 +39,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --all -- --check
+
       - name: Default unit tests
         run: cargo test
 
