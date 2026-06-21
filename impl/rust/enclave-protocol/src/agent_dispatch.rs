@@ -1678,6 +1678,7 @@ fn handle_restore_backup(
         verify_recovery_high_water, verify_restore_ingress,
     };
     use ml_kem::{DecapsulationKey, MlKem1024};
+    use zeroize::Zeroize;
 
     // (1) Decode the request body: ingress envelope + original backup + key_refs selector + signed high-water.
     let req = decode_restore_request(env.payload.as_deref().ok_or(AgentError::Malformed)?)
@@ -1685,8 +1686,10 @@ fn handle_restore_backup(
     // (2) Snapshot the published ephemeral + reconstruct the decaps key. No ephemeral published (GET_RESTORE_PUBKEY
     //     not run / already retired) ⇒ the ceremony cannot proceed ⇒ fail closed (the operator must publish one first).
     let snap = snapshot_restore_ephemeral().ok_or(AgentError::NotConfigured)?;
-    let dest_dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*snap.decaps_seed));
-    // (3) Open the attested ingress envelope (AC#1: decap with the ephemeral private key + AEAD-tag verify over AAD').
+    let mut seed_temp = *snap.decaps_seed; // copy out of Zeroizing for Seed::from (which takes by value)
+    let dest_dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(seed_temp));
+    seed_temp.zeroize(); // scrub the explicit copy (ml_kem's zeroize feature scrubs its internal copy on drop)
+                         // (3) Open the attested ingress envelope (AC#1: decap with the ephemeral private key + AEAD-tag verify over AAD').
     let opened = open_restore_ingress_envelope(&dest_dk, &req.ingress_envelope)
         .map_err(|_| AgentError::SealFailed)?;
     // (4) Parse the restore-ingress payload (AC#2: magic/version/strict-CBOR).
