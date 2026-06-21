@@ -1341,8 +1341,58 @@ pub(crate) fn adopt_ac6_high_water(
         .collect();
     candidate.faucet.cumulative_native_spend = authenticated.cumulative_native_spend;
     candidate.faucet.lifetime_spend = authenticated.lifetime_spend;
-    candidate.strict_recovery_counter =
-        candidate.strict_recovery_counter.max(authenticated.strict_recovery_counter);
+    candidate.strict_recovery_counter = candidate
+        .strict_recovery_counter
+        .max(authenticated.strict_recovery_counter);
+}
+
+/// TEST-ONLY deterministic seal of a `restore-ingress-v1` ENVELOPE to the destination ephemeral key
+/// (the operator's offline re-wrap, ceremony step (iii)). Mirrors [`seal_backup_blob_with_m`]:
+/// `(ingress_kem_ct, ss') = Encaps(dest_ephemeral_encaps_key, m')`, then ChaCha20Poly1305 with AAD' =
+/// the full header. Self-checks a strict re-parse. The encapsulation reuses [`encapsulate_to_recovery_key`]
+/// — it is the GENERIC ML-KEM Encaps-to-a-public-key (the "recovery" in the name is the backup role; the
+/// operation is key-independent), so a separate copy would be pure duplication. `pub(crate)` so the
+/// `agent_dispatch` end-to-end RESTORE_BACKUP test can build an envelope to a known ephemeral key.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_restore_ingress_envelope_with_m(
+    dest_ephemeral_encaps_key: &[u8],
+    dest_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &str,
+    manifest_hash: &[u8; SHA3_256_LEN],
+    original_backup_digest: &[u8; SHA3_256_LEN],
+    payload: &[u8],
+    m: &[u8; 32],
+) -> Result<Vec<u8>, BackupError> {
+    let (ingress_kem_ct, ss_prime) = encapsulate_to_recovery_key(dest_ephemeral_encaps_key, m)?;
+    let ingress_key = derive_ingress_key(&ss_prime[..]);
+    let ingress_nonce = [0u8; INGRESS_NONCE_LEN];
+    let header = build_ingress_header(
+        dest_measurement,
+        chain_id,
+        environment_identifier,
+        manifest_hash,
+        original_backup_digest,
+        &ingress_kem_ct,
+        &ingress_nonce,
+    )?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Encrypt)?;
+    let dem_ct = cipher
+        .encrypt(
+            Nonce::from_slice(&ingress_nonce),
+            Payload {
+                msg: payload,
+                aad: &header,
+            },
+        )
+        .map_err(|_| BackupError::Encrypt)?;
+    let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
+    blob.extend_from_slice(&header);
+    put_lp32(&mut blob, &dem_ct)?;
+    strict_parse_ingress_envelope(&blob)?; // self-check: strict re-parse before hand-back
+    Ok(blob)
 }
 
 #[cfg(test)]
@@ -2267,55 +2317,6 @@ mod tests {
     /// SNP launch measurement; non-empty + variable-length to exercise the lp16 framing).
     const DEST_MEASUREMENT: &[u8] = b"dest-tee-measurement-v1";
 
-    /// TEST-ONLY deterministic seal of a `restore-ingress-v1` ENVELOPE to the destination ephemeral key
-    /// (the operator's offline re-wrap, ceremony step (iii)). Mirrors [`seal_backup_blob_with_m`]:
-    /// `(ingress_kem_ct, ss') = Encaps(dest_ephemeral_encaps_key, m')`, then ChaCha20Poly1305 with AAD' =
-    /// the full header. Self-checks a strict re-parse. The encapsulation reuses [`encapsulate_to_recovery_key`]
-    /// — it is the GENERIC ML-KEM Encaps-to-a-public-key (the "recovery" in the name is the backup role;
-    /// the operation is key-independent), so a separate copy would be pure duplication.
-    #[allow(clippy::too_many_arguments)]
-    fn seal_restore_ingress_envelope_with_m(
-        dest_ephemeral_encaps_key: &[u8],
-        dest_measurement: &[u8],
-        chain_id: u64,
-        environment_identifier: &str,
-        manifest_hash: &[u8; SHA3_256_LEN],
-        original_backup_digest: &[u8; SHA3_256_LEN],
-        payload: &[u8],
-        m: &[u8; 32],
-    ) -> Result<Vec<u8>, BackupError> {
-        let (ingress_kem_ct, ss_prime) = encapsulate_to_recovery_key(dest_ephemeral_encaps_key, m)?;
-        let ingress_key = derive_ingress_key(&ss_prime[..]);
-        let ingress_nonce = [0u8; INGRESS_NONCE_LEN];
-        let header = build_ingress_header(
-            dest_measurement,
-            chain_id,
-            environment_identifier,
-            manifest_hash,
-            original_backup_digest,
-            &ingress_kem_ct,
-            &ingress_nonce,
-        )?;
-        let cipher =
-            ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Encrypt)?;
-        let dem_ct = cipher
-            .encrypt(
-                Nonce::from_slice(&ingress_nonce),
-                Payload {
-                    msg: payload,
-                    aad: &header,
-                },
-            )
-            .map_err(|_| BackupError::Encrypt)?;
-        let mut blob = Vec::with_capacity(header.len() + 4 + dem_ct.len());
-        blob.extend_from_slice(&header);
-        put_lp32(&mut blob, &dem_ct)?;
-        // Self-check: the just-minted envelope must STRICTLY re-parse before hand-back (mirrors
-        // `seal_backup_blob_with_m`'s `strict_parse(&blob)?` self-check).
-        strict_parse_ingress_envelope(&blob)?;
-        Ok(blob)
-    }
-
     /// Build the golden ingress envelope: the frozen `restore_ingress_v1.bin` PAYLOAD re-wrapped to the
     /// fixed destination ephemeral key, with AAD' binding the frozen `agent_backup_v1.bin` digest + the
     /// payload's own manifest hash. Cross-references BOTH prior goldens (payload + backup envelope) so the
@@ -3203,13 +3204,24 @@ mod tests {
             (V::Integer(2.into()), V::Bytes(req.original_backup.clone())),
             (
                 V::Integer(3.into()),
-                V::Array(req.requested_refs.iter().map(|r| V::Bytes(r.to_vec())).collect()),
+                V::Array(
+                    req.requested_refs
+                        .iter()
+                        .map(|r| V::Bytes(r.to_vec()))
+                        .collect(),
+                ),
             ),
             (
                 V::Integer(4.into()),
                 V::Map(vec![
-                    (V::Integer(1.into()), V::Bytes(req.recovery_high_water.marks_payload.clone())),
-                    (V::Integer(2.into()), V::Bytes(req.recovery_high_water.signature.to_vec())),
+                    (
+                        V::Integer(1.into()),
+                        V::Bytes(req.recovery_high_water.marks_payload.clone()),
+                    ),
+                    (
+                        V::Integer(2.into()),
+                        V::Bytes(req.recovery_high_water.signature.to_vec()),
+                    ),
                 ]),
             ),
         ]
@@ -3227,7 +3239,10 @@ mod tests {
     #[test]
     fn decode_restore_request_round_trips() {
         let req = sample_req(vec![[0x11; 32], [0x22; 32]]);
-        assert_eq!(decode_restore_request(&restore_request_map(&req)).unwrap(), req);
+        assert_eq!(
+            decode_restore_request(&restore_request_map(&req)).unwrap(),
+            req
+        );
     }
 
     #[test]
