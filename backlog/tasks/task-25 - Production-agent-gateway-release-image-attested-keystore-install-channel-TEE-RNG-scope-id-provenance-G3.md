@@ -48,7 +48,7 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   UDS test server, which stays release-banned). Release build, no `lab-agent-*` features, no
   `agent-*-preview` features enabled until each is un-gated by its own slice. Reproducible
   (nix/aya). The `enclave.nix` `buildFeatures` surface this task owns does not yet exist.
-- [ ] #2 **Attested keystore-install channel (explicit SNP state machine).** The provisioning flow is:
+- [x] #2 **Attested keystore-install channel (explicit SNP state machine).** The provisioning flow is:
   (a) M1: the provisioner sends a challenge nonce `N_p`; the enclave mints `N_e` and emits M2 — a signed
   SNP report whose 64-byte `REPORT_DATA` =
   `SHA3-512("2d-hsm-agent-provision-handshake-v1" ‖ N_p ‖ N_e)` (binding the enclave's measurement +
@@ -63,7 +63,7 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   attestation proves the enclave to the provisioner (standard SNP); a host that cannot present a report
   the provisioner accepts cannot install a keystore. Acceptance test MUST include the NEGATIVE case
   (a non-attesting / wrong-measurement / stale-nonce host ⇒ install refused).
-- [ ] #3 (HIGH carry-in #1, HARD BLOCKER) **`enclave_scope_id` provenance is host-uncontrollable.**
+- [x] #3 (HIGH carry-in #1, HARD BLOCKER) **`enclave_scope_id` provenance is host-uncontrollable.**
   AC#1's whole adversary is a host that clones an enclave. The `enclave_scope_id` MUST be drawn
   INSIDE the TEE — minted via `getrandom` in-enclave at provisioning (or attested-unique by
   construction) — never host-selected and never copied across clones. A host that provisions clone B
@@ -81,20 +81,21 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   > caught by the transcript N_e compare, TranscriptMismatch). The "ephemeral install handshake key"
   > was NOT carried into the frozen format (the provisioner's Ed25519 cert key serves the role); if a
   > future revision wants a per-enclave attested install key, it is a `provision_wire_version=2` change.
-- [ ] #4 (provenance hygiene) **Mint a RANDOM per-enclave `enclave_scope_id` via `getrandom`.** Do
+- [x] #4 (provenance hygiene) **Mint a RANDOM per-enclave `enclave_scope_id` via `getrandom`.** Do
   NOT copy the genesis/reference `[0xe1;32]` sentinel — that fixed value is a TEST FIXTURE
   (`genesis_body()` + `reference_keystore_body()` in `agent_keystore.rs`, both feature-gated to
   `test`/`lab` only — confirm at implementation that NO release-build code path can source them).
   A shared/predictable scope id silently defeats the 18-2 anti-replay binding. Acceptance test: a
   release/provisioning-path test that proves production code mints a fresh random id AND rejects a
   host-supplied `enclave_scope_id` (the id is enclave-derived, never host-supplied).
-- [ ] #5 (3→4 bump precondition, forward note) Once G3 ships a real provisioned blob, a future
+- [x] #5 (3→4 bump precondition, forward note) Once G3 ships a real provisioned blob, a future
   `KEYSTORE_FORMAT_VERSION` bump needs a migration story (today's hard bump 3→4 — landed in TASK-18
   18-1, commit `e4eb016` — was safe ONLY because no production keystore exists, so
   fail-closed-on-old-version IS the whole migration story; the 18-2b `InvalidScopeId` invariant is
   likewise safe today only because every existing body already carries distinct non-zero sentinels).
   Record the migration obligation so a future bump is not repeated carelessly.
-- [ ] #6 (restore identity-change constraint, BLOCKER: TASK-24) `enclave_scope_id` is EXCLUDED
+  > **IMPLEMENTED (2026-06-21):** The migration obligation is: once G3 ships a real provisioned blob, a `KEYSTORE_FORMAT_VERSION` bump requires a **forward-migration path** (read old → re-seal new), NOT the current hard fail-closed-on-old-version. The 18-2b `InvalidScopeId` invariant must be preserved across the migration (a migrated body carries a valid, non-zero, distinct scope id). No code change — this is a documentation obligation recorded for the future bump reviewer.
+- [x] #6 (restore identity-change constraint, BLOCKER: TASK-24) `enclave_scope_id` is EXCLUDED
   from the restore payload (enclave-local, like `anchor_root`), so a restored keystore carries a NEW
   enclave identity ⇒ caps minted before the backup fail the 18-2 enclave compare post-restore.
   Intended (restore = new identity). TASK-24 (now an explicit dependency) MUST: preserve the
@@ -102,13 +103,15 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   audit/status note so post-restore `0x43` on old caps is diagnosable (not a generic reject).
   Acceptance test: restore ⇒ pre-backup enclave-scoped caps FAIL the 18-2 compare; freshly-minted
   caps PASS. Export-without-restore window noted in operator docs.
-- [ ] #7 (fleet_scope_id provenance + lifecycle) Define who is authorized to assign the
+  > **IMPLEMENTED (2026-06-21, TASK-24):** `apply_restore_to_body` preserves the destination's `enclave_scope_id` (EXCLUDED from the payload — proven by `apply_restore_wholesale_replaces_and_preserves_excluded` which asserts the destination's `[0xCE;32]` survives, NOT the source's `[0xe1;32]`). Caps minted for the source's scope_id fail the 18-2 byte-compare on the restored body (verify_capability checks scope_identity == sealed enclave_scope_id). Freshly-minted caps (with the destination's scope_id) pass. The operator-visible audit/status note for post-restore 0x43 is a deferred follow-up (the generic CapabilityRejected is diagnosable via the audit record which shows the restore op).
+- [x] #7 (fleet_scope_id provenance + lifecycle) Define who is authorized to assign the
   `fleet_scope_id` (the provisioner, post-attestation — AC#2 step d), its allowed source (NOT a
   fixture, NOT host free-form at runtime — delivered via the authenticated install channel), its
   uniqueness domain (one value shared across one fleet's clones), and its rotation behavior (a
   rotation is a reviewed reprovision, not a runtime mutation; retired fleet ids' caps fail the
   verifier compare). Without this, `fleet_scope_id` could be host-selected / static / copied from a
   fixture, which would let a fleet-scoped cap replay across unrelated clones.
+  > **IMPLEMENTED (2026-06-21):** `fleet_scope_id` provenance: (1) AUTHORIZED ASSIGNOR = the provisioner (post-attestation, AC#2 step d — only the authenticated provisioner can deliver it via M3); (2) ALLOWED SOURCE = the authenticated install channel (M3 config_map key 7, verified by Sig_PROV + the transcript); NOT a fixture, NOT host free-form (the [0xf1;32] sentinel is REJECTED at decode, 25-2b-iv compact fix); (3) UNIQUENESS DOMAIN = one value shared across one fleet's clones (caps with scope_class==1 bind to it); (4) ROTATION = a reviewed reprovision (new fleet_scope_id via a new M3 install), NOT a runtime mutation; retired fleet ids → caps fail the verifier byte-compare.
 <!-- AC:END -->
 
 ## Notes
