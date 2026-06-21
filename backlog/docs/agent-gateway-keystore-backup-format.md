@@ -281,7 +281,7 @@ Three keying assumptions, stated separately:
    attested ephemeral public key as an **import envelope** — the *same* KEM-DEM construction
    as the backup blob, but to the ephemeral key:
    - `(ingress_kem_ct, ss') = ML-KEM-1024.Encaps(dest_ephemeral_pubkey)`
-   - `ingress_key = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ ss')`
+   - `ingress_key = SHA3-256(b"2d-hsm-agent-restore-ingress-v1" ‖ 0x00 ‖ ss')` (the `0x00` makes the domain tag structurally prefix-free — see the frozen-encoding note below)
    - `ChaCha20Poly1305(ingress_key, ingress_nonce, payload, AAD')`, with
      `AAD'` (semantic content — the fields authenticated; see the **AAD' encoding (frozen)** block
      immediately below for the authoritative byte layout, which additionally binds `magic`, `version`,
@@ -295,8 +295,13 @@ Three keying assumptions, stated separately:
      re-partition the same authenticated byte string into a different `chain_id`/`env`/`measurement` by
      mutating only the on-disk length prefixes. The seal and the open use the IDENTICAL header bytes as
      AAD', so they cannot diverge. `manifest_hash = SHA3-256("2d-hsm-agent-restore-ingress-v1-manifest-hash"
-     ‖ manifest)` and `original_backup_digest = SHA3-256("2d-hsm-agent-restore-ingress-v1-backup-digest" ‖
-     original_backup_blob)` — both domain-separated so neither collides with the other or with the DEM key.
+     ‖ 0x00 ‖ manifest)` and `original_backup_digest = SHA3-256("2d-hsm-agent-restore-ingress-v1-backup-\
+     digest" ‖ 0x00 ‖ original_backup_blob)` — all three ingress domains (the KDF + both hashes) are made
+     STRUCTURALLY prefix-free by a trailing `0x00` separator after the ASCII domain tag (none of the labels
+     contains `\x00`), so `domain1 ‖ 0x00 ‖ data1 == domain2 ‖ 0x00 ‖ data2` implies `domain1 == data1`'s
+     domain AND identical data — disjointness by construction, not just SHA3-256 collision resistance. (The
+     older backup envelope's `derive_payload_key` keeps its frozen non-prefix-free shape; the new ingress
+     domains adopt the stricter form.)
      `ingress_nonce` is fixed-zero, safe ONLY because `ss'` is fresh per `Encaps` (the operator draws a
      fresh encaps message `m'` per re-wrap), so the DEM key is unique per ingress envelope — the same
      one-message-per-key argument as the backup envelope's fixed-zero `payload_nonce`. Magic

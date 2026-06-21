@@ -613,12 +613,26 @@ const SHA3_256_LEN: usize = 32;
 /// ChaCha20Poly1305 ingress-nonce length (96-bit). Fixed-zero is safe — see the nonce-safety note above.
 const INGRESS_NONCE_LEN: usize = 12;
 
-/// Derive the ingress DEM key `SHA3-256(domain ‖ ss')` into a pre-zeroed `Zeroizing` buffer — the ingress
-/// twin of [`derive_payload_key`] (different domain ⇒ different key for the same `ss`, so the two KEM-DEM
-/// layers are cryptographically disjoint). Scrubs the `finalize()` temporary after the copy.
+/// Update the hasher with a domain tag followed by a `0x00` separator byte — makes every ingress
+/// domain transcript STRUCTURALLY prefix-free: none of the ASCII domain constants contains `\x00`, so the
+/// `0x00` unambiguously terminates the domain label and `domain1 ‖ 0x00 ‖ data1 == domain2 ‖ 0x00 ‖ data2`
+/// implies `domain1 == domain2` AND `data1 == data2`. This resolves the `RESTORE_INGRESS_KDF_DOMAIN`-
+/// is-a-prefix-of-the-hash-domains ambiguity structurally (claude-code + compact-codex Low, raised twice)
+/// rather than relying on SHA3-256 collision resistance alone. The backup envelope's older
+/// [`derive_payload_key`] keeps its frozen non-prefix-free `domain ‖ ss` shape; the ingress domains adopt
+/// the stricter form because they are new (not yet frozen at the first commit of this slice).
+fn hash_domain_tag(hasher: &mut Sha3_256, domain: &[u8]) {
+    hasher.update(domain);
+    hasher.update(&[0x00]);
+}
+
+/// Derive the ingress DEM key `SHA3-256(domain ‖ 0x00 ‖ ss')` into a pre-zeroed `Zeroizing` buffer — the
+/// ingress twin of [`derive_payload_key`] (different domain + the prefix-free separator ⇒ a different key
+/// for the same `ss`, so the two KEM-DEM layers are cryptographically disjoint). Scrubs the `finalize()`
+/// temporary after the copy.
 fn derive_ingress_key(ss: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut hasher = Sha3_256::new();
-    hasher.update(RESTORE_INGRESS_KDF_DOMAIN);
+    hash_domain_tag(&mut hasher, RESTORE_INGRESS_KDF_DOMAIN);
     hasher.update(ss);
     let mut digest = hasher.finalize();
     let mut key = Zeroizing::new([0u8; 32]);
@@ -627,27 +641,28 @@ fn derive_ingress_key(ss: &[u8]) -> Zeroizing<[u8; 32]> {
     key
 }
 
-/// The authenticated key-refs manifest hash: `SHA3-256(MANIFEST_HASH_DOMAIN ‖ manifest)`. Domain-
-/// separated so the destination can match the envelope's authenticated manifest against the request's
-/// manifest set-wise without confusing it with the backup digest. `pub(crate)` so the Slice-2 handler
-/// recomputes the EXPECTED hash from the request's canonical manifest for the AAD' semantic check.
+/// The authenticated key-refs manifest hash: `SHA3-256(MANIFEST_HASH_DOMAIN ‖ 0x00 ‖ manifest)`. Domain-
+/// separated + prefix-free so the destination can match the envelope's authenticated manifest against the
+/// request's manifest set-wise without confusing it with the backup digest or the DEM key. `pub(crate)`
+/// so the Slice-2 handler recomputes the EXPECTED hash from the request's canonical manifest for the AAD'
+/// semantic check.
 pub(crate) fn compute_manifest_hash(manifest: &[u8]) -> [u8; SHA3_256_LEN] {
     let mut hasher = Sha3_256::new();
-    hasher.update(MANIFEST_HASH_DOMAIN);
+    hash_domain_tag(&mut hasher, MANIFEST_HASH_DOMAIN);
     hasher.update(manifest);
     let mut out = [0u8; SHA3_256_LEN];
     out.copy_from_slice(hasher.finalize().as_slice());
     out
 }
 
-/// The authenticated original-backup digest: `SHA3-256(BACKUP_DIGEST_DOMAIN ‖ original_backup_blob)`.
+/// The authenticated original-backup digest: `SHA3-256(BACKUP_DIGEST_DOMAIN ‖ 0x00 ‖ original_backup_blob)`.
 /// `original_backup_blob` is the FULL `pq-agent-backup-v1` bytes (magic `2DAGTBK\0` …) the operator
 /// decapsulated offline; binding its digest into AAD' ties the ingress re-wrap to the EXACT backup the
 /// recovery authority authorized, so a re-wrap of a different backup under the same ceremony fails the
 /// destination's semantic check. `pub(crate)` so the Slice-2 handler recomputes the EXPECTED digest.
 pub(crate) fn compute_original_backup_digest(original_backup_blob: &[u8]) -> [u8; SHA3_256_LEN] {
     let mut hasher = Sha3_256::new();
-    hasher.update(BACKUP_DIGEST_DOMAIN);
+    hash_domain_tag(&mut hasher, BACKUP_DIGEST_DOMAIN);
     hasher.update(original_backup_blob);
     let mut out = [0u8; SHA3_256_LEN];
     out.copy_from_slice(hasher.finalize().as_slice());
@@ -798,8 +813,13 @@ pub(crate) fn open_restore_ingress_envelope(
         .try_into()
         .map_err(|_| BackupError::Truncated)?;
     // Infallible ML-KEM decap (implicit rejection on a bad ct ⇒ pseudo-random ss' ⇒ tag fails below).
-    let ss_prime = dk.decapsulate(&ct_arr);
+    let mut ss_prime = dk.decapsulate(&ct_arr);
     let ingress_key = derive_ingress_key(ss_prime.as_slice());
+    // Scrub the ML-KEM shared secret now that the DEM key is derived — `ss'` is sensitive key material
+    // (with the ephemeral private key it re-derives the DEM key), so it must not linger in enclave memory
+    // past the derive. Symmetric with `encapsulate_to_recovery_key`'s `ss.zeroize()` on the seal side
+    // (claude-code/compact Medium: the decap path zeroizes too, not just the encaps path).
+    ss_prime.zeroize();
     let nonce: [u8; INGRESS_NONCE_LEN] =
         parsed.ingress_nonce.try_into().map_err(|_| BackupError::Truncated)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&ingress_key[..]).map_err(|_| BackupError::Decrypt)?;
@@ -1789,11 +1809,11 @@ mod tests {
     /// input they yield distinct SHA3-256 outputs — a shared secret / manifest / backup blob cannot be
     /// confused across the three uses. The KDF↔backup-DEM disjointness (a shared `ss` derives a different
     /// ingress vs backup key) is the cryptographically load-bearing one; the KDF↔hash disjointness pins
-    /// the in-code claim that no two ingress domains collide for the same bytes. NB the domains are
-    /// domain-STRING-separated (not structurally prefix-free — `RESTORE_INGRESS_KDF_DOMAIN` is a prefix of
-    /// the two hash domains); under SHA3-256 with the structurally-distinct inputs each domain feeds, the
-    /// collision probability is negligible, matching the backup envelope's accepted `derive_payload_key`
-    /// pattern.
+    /// the in-code claim that no two ingress domains collide for the same bytes. All three ingress domains
+    /// are STRUCTURALLY prefix-free via the `0x00` separator in [`hash_domain_tag`] (none of the ASCII
+    /// domain labels contains `\x00`), so disjointness holds by construction, not just SHA3-256 collision
+    /// resistance — the older backup envelope's [`derive_payload_key`] keeps its frozen non-prefix-free
+    /// shape; the ingress domains adopt the stricter form (claude-code + compact-codex Low).
     #[test]
     fn ingress_domains_are_pairwise_disjoint() {
         let ss = [0xaa; 32]; // arbitrary shared secret, reused as the "data" for every domain
