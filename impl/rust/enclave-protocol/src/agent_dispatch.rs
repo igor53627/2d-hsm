@@ -7139,12 +7139,13 @@ mod tests {
         /// The full dispatch envelope for a RESTORE_BACKUP request: a recovery-tier cap (key 5) + the
         /// key-7 restore-request map {1: ingress envelope, 2: original backup, 3: refs, 4: high-water}.
         fn restore_env(
-            signer: &SigningKey,
+            cap_signer: &SigningKey,
             is_recovery: bool,
+            hw_signer: &SigningKey,
             request_id: &[u8],
             counter: u64,
             n_keys: usize,
-        ) -> Vec<u8> {
+        ) -> (Vec<u8>, KeystoreBody) {
             // Publish the destination ephemeral (deterministic seed ⇒ the test knows the decaps key).
             let dest_pub =
                 crate::agent_dispatch::install_restore_ephemeral_with_seed(&DEST_MEAS, &DEST_SEED)
@@ -7171,7 +7172,7 @@ mod tests {
             )
             .unwrap();
             // Signed high-water over the source's marks_payload.
-            let hwm = signed_high_water(signer, request_id, &src.encode_marks_payload());
+            let hwm = signed_high_water(hw_signer, request_id, &src.encode_marks_payload());
             // Key-7 restore-request map.
             let req_map = vec![
                 (Value::Integer(1.into()), Value::Bytes(envelope_blob)),
@@ -7197,7 +7198,7 @@ mod tests {
             // Recovery-tier cap (opcode 8, is_recovery=true). payload_binding is a placeholder — the
             // handler does not yet enforce it (a 2c refinement; the high-water signature binds the request).
             let cap = crate::agent_capability::test_signed_capability(
-                signer,
+                cap_signer,
                 8,
                 request_id,
                 counter,
@@ -7210,13 +7211,16 @@ mod tests {
                 [0xab; 32],
                 [0xe1; 32],
             );
-            envelope_rid(
-                8,
-                request_id,
-                vec![
-                    (Value::Integer(5.into()), Value::Map(cap)),
-                    (Value::Integer(7.into()), Value::Map(req_map)),
-                ],
+            (
+                envelope_rid(
+                    8,
+                    request_id,
+                    vec![
+                        (Value::Integer(5.into()), Value::Map(cap)),
+                        (Value::Integer(7.into()), Value::Map(req_map)),
+                    ],
+                ),
+                src,
             )
         }
 
@@ -7232,30 +7236,43 @@ mod tests {
                                         // The cap + high-water signatures both verify against the sealed recovery_authority_pk — set it
                                         // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2);
+            let (env, src) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
             let resp = dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).unwrap();
             match resp {
                 AgentResponse::RestoreBackup { candidate, .. } => {
+                    // Exact-match the restored state against the SOURCE body (not just counts).
+                    assert_eq!(candidate.entries.len(), src.entries.len());
+                    for (i, (c, s)) in candidate.entries.iter().zip(src.entries.iter()).enumerate()
+                    {
+                        assert_eq!(c.key_ref, s.key_ref, "entry {i}: key_ref");
+                        assert_eq!(c.public_identity, s.public_identity, "entry {i}: pubkey");
+                        assert_eq!(c.secret_scalar, s.secret_scalar, "entry {i}: secret scalar");
+                        assert_eq!(c.purpose, s.purpose, "entry {i}: purpose");
+                    }
                     assert_eq!(
-                        candidate.entries.len(),
-                        2,
-                        "the 2 source entries are restored"
+                        candidate.config.twod_chain_id, src.config.twod_chain_id,
+                        "chain"
                     );
                     assert_eq!(
-                        candidate.counters.len(),
-                        source_body(2).counters.len(),
-                        "counters match the source (base_body+generate_keys seeds none)"
+                        candidate.config.environment_identifier, src.config.environment_identifier,
+                        "env"
                     );
                     assert_eq!(
-                        candidate.strict_recovery_counter, 1,
-                        "strict_recovery advanced (max(local 0, backup 0)+1)"
+                        candidate.config.admin_authority_pk, src.config.admin_authority_pk,
+                        "admin pk"
                     );
-                    assert_eq!(candidate.structural_version, 2, "local+1 (1 → 2, AC#4)");
-                    assert_eq!(candidate.freshness_epoch, 2, "epoch advanced");
+                    // EXCLUDED surfaces preserved (the destination's own).
                     assert_eq!(
-                        candidate.config.environment_identifier, "testnet",
-                        "config-identity restored from the payload"
+                        candidate.config.anchor_root, dest.config.anchor_root,
+                        "anchor preserved"
                     );
+                    assert_eq!(
+                        candidate.config.enclave_scope_id, dest.config.enclave_scope_id,
+                        "scope_id preserved"
+                    );
+                    // Anti-rollback advances.
+                    assert_eq!(candidate.strict_recovery_counter, 1, "strict_recovery");
+                    assert_eq!(candidate.structural_version, 2, "local+1");
                 }
                 _ => panic!("expected RestoreBackup"),
             }
@@ -7269,7 +7286,7 @@ mod tests {
             let recovery = recovery_key();
             let mut dest = base_body();
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2); // builds + installs the ephemeral
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2); // builds + installs the ephemeral
             retire_restore_ephemeral(); // …then retire it ⇒ the handler finds no ephemeral
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
@@ -7286,8 +7303,8 @@ mod tests {
             let recovery = recovery_key();
             let mut dest = base_body();
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let env = restore_env(&recovery, true, &[0x11; 16], 1, 2); // envelope AAD' measurement = DEST_MEAS
-                                                                       // Dispatch claiming a DIFFERENT measurement ⇒ opened.dest_measurement != OWN ⇒ SealFailed.
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2); // envelope AAD' measurement = DEST_MEAS
+                                                                                       // Dispatch claiming a DIFFERENT measurement ⇒ opened.dest_measurement != OWN ⇒ SealFailed.
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &dest, b"OTHER-tee-measurement").err(),
                 Some(AgentError::SealFailed),
@@ -7302,11 +7319,14 @@ mod tests {
         fn restore_backup_admin_cap_rejected() {
             let _g = gate_configured();
             let admin = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
+            let recovery = recovery_key();
             let mut dest = base_body();
             dest.config.admin_authority_pk = admin.verifying_key().to_bytes();
-            dest.config.recovery_authority_pk = recovery_key().verifying_key().to_bytes();
-            // An ADMIN-signed cap (is_recovery=false) for opcode 8 — tier-mismatch.
-            let env = restore_env(&admin, false, &[0x11; 16], 1, 2);
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            // An ADMIN-signed cap (is_recovery=false) for opcode 8 — the tier check rejects BEFORE the
+            // handler. The high-water is correctly recovery-signed, so if the tier check regressed, the
+            // handler would proceed + succeed (the test would FAIL, catching the regression).
+            let (env, _) = restore_env(&admin, false, &recovery, &[0x11; 16], 1, 2);
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
                 Some(AgentError::CapabilityRejected),
