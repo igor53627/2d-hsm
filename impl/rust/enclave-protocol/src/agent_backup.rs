@@ -920,15 +920,21 @@ pub(crate) fn apply_restore_to_body(
     if (audit_capacity as usize) < data.audit_records.len() {
         return Err(RestoreApplyError::AuditCapacityOverflow);
     }
-    // AC#7: reconstruct the EXCLUDED cursors enclave-locally (the payload carries records, not cursors).
-    let next_seq = data
-        .audit_records
-        .iter()
-        .map(|r| r.seq)
-        .max()
-        .map(|m| m.saturating_add(1))
-        .unwrap_or(1);
-    let last_exported_seq = next_seq - 1; // restored ring starts fully drained (next_seq >= 1 ⇒ no underflow)
+    // HIGH #3 (compact 9516): compute ALL fallible values BEFORE any write — no partial mutation on
+    // overflow. `checked_add` for both next_seq + strict_recovery; overflow ⇒ Err with body UNTOUCHED.
+    let next_seq = match data.audit_records.iter().map(|r| r.seq).max() {
+        Some(m) => m
+            .checked_add(1)
+            .ok_or(RestoreApplyError::MonotonicOverflow)?,
+        None => 1,
+    };
+    let last_exported_seq = next_seq - 1; // next_seq >= 1 ⇒ no underflow
+    let highest = body
+        .strict_recovery_counter
+        .max(data.strict_recovery_counter);
+    let new_strict_recovery = highest
+        .checked_add(1)
+        .ok_or(RestoreApplyError::MonotonicOverflow)?;
 
     // AC#3: wholesale-replace the config-IDENTITY subset. The enclave-local identity fields
     // (anchor_root / backup_recovery_wrapping_pubkey / enclave_scope_id / fleet_scope_id) are EXCLUDED —
@@ -947,14 +953,7 @@ pub(crate) fn apply_restore_to_body(
     body.audit.capacity = audit_capacity;
     body.audit.next_seq = next_seq;
     body.audit.last_exported_seq = last_exported_seq;
-
-    // AC#6 (strict_recovery): forward-only advance — strictly > the current highest of (local, backup).
-    let highest = body
-        .strict_recovery_counter
-        .max(data.strict_recovery_counter);
-    body.strict_recovery_counter = highest
-        .checked_add(1)
-        .ok_or(RestoreApplyError::MonotonicOverflow)?;
+    body.strict_recovery_counter = new_strict_recovery;
 
     Ok(())
 }
