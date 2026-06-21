@@ -1046,11 +1046,13 @@ pub(crate) fn verify_restore_ingress(
     Ok(())
 }
 
-/// The decoded RESTORE_BACKUP(8) request body (envelope key 7). Carries the attested ingress envelope
+/// The decoded RESTORE_BACKUP(8) request body (envelope key 7). Carries: the attested ingress envelope
 /// blob (the operator's re-wrap), the ORIGINAL `pq-agent-backup-v1` blob (so the handler can verify the
-/// AAD' `original_backup_digest`), and the request's `key_refs` selector (for the AC#9 set-match against
-/// the payload's entry refs). The ingress envelope + original backup are OPAQUE byte strings here — the
-/// handler opens/decapsulates the envelope + hashes the backup; this struct only frames them.
+/// AAD' `original_backup_digest`), the request's `key_refs` selector (AC#9 set-match), AND the
+/// recovery-authority-signed high-water (AC#6 source (a) — the authenticated high-water the operator
+/// attests is current; REQUIRED — a fresh TEE with no authenticated source is rejected). The ingress
+/// envelope + original backup + marks payload are OPAQUE byte strings here — the handler opens/decapsulates/
+/// hashes/verifies them; this struct only frames them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RestoreRequest {
     /// The `2d-hsm-agent-restore-ingress-v1` blob (magic `2DAGRIE\0`) — the attested re-wrap to dest.
@@ -1060,13 +1062,17 @@ pub(crate) struct RestoreRequest {
     /// The request's key_refs selector — a SET (AC#9 order/multiplicity-insensitive) the handler matches
     /// against the payload's entry refs.
     pub requested_refs: Vec<[u8; 32]>,
+    /// The AC#6 authenticated high-water source (a): the recovery-authority-signed marks (the current
+    /// authoritative counters/spend). REQUIRED — AC#6 rejects a restore with no authenticated source.
+    pub recovery_high_water: RecoveryHighWater,
 }
 
 /// Strict decode of the RESTORE_BACKUP(8) request body (envelope key 7). Exactly the canonical CBOR map
-/// `{1: ingress_envelope(bstr), 2: original_backup(bstr), 3: requested_refs(array<32B bstr>)}`, keys
-/// ascending, deny-unknown-fields. EVERY deviation ⇒ `Err` (fail closed): wrong types, unknown keys, a
-/// ref that is not exactly 32 bytes, or an empty selector (a restore with no refs is malformed). Mirrors
-/// the strict-canonical discipline of [`parse_restore_ingress`].
+/// `{1: ingress_envelope(bstr), 2: original_backup(bstr), 3: requested_refs(array<32B bstr>), 4:
+/// recovery_high_water({1: marks_payload(bstr), 2: signature(bstr(64))})}`, keys ascending, deny-unknown.
+/// EVERY deviation ⇒ `Err` (fail closed): wrong types, unknown keys, a ref not exactly 32 bytes, a
+/// signature not exactly 64 bytes, an empty selector, or a MISSING required field (incl. the high-water —
+/// AC#6 rejects a restore with no authenticated source). Mirrors [`parse_restore_ingress`]'s discipline.
 pub(crate) fn decode_restore_request(payload: &[u8]) -> Result<RestoreRequest, BackupError> {
     let mut cursor = std::io::Cursor::new(payload);
     let v: ciborium::value::Value =
@@ -1081,6 +1087,7 @@ pub(crate) fn decode_restore_request(payload: &[u8]) -> Result<RestoreRequest, B
     let mut ingress_envelope = None;
     let mut original_backup = None;
     let mut requested_refs = None;
+    let mut recovery_high_water = None;
     for (k, val) in map.into_iter() {
         match k {
             ciborium::value::Value::Integer(i) if i == 1.into() => {
@@ -1092,12 +1099,16 @@ pub(crate) fn decode_restore_request(payload: &[u8]) -> Result<RestoreRequest, B
             ciborium::value::Value::Integer(i) if i == 3.into() => {
                 requested_refs = Some(as_ref_array(&val)?);
             }
+            ciborium::value::Value::Integer(i) if i == 4.into() => {
+                recovery_high_water = Some(as_high_water(&val)?);
+            }
             _ => return Err(BackupError::Serialization), // deny unknown fields
         }
     }
     let ingress_envelope = ingress_envelope.ok_or(BackupError::Serialization)?;
     let original_backup = original_backup.ok_or(BackupError::Serialization)?;
     let requested_refs = requested_refs.ok_or(BackupError::Serialization)?;
+    let recovery_high_water = recovery_high_water.ok_or(BackupError::Serialization)?;
     if requested_refs.is_empty() {
         return Err(BackupError::Truncated); // a restore with no refs is malformed (no-op restore)
     }
@@ -1105,6 +1116,7 @@ pub(crate) fn decode_restore_request(payload: &[u8]) -> Result<RestoreRequest, B
         ingress_envelope,
         original_backup,
         requested_refs,
+        recovery_high_water,
     })
 }
 
@@ -1132,6 +1144,41 @@ fn as_ref_array(v: &ciborium::value::Value) -> Result<Vec<[u8; 32]>, BackupError
             _ => Err(BackupError::Serialization),
         })
         .collect()
+}
+
+/// Extract the `RecoveryHighWater` sub-map (key 4): `{1: marks_payload(bstr), 2: signature(bstr(64))}`,
+/// deny-unknown. Fail closed on a non-map, a missing field, or a signature not exactly 64 bytes.
+fn as_high_water(v: &ciborium::value::Value) -> Result<RecoveryHighWater, BackupError> {
+    let m = match v {
+        ciborium::value::Value::Map(m) => m,
+        _ => return Err(BackupError::Serialization),
+    };
+    let mut marks_payload = None;
+    let mut signature = None;
+    for (k, val) in m.iter() {
+        match k {
+            ciborium::value::Value::Integer(i) if *i == 1.into() => {
+                marks_payload = Some(as_bytes(val)?);
+            }
+            ciborium::value::Value::Integer(i) if *i == 2.into() => {
+                let sig_bytes = match val {
+                    ciborium::value::Value::Bytes(b) => b,
+                    _ => return Err(BackupError::Serialization),
+                };
+                if sig_bytes.len() != 64 {
+                    return Err(BackupError::Serialization);
+                }
+                let mut sig = [0u8; 64];
+                sig.copy_from_slice(sig_bytes);
+                signature = Some(sig);
+            }
+            _ => return Err(BackupError::Serialization), // deny unknown sub-fields
+        }
+    }
+    Ok(RecoveryHighWater {
+        marks_payload: marks_payload.ok_or(BackupError::Serialization)?,
+        signature: signature.ok_or(BackupError::Serialization)?,
+    })
 }
 
 /// Fail-closed errors for [`verify_ac6_high_water`] (the AC#6 forward-only gate).
@@ -3114,7 +3161,14 @@ mod tests {
 
     // ─── TASK-24: RESTORE_BACKUP request body decode (decode_restore_request) ───
 
-    /// Encode a request body map (the canonical shape decode_restore_request expects).
+    /// A placeholder high-water for the decode-round-trip tests (decode frames bytes; it doesn't verify).
+    fn test_high_water() -> RecoveryHighWater {
+        RecoveryHighWater {
+            marks_payload: vec![0xAB; 8],
+            signature: [0xCD; 64],
+        }
+    }
+
     fn encode_restore_request(req: &RestoreRequest) -> Vec<u8> {
         let map = ciborium::value::Value::Map(vec![
             (
@@ -3134,6 +3188,21 @@ mod tests {
                         .collect(),
                 ),
             ),
+            (
+                ciborium::value::Value::Integer(4.into()),
+                ciborium::value::Value::Map(vec![
+                    (
+                        ciborium::value::Value::Integer(1.into()),
+                        ciborium::value::Value::Bytes(
+                            req.recovery_high_water.marks_payload.clone(),
+                        ),
+                    ),
+                    (
+                        ciborium::value::Value::Integer(2.into()),
+                        ciborium::value::Value::Bytes(req.recovery_high_water.signature.to_vec()),
+                    ),
+                ]),
+            ),
         ]);
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&map, &mut buf).unwrap();
@@ -3146,6 +3215,7 @@ mod tests {
             ingress_envelope: vec![0xAB; 10],
             original_backup: vec![0xCD; 20],
             requested_refs: vec![[0x11; 32], [0x22; 32]],
+            recovery_high_water: test_high_water(),
         };
         let bytes = encode_restore_request(&req);
         let decoded = decode_restore_request(&bytes).unwrap();
@@ -3158,6 +3228,7 @@ mod tests {
             ingress_envelope: vec![0xAB; 10],
             original_backup: vec![0xCD; 20],
             requested_refs: vec![],
+            recovery_high_water: test_high_water(),
         };
         assert_eq!(
             decode_restore_request(&encode_restore_request(&req)),
@@ -3173,6 +3244,7 @@ mod tests {
             ingress_envelope: vec![0xAB; 10],
             original_backup: vec![0xCD; 20],
             requested_refs: vec![[0x11; 32]],
+            recovery_high_water: test_high_water(),
         });
         let bad_ref_map = ciborium::value::Value::Map(vec![(
             ciborium::value::Value::Integer(3.into()),
@@ -3205,6 +3277,7 @@ mod tests {
             ingress_envelope: vec![0xAB; 10],
             original_backup: vec![0xCD; 20],
             requested_refs: vec![[0x11; 32]],
+            recovery_high_water: test_high_water(),
         };
         let mut trailing = encode_restore_request(&req);
         trailing.push(0x00);
@@ -3212,6 +3285,33 @@ mod tests {
             decode_restore_request(&trailing),
             Err(BackupError::Truncated),
             "trailing bytes"
+        );
+    }
+
+    #[test]
+    fn decode_restore_request_rejects_missing_high_water() {
+        // AC#6: the recovery_high_water (key 4) is REQUIRED — a request without it (no authenticated
+        // source) is rejected at decode (a fresh TEE with no authenticated source is rejected, no zero-init).
+        let map = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Integer(1.into()),
+                ciborium::value::Value::Bytes(vec![0xAB; 10]),
+            ),
+            (
+                ciborium::value::Value::Integer(2.into()),
+                ciborium::value::Value::Bytes(vec![0xCD; 20]),
+            ),
+            (
+                ciborium::value::Value::Integer(3.into()),
+                ciborium::value::Value::Array(vec![ciborium::value::Value::Bytes(vec![0x11; 32])]),
+            ),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&map, &mut buf).unwrap();
+        assert_eq!(
+            decode_restore_request(&buf),
+            Err(BackupError::Serialization),
+            "a request with no recovery_high_water (key 4) is rejected — AC#6 no-source ⇒ reject"
         );
     }
 
