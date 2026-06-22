@@ -81,8 +81,7 @@ The contract AC#1-#8 document is merged (PR #107) but these content issues mean 
 ---
 <!-- COMMENTS:END -->
 
-## Final Summary
-
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
 PR #107 (2d-hsm, contract doc AC#1-8) + PR #218 (2d, fixture test AC#7). **Status: In Progress** — the contract doc + fixture landed, but compact-9651 surfaced HIGH content issues (AEAD-encrypted keystore means the host cannot read identities; nonce model contradiction; missing public_identity field; remediation_log schema). TASK-28 addressed the response-shape half; the nonce/schema fixes + AC re-verification remain before this task flips to Done.
 <!-- SECTION:FINAL_SUMMARY:END -->
 

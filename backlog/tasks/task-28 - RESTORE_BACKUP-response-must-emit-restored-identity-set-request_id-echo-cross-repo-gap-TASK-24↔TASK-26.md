@@ -112,6 +112,8 @@ All 4 TASK-28 acceptance criteria are now met. The attestation enforcement is de
 
 ## Final Summary
 
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
 2D-side attestation enforcement (AC#4) landed (commit a488d205, 2d repo). Migration + schema + writer + provenance + audit evidence + 6 test files updated. 554 tests pass. 2d-hsm side compact-clean (9775). Cross-repo contract (TASK-26) aligned. All 4 ACs met.
 
 **Done scope caveat (claude-code design review job 9839, MEDIUM finding #5):** Done covers the wire/attestation SUBSTRATE only. The completion-attestation `fetch_report` (`restore_seal_attest_commit_emit`, `agent_dispatch.rs:2456`) is unbounded on the serial serve loop — same class as the GET_RESTORE_PUBKEY fetch. Both are tracked as a HARD un-gate precondition in TASK-27 (whose scope was widened to enumerate both call sites). Do NOT enable `agent-backup-export-preview` in a release build until TASK-27 resolves both.
+<!-- SECTION:FINAL_SUMMARY:END -->
