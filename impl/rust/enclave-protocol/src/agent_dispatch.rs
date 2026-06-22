@@ -2788,9 +2788,11 @@ struct RestoredKeyIdentity {
 }
 
 /// Encode the RESTORE_BACKUP success body (TASK-24 + TASK-28): `{1: sealed_keystore_blob,
-/// 2: request_id_echo, 3: restored_identity_set}`. Key 2 is the cap-bound `request_id` echo (2D replay
-/// prevention — verifies the ceremony consumed its live nonce). Key 3 is the array of restored-key
-/// identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`) the host needs to
+/// 2: request_id_echo, 3: restored_identity_set}`. Key 2 is the `request_id` echo — the SOLE replay token
+/// (nonce-model resolution, TASK-26 §2: `decode_restore_request` denies unknown fields, so the ceremony
+/// receives NO `attempt_challenge`; `request_id` is cap-bound + high-water-bound + echoed, so a replay
+/// against a fresh attempt fails at BOTH signature verifies. `attempt_started.id` MUST be high-entropy).
+/// Key 3 is the array of restored-key identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`) the host needs to
 /// compute `restored_identity_set_sha256` WITHOUT unsealing (the blob is AEAD-encrypted/host-opaque).
 /// Invoked by the frame-layer seam ONLY after the anchor commit succeeds.
 fn encode_restore_backup_response(

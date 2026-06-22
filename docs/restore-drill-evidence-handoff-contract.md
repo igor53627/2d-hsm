@@ -27,8 +27,8 @@ The 2D node's `RestoreWriter.verify_completion/2` expects the ceremony to have r
 | `backup_batch.artifact_uri` | `operator.agent_key_backup_batches.artifact_uri` | The URI the operator fetched the encrypted blob from |
 | `backup_batch.artifact_sha256` | `operator.agent_key_backup_batches.artifact_sha256` | Verified by the ceremony's AAD' `original_backup_digest` check |
 | `backup_batch.artifact_size_bytes` | `operator.agent_key_backup_batches.artifact_size_bytes` | Verified by the ceremony's envelope parser (trailing-bytes rejection) |
-| `attempt_started.id` | 2D audit row | The ceremony's `request_id` — binds this ceremony to this specific attempt |
-| `attempt_started.attempt_challenge` | 2D audit row (32-byte nonce) | Used by 2D as the `attempt_started` high-entropy nonce; the ceremony's `request_id` (= `attempt_started.id`) is the value bound into the cap's `payload_binding` (NOT the challenge itself) |
+| `attempt_started.id` | 2D audit row | **The ceremony's `request_id` — the SOLE replay token.** Bound into the cap's `payload_binding` AND the recovery-authority high-water signature AND echoed in the RESTORE_BACKUP response (key 2). A cap+high-water minted for one `request_id` cannot authorize/verify under another ⇒ replay of a prior ceremony output against a fresh attempt is caught at BOTH the cap verify (payload_binding mismatch → 0x43) and the high-water verify (signature bound to request_id). **Nonce model RESOLUTION (was contradictory):** `attempt_started.id` MUST be a fresh high-entropy value per attempt (2D mints it — e.g. a UUID or a CSPRNG-drawn id), so `request_id` carries the challenge entropy directly. |
+| `attempt_started.attempt_challenge` | 2D audit row (32-byte nonce) | **2D-side audit field, NOT a ceremony input.** `decode_restore_request` denies unknown fields — the RESTORE_BACKUP request carries NO `attempt_challenge` field, so the ceremony cannot consume or echo it. 2D records it for its own freshness tracking; it is not part of the ceremony's replay contract (the replay token is `request_id` above). If 2D wants the challenge on the wire, it folds it into `attempt_started.id` (= `request_id`). |
 | `attempt_started.baseline_snapshot_sha256` | 2D audit row | Verified post-restore: the restored identity-set hash must match the baseline recorded when the batch reached `identity_verified` |
 
 ### Ceremony dispatch
@@ -67,13 +67,13 @@ The fixture path uses the same handler (under `agent-backup-export-preview` feat
 
 ### Where the echo lives
 
-The `request_id` field of the `AGENT_ENVELOPE` is the challenge nonce. It flows:
+The ceremony's `request_id` (envelope-level) is the replay token. It flows:
 
-1. **2D commits** `attempt_started` with a high-entropy `attempt_challenge` (32-byte random nonce).
+1. **2D commits** `attempt_started` with a high-entropy `id` (this becomes `request_id`; see §2 — `attempt_challenge` is a separate 2D audit field, NOT a ceremony input).
 2. **Operator** passes `attempt_started.id` as the ceremony's `request_id`.
-3. **Ceremony** binds the `request_id` into the cap's `payload_binding` (`restore_canonical_params(requested_refs, backup_digest)` + `request_id`). A cap issued for one `request_id` cannot authorize a different one.
-4. **Ceremony** returns `AgentResponse::RestoreBackup { request_id }` — the SAME value.
-5. **2D** verifies `attempt_completed.attempt_challenge == the value it committed in attempt_started` AND `ceremony_response.request_id == attempt_started.id`.
+3. **Ceremony** binds the `request_id` into the cap's `payload_binding` (`restore_canonical_params(requested_refs, backup_digest)` + `request_id`) AND the recovery-authority high-water signature. A cap+high-water issued for one `request_id` cannot authorize/verify under another.
+4. **Ceremony** echoes `request_id` in the RESTORE_BACKUP success body (key 2 — emitted by the enclave-side frame layer; the ceremony receives no `attempt_challenge`, see §2).
+5. **2D** verifies `ceremony_response.request_id_echo == attempt_started.id` (the ceremony consumed 2D's live attempt) AND records its own `attempt_completed.attempt_challenge` from its committed `attempt_started.attempt_challenge` (a 2D-side consistency record, not a ceremony echo).
 
 ### Replay prevention
 
