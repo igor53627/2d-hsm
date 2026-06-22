@@ -3,9 +3,10 @@ id: TASK-24
 title: >-
   RESTORE_BACKUP(8) recovery-ceremony handler (attested confidential ingress +
   AC#11/#12 counter seeding)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-18 21:28'
+updated_date: '2026-06-22 00:47'
 labels:
   - agent-gateway
   - restore
@@ -50,6 +51,28 @@ Current state: RESTORE_BACKUP is the **last fail-closed stub** among privileged 
 - [x] #11 Release-banned behind a preview feature (mirroring `agent-keygen-exec-preview`) until a TASK-18-style un-gate; non-preview builds keep the `NotConfigured` fail-closed stub. EVERY error path on the live arm (decap fail, AAD mismatch, version mismatch, capacity overflow, counter-would-lower, seal fail, missing channel) fails closed with NO partial import + NO counter/anchor advance — seal-before-emit holds (compute → commit → swap → emit; a deterministic seal failure commits nothing). Reuse the `finalize_privileged_candidate`/`commit_before_emit` shared seam (slice 6-7) rather than re-duplicating the finalize block.
 - [x] #12 On-chain RecoveryTicket / MeasurementRegistry (TASK-1.4, 2d-solidity) is EXPLICITLY OUT of scope — a disjoint BlockProducer subsystem with zero references from the agent RESTORE path. The "recovery authority"/"recovery counter" here are the agent-gateway TASK-7.2/7.7 mechanisms. Also out of scope: Vault cap-fetch, OPA, cap pre-signing, ML-KEM private-key custody / the offline re-wrap step, host-side expiry/revocation, quorum/M-of-N recovery (`recovery_key_id` reserved, single-key MVP), classical hybrid X25519+ML-KEM, and authority rotation (`authority_epoch` reserved — restore under a rotated authority needs full re-provisioning in MVP).
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+RESTORE_BACKUP(8) recovery-ceremony handler landed (slices 2a/2b/2c) + multi-vendor matrix-reviewed (2 rounds), all 12 ACs met.
+
+**Matrix (Full):** Round 1 on the handler (dc5120f..4fa69e7, 8 cells: codex/gemini security, claude-code design, grok security via pi+xai, codex design + design-max). gemini/design + gemini/design-max structurally unavailable (global config `design_model='opus'` post-agy-migration → gemini-cli fallback; last gemini/design done 2026-06-16, pre-migration) — degradation noted; design lens covered by claude-code/design + codex/design + codex/design-max (3 live cells incl. the concurrency-max cell). Round 2 on the new attestation surface (4fa69e7..HEAD, 5 cells) after Fix #2 added the SNP binding.
+
+**Findings addressed:**
+- HIGH AC#10 wrapping-key separation: verify_restore_ingress now binds the backup header's recovery_key_id to derive_recovery_key_id(sealed wrapping pubkey) — backup sealed to a different ML-KEM key fails closed. (commit d0f3b78)
+- MEDIUM restore_canonical_params malformed CBOR: put_uint(0xA0/0x80) → major types 5/4; RFC 8949 interop test pins the bytes (external cap issuers were being rejected). (commit d0f3b78)
+- HIGH #2 AC#1 attested ephemeral key: GET_RESTORE_PUBKEY now fetches a fresh SNP quote (report_data_for_restore_ephemeral binds encaps_key+measurement+chain+env, domain-separated from producer) + returns {1,2,3,4} response; operator verifies via verify_restore_ephemeral_attestation. (commit 7a90522)
+- MEDIUM Fix B (gemini 9632): verify_restore_ephemeral_attestation now verifies the report's hardware-signed measurement field == expected (not just report_data — a wrong-measurement enclave with forged report_data is caught). (commit bd62034)
+- MEDIUM wire-format spec: opcode 9 documented as GET_RESTORE_PUBKEY (was stale "TRON RESERVED") with the {1,2,3,4} response shape. (commit 9f181a0)
+- Round-2: removed stray logic_diff.diff artifact + added MonotonicOverflow no-mutation tests. (commit 6f34adc)
+
+**Finding tracked (NOT inline-fixed):** unbounded fetch_report DoS (codex+gemini confirmed, Med) — GET_RESTORE_PUBKEY's quote fetch runs unbounded on the serial serve loop. The crate's only accepted bound is the killable subprocess (cooperative deadlines removed in (4a)); fetch_quote_via_child is private + coupled to the boot-relay serve-gate. Tracked as **TASK-27** — a HARD production-un-gate blocker (release-ban removed in TASK-18 18-9; agent-gateway-release Nix profile enables the feature; inline TODO references TASK-27). Accepted-with-rationale: preview-gated, ceremony-setup op is low-frequency, bounded-subprocess coupling needs design.
+
+**Deferred coverage gap:** cap-counter-max regression test (compact round-2 Med) — the handler's anti-replay max-path (highest_accepted_counter.max(verified.counter)) lacks an e2e test where authenticated marks carry a higher counter than the cap. Simple, well-commented code; testing it through the ceremony setup requires modifying the shared restore_env helper (risk to 5 other tests) or duplicating the complex setup — disproportionate for Med coverage. Noted here for a future test pass.
+
+**Verification:** 644 crate tests pass (--features agent-gateway agent-backup-export-preview); cargo fmt clean. Production install fetch_report path is CI-untested (requires SNP hardware, like the producer fetch_measurement_and_report — tested on-device, not in unit tests).
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Notes
 <!-- SECTION:NOTES:BEGIN -->
