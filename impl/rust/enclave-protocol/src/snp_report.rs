@@ -223,6 +223,73 @@ pub fn verify_restore_ephemeral_attestation(
     Ok(report_measurement)
 }
 
+/// Domain separation for the RESTORE_BACKUP completion-evidence attestation (compact-9675 HIGH):
+/// binds the enclave to the restored identity set + the request_id it processed, so 2D can verify the
+/// completion evidence was cryptographically produced by the attested enclave (not forged by the host).
+/// Distinct from the ephemeral-key + producer bindings.
+const RESTORE_COMPLETION_DOMAIN: &[u8] = b"2d-hsm-restore-completion-v1";
+
+/// 64-byte `report_data` binding the RESTORE_BACKUP completion evidence to the attested enclave
+/// (compact-9675 HIGH). The enclave attests: "for request `request_id` in (chain, env), I produced the
+/// restored key set whose canonical hash is `identity_set_hash`." 2D verifies this BEFORE recording
+/// completion — a host cannot forge the AMD-signed report, and a mismatched (request_id, identity_set,
+/// chain, env) breaks the binding. NB this binds the IDENTITY SET (the evidence 2D consumes), NOT the
+/// sealed blob directly — the sealed blob is the host's persistence; its content integrity is the AEAD
+/// tag on next-boot unseal, and the attested identity_set is what 2D verifies against its baseline.
+pub fn report_data_for_restore_completion(
+    request_id_echo: &[u8],
+    identity_set_hash: &[u8; 32],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> [u8; REPORT_DATA_LEN] {
+    use sha3::{Digest, Sha3_512};
+    let mut h = Sha3_512::new();
+    h.update(RESTORE_COMPLETION_DOMAIN);
+    h.update(chain_id.to_be_bytes());
+    h.update(environment_identifier);
+    h.update(request_id_echo);
+    h.update(identity_set_hash);
+    h.finalize().into()
+}
+
+/// 2D-side verification of the RESTORE_BACKUP completion attestation (compact-9675 HIGH). Confirms the
+/// SNP report's `report_data` binds the enclave to the EXACT (request_id, identity_set_hash, chain, env)
+/// 2D is recording — so a host that forged the plaintext echo/identity fields (key 2/3) is caught here
+/// (the report_data won't match), and a forged report is caught by the AMD-signature check (out-of-crate:
+/// 2D verifies the cert chain against the AMD root). Verifies the hardware-signed measurement field ==
+/// `expected_measurement` (a wrong-measurement enclave with forged report_data is rejected). Returns the
+/// measurement on success.
+pub fn verify_restore_completion_attestation(
+    report: &[u8],
+    request_id_echo: &[u8],
+    identity_set_hash: &[u8; 32],
+    expected_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
+    let echoed = report_data_from_report(report)?;
+    let expected = report_data_for_restore_completion(
+        request_id_echo,
+        identity_set_hash,
+        chain_id,
+        environment_identifier,
+    );
+    if echoed != expected {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-completion attestation: report_data does not bind (request_id, identity_set, chain, \
+             env) — the host may have forged the plaintext evidence or replayed a foreign report",
+        ));
+    }
+    let report_measurement = measurement_from_report(report)?;
+    if report_measurement[..] != *expected_measurement {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-completion attestation: the report's hardware-signed measurement does not match the \
+             expected enclave measurement",
+        ));
+    }
+    Ok(report_measurement)
+}
+
 /// The configfs-tsm filesystem operations, behind a seam so the cleanup orchestration in
 /// [`fetch_report_with`] is unit-testable WITHOUT a live `/sys/kernel/config/tsm` (the cleanup-on-error
 /// invariant — entry removed even when a step fails mid-sequence — is the defect-prone part and the

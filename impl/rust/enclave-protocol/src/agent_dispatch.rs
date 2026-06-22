@@ -2513,12 +2513,15 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             // re-wrap) is the accepted tradeoff vs threading a success signal out of the seam.
             #[cfg(feature = "agent-backup-export-preview")]
             let body = {
-                // TASK-28 / compact-9651 HIGH: extract the restored-key identity evidence from the
-                // PLAINTEXT candidate BEFORE the move into commit_before_emit — the sealed blob is
-                // XChaCha20Poly1305 AEAD-encrypted, so the host cannot read it. Capture the identity set
-                // + the request_id echo into the seam closure (the seam calls it after the commit, with
-                // the sealed blob); 2D derives restored_identity_set_sha256 + verifies the request_id
-                // echo from the response ALONE.
+                // TASK-28 / compact-9675 HIGH (option A — attestation binding): extract the restored-key
+                // identity evidence + chain/env from the PLAINTEXT candidate BEFORE the move into
+                // commit_before_emit (the sealed blob is XChaCha20Poly1305 AEAD-encrypted/host-opaque).
+                // Then fetch the completion attestation BEFORE the commit — a fetch failure ⇒ no commit
+                // (fail-closed: no enclave-verifiable evidence ⇒ no restore). The attestation's report_data
+                // binds (request_id, identity_set_hash, chain, env), so 2D verifies keys 2+3 against key 4
+                // (AMD-signed) before trusting them — defeating a host forge.
+                // TODO(production-un-gate, TASK-27): fetch_report is UNBOUNDED on the serve loop here too
+                // (same class as GET_RESTORE_PUBKEY) — route through the bounded subprocess before un-gate.
                 let identity_set: Vec<RestoredKeyIdentity> = candidate
                     .entries
                     .iter()
@@ -2528,14 +2531,34 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
                         key_purpose: key_purpose_code(e.purpose),
                     })
                     .collect();
+                let chain_id = candidate.config.twod_chain_id;
+                let env_bytes = candidate.config.environment_identifier.as_bytes().to_vec();
+                let identity_set_hash = compute_restored_identity_set_hash(&identity_set);
                 let rid_echo = request_id.clone();
-                commit_before_emit(
-                    candidate,
-                    &request_id,
-                    measurement,
-                    &mut guard,
-                    move |sealed| encode_restore_backup_response(sealed, &rid_echo, &identity_set),
-                )
+                let report_data = crate::snp_report::report_data_for_restore_completion(
+                    &rid_echo,
+                    &identity_set_hash,
+                    chain_id,
+                    &env_bytes,
+                );
+                match crate::snp_report::fetch_report(&report_data) {
+                    Ok((attestation_report, cert_chain)) => commit_before_emit(
+                        candidate,
+                        &request_id,
+                        measurement,
+                        &mut guard,
+                        move |sealed| {
+                            encode_restore_backup_response(
+                                sealed,
+                                &rid_echo,
+                                &identity_set,
+                                &attestation_report,
+                                &cert_chain,
+                            )
+                        },
+                    ),
+                    Err(_) => encode_agent_error(AgentError::SealFailed), // no attestation ⇒ no commit
+                }
             };
             #[cfg(feature = "agent-backup-export-preview")]
             retire_restore_ephemeral();
@@ -2778,6 +2801,7 @@ fn encode_export_backup_response(backup_blob: &[u8], sealed_blob: &[u8]) -> Vec<
 /// plaintext candidate and emits them here (TASK-28 / compact-9651 HIGH). `secret_scalar` is NEVER
 /// emitted (confidential — lives only in the sealed blob).
 #[cfg(feature = "agent-backup-export-preview")]
+#[derive(Clone)]
 struct RestoredKeyIdentity {
     key_ref: [u8; 32],
     /// Uncompressed SEC1 (`0x04‖X‖Y`, 65 bytes) — 2D derives the Ethereum address + binds public-key
@@ -2787,23 +2811,45 @@ struct RestoredKeyIdentity {
     key_purpose: u64,
 }
 
+/// SHA-256 over the restored identity set in a FIXED canonical form (sorted by key_ref, length-prefixed)
+/// — the hash the RESTORE_BACKUP completion attestation binds (compact-9675 HIGH). Both the enclave +
+/// 2D compute it identically over key 3's content (2D reimplements this exact layout — documented in
+/// TASK-26 contract §4): `count(u64 BE) ‖ for each entry (sorted by key_ref): key_ref(32) ‖
+/// lp64(public_identity) ‖ public_identity ‖ key_purpose(u64 BE)`. Length-prefixing makes the byte stream
+/// unambiguous (no delimiter collisions).
+#[cfg(feature = "agent-backup-export-preview")]
+fn compute_restored_identity_set_hash(identity_set: &[RestoredKeyIdentity]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut entries = identity_set.to_vec();
+    entries.sort_by_key(|e| e.key_ref);
+    let mut h = sha2::Sha256::new();
+    h.update((entries.len() as u64).to_be_bytes());
+    for e in &entries {
+        h.update(e.key_ref);
+        h.update((e.public_identity.len() as u64).to_be_bytes());
+        h.update(&e.public_identity);
+        h.update(e.key_purpose.to_be_bytes());
+    }
+    h.finalize().into()
+}
+
 #[cfg(feature = "agent-backup-export-preview")]
 /// Encode the RESTORE_BACKUP success body (TASK-24 + TASK-28): `{1: sealed_keystore_blob,
-/// 2: request_id_echo, 3: restored_identity_set}`. Key 2 is the `request_id` echo — the SOLE replay token
-/// (nonce-model resolution, TASK-26 §2: `decode_restore_request` denies unknown fields, so the ceremony
-/// against a fresh attempt fails at BOTH signature verifies. `attempt_started.id` MUST be high-entropy).
-/// ⚠️ UNAUTHENTICATED (compact-9675 HIGH, codex+gemini+claude-code): keys 2 + 3 are PLAINTEXT — a
-/// compromised host can FORGE the response (fresh request_id + old sealed blob + expected identities),
-/// so 2D MUST NOT trust these fields until an enclave-verifiable signature/attestation over them lands
-/// (the core remaining TASK-28 work). The fields are the necessary SUBSTRATE for that authenticated
-/// evidence (the binding signs OVER them), not deliverable evidence on their own.
-/// Key 3 is the array of restored-key identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`) the host needs to
-/// compute `restored_identity_set_sha256` WITHOUT unsealing (the blob is AEAD-encrypted/host-opaque).
-/// Invoked by the frame-layer seam ONLY after the anchor commit succeeds.
+/// 2: request_id_echo, 3: restored_identity_set, 4: attestation_report, 5: cert_chain}`. Key 2 is the
+/// `request_id` echo — the SOLE replay token (nonce-model resolution, TASK-26 §2: the ceremony receives
+/// NO `attempt_challenge`; `request_id` is cap-bound + high-water-bound + echoed). Key 3 is the array of
+/// restored-key identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`). Key 4 +
+/// 5 are the completion attestation (compact-9675 HIGH, option A): a fresh SNP report whose `report_data`
+/// binds (request_id, identity_set_hash, chain, env) to the attested enclave, + its cert chain. 2D
+/// verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
+/// forge the plaintext evidence. Invoked by the frame-layer seam ONLY after the anchor commit succeeds
+/// (the attestation is fetched BEFORE the commit — fail-closed: no attestation ⇒ no commit/restore).
 fn encode_restore_backup_response(
     sealed_blob: &[u8],
     request_id_echo: &[u8],
     identity_set: &[RestoredKeyIdentity],
+    attestation_report: &[u8],
+    cert_chain: &[u8],
 ) -> Vec<u8> {
     let entries: Vec<Value> = identity_set
         .iter()
@@ -2828,6 +2874,11 @@ fn encode_restore_backup_response(
             Value::Bytes(request_id_echo.to_vec()),
         ),
         (Value::Integer(3.into()), Value::Array(entries)),
+        (
+            Value::Integer(4.into()),
+            Value::Bytes(attestation_report.to_vec()),
+        ),
+        (Value::Integer(5.into()), Value::Bytes(cert_chain.to_vec())),
     ])
 }
 
@@ -7706,8 +7757,13 @@ mod tests {
         /// WITHOUT unsealing the AEAD-encrypted keystore blob (key 1). Pins the {1,2,3} wire shape.
         #[test]
         fn restore_backup_response_carries_identity_set_and_echo_without_unsealing() {
+            use crate::snp_report::{
+                report_data_for_restore_completion, verify_restore_completion_attestation,
+                MEASUREMENT_OFFSET, MIN_REPORT_LEN, REPORT_DATA_OFFSET, SNP_MEASUREMENT_LEN,
+            };
             let sealed_blob = b"opaque-aead-sealed-keystore-blob".to_vec();
             let rid = b"req-restore-task28";
+            let measurement = [0x55u8; SNP_MEASUREMENT_LEN];
             let identity = vec![
                 RestoredKeyIdentity {
                     key_ref: [0xAA; 32],
@@ -7720,38 +7776,46 @@ mod tests {
                     key_purpose: 2, // agent_faucet_treasury_k1
                 },
             ];
-            let body = encode_restore_backup_response(&sealed_blob, rid, &identity);
-            // Decode the success body map.
+            // Build the completion attestation's report_data + a STAND-IN report (production fetches a real
+            // AMD-signed SNP quote). report_data binds (request_id, identity_set_hash, chain, env).
+            let identity_set_hash = compute_restored_identity_set_hash(&identity);
+            let report_data =
+                report_data_for_restore_completion(rid, &identity_set_hash, 11565, b"testnet");
+            let mut attestation_report = vec![0u8; MIN_REPORT_LEN];
+            attestation_report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64]
+                .copy_from_slice(&report_data);
+            attestation_report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
+                .copy_from_slice(&measurement);
+            let cert_chain = b"vcek-ask-ark-cert-chain-stand-in".to_vec();
+            let body = encode_restore_backup_response(
+                &sealed_blob,
+                rid,
+                &identity,
+                &attestation_report,
+                &cert_chain,
+            );
             let v = ciborium::de::from_reader::<Value, _>(body.as_slice()).unwrap();
             let Value::Map(top) = v else {
                 panic!("response body is a CBOR map");
             };
-            // Key 1: the sealed blob (opaque, host persists — NOT read for identities).
-            let k1 = top
-                .iter()
-                .find(|(k, _)| *k == Value::Integer(1.into()))
-                .map(|(_, v)| v.clone())
-                .unwrap();
-            assert_eq!(k1, Value::Bytes(sealed_blob.clone()), "key 1 = sealed blob");
-            // Key 2: the request_id echo (2D replay prevention — verifies ceremony consumed live nonce).
-            let k2 = top
-                .iter()
-                .find(|(k, _)| *k == Value::Integer(2.into()))
-                .map(|(_, v)| v.clone())
-                .unwrap();
+            let get = |n: i64| -> Value {
+                top.iter()
+                    .find(|(k, _)| *k == Value::Integer(n.into()))
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
             assert_eq!(
-                k2,
+                get(1),
+                Value::Bytes(sealed_blob.clone()),
+                "key 1 = sealed blob"
+            );
+            assert_eq!(
+                get(2),
                 Value::Bytes(rid.to_vec()),
                 "key 2 = request_id echo (plaintext, no unsealing)"
             );
-            // Key 3: the restored identity set (array of {1: key_ref, 2: public_identity, 3: key_purpose}).
-            // The host reads this PLAINTEXT — the AEAD-sealed blob (key 1) is never unsealed to derive it.
-            let k3 = top
-                .iter()
-                .find(|(k, _)| *k == Value::Integer(3.into()))
-                .map(|(_, v)| v.clone())
-                .unwrap();
-            let Value::Array(entries) = k3 else {
+            // Key 3: the restored identity set — host reads PLAINTEXT (never unseals key 1).
+            let Value::Array(entries) = get(3) else {
                 panic!("key 3 = restored identity-set array");
             };
             assert_eq!(entries.len(), 2, "two restored keys");
@@ -7759,37 +7823,67 @@ mod tests {
                 let Value::Map(fields) = entry else {
                     panic!("each identity entry is a map");
                 };
-                let key_ref = fields
-                    .iter()
-                    .find(|(k, _)| *k == Value::Integer(1.into()))
-                    .map(|(_, v)| v.clone())
-                    .unwrap();
-                let pub_id = fields
-                    .iter()
-                    .find(|(k, _)| *k == Value::Integer(2.into()))
-                    .map(|(_, v)| v.clone())
-                    .unwrap();
-                let purpose = fields
-                    .iter()
-                    .find(|(k, _)| *k == Value::Integer(3.into()))
-                    .map(|(_, v)| v.clone())
-                    .unwrap();
+                let f = |n: i64| -> Value {
+                    fields
+                        .iter()
+                        .find(|(k, _)| *k == Value::Integer(n.into()))
+                        .map(|(_, v)| v.clone())
+                        .unwrap()
+                };
                 assert_eq!(
-                    key_ref,
+                    f(1),
                     Value::Bytes(expected.key_ref.to_vec()),
                     "key_ref plaintext"
                 );
                 assert_eq!(
-                    pub_id,
+                    f(2),
                     Value::Bytes(expected.public_identity.clone()),
-                    "public_identity plaintext (address-only is insufficient; TASK-26 AC#4)"
+                    "public_identity plaintext (address-only insufficient; TASK-26 AC#4)"
                 );
                 assert_eq!(
-                    purpose,
+                    f(3),
                     Value::Integer(expected.key_purpose.into()),
                     "key_purpose plaintext (maps to 2D source_table)"
                 );
             }
+            // Keys 4 + 5: the completion attestation + cert chain. 2D verifies key 4 (AMD-signed) BEFORE
+            // trusting keys 2 + 3 — the binding defeats a host forge (compact-9675 HIGH).
+            let Value::Bytes(report_bytes) = get(4) else {
+                panic!("key 4 = attestation report bytes");
+            };
+            assert_eq!(
+                get(5),
+                Value::Bytes(cert_chain.clone()),
+                "key 5 = cert chain"
+            );
+            let verified = verify_restore_completion_attestation(
+                &report_bytes,
+                rid,
+                &identity_set_hash,
+                &measurement,
+                11565,
+                b"testnet",
+            )
+            .expect("the completion attestation binds (request_id, identity_set_hash, chain, env)");
+            assert_eq!(
+                verified[..],
+                measurement[..],
+                "attestation measurement == expected (the host/2D verifies against the enclave build)"
+            );
+            // A FORGED response (host rewrites key 2 to a fresh rid, reuses the attestation) fails: the
+            // attestation's report_data was bound to the ORIGINAL rid ⇒ verify under the forged rid ⇒ Err.
+            assert!(
+                verify_restore_completion_attestation(
+                    &report_bytes,
+                    b"FORGED-fresh-rid",
+                    &identity_set_hash,
+                    &measurement,
+                    11565,
+                    b"testnet",
+                )
+                .is_err(),
+                "a host forging key 2 (request_id) fails attestation verification — the binding is the defense"
+            );
         }
 
         /// AC#11 fail-closed: an ADMIN-tier cap (is_recovery=false) on a RESTORE_BACKUP opcode ⇒ the

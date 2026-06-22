@@ -114,7 +114,18 @@ The ceremony's restored `KeystoreBody.entries` (type `KeyEntry`) maps to the 2D 
 | `status` | (not in KeyEntry) | Derived from the 2D batch's key-row status at baseline time (the ceremony restores the entries; the status is a 2D-side lifecycle field, not an enclave property) |
 | `address` | `KeyEntry.public_identity` | Derive the 20-byte Ethereum address from the 65-byte uncompressed SEC1 public key: `keccak256(pubkey[1..65])[12..32]` (standard Ethereum derivation — the LAST 20 bytes of the 32-byte hash, matching `secp256k1.rs:address_from_uncompressed_xy`) |
 
-The restored identity-set SHA-256 hash is computed over the canonical JSON of this entry set (sorted by `(source_table, row_id)`, lowercase strings, explicit nulls — same canonicalization as 2D's `RestoreCanonical.identity_set_hash/1`).
+**`restored_identity_set_sha256` — the EXACT pinned byte layout (compact-9675, TASK-28 attestation binding).** This hash is bound into the RESTORE_BACKUP completion attestation (§3) AND recorded in the bundle, so 2D + the enclave MUST compute it byte-identically. **Algorithm: SHA-2-256 (NIST FIPS 180-4) — NOT SHA-3 / Keccak.** Input is a fixed length-prefixed binary stream (NOT JSON — JSON canonicalization is 2D-internal only, NOT the attested form):
+
+```
+count(u64 big-endian)
+for each entry, sorted ascending by key_ref (the 32-byte opaque handle):
+    key_ref(32 bytes, raw)
+    public_identity_len(u64 big-endian)
+    public_identity(public_identity_len bytes — the 65-byte uncompressed SEC1, 0x04‖X‖Y)
+    key_purpose(u64 big-endian; 1=agent_transfer_k1, 2=agent_faucet_treasury_k1)
+```
+
+2D reimplements this exact layout (`agent_dispatch.rs::compute_restored_identity_set_hash` is the reference). A mismatch (SHA-3 instead of SHA-2, wrong endianness, wrong sort, JSON vs binary) makes the attestation ALWAYS fail to verify — the cross-repo fixture (AC#7) is the only thing that catches a divergence; the enclave's own tests are symmetric (same fn binds + verifies) and will NOT catch it.
 
 ## 5. Production-readiness evidence bundle schema (AC#5)
 
