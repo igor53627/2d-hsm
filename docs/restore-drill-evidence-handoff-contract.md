@@ -49,13 +49,15 @@ AGENT_ENVELOPE {
 
 ### Ceremony return (what 2D consumes)
 
-The handler returns `AgentResponse::RestoreBackup { candidate: Box<KeystoreBody>, request_id }`. The 2D side does NOT receive the candidate body directly (it stays inside the enclave); instead, the host-side frame layer extracts:
+The handler returns `AgentResponse::RestoreBackup { candidate: Box<KeystoreBody>, request_id }`. The 2D side does NOT receive the candidate body directly (it stays inside the enclave). The RESTORE_BACKUP success wire body (§10.4 of the vsock wire-format spec; TASK-24 + TASK-28) is `{1: sealed_keystore_blob, 2: request_id_echo, 3: restored_identity_set}`. The sealed keystore (key 1) is **XChaCha20Poly1305 AEAD-encrypted** (`agent_keystore.rs`) — the host CANNOT read plaintext `KeyEntry` fields from it. So the **enclave-side frame layer** extracts the identity evidence from the plaintext candidate (before/around the seal) and emits it on the wire; the host/2D reads keys 2 + 3 WITHOUT unsealing:
 
-| Return artifact | How extracted | What 2D records |
+| Return artifact | Where on the wire | What 2D records |
 |---|---|---|
-| Restored identity set | The frame layer reads each `KeyEntry.public_identity` from the sealed candidate and computes the `agent_restore_identity_set_v1` hash | `attempt_completed.restored_identity_set_sha256` |
-| Challenge echo | `request_id` in the response == `request_id` in the request == `attempt_started.id` | `attempt_completed.attempt_challenge` (proves ceremony consumed the live nonce) |
+| Restored identity set | Key 3 — array of `{1: key_ref(32B), 2: public_identity(65B uncompressed SEC1), 3: key_purpose(1=transfer,2=faucet)}`, emitted PLAINTEXT by the enclave-side frame layer (the host cannot unseal key 1). 2D maps these to `agent_restore_identity_set_v1` (§4) + derives the Ethereum address from `public_identity`. | `attempt_completed.restored_identity_set_sha256` |
+| Challenge echo | Key 2 — `request_id_echo` == the request's `request_id` == `attempt_started.id` (bound into the cap's `payload_binding`). Emitted PLAINTEXT. | `attempt_completed.attempt_challenge` (proves ceremony consumed the live nonce) |
 | Ceremony success | No error code (0x00 ACK) | `attempt_completed.result = "success"` |
+
+`secret_scalar` is NEVER emitted (lives only in the sealed blob).
 
 ### Non-production fixture path
 
@@ -90,8 +92,9 @@ A replay of a prior ceremony output against a fresh `attempt_started` is detecte
       "backend": "twod_hsm",
       "algorithm": "secp256k1",
       "key_ref": "hex-string",
+      "public_identity": "hex-65 (uncompressed SEC1 0x04‖X‖Y — from the RESTORE_BACKUP response key 3)",
       "status": "assigned",
-      "address": "0x..."
+      "address": "0x... (derived: keccak256(public_identity[1..65])[12..32])"
     }
   ]
 }

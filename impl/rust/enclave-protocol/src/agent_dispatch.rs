@@ -2512,10 +2512,31 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             // conservative single-use choice (the ephemeral is NEVER reused); the retry-cost (re-fetch +
             // re-wrap) is the accepted tradeoff vs threading a success signal out of the seam.
             #[cfg(feature = "agent-backup-export-preview")]
-            let body =
-                commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
-                    encode_restore_backup_response(sealed)
-                });
+            let body = {
+                // TASK-28 / compact-9651 HIGH: extract the restored-key identity evidence from the
+                // PLAINTEXT candidate BEFORE the move into commit_before_emit — the sealed blob is
+                // XChaCha20Poly1305 AEAD-encrypted, so the host cannot read it. Capture the identity set
+                // + the request_id echo into the seam closure (the seam calls it after the commit, with
+                // the sealed blob); 2D derives restored_identity_set_sha256 + verifies the request_id
+                // echo from the response ALONE.
+                let identity_set: Vec<RestoredKeyIdentity> = candidate
+                    .entries
+                    .iter()
+                    .map(|e| RestoredKeyIdentity {
+                        key_ref: e.key_ref,
+                        public_identity: e.public_identity.clone(),
+                        key_purpose: key_purpose_code(e.purpose),
+                    })
+                    .collect();
+                let rid_echo = request_id.clone();
+                commit_before_emit(
+                    candidate,
+                    &request_id,
+                    measurement,
+                    &mut guard,
+                    move |sealed| encode_restore_backup_response(sealed, &rid_echo, &identity_set),
+                )
+            };
             #[cfg(feature = "agent-backup-export-preview")]
             retire_restore_ephemeral();
             #[cfg(not(feature = "agent-backup-export-preview"))]
@@ -2751,16 +2772,56 @@ fn encode_export_backup_response(backup_blob: &[u8], sealed_blob: &[u8]) -> Vec<
     ])
 }
 
-/// Encode the RESTORE_BACKUP success body (TASK-24): `{1: sealed_keystore_blob}` — the restored
-/// keystore (the host persists it). Mirrors CONFIGURE_TREASURY's single-blob response (a restore emits
-/// no separate artifact — the restored entries live in the sealed blob). Invoked by the frame-layer seam
-/// ONLY after the anchor commit succeeds, so a restore success is reported iff the post-restore state is
-/// durably committed.
-fn encode_restore_backup_response(sealed_blob: &[u8]) -> Vec<u8> {
-    encode_body(vec![(
-        Value::Integer(1.into()),
-        Value::Bytes(sealed_blob.to_vec()),
-    )])
+/// One restored key's identity evidence — the subset of [`KeyEntry`] the host/2D needs to verify the
+/// restore restored the EXPECTED keys. The sealed keystore is XChaCha20Poly1305 AEAD-encrypted, so the
+/// host CANNOT read these from the sealed blob; the enclave-side frame layer extracts them from the
+/// plaintext candidate and emits them here (TASK-28 / compact-9651 HIGH). `secret_scalar` is NEVER
+/// emitted (confidential — lives only in the sealed blob).
+#[cfg(feature = "agent-backup-export-preview")]
+struct RestoredKeyIdentity {
+    key_ref: [u8; 32],
+    /// Uncompressed SEC1 (`0x04‖X‖Y`, 65 bytes) — 2D derives the Ethereum address + binds public-key
+    /// evidence (address-only is insufficient, per TASK-26 AC#4).
+    public_identity: Vec<u8>,
+    /// 1 = agent_transfer_k1, 2 = agent_faucet_treasury_k1 (maps to 2D `source_table`).
+    key_purpose: u64,
+}
+
+/// Encode the RESTORE_BACKUP success body (TASK-24 + TASK-28): `{1: sealed_keystore_blob,
+/// 2: request_id_echo, 3: restored_identity_set}`. Key 2 is the cap-bound `request_id` echo (2D replay
+/// prevention — verifies the ceremony consumed its live nonce). Key 3 is the array of restored-key
+/// identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`) the host needs to
+/// compute `restored_identity_set_sha256` WITHOUT unsealing (the blob is AEAD-encrypted/host-opaque).
+/// Invoked by the frame-layer seam ONLY after the anchor commit succeeds.
+fn encode_restore_backup_response(
+    sealed_blob: &[u8],
+    request_id_echo: &[u8],
+    identity_set: &[RestoredKeyIdentity],
+) -> Vec<u8> {
+    let entries: Vec<Value> = identity_set
+        .iter()
+        .map(|e| {
+            Value::Map(vec![
+                (Value::Integer(1.into()), Value::Bytes(e.key_ref.to_vec())),
+                (
+                    Value::Integer(2.into()),
+                    Value::Bytes(e.public_identity.clone()),
+                ),
+                (
+                    Value::Integer(3.into()),
+                    Value::Integer(e.key_purpose.into()),
+                ),
+            ])
+        })
+        .collect();
+    encode_body(vec![
+        (Value::Integer(1.into()), Value::Bytes(sealed_blob.to_vec())),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(request_id_echo.to_vec()),
+        ),
+        (Value::Integer(3.into()), Value::Array(entries)),
+    ])
 }
 
 /// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
@@ -7630,6 +7691,98 @@ mod tests {
                 "backup sealed to a different wrapping key than the destination's sealed pubkey ⇒ \
                  fail closed (SealFailed) — AC#10 wrapping-key separation"
             );
+        }
+
+        /// TASK-28 / compact-9651 HIGH: the RESTORE_BACKUP success body carries the restored-key
+        /// identity set (key 3) + the request_id echo (key 2) as PLAINTEXT — the host/2D derives
+        /// `restored_identity_set_sha256` + verifies the replay-protecting echo from the response ALONE,
+        /// WITHOUT unsealing the AEAD-encrypted keystore blob (key 1). Pins the {1,2,3} wire shape.
+        #[test]
+        fn restore_backup_response_carries_identity_set_and_echo_without_unsealing() {
+            let sealed_blob = b"opaque-aead-sealed-keystore-blob".to_vec();
+            let rid = b"req-restore-task28";
+            let identity = vec![
+                RestoredKeyIdentity {
+                    key_ref: [0xAA; 32],
+                    public_identity: vec![0x04; 65],
+                    key_purpose: 1, // agent_transfer_k1
+                },
+                RestoredKeyIdentity {
+                    key_ref: [0xBB; 32],
+                    public_identity: vec![0x04; 65],
+                    key_purpose: 2, // agent_faucet_treasury_k1
+                },
+            ];
+            let body = encode_restore_backup_response(&sealed_blob, rid, &identity);
+            // Decode the success body map.
+            let v = ciborium::de::from_reader::<Value, _>(body.as_slice()).unwrap();
+            let Value::Map(top) = v else {
+                panic!("response body is a CBOR map");
+            };
+            // Key 1: the sealed blob (opaque, host persists — NOT read for identities).
+            let k1 = top
+                .iter()
+                .find(|(k, _)| *k == Value::Integer(1.into()))
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            assert_eq!(k1, Value::Bytes(sealed_blob.clone()), "key 1 = sealed blob");
+            // Key 2: the request_id echo (2D replay prevention — verifies ceremony consumed live nonce).
+            let k2 = top
+                .iter()
+                .find(|(k, _)| *k == Value::Integer(2.into()))
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            assert_eq!(
+                k2,
+                Value::Bytes(rid.to_vec()),
+                "key 2 = request_id echo (plaintext, no unsealing)"
+            );
+            // Key 3: the restored identity set (array of {1: key_ref, 2: public_identity, 3: key_purpose}).
+            // The host reads this PLAINTEXT — the AEAD-sealed blob (key 1) is never unsealed to derive it.
+            let k3 = top
+                .iter()
+                .find(|(k, _)| *k == Value::Integer(3.into()))
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let Value::Array(entries) = k3 else {
+                panic!("key 3 = restored identity-set array");
+            };
+            assert_eq!(entries.len(), 2, "two restored keys");
+            for (entry, expected) in entries.iter().zip(identity.iter()) {
+                let Value::Map(fields) = entry else {
+                    panic!("each identity entry is a map");
+                };
+                let key_ref = fields
+                    .iter()
+                    .find(|(k, _)| *k == Value::Integer(1.into()))
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                let pub_id = fields
+                    .iter()
+                    .find(|(k, _)| *k == Value::Integer(2.into()))
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                let purpose = fields
+                    .iter()
+                    .find(|(k, _)| *k == Value::Integer(3.into()))
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                assert_eq!(
+                    key_ref,
+                    Value::Bytes(expected.key_ref.to_vec()),
+                    "key_ref plaintext"
+                );
+                assert_eq!(
+                    pub_id,
+                    Value::Bytes(expected.public_identity.clone()),
+                    "public_identity plaintext (address-only is insufficient; TASK-26 AC#4)"
+                );
+                assert_eq!(
+                    purpose,
+                    Value::Integer(expected.key_purpose.into()),
+                    "key_purpose plaintext (maps to 2D source_table)"
+                );
+            }
         }
 
         /// AC#11 fail-closed: an ADMIN-tier cap (is_recovery=false) on a RESTORE_BACKUP opcode ⇒ the
