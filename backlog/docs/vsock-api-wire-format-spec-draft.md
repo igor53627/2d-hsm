@@ -730,18 +730,22 @@ and error contract, with the per-command map carried at envelope key 7:
   5: key_purpose, 6: backend_version}`. Returning **both** address encodings reflects the
   unified-account model (TRON-reserve decision).
 - **`AGENT_KEYSTORE_RESTORE_BACKUP`** success response (TASK-24 + TASK-28) — `{1: sealed_keystore_blob,
-  2: request_id_echo, 3: restored_identity_set}`. Key 1 is the AEAD-sealed post-restore keystore the host
-  persists (XChaCha20Poly1305 — host-opaque). Key 2 echoes the cap-bound `request_id` (2D replay
-  prevention: verifies the ceremony consumed its live nonce). Key 3 is the array of restored-key identity
-  evidence, each entry `{1: key_ref(32B), 2: public_identity(65B uncompressed SEC1), 3: key_purpose(uint:
-  1=agent_transfer_k1, 2=agent_faucet_treasury_k1)}` — emitted PLAINTEXT by the enclave-side frame layer
-  (the host CANNOT read these from the sealed blob), so 2D derives `restored_identity_set_sha256` + the
-  Ethereum address from `public_identity` WITHOUT unsealing. `secret_scalar` is NEVER emitted. The request
-  payload (key 7) is `{1: ingress_envelope, 2: original_backup, 3: requested_refs, 4: recovery_high_water}`
-  (the ceremony inputs — owned by TASK-24). Mutating / Structural (wholesale-replace + local+1 structural);
-  routes through the seal→anchor-commit→swap→emit seam; production-gated behind `agent-backup-export-preview`
-  (TASK-27 is a hard un-gate blocker for the unbounded GET_RESTORE_PUBKEY quote fetch). Error bands:
-  request shape → 0x40; cap tier / payload_binding → 0x43; seal/commit → 0x46.
+  2: request_id_echo, 3: restored_identity_set, 4: attestation_report, 5: cert_chain}`. Key 1 is the
+  AEAD-sealed post-restore keystore (XChaCha20Poly1305 — host-opaque). Key 2 echoes the cap-bound
+  `request_id` (the SOLE replay token — nonce model, TASK-26 §2). Key 3 is the restored-key identity
+  evidence, each entry `{1: key_ref(32B), 2: public_identity(65B uncompressed SEC1), 3: key_purpose(uint)}`,
+  emitted PLAINTEXT by the enclave-side frame layer (the host CANNOT unseal key 1). Keys 4 + 5 are the
+  **completion attestation** (compact-9675 HIGH, option A): a fresh SNP report whose `report_data` binds
+  (request_id_echo, restored_identity_set_sha256, chain, env) to the attested enclave + its cert chain.
+  2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
+  forge the plaintext evidence (replay a fresh request_id against an old sealed blob + expected identities).
+  `restored_identity_set_sha256` (SHA-2-256, the EXACT pinned byte layout — TASK-26 contract §4) is what
+  the attestation binds. `secret_scalar` is NEVER emitted. The request payload (key 7) is
+  `{1: ingress_envelope, 2: original_backup, 3: requested_refs, 4: recovery_high_water}`. Mutating /
+  Structural; routes through the seal→anchor-commit→swap→emit seam (the attestation is fetched BEFORE the
+  commit — fail-closed); production-gated behind `agent-backup-export-preview` (TASK-27 is a hard un-gate
+  blocker for the TWO unbounded restore-path quote fetches: GET_RESTORE_PUBKEY + RESTORE_BACKUP completion).
+  Error bands: request shape → 0x40; cap tier / payload_binding → 0x43; seal/commit/attestation-fetch → 0x46.
 
 ### 10.5 Administrative / recovery capability (AC#6, AC#7, AC#11)
 
