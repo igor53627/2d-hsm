@@ -2404,6 +2404,77 @@ fn commit_before_emit<F: FnOnce(&[u8]) -> Vec<u8>>(
     body
 }
 
+/// RESTORE_BACKUP commit path — a RESTORE-SPECIFIC seal→attest→commit→swap→emit (NOT the shared
+/// [`commit_before_emit`], which couples seal+commit and so can't bind the sealed blob into the completion
+/// attestation). compact-9703 (codex+grok): the attestation binds the EXACT sealed blob the host persists,
+/// so the seal must happen BEFORE the attestation fetch (which is BEFORE the commit — fail-closed: no
+/// attestation ⇒ no commit). Reuses the shared [`seal_body`] + [`commit_candidate_to_anchor`] primitives;
+/// only the orchestration order is RESTORE-specific. EVERY failure (seal / fetch / commit) ⇒ a §10.9 error
+/// body with NO swap (the live slot is untouched); the caller retires the ephemeral regardless.
+// TODO(production-un-gate, TASK-27): the fetch_report here is UNBOUNDED on the serve loop — route through
+// the bounded subprocess before un-gate (same class as GET_RESTORE_PUBKEY).
+#[cfg(feature = "agent-backup-export-preview")]
+fn restore_seal_attest_commit_emit(
+    candidate: Box<KeystoreBody>,
+    request_id: &[u8],
+    measurement: Vec<u8>,
+    guard: &mut Option<InstalledAgentKeystore>,
+) -> Vec<u8> {
+    // (1) identity evidence + chain/env from the plaintext candidate (before the move into the swap).
+    let identity_set: Vec<RestoredKeyIdentity> = candidate
+        .entries
+        .iter()
+        .map(|e| RestoredKeyIdentity {
+            key_ref: e.key_ref,
+            public_identity: e.public_identity.clone(),
+            key_purpose: key_purpose_code(e.purpose),
+        })
+        .collect();
+    let chain_id = candidate.config.twod_chain_id;
+    let env_bytes = candidate.config.environment_identifier.as_bytes().to_vec();
+    let identity_set_hash = compute_restored_identity_set_hash(&identity_set);
+    let rid_echo = request_id.to_vec();
+    // (2) seal FIRST so the attestation can bind the EXACT blob the host persists (compact-9703).
+    let sealed = match crate::seal_root::resolve_provisioning_root() {
+        Ok(root) => match seal_body(&candidate, &root, &measurement) {
+            Ok(blob) => blob,
+            Err(_) => return encode_agent_error(AgentError::SealFailed),
+        },
+        Err(_) => return encode_agent_error(AgentError::SealFailed),
+    };
+    // (3) sealed_blob_hash + the completion attestation binding (full tuple, length-prefixed).
+    use sha2::Digest;
+    let sealed_blob_hash: [u8; 32] = sha2::Sha256::digest(&sealed).into();
+    let report_data = crate::snp_report::report_data_for_restore_completion(
+        &rid_echo,
+        &identity_set_hash,
+        &sealed_blob_hash,
+        chain_id,
+        &env_bytes,
+    );
+    // (4) fetch the completion attestation — fail-closed: no attestation ⇒ no commit/swap (clean abort).
+    let (attestation_report, cert_chain) = match crate::snp_report::fetch_report(&report_data) {
+        Ok(r) => r,
+        Err(_) => return encode_agent_error(AgentError::SealFailed),
+    };
+    // (5) anchor commit (the restore's Structural bump) + swap the live slot.
+    if let Err(e) = commit_candidate_to_anchor(&candidate, request_id) {
+        return encode_agent_error(e);
+    }
+    *guard = Some(InstalledAgentKeystore {
+        body: *candidate,
+        measurement,
+    });
+    // (6) emit the full {1,2,3,4,5} body.
+    encode_restore_backup_response(
+        &sealed,
+        &rid_echo,
+        &identity_set,
+        &attestation_report,
+        &cert_chain,
+    )
+}
+
 /// Frame-layer entry point: dispatch a `0x40` inner-envelope `payload` against the installed
 /// keystore and return the encoded response BODY — a per-opcode success map or a §10.9 error map.
 /// Always returns a body (never errors out of band), so the wire layer just frames it. Profile is
@@ -2512,54 +2583,8 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             // conservative single-use choice (the ephemeral is NEVER reused); the retry-cost (re-fetch +
             // re-wrap) is the accepted tradeoff vs threading a success signal out of the seam.
             #[cfg(feature = "agent-backup-export-preview")]
-            let body = {
-                // TASK-28 / compact-9675 HIGH (option A — attestation binding): extract the restored-key
-                // identity evidence + chain/env from the PLAINTEXT candidate BEFORE the move into
-                // commit_before_emit (the sealed blob is XChaCha20Poly1305 AEAD-encrypted/host-opaque).
-                // Then fetch the completion attestation BEFORE the commit — a fetch failure ⇒ no commit
-                // (fail-closed: no enclave-verifiable evidence ⇒ no restore). The attestation's report_data
-                // binds (request_id, identity_set_hash, chain, env), so 2D verifies keys 2+3 against key 4
-                // (AMD-signed) before trusting them — defeating a host forge.
-                // TODO(production-un-gate, TASK-27): fetch_report is UNBOUNDED on the serve loop here too
-                // (same class as GET_RESTORE_PUBKEY) — route through the bounded subprocess before un-gate.
-                let identity_set: Vec<RestoredKeyIdentity> = candidate
-                    .entries
-                    .iter()
-                    .map(|e| RestoredKeyIdentity {
-                        key_ref: e.key_ref,
-                        public_identity: e.public_identity.clone(),
-                        key_purpose: key_purpose_code(e.purpose),
-                    })
-                    .collect();
-                let chain_id = candidate.config.twod_chain_id;
-                let env_bytes = candidate.config.environment_identifier.as_bytes().to_vec();
-                let identity_set_hash = compute_restored_identity_set_hash(&identity_set);
-                let rid_echo = request_id.clone();
-                let report_data = crate::snp_report::report_data_for_restore_completion(
-                    &rid_echo,
-                    &identity_set_hash,
-                    chain_id,
-                    &env_bytes,
-                );
-                match crate::snp_report::fetch_report(&report_data) {
-                    Ok((attestation_report, cert_chain)) => commit_before_emit(
-                        candidate,
-                        &request_id,
-                        measurement,
-                        &mut guard,
-                        move |sealed| {
-                            encode_restore_backup_response(
-                                sealed,
-                                &rid_echo,
-                                &identity_set,
-                                &attestation_report,
-                                &cert_chain,
-                            )
-                        },
-                    ),
-                    Err(_) => encode_agent_error(AgentError::SealFailed), // no attestation ⇒ no commit
-                }
-            };
+            let body =
+                restore_seal_attest_commit_emit(candidate, &request_id, measurement, &mut guard);
             #[cfg(feature = "agent-backup-export-preview")]
             retire_restore_ephemeral();
             #[cfg(not(feature = "agent-backup-export-preview"))]
@@ -7779,8 +7804,13 @@ mod tests {
             // Build the completion attestation's report_data + a STAND-IN report (production fetches a real
             // AMD-signed SNP quote). report_data binds (request_id, identity_set_hash, chain, env).
             let identity_set_hash = compute_restored_identity_set_hash(&identity);
-            let report_data =
-                report_data_for_restore_completion(rid, &identity_set_hash, 11565, b"testnet");
+            let report_data = report_data_for_restore_completion(
+                rid,
+                &identity_set_hash,
+                &[0xCC; 32],
+                11565,
+                b"testnet",
+            );
             let mut attestation_report = vec![0u8; MIN_REPORT_LEN];
             attestation_report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64]
                 .copy_from_slice(&report_data);
@@ -7860,6 +7890,7 @@ mod tests {
                 &report_bytes,
                 rid,
                 &identity_set_hash,
+                &[0xCC; 32],
                 &measurement,
                 11565,
                 b"testnet",
@@ -7877,6 +7908,7 @@ mod tests {
                     &report_bytes,
                     b"FORGED-fresh-rid",
                     &identity_set_hash,
+                    &[0xCC; 32],
                     &measurement,
                     11565,
                     b"testnet",

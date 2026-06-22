@@ -236,17 +236,15 @@ const RESTORE_COMPLETION_DOMAIN: &[u8] = b"2d-hsm-restore-completion-v1";
 /// chain, env) breaks the binding. NB this binds the IDENTITY SET (the evidence 2D consumes), NOT the
 /// sealed blob directly — the sealed blob is the host's persistence; its content integrity is the AEAD
 /// tag on next-boot unseal, and the attested identity_set is what 2D verifies against its baseline.
-/// DEFENSE-IN-DEPTH DEFERRED (compact-9698/9703, codex+grok): the binding does NOT include
-/// `sha256(sealed_blob)`, so a host could in principle splice a DIFFERENT valid sealed blob while keeping
-/// the attested identity evidence. claude-code verified the realistic instance of this (replaying an older
-/// valid blob) is caught by the anchor anti-rollback at next-boot reconcile (strict_recovery_counter /
-/// structural_version reject the lower-counter blob). Binding sealed_blob_hash is the robust close but
-/// requires splitting the shared commit_before_emit seam (seal→attest→commit) — risk to the 5 other ops
-/// that share it; tracked as a TASK-28 follow-up, not worth the seam refactor for a defense-in-depth the
-/// anchor already mitigates.
+/// The binding INCLUDES `sealed_blob_hash` (compact-9703 codex+grok): the attestation binds the EXACT
+/// sealed blob the host persists, so a host cannot splice a different valid sealed blob while keeping the
+/// attested identity evidence. The frame layer seals the candidate FIRST, hashes the sealed blob, then
+/// fetches the attestation over the full tuple, then commits + emits — the attestation is fetched BEFORE
+/// the commit (fail-closed: no attestation ⇒ no commit).
 pub fn report_data_for_restore_completion(
     request_id_echo: &[u8],
     identity_set_hash: &[u8; 32],
+    sealed_blob_hash: &[u8; 32],
     chain_id: u64,
     environment_identifier: &[u8],
 ) -> [u8; REPORT_DATA_LEN] {
@@ -259,20 +257,22 @@ pub fn report_data_for_restore_completion(
     h.update(&(request_id_echo.len() as u64).to_be_bytes()); // length-prefix (no (env,rid) tuple collision)
     h.update(request_id_echo);
     h.update(identity_set_hash);
+    h.update(sealed_blob_hash); // compact-9703: bind the EXACT persisted blob (no host splicing)
     h.finalize().into()
 }
 
 /// 2D-side verification of the RESTORE_BACKUP completion attestation (compact-9675 HIGH). Confirms the
-/// SNP report's `report_data` binds the enclave to the EXACT (request_id, identity_set_hash, chain, env)
-/// 2D is recording — so a host that forged the plaintext echo/identity fields (key 2/3) is caught here
-/// (the report_data won't match), and a forged report is caught by the AMD-signature check (out-of-crate:
-/// 2D verifies the cert chain against the AMD root). Verifies the hardware-signed measurement field ==
-/// `expected_measurement` (a wrong-measurement enclave with forged report_data is rejected). Returns the
+/// SNP report's `report_data` binds the enclave to the EXACT (request_id, identity_set_hash,
+/// sealed_blob_hash, chain, env) 2D is recording — so a host that forged the plaintext echo/identity
+/// fields (key 2/3) OR spliced a different sealed blob is caught here (the report_data won't match), and a
+/// forged report is caught by the AMD-signature check (out-of-crate: 2D verifies the cert chain against the
+/// AMD root). Verifies the hardware-signed measurement field == `expected_measurement`. Returns the
 /// measurement on success.
 pub fn verify_restore_completion_attestation(
     report: &[u8],
     request_id_echo: &[u8],
     identity_set_hash: &[u8; 32],
+    sealed_blob_hash: &[u8; 32],
     expected_measurement: &[u8],
     chain_id: u64,
     environment_identifier: &[u8],
@@ -281,13 +281,15 @@ pub fn verify_restore_completion_attestation(
     let expected = report_data_for_restore_completion(
         request_id_echo,
         identity_set_hash,
+        sealed_blob_hash,
         chain_id,
         environment_identifier,
     );
     if echoed != expected {
         return Err(ProtocolError::PqSigningUnavailable(
-            "restore-completion attestation: report_data does not bind (request_id, identity_set, chain, \
-             env) — the host may have forged the plaintext evidence or replayed a foreign report",
+            "restore-completion attestation: report_data does not bind (request_id, identity_set, \
+             sealed_blob, chain, env) — the host may have forged the plaintext evidence, spliced a \
+             different sealed blob, or replayed a foreign report",
         ));
     }
     let report_measurement = measurement_from_report(report)?;
@@ -717,7 +719,8 @@ mod tests {
         let meas = [0x55u8; SNP_MEASUREMENT_LEN];
         let real_hash = [0xAAu8; 32];
         let wrong_hash = [0xBBu8; 32];
-        let rd = report_data_for_restore_completion(rid, &real_hash, 11565, b"testnet");
+        let rd =
+            report_data_for_restore_completion(rid, &real_hash, &[0xCC; 32], 11565, b"testnet");
         let mut report = vec![0u8; MIN_REPORT_LEN];
         report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
         report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
@@ -727,6 +730,7 @@ mod tests {
                 &report,
                 rid,
                 &wrong_hash,
+                &[0xCC; 32],
                 &meas,
                 11565,
                 b"testnet"
@@ -742,7 +746,7 @@ mod tests {
         let rid = b"req-completion-1";
         let meas = [0x55u8; SNP_MEASUREMENT_LEN];
         let hash = [0xAAu8; 32];
-        let rd = report_data_for_restore_completion(rid, &hash, 11565, b"testnet");
+        let rd = report_data_for_restore_completion(rid, &hash, &[0xCC; 32], 11565, b"testnet");
         let mut report = vec![0u8; MIN_REPORT_LEN];
         report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
         report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
@@ -751,6 +755,7 @@ mod tests {
                 &report,
                 b"FORGED-rid",
                 &hash,
+                &[0xCC; 32],
                 &meas,
                 11565,
                 b"testnet"
@@ -768,15 +773,56 @@ mod tests {
         let expected_meas = [0x55u8; SNP_MEASUREMENT_LEN];
         let wrong_meas = [0x66u8; SNP_MEASUREMENT_LEN];
         let hash = [0xAAu8; 32];
-        let rd = report_data_for_restore_completion(rid, &hash, 11565, b"testnet");
+        let rd = report_data_for_restore_completion(rid, &hash, &[0xCC; 32], 11565, b"testnet");
         let mut report = vec![0u8; MIN_REPORT_LEN];
         report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
         report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
             .copy_from_slice(&wrong_meas);
         assert!(
-            verify_restore_completion_attestation(&report, rid, &hash, &expected_meas, 11565, b"testnet")
+            verify_restore_completion_attestation(
+                &report,
+                rid,
+                &hash,
+                &[0xCC; 32],
+                &expected_meas,
+                11565,
+                b"testnet"
+            )
                 .is_err(),
             "a report whose signed measurement field != expected MUST fail (forged report_data is not enough)"
+        );
+    }
+
+    /// compact-9703: a report whose report_data binds a DIFFERENT sealed_blob_hash → Err. The attestation
+    /// binds the EXACT persisted blob (the compact-9703 fix); a host splicing a different sealed blob while
+    /// keeping the attestation fails here. Exercises the NEW sealed_blob_hash reject path (the other reject
+    /// tests use a matching sealed_blob_hash on both sides, so they don't cover this).
+    #[test]
+    fn verify_restore_completion_rejects_substituted_sealed_blob_hash() {
+        let rid = b"req-completion-1";
+        let meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let hash = [0xAAu8; 32];
+        let real_blob_hash = [0x11u8; 32];
+        let wrong_blob_hash = [0x22u8; 32];
+        // Build the report binding the REAL sealed_blob_hash.
+        let rd = report_data_for_restore_completion(rid, &hash, &real_blob_hash, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        // Verify expecting a DIFFERENT sealed_blob_hash than the report was minted for ⇒ Err (host spliced
+        // a different valid sealed blob while keeping the attestation — the binding catches it).
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                rid,
+                &hash,
+                &wrong_blob_hash,
+                &meas,
+                11565,
+                b"testnet"
+            )
+            .is_err(),
+            "a report bound to a different sealed_blob_hash MUST fail (host sealed-blob splice)"
         );
     }
 
