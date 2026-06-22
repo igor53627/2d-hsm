@@ -646,7 +646,7 @@ Mixed-role fixtures are permitted only in non-deployable tests.
 | 6 | `AGENT_K1_CONFIGURE_TREASURY` | treasury admin / recovery | **enclave** (AC#12) |
 | 7 | `AGENT_KEYSTORE_EXPORT_BACKUP` | backup-export admin | enclave default |
 | 8 | `AGENT_KEYSTORE_RESTORE_BACKUP` | recovery/quorum | recovery counter |
-| **9** | `AGENT_K1_SIGN_TRON_TRANSFER` | **RESERVED** (eth-MVP + reserve-TRON) — fail-closed until a future task | — |
+| **9** | `AGENT_K1_GET_RESTORE_PUBKEY` | low-privilege ceremony read | — (TASK-24: publishes the attested ephemeral ML-KEM-1024 key the operator re-wraps the DR backup to; response `{1: encaps_key(1568B), 2: measurement(48B), 3: attestation_report, 4: cert_chain}` — see §10.4. Non-mutating/NotCommitted. NB this opcode was RESERVED for a future SIGN_TRON_TRANSFER in an earlier draft; that slot is now vacant — TRON transfer, if ever added, takes a new opcode ≥ 10.) |
 | 0, 10.. | reserved; decoder fails closed on any non-allow-listed opcode | | |
 
 `CONFIGURE_TREASURY` sub-operations are an **inner discriminant** (not separate opcodes):
