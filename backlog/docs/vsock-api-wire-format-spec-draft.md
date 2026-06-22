@@ -736,11 +736,13 @@ and error contract, with the per-command map carried at envelope key 7:
   evidence, each entry `{1: key_ref(32B), 2: public_identity(65B uncompressed SEC1), 3: key_purpose(uint)}`,
   emitted PLAINTEXT by the enclave-side frame layer (the host CANNOT unseal key 1). Keys 4 + 5 are the
   **completion attestation** (compact-9675 HIGH, option A): a fresh SNP report whose `report_data` binds
-  (request_id_echo, restored_identity_set_sha256, chain, env) to the attested enclave + its cert chain.
-  2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
-  forge the plaintext evidence (replay a fresh request_id against an old sealed blob + expected identities).
-  `restored_identity_set_sha256` (SHA-2-256, the EXACT pinned byte layout — TASK-26 contract §4) is what
-  the attestation binds. `secret_scalar` is NEVER emitted. The request payload (key 7) is
+  (request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env) — the FULL 5-field tuple,
+  including the EXACT sealed blob (SHA-2-256 of key 1) the host persists — to the attested enclave + its
+  cert chain. 2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a
+  host could forge the plaintext evidence (replay a fresh request_id against an old sealed blob + expected
+  identities) OR splice a different valid sealed blob. NB two distinct hashes: the `report_data` binding is
+  SHA3-512 (64-byte SNP field, domain-separated); `restored_identity_set_sha256` (a bound field) is SHA-2-256
+  (§4 layout). `secret_scalar` is NEVER emitted. The request payload (key 7) is
   `{1: ingress_envelope, 2: original_backup, 3: requested_refs, 4: recovery_high_water}`. Mutating /
   Structural; routes through the seal→anchor-commit→swap→emit seam (the attestation is fetched BEFORE the
   commit — fail-closed); production-gated behind `agent-backup-export-preview` (TASK-27 is a hard un-gate
