@@ -149,6 +149,68 @@ pub fn report_data_for_pubkey(pq_pubkey: &[u8]) -> [u8; REPORT_DATA_LEN] {
     h.finalize().into()
 }
 
+/// Domain separation for the restore-ephemeral `report_data` binding — DISTINCT from the producer
+/// [`REPORT_DATA_DOMAIN`] so a producer-key report cannot be replayed as a restore-ephemeral binding
+/// (and vice versa). The GET_RESTORE_PUBKEY attestation binds the ephemeral ML-KEM key to the TEE so the
+/// operator (performing the offline re-wrap) can verify the key came from the attested enclave, not a
+/// host-substituted key (compact 9611 HIGH #2: AC#1 "attested ephemeral key").
+const RESTORE_REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-restore-ephemeral-v1";
+
+/// 64-byte `report_data` binding the GET_RESTORE_PUBKEY ephemeral ML-KEM-1024 key into a fresh SNP
+/// attestation. Domain-separated from the producer binding ([`report_data_for_pubkey`]) and committing
+/// to the ephemeral key + the TEE measurement + chain + environment, so the operator verifies the
+/// re-wrap target key came from THIS attested TEE for THIS chain/env (a host substituting its own key
+/// breaks the binding; a host cannot forge the AMD-signed report). Mirrors [`report_data_for_pubkey`]'s
+/// SHA3-512 shape.
+pub fn report_data_for_restore_ephemeral(
+    encaps_key: &[u8],
+    measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> [u8; REPORT_DATA_LEN] {
+    use sha3::{Digest, Sha3_512};
+    let mut h = Sha3_512::new();
+    h.update(RESTORE_REPORT_DATA_DOMAIN);
+    h.update(encaps_key);
+    h.update(measurement);
+    h.update(chain_id.to_be_bytes());
+    h.update(environment_identifier);
+    h.finalize().into()
+}
+
+/// Operator-side verification of the GET_RESTORE_PUBKEY attestation binding (compact 9611 HIGH #2 / AC#1
+/// "attested ephemeral key"). The operator calls this BEFORE re-wrapping the backup to the ephemeral key:
+/// it confirms the SNP report's `report_data` binds the EXACT ephemeral encaps key + the TEE measurement +
+/// chain + environment the operator intends to restore into — so a host that substituted its own key
+/// (and replayed a valid AMD-signed report) is caught here (the report_data won't match), and a host that
+/// forged the report is caught by the AMD-signature check (out-of-crate: the operator verifies the cert
+/// chain against the AMD root separately). Returns the report's launch measurement on success (the operator
+/// compares it against the expected measurement for this enclave build).
+///
+/// `report` is the raw `ATTESTATION_REPORT` bytes from the GET_RESTORE_PUBKEY response (key 3).
+pub fn verify_restore_ephemeral_attestation(
+    report: &[u8],
+    encaps_key: &[u8],
+    expected_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
+    let echoed = report_data_from_report(report)?;
+    let expected = report_data_for_restore_ephemeral(
+        encaps_key,
+        expected_measurement,
+        chain_id,
+        environment_identifier,
+    );
+    if echoed != expected {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-ephemeral attestation: report_data does not bind the ephemeral key + TEE identity \
+             (host may have substituted the key or replayed a foreign report)",
+        ));
+    }
+    measurement_from_report(report)
+}
+
 /// The configfs-tsm filesystem operations, behind a seam so the cleanup orchestration in
 /// [`fetch_report_with`] is unit-testable WITHOUT a live `/sys/kernel/config/tsm` (the cleanup-on-error
 /// invariant — entry removed even when a step fails mid-sequence — is the defect-prone part and the
@@ -463,6 +525,74 @@ mod tests {
         use sha3::{Digest, Sha3_512};
         let bare: [u8; 64] = Sha3_512::digest(b"producer-pubkey-bytes").into();
         assert_ne!(a, bare);
+    }
+
+    /// Compact 9611 HIGH #2: the restore-ephemeral report_data binding is deterministic, distinct from
+    /// the producer binding, and sensitive to EVERY bound field (encaps key, measurement, chain, env) —
+    /// so a host substituting any of them breaks the binding the operator verifies before re-wrapping.
+    #[test]
+    fn restore_ephemeral_binding_is_deterministic_distinct_and_field_sensitive() {
+        let ek = [0xAAu8; 32];
+        let meas = [0xBBu8; 48];
+        let a = report_data_for_restore_ephemeral(&ek, &meas, 11565, b"testnet");
+        let b = report_data_for_restore_ephemeral(&ek, &meas, 11565, b"testnet");
+        assert_eq!(a, b, "deterministic");
+        assert_eq!(a.len(), REPORT_DATA_LEN);
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&[0xCC; 32], &meas, 11565, b"testnet"),
+            "encaps-key substitution breaks the binding"
+        );
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&ek, &[0xDD; 48], 11565, b"testnet"),
+            "measurement substitution breaks the binding"
+        );
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&ek, &meas, 1, b"testnet"),
+            "chain substitution breaks the binding"
+        );
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&ek, &meas, 11565, b"mainnet"),
+            "env substitution breaks the binding"
+        );
+        // Domain separation: distinct from the producer binding (a producer report cannot be replayed).
+        assert_ne!(
+            a[..],
+            report_data_for_pubkey(&ek)[..],
+            "restore-ephemeral binding is domain-separated from the producer binding"
+        );
+    }
+
+    /// The operator verification helper accepts a report whose report_data matches the recomputed binding
+    /// + returns the measurement; it REJECTS a report whose binding was minted for a DIFFERENT (substituted)
+    /// ephemeral key. (The AMD-signature half is verified by the operator out-of-crate via the cert chain.)
+    #[test]
+    fn verify_restore_ephemeral_attestation_rejects_substituted_key() {
+        let ek = [0xAAu8; 32];
+        let meas = [0xBBu8; 48];
+        let rd = report_data_for_restore_ephemeral(&ek, &meas, 11565, b"testnet");
+        // Stand-in report: zeroed, with report_data patched at 0x50 + measurement at 0x90.
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        let extracted =
+            verify_restore_ephemeral_attestation(&report, &ek, &meas, 11565, b"testnet")
+                .expect("matching binding verifies");
+        assert_eq!(
+            extracted[..],
+            meas[..],
+            "measurement returned for operator comparison"
+        );
+        // A report minted for a DIFFERENT key (host substitution) is rejected.
+        let bad_rd = report_data_for_restore_ephemeral(&[0xCC; 32], &meas, 11565, b"testnet");
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&bad_rd);
+        assert!(
+            verify_restore_ephemeral_attestation(&report, &ek, &meas, 11565, b"testnet").is_err(),
+            "a report bound to a different key MUST fail operator verification"
+        );
     }
 
     // ---- fetch orchestration + unconditional cleanup over the TsmFs seam (TASK-7.7 5b-2; no live configfs needed) ----
