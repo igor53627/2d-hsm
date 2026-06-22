@@ -740,9 +740,10 @@ and error contract, with the per-command map carried at envelope key 7:
   including the EXACT sealed blob (SHA-2-256 of key 1) the host persists — to the attested enclave + its
   cert chain. 2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a
   host could forge the plaintext evidence (replay a fresh request_id against an old sealed blob + expected
-  identities) OR splice a different valid sealed blob. NB two distinct hashes: the `report_data` binding is
-  SHA3-512 (64-byte SNP field, domain-separated); `restored_identity_set_sha256` (a bound field) is SHA-2-256
-  (§4 layout). `secret_scalar` is NEVER emitted. The request payload (key 7) is
+  identities) OR splice a different valid sealed blob. NB three hash values using two algorithms:
+  `report_data = SHA3-512(...)` (64-byte SNP field, domain-separated); `restored_identity_set_sha256 =
+  SHA-2-256(key 3 layout, §4)`; `sealed_blob_sha256 = SHA-2-256(response key 1)`. `secret_scalar` is NEVER
+  emitted. The request payload (key 7) is
   `{1: ingress_envelope, 2: original_backup, 3: requested_refs, 4: recovery_high_water}`. Mutating /
   Structural; routes through the seal→anchor-commit→swap→emit seam (the attestation is fetched BEFORE the
   commit — fail-closed); production-gated behind `agent-backup-export-preview` (TASK-27 is a hard un-gate

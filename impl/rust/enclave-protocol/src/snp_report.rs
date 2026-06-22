@@ -230,17 +230,19 @@ pub fn verify_restore_ephemeral_attestation(
 const RESTORE_COMPLETION_DOMAIN: &[u8] = b"2d-hsm-restore-completion-v1";
 
 /// 64-byte `report_data` binding the RESTORE_BACKUP completion evidence to the attested enclave
-/// (compact-9675 HIGH). The enclave attests: "for request `request_id` in (chain, env), I produced the
-/// restored key set whose canonical hash is `identity_set_hash`." 2D verifies this BEFORE recording
-/// completion — a host cannot forge the AMD-signed report, and a mismatched (request_id, identity_set,
-/// chain, env) breaks the binding. NB this binds the IDENTITY SET (the evidence 2D consumes), NOT the
-/// sealed blob directly — the sealed blob is the host's persistence; its content integrity is the AEAD
-/// tag on next-boot unseal, and the attested identity_set is what 2D verifies against its baseline.
-/// The binding INCLUDES `sealed_blob_hash` (compact-9703 codex+grok): the attestation binds the EXACT
-/// sealed blob the host persists, so a host cannot splice a different valid sealed blob while keeping the
-/// attested identity evidence. The frame layer seals the candidate FIRST, hashes the sealed blob, then
-/// fetches the attestation over the full tuple, then commits + emits — the attestation is fetched BEFORE
-/// the commit (fail-closed: no attestation ⇒ no commit).
+/// (compact-9675 HIGH). The enclave attests the FULL tuple `(request_id, identity_set_hash,
+/// sealed_blob_hash, chain, env)` — including the EXACT sealed blob the host persists
+/// (`sealed_blob_hash = SHA-2-256(key 1)`, compact-9703 codex+grok), so a host cannot splice a different
+/// valid sealed blob while keeping the attested plaintext evidence. The frame layer seals the candidate
+/// FIRST, hashes the sealed blob, fetches the attestation over this tuple, THEN commits + emits (the
+/// attestation is fetched BEFORE the commit — fail-closed: no attestation ⇒ no commit). 2D verifies this
+/// BEFORE recording completion — a host cannot forge the AMD-signed report, and a mismatched
+/// (request_id, identity_set, sealed_blob, chain, env) breaks the binding. NB three hash values using two
+/// algorithms: `report_data` is SHA3-512 (the 64-byte SNP field); `identity_set_hash` is SHA-2-256 (the §4
+/// layout 2D recomputes); `sealed_blob_hash` is SHA-2-256 (response key 1) — do not conflate them. The
+/// anchor anti-rollback (next-boot
+/// strict_recovery_counter/structural_version reconcile) is additional defense-in-depth that catches a
+/// substituted older blob even if this binding were bypassed.
 pub fn report_data_for_restore_completion(
     request_id_echo: &[u8],
     identity_set_hash: &[u8; 32],
