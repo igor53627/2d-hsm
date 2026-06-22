@@ -2787,6 +2787,7 @@ struct RestoredKeyIdentity {
     key_purpose: u64,
 }
 
+#[cfg(feature = "agent-backup-export-preview")]
 /// Encode the RESTORE_BACKUP success body (TASK-24 + TASK-28): `{1: sealed_keystore_blob,
 /// 2: request_id_echo, 3: restored_identity_set}`. Key 2 is the `request_id` echo — the SOLE replay token
 /// (nonce-model resolution, TASK-26 §2: `decode_restore_request` denies unknown fields, so the ceremony
