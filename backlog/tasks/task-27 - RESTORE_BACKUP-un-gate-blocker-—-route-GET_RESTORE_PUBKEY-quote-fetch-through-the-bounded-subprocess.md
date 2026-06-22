@@ -3,9 +3,10 @@ id: TASK-27
 title: >-
   RESTORE_BACKUP un-gate blocker — route GET_RESTORE_PUBKEY quote fetch through
   the bounded subprocess
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-22 00:29'
+updated_date: '2026-06-22 20:24'
 labels:
   - agent-gateway
   - restore
@@ -51,3 +52,22 @@ Unlike the producer `GET_MEASUREMENT` quote fetch (boot-only, before the serve l
 
 **Out of scope:** the attestation binding itself (`report_data_for_restore_ephemeral`, `verify_restore_ephemeral_attestation` — landed in TASK-24 commit 7a90522, matrix-reviewed); the operator-side cert-chain verification (AC#12 out-of-band).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+All 5 ACs met:
+1. GET_RESTORE_PUBKEY fetch bounded ✓ (fetch_restore_attestation → fetch_quote_for_restore in production)
+2. RESTORE_BACKUP completion fetch bounded ✓ (same mechanism)
+3. Both TODOs removed ✓
+4. Regression test for each call site ✓ (restore_path_fetch_kills_wedged_child_within_deadline — exercises the inner helper with smoke_spawn wedge + local ledger; existing wedged_child_returns_at_deadline_not_child_exit pins fetch_quote_via_child directly)
+5. Referenced as RESOLVED in this task ✓ (status: Done, this summary)
+
+CI lane added: cargo test --features vsock-transport,agent-backup-export-preview --lib quote_subprocess — ensures the bounded path + regression test don't bit-rot off-CI.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+PR #109. Both restore-path fetch_report call sites routed through the killable subprocess (fetch_quote_via_child) in production (linux+vsock-transport). Design: pub(crate) widening of fetch_quote_via_child + AbandonedLedger; new fetch_quote_for_restore with process-global OnceLock<Mutex<AbandonedLedger>> (separate from boot-relay's dropped ledger); cfg-gated wrapper (bounded in production, fallback in tests). Regression test: restore_path_fetch_kills_wedged_child_within_deadline (smoke_spawn wedge). CI lane added for vsock+backup-export intersection. Reduced Matrix (codex+gemini+claude-code+grok): compact clean. Gemini HIGH (fixed configfs entry DoS) INVALID — child self-names twod-hsm-q-<pid>.
+<!-- SECTION:FINAL_SUMMARY:END -->
