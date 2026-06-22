@@ -316,7 +316,7 @@ pub(crate) trait QuoteChildSpawn {
 /// sweep after the LAST fetch: children abandoned on late attempts stay zombies until process exit —
 /// `Drop` below runs one final best-effort kill+reap pass to shrink that window, but a still-wedged
 /// child is structurally unreapable and is left to pid-1.
-struct AbandonedLedger<H: ChildHandle> {
+pub(crate) struct AbandonedLedger<H: ChildHandle> {
     children: Vec<H>,
 }
 
@@ -363,21 +363,21 @@ pub(crate) const QUOTE_ATTEMPT_OVERHEAD: Duration =
     REAP_GRACE.saturating_add(Duration::from_millis(2));
 
 impl<H: ChildHandle> AbandonedLedger<H> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             children: Vec::new(),
         }
     }
     /// O(≤budget) WNOHANG sweep: drop every since-exited child, keep the rest. Run at every fetch start
     /// so un-wedged children are reclaimed promptly.
-    fn sweep(&mut self) {
+    pub(crate) fn sweep(&mut self) {
         self.children
             .retain_mut(|h| h.try_reap() == ReapOutcome::Running);
     }
-    fn abandon(&mut self, h: H) {
+    pub(crate) fn abandon(&mut self, h: H) {
         self.children.push(h);
     }
-    fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         self.children.len() >= ABANDONED_CHILD_BUDGET
     }
     #[cfg(test)]
@@ -471,7 +471,7 @@ fn dispose_child<H: ChildHandle>(mut h: H, ledger: &mut AbandonedLedger<H>) {
 /// 8. single relabel arm: the helper-neutral [`DEADLINE_LAPSED_MSG`] becomes
 ///    `"anchor relay: quote pipe deadline lapsed"` by exact-const match (the `connect_bounded` pattern) —
 ///    all other errors pass through with their own triage strings.
-fn fetch_quote_via_child<S: QuoteChildSpawn>(
+pub(crate) fn fetch_quote_via_child<S: QuoteChildSpawn>(
     spawn: &S,
     ledger: &mut AbandonedLedger<S::Handle>,
     report_data: &[u8; 64],
@@ -838,6 +838,80 @@ impl ExecChildSpawn {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// TASK-27: Restore-path bounded quote fetch — a SEPARATE door from the boot-relay's
+// HardBoundedQuoteProducer. The boot-relay claims PROCESS_QUOTE_LEDGER_CLAIMED (one-per-process,
+// never released); the restore path runs AFTER boot when the producer + its ledger are already
+// dropped, so the claim is irrelevant. This door uses fetch_quote_via_child directly with its OWN
+// process-global ledger (OnceLock<Mutex<AbandonedLedger<StdChildHandle>>>), same budget semantics.
+// ---------------------------------------------------------------------------------------------------
+
+/// The deadline for a restore-path quote fetch. The configfs-tsm read typically completes in <1s;
+/// 5s is a generous bound that catches a wedged provider without over-penalizing a slow one.
+#[cfg(feature = "agent-backup-export-preview")]
+const RESTORE_QUOTE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The restore-path abandoned-child ledger — process-global, lazily initialized on first use.
+/// SEPARATE from the boot-relay's ledger (which is dropped after boot, its zombies reaped by Drop).
+/// Same [`ABANDONED_CHILD_BUDGET`] cap: the restore path is low-frequency (operator-called, once per
+/// restore), so the practical zombie accumulation risk is negligible. NB: because this is a SECOND
+/// process-global ledger (the boot-relay's is dropped before this one initializes), the worst-case
+/// zombie ceiling for the process is 2 × ABANDONED_CHILD_BUDGET — acceptable given restore is
+/// operator-frequency and the two ledgers never coexist.
+#[cfg(feature = "agent-backup-export-preview")]
+static RESTORE_QUOTE_LEDGER: std::sync::OnceLock<
+    std::sync::Mutex<AbandonedLedger<StdChildHandle>>,
+> = std::sync::OnceLock::new();
+
+/// Inner orchestration + restore-path error relabel — split out so tests can inject a
+/// [`smoke_spawn`] wedge child + a local ledger (the process-global [`RESTORE_QUOTE_LEDGER`]
+/// hardcodes `ExecChildSpawn::production()`, which re-execs the BIN — not the test binary).
+#[cfg(feature = "agent-backup-export-preview")]
+fn fetch_quote_for_restore_inner<S: QuoteChildSpawn>(
+    spawn: &S,
+    ledger: &mut AbandonedLedger<S::Handle>,
+    report_data: &[u8; 64],
+    deadline: Instant,
+) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+    fetch_quote_via_child(spawn, ledger, report_data, deadline).map_err(|e| match e {
+        // Relabel the boot-relay's triage string to the restore-path context.
+        // NB: this matches the INTERMEDIATE string produced by fetch_quote_via_child's own relabel
+        // (of DEADLINE_LAPSED_MSG → "anchor relay: quote pipe deadline lapsed"). If that intermediate
+        // literal changes, this arm silently falls through — pinned by
+        // restore_path_fetch_kills_wedged_child_within_deadline.
+        ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed") => {
+            ProtocolError::WireProtocol(
+                "restore quote: pipe deadline lapsed (configfs-tsm provider may be wedged)",
+            )
+        }
+        other => other,
+    })
+}
+
+/// Bounded quote fetch for the restore path (TASK-27): routes the configfs-tsm quote read through
+/// a killable subprocess with a hard wall-clock deadline — the SAME mechanism as the boot-relay's
+/// [`HardBoundedQuoteProducer::fetch`], but without the one-per-process claim (the restore path runs
+/// after boot, when the producer is already dropped). A wedged configfs-tsm provider is SIGKILLed
+/// within [`RESTORE_QUOTE_DEADLINE`] (5s); the abandoned child is tracked in
+/// [`RESTORE_QUOTE_LEDGER`] (same budget semantics as the boot-relay). Called from
+/// `install_restore_ephemeral` (GET_RESTORE_PUBKEY) and `restore_seal_attest_commit_emit`
+/// (RESTORE_BACKUP completion attestation) — both run on the serial serve loop, so bounding these
+/// fetches prevents a wedged configfs read from blocking all subsequent agent operations (DoS).
+#[cfg(feature = "agent-backup-export-preview")]
+pub(crate) fn fetch_quote_for_restore(
+    report_data: &[u8; 64],
+) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
+    let ledger = RESTORE_QUOTE_LEDGER.get_or_init(|| std::sync::Mutex::new(AbandonedLedger::new()));
+    let mut guard = ledger.lock().map_err(|_| {
+        ProtocolError::WireProtocol(
+            "restore quote: ledger mutex poisoned (a prior fetch panicked — restart the enclave process)",
+        )
+    })?;
+    let spawn = ExecChildSpawn::production();
+    let deadline = Instant::now() + RESTORE_QUOTE_DEADLINE;
+    fetch_quote_for_restore_inner(&spawn, &mut guard, report_data, deadline)
+}
+
+// ---------------------------------------------------------------------------------------------------
 // (d-ii)/2 — HardBoundedQuoteProducer: the structural serve-gate type. Owns THE one AbandonedLedger.
 // ---------------------------------------------------------------------------------------------------
 
@@ -866,7 +940,11 @@ static PROCESS_QUOTE_LEDGER_CLAIMED: std::sync::atomic::AtomicBool =
 /// [`ABANDONED_CHILD_BUDGET`]'s cross-handshake accumulation hole (a caller looping handshakes must
 /// reuse this one producer or fail closed; ONE boot handshake per process is the design — a supervisor
 /// restart is a new process and claims fresh); (ii) [`fetch_quote_via_child`] and [`AbandonedLedger`]
-/// are module-PRIVATE, so outside this module the producer is the only quote-fetch door — NB the
+/// are `pub(crate)` (widened from module-private by TASK-27 for the restore-path bounded fetch
+/// [`fetch_quote_for_restore`], which runs AFTER boot when the producer is already dropped — it uses
+/// its OWN process-global ledger [`RESTORE_QUOTE_LEDGER`], so the one-per-process claim is not
+/// circumvented: the boot-relay's ledger is gone before the restore ledger is initialized). For the
+/// boot-relay path the producer REMAINS the only quote-fetch door (the §8 concrete-type obligation);
 /// door's SHAPE is not sealed: [`ExecChildSpawn`]'s fields stay pub(crate) (the smokes build test
 /// shapes), so an in-crate caller could claim THE producer over a custom spawner; shape discipline
 /// rests on the (4b) wired wrapper's in-body `ExecChildSpawn::production()` literal
@@ -3345,6 +3423,39 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "must return at the deadline"
+        );
+        assert_eventually_swept(&mut ledger);
+    }
+
+    /// TASK-27 regression: the restore-path fetch kills a wedged child within the deadline and
+    /// produces the RESTORE-PATH relabel (not the boot-relay's "anchor relay" string). Uses the
+    /// same smoke_spawn("wedge") pattern as `wedged_child_returns_at_deadline_not_child_exit` +
+    /// a LOCAL ledger (avoids polluting the process-global RESTORE_QUOTE_LEDGER).
+    #[cfg(feature = "agent-backup-export-preview")]
+    #[test]
+    fn restore_path_fetch_kills_wedged_child_within_deadline() {
+        let mut ledger = AbandonedLedger::new();
+        let start = Instant::now();
+        let err = fetch_quote_for_restore_inner(
+            &smoke_spawn("wedge"),
+            &mut ledger,
+            &[0u8; 64],
+            start + Duration::from_millis(400),
+        )
+        .expect_err("wedged child must lapse");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::WireProtocol(
+                    "restore quote: pipe deadline lapsed (configfs-tsm provider may be wedged)"
+                )
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "must return at the deadline (got {:?})",
+            start.elapsed()
         );
         assert_eventually_swept(&mut ledger);
     }
