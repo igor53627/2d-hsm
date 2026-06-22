@@ -56,9 +56,11 @@ Defines the **cross-repo handoff artifact contract** between the `2d-hsm` restor
 
 ## Implementation Notes
 
-<!-- SECTION:NOTES:BEGIN -->
+<!-- SECTION:IMPL_NOTES:BEGIN -->
 AC#1-#8 contract document landed via PR #107 (merged into main). The contract covers: ceremony+artifact version pins, restore command contract, challenge/nonce echo binding, identity-set field mapping, evidence bundle schema, coverage rule, cross-repo fixture design, scope exclusions. Round-1 (cursor+greptile): fixed Ethereum address derivation [12..32 not 0..20], clarified payload_binding vs attempt_challenge, separated remediation_log from batches[] in the schema. AC#7 fixture test (the 2D-side end-to-end test) is a follow-up PR in the 2d repo — it was split out because it drives 2D-side code paths (RestoreWriter, validator, audit evidence).
-<!-- SECTION:NOTES:END -->
+
+**AC#7 stand-in caveat (claude-code design review job 9839, MEDIUM finding #3 — deferred, not dropped):** AC#7 permits "a documented non-production stand-in that preserves the AC#1–#4 contract" in place of the real enclave handler. Contract §4 states the cross-repo fixture (AC#7) is "the only thing that catches a divergence" between the enclave's `compute_restored_identity_set_hash` and 2D's reimplementation — but if the stand-in does not exercise the real enclave hash function, it cannot detect a SHA-2-vs-SHA-3 / endianness / sort mismatch, making the named safety net illusory. **Resolution:** the 2d-hsm side now exposes `compute_restored_identity_set_hash` + the §4 byte layout as a pinned known-answer vector (contract §4 + `agent_dispatch.rs:2847`). The 2D-side fixture (AC#7, landed as PR #218) MUST assert byte-equality against this pinned vector — not a stand-in reimplementation. Upgrading the fixture to call the real enclave hash (or assert the KAV) is a 2D-repo follow-up; the contract + code now provide the ground truth to pin against. The §4 claim is accurate once the fixture asserts against the real layout; until then the risk is a cross-repo hash mismatch that would surface as "attestation ALWAYS fails to verify" at integration, not a silent forge.
+<!-- SECTION:IMPL_NOTES:END -->
 
 ## Comments
 
@@ -81,8 +83,7 @@ The contract AC#1-#8 document is merged (PR #107) but these content issues mean 
 
 ## Final Summary
 
-<!-- SECTION:FINAL_SUMMARY:BEGIN -->
-PR #107 (2d-hsm, contract doc AC#1-8) + PR #218 (2d, fixture test AC#7). The cross-repo handoff contract is complete: contract document defines the ceremony version pins, restore command contract, challenge/nonce echo, identity-set mapping, evidence bundle schema, coverage rule; the fixture test in 2D drives the full path (baseline → attempt_started → ceremony stand-in → attempt_completed → verify_completion → validator_for → true) and validates the bundle schema rejects invalid shapes. The 2D-side cross-reference to TASK-132.5.3.4 was already landed in commit 771b6ac5.
+PR #107 (2d-hsm, contract doc AC#1-8) + PR #218 (2d, fixture test AC#7). **Status: In Progress** — the contract doc + fixture landed, but compact-9651 surfaced HIGH content issues (AEAD-encrypted keystore means the host cannot read identities; nonce model contradiction; missing public_identity field; remediation_log schema). TASK-28 addressed the response-shape half; the nonce/schema fixes + AC re-verification remain before this task flips to Done.
 <!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Notes
