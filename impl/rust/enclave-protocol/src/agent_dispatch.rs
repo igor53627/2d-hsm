@@ -1928,6 +1928,28 @@ pub(crate) struct RestoreEphemeralPub {
     pub cert_chain: Vec<u8>,
 }
 
+/// Bounded restore-path SNP quote fetch (TASK-27): routes the configfs-tsm quote read through the
+/// killable subprocess in production (linux + vsock-transport — where [`quote_subprocess`] compiles),
+/// falling back to the unbounded in-process `fetch_report` in non-production builds (tests, non-linux).
+/// A wedged configfs-tsm provider is SIGKILLed within the deadline (5s) in production; in tests the
+/// fetch fails immediately (no configfs-tsm on macOS), so the fallback is safe.
+#[cfg(feature = "agent-backup-export-preview")]
+fn fetch_restore_attestation(
+    report_data: &[u8; 64],
+) -> Result<(Vec<u8>, Vec<u8>), crate::ProtocolError> {
+    #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+    {
+        crate::quote_subprocess::fetch_quote_for_restore(report_data)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "vsock-transport")))]
+    {
+        // Non-production fallback: unbounded read (tests never hit a real configfs-tsm;
+        // the fetch fails immediately on macOS/non-SNP hosts). This path is NEVER compiled
+        // into a production release build (agent-gateway-release enables vsock-transport).
+        crate::snp_report::fetch_report(report_data)
+    }
+}
+
 /// Generate + install a FRESH attested restore-ephemeral ML-KEM-1024 keypair (the GET_RESTORE_PUBKEY
 /// opcode's action). **Install-once**: returns `None` if an ephemeral is already installed (a second
 /// GET_RESTORE_PUBKEY this boot is a no-op — the operator re-uses the already-published key until it is
@@ -1959,26 +1981,16 @@ pub(crate) fn install_restore_ephemeral(
     // verify — before re-wrapping — that the key came from the attested enclave (not a host-substituted
     // key). On a non-SNP host the fetch fails ⇒ None (fail-closed: no attestation ⇒ no ephemeral
     // published; the restore ceremony REQUIRES a real TEE). The fixed configfs entry is safe here: the
-    // producer's boot-time fetch is long-complete by ceremony time, and fetch_report unconditionally
-    // cleans up the entry.
-    //
-    // TODO(production-un-gate, compact-9611 Med codex+gemini): `fetch_report` is UNBOUNDED (the same
-    // contract as the producer GET_MEASUREMENT boot path). Unlike GET_MEASUREMENT (boot-only, before the
-    // serve loop), GET_RESTORE_PUBKEY runs IN the serial agent serve loop — a stuck configfs-tsm read
-    // here blocks all later requests (DoS). The crate's accepted bound is the killable subprocess
-    // (quote_subprocess::HardBoundedQuoteProducer); cooperative deadlines were deliberately removed
-    // ((4a)). Routing this fetch through the bounded subprocess is tracked as TASK-27 — a HARD un-gate
-    // blocker (the `agent-backup-export-preview` release-ban was removed in TASK-18 18-9 and the
-    // `agent-gateway-release` Nix profile enables the feature, so this DoS ships the moment RESTORE is
-    // un-gated unless TASK-27 gates it). The ceremony-setup op is low-frequency (operator-called, once
-    // per restore), which limits but does not eliminate the vector.
+    // cleans up the entry. TASK-27: the fetch is now BOUNDED (killable subprocess in production —
+    // a wedged configfs-tsm read is SIGKILLed within 5s, not blocking the serve loop; in tests the
+    // unbounded fallback fails immediately on non-SNP hosts).
     let report_data = crate::snp_report::report_data_for_restore_ephemeral(
         &encaps_key,
         measurement,
         chain_id,
         environment_identifier,
     );
-    let (attestation_report, cert_chain) = crate::snp_report::fetch_report(&report_data).ok()?;
+    let (attestation_report, cert_chain) = fetch_restore_attestation(&report_data).ok()?;
     let pub_info = RestoreEphemeralPub {
         encaps_key: encaps_key.clone(),
         measurement: measurement.to_vec(),
@@ -2411,8 +2423,6 @@ fn commit_before_emit<F: FnOnce(&[u8]) -> Vec<u8>>(
 /// attestation ⇒ no commit). Reuses the shared [`seal_body`] + [`commit_candidate_to_anchor`] primitives;
 /// only the orchestration order is RESTORE-specific. EVERY failure (seal / fetch / commit) ⇒ a §10.9 error
 /// body with NO swap (the live slot is untouched); the caller retires the ephemeral regardless.
-// TODO(production-un-gate, TASK-27): the fetch_report here is UNBOUNDED on the serve loop — route through
-// the bounded subprocess before un-gate (same class as GET_RESTORE_PUBKEY).
 #[cfg(feature = "agent-backup-export-preview")]
 fn restore_seal_attest_commit_emit(
     candidate: Box<KeystoreBody>,
@@ -2453,7 +2463,7 @@ fn restore_seal_attest_commit_emit(
         &env_bytes,
     );
     // (4) fetch the completion attestation — fail-closed: no attestation ⇒ no commit/swap (clean abort).
-    let (attestation_report, cert_chain) = match crate::snp_report::fetch_report(&report_data) {
+    let (attestation_report, cert_chain) = match fetch_restore_attestation(&report_data) {
         Ok(r) => r,
         Err(_) => return encode_agent_error(AgentError::SealFailed),
     };
