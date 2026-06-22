@@ -7787,7 +7787,9 @@ mod tests {
                 report_data_for_restore_completion, verify_restore_completion_attestation,
                 MEASUREMENT_OFFSET, MIN_REPORT_LEN, REPORT_DATA_OFFSET, SNP_MEASUREMENT_LEN,
             };
+            use sha2::Digest;
             let sealed_blob = b"opaque-aead-sealed-keystore-blob".to_vec();
+            let sealed_blob_hash: [u8; 32] = sha2::Sha256::digest(&sealed_blob).into();
             let rid = b"req-restore-task28";
             let measurement = [0x55u8; SNP_MEASUREMENT_LEN];
             let identity = vec![
@@ -7803,12 +7805,12 @@ mod tests {
                 },
             ];
             // Build the completion attestation's report_data + a STAND-IN report (production fetches a real
-            // AMD-signed SNP quote). report_data binds (request_id, identity_set_hash, chain, env).
+            // AMD-signed SNP quote). report_data binds (request_id, identity_set_hash, sealed_blob_hash, chain, env).
             let identity_set_hash = compute_restored_identity_set_hash(&identity);
             let report_data = report_data_for_restore_completion(
                 rid,
                 &identity_set_hash,
-                &[0xCC; 32],
+                &sealed_blob_hash,
                 11565,
                 b"testnet",
             );
@@ -7891,12 +7893,12 @@ mod tests {
                 &report_bytes,
                 rid,
                 &identity_set_hash,
-                &[0xCC; 32],
+                &sealed_blob_hash,
                 &measurement,
                 11565,
                 b"testnet",
             )
-            .expect("the completion attestation binds (request_id, identity_set_hash, chain, env)");
+            .expect("the completion attestation binds (request_id, identity_set_hash, sealed_blob_hash, chain, env)");
             assert_eq!(
                 verified[..],
                 measurement[..],

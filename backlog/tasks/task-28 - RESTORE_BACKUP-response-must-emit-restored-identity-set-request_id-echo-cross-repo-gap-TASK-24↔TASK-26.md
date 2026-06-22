@@ -3,10 +3,10 @@ id: TASK-28
 title: >-
   RESTORE_BACKUP response must emit restored identity set + request_id echo
   (cross-repo gap TASK-24↔TASK-26)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-22 01:02'
-updated_date: '2026-06-22 08:38'
+updated_date: '2026-06-22 11:18'
 labels:
   - agent-gateway
   - restore
@@ -50,6 +50,14 @@ The contract §3 currently says "the host-side frame layer reads each `KeyEntry.
 **Context:** TASK-24 was marked Done on its 12 ACs (the handler restores correctly) — those ACs do not explicitly require the response shape, but the ceremony's downstream contract (TASK-26) does. This task is the durable tracker so the HIGH gap is not hidden behind TASK-24's Done flip. Tracked jointly with TASK-26 (re-opened — its contract doc has the matching HIGH findings).
 <!-- SECTION:DESCRIPTION:END -->
 
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [x] #1 RESTORE_BACKUP success response carries the restored identity set + request_id echo (wire-format change + golden + spec §10.4 update)
+- [x] #2 A test proves the host can derive restored_identity_set_sha256 + verify the request_id echo from the response ALONE (no unsealing)
+- [x] #3 TASK-26 contract §3/§4/§5 aligned to the emitted shape; the nonce model + remediation_log findings resolved
+- [x] #4 2D-side (TASK-132.5.3) consumer updated to read the new fields (cross-repo coordination)
+<!-- AC:END -->
+
 ## Comments
 
 <!-- COMMENTS:BEGIN -->
@@ -76,4 +84,31 @@ created: 2026-06-22 08:38
 ---
 DEFENSE-IN-DEPTH DEFERRED (codex+grok, compact 9703): report_data_for_restore_completion binds the identity set but NOT sha256(sealed_blob) — a host could in principle splice a different valid sealed blob. claude-code verified the realistic instance (replaying an older valid blob) is caught by the anchor anti-rollback at next-boot (strict_recovery_counter/structural_version). Binding sealed_blob_hash is the robust close but requires splitting the shared commit_before_emit seam (risk to the 5 other ops); deferred to a TASK-28 follow-up — documented inline + here, the anchor mitigates the realistic attack. NB: the compact will keep re-verifying this until either the binding lands or the finding is closed with this rationale — it is a tracked defense-in-depth, not a realistic-attack gap.
 ---
+
+created: 2026-06-22 11:18
+---
+#5 — 2026-06-22 10:30
+
+2D-side consumer update (AC#4) LANDED — commit a488d205 (2d repo, branch task-26.6.2-unhalt-prune).
+
+**Changes:**
+- Migration `20260622100000_add_attestation_to_restore_drill_completed.exs`: 5 new columns (request_id_echo, attestation_verified, attestation_report_sha256, attestation_cert_chain_sha256, sealed_blob_sha256) + CHECK constraints (success MUST have attestation_verified=true + all fields non-null/32-byte; failure MUST have all NULL).
+- Schema (`RestoreDrillAttemptCompletedEvent`): `validate_success_evidence` requires attestation fields; `validate_attestation_verified` rejects `attestation_verified != true`.
+- Writer (`RestoreWriter.verify_completion`): reads `attestation_verified` from DB, returns `{:error, :attestation_not_verified}` if not true.
+- Provenance (`RestoreProvenance.row_matches?`): checks `completed_attestation_verified == true` — a batch without verified attestation cannot satisfy the funding gate.
+- Audit evidence: `completed_events` snapshot includes the attestation fields.
+- Tests: all 6 restore test files updated with attestation fields. New enforcement test: "rejects success completion without verified attestation". 554 tests pass, 0 failures.
+
+**2d-hsm side (already done, compact-clean):** RESTORE_BACKUP response carries keys 2-5 (request_id_echo, restored_identity_set, attestation_report, cert_chain) + sealed_blob_sha256 binding (key 1). Completion attestation `report_data` binds the full 5-field tuple `(request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env)` — SHA3-512, domain-separated. Three hash values using two algorithms (compact-9767/9772/9775 all resolved).
+
+**Cross-repo contract (TASK-26, §3/§4/§5):** aligned to the emitted shape. The nonce model is resolved (request_id is the SOLE replay token). The contract requires 2D to verify key 4 before trusting keys 2/3.
+
+All 4 TASK-28 acceptance criteria are now met. The attestation enforcement is defense-in-depth on top of the 2d-hsm anchor anti-rollback (next-boot strict_recovery_counter/structural_version reconcile).
+---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+2D-side attestation enforcement (AC#4) landed (commit a488d205, 2d repo). Migration + schema + writer + provenance + audit evidence + 6 test files updated. 554 tests pass. 2d-hsm side compact-clean (9775). Cross-repo contract (TASK-26) aligned. All 4 ACs met.
+<!-- SECTION:FINAL_SUMMARY:END -->
