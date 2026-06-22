@@ -3068,6 +3068,45 @@ mod tests {
         );
     }
 
+    /// Compact 9611 Med: the audit-seq MonotonicOverflow path (max record seq == u64::MAX ⇒
+    /// next_seq checked_add overflows) fails closed with NO partial mutation — HIGH #3 (compact 9516)
+    /// computes ALL fallible values before any write.
+    #[test]
+    fn apply_restore_audit_seq_overflow_fails_closed_no_mutation() {
+        let mut target = restore_target_body();
+        let pre = target.clone();
+        let mut data = sample_restore_data();
+        data.audit_records[0].seq = u64::MAX; // max seq ⇒ next_seq = MAX+1 overflows
+        assert_eq!(
+            apply_restore_to_body(&mut target, &data, 64),
+            Err(RestoreApplyError::MonotonicOverflow),
+            "audit-seq overflow ⇒ fail closed"
+        );
+        assert_eq!(
+            target, pre,
+            "NO partial mutation on the audit-seq-overflow path (compute-before-write)"
+        );
+    }
+
+    /// Compact 9611 Med: the strict-recovery MonotonicOverflow path (max(local, backup) ==
+    /// u64::MAX ⇒ strict_recovery checked_add overflows) fails closed with NO partial mutation.
+    #[test]
+    fn apply_restore_strict_recovery_overflow_fails_closed_no_mutation() {
+        let mut target = restore_target_body();
+        target.strict_recovery_counter = u64::MAX; // local high-water at the monotonic ceiling
+        let pre = target.clone();
+        let data = sample_restore_data(); // data.strict_recovery_counter (0) ≤ MAX ⇒ max == MAX
+        assert_eq!(
+            apply_restore_to_body(&mut target, &data, 64),
+            Err(RestoreApplyError::MonotonicOverflow),
+            "strict-recovery overflow ⇒ fail closed"
+        );
+        assert_eq!(
+            target, pre,
+            "NO partial mutation on the strict-recovery-overflow path (compute-before-write)"
+        );
+    }
+
     /// AC#7 edge: an empty audit-records backup ⇒ next_seq=1, last_exported_seq=0 (a fresh ring).
     #[test]
     fn apply_restore_empty_audit_records_yields_fresh_cursors() {
