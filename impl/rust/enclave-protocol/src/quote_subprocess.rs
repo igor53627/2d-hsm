@@ -855,8 +855,9 @@ const RESTORE_QUOTE_DEADLINE: Duration = Duration::from_secs(5);
 /// Same [`ABANDONED_CHILD_BUDGET`] cap: the restore path is low-frequency (operator-called, once per
 /// restore), so the practical zombie accumulation risk is negligible.
 #[cfg(feature = "agent-backup-export-preview")]
-static RESTORE_QUOTE_LEDGER: std::sync::OnceLock<std::sync::Mutex<AbandonedLedger<StdChildHandle>>> =
-    std::sync::OnceLock::new();
+static RESTORE_QUOTE_LEDGER: std::sync::OnceLock<
+    std::sync::Mutex<AbandonedLedger<StdChildHandle>>,
+> = std::sync::OnceLock::new();
 
 /// Inner orchestration + restore-path error relabel — split out so tests can inject a
 /// [`smoke_spawn`] wedge child + a local ledger (the process-global [`RESTORE_QUOTE_LEDGER`]
@@ -892,8 +893,7 @@ fn fetch_quote_for_restore_inner<S: QuoteChildSpawn>(
 pub(crate) fn fetch_quote_for_restore(
     report_data: &[u8; 64],
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
-    let ledger = RESTORE_QUOTE_LEDGER
-        .get_or_init(|| std::sync::Mutex::new(AbandonedLedger::new()));
+    let ledger = RESTORE_QUOTE_LEDGER.get_or_init(|| std::sync::Mutex::new(AbandonedLedger::new()));
     let mut guard = ledger.lock().map_err(|_| {
         ProtocolError::WireProtocol(
             "restore quote: ledger mutex poisoned (a prior fetch panicked — restart the enclave process)",
