@@ -7911,7 +7911,7 @@ mod tests {
                     &report_bytes,
                     b"FORGED-fresh-rid",
                     &identity_set_hash,
-                    &[0xCC; 32],
+                &sealed_blob_hash,
                     &measurement,
                     11565,
                     b"testnet",
