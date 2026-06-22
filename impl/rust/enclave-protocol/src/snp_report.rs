@@ -174,6 +174,7 @@ pub fn report_data_for_restore_ephemeral(
     h.update(encaps_key);
     h.update(measurement);
     h.update(chain_id.to_be_bytes());
+    h.update(&(environment_identifier.len() as u64).to_be_bytes()); // length-prefix (consistency with report_data_for_restore_completion)
     h.update(environment_identifier);
     h.finalize().into()
 }
@@ -254,9 +255,9 @@ pub fn report_data_for_restore_completion(
     let mut h = Sha3_512::new();
     h.update(RESTORE_COMPLETION_DOMAIN);
     h.update(chain_id.to_be_bytes());
-    h.update(&(environment_identifier.len() as u64).to_be_bytes()); // length-prefix (compact-9698 Med)
+    h.update((environment_identifier.len() as u64).to_be_bytes()); // length-prefix (compact-9698 Med)
     h.update(environment_identifier);
-    h.update(&(request_id_echo.len() as u64).to_be_bytes()); // length-prefix (no (env,rid) tuple collision)
+    h.update((request_id_echo.len() as u64).to_be_bytes()); // length-prefix (no (env,rid) tuple collision)
     h.update(request_id_echo);
     h.update(identity_set_hash);
     h.update(sealed_blob_hash); // compact-9703: bind the EXACT persisted blob (no host splicing)

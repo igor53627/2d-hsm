@@ -2575,9 +2575,10 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             request_id,
         }) => {
             // RESTORE_BACKUP (rollback-sensitive; Structural — wholesale-replaced body + local+1 structural
-            // bump) goes through the SAME shared seal-before-emit seam. After the commit succeeds the
+            // bump) uses the restore-specific seal→attest→commit→swap→emit seam so the completion
+            // attestation can bind the exact sealed blob. After the commit succeeds the
             // restore-ephemeral key is RETIRED (single-use: a second restore must re-fetch GET_RESTORE_PUBKEY
-            // + fresh attestation + fresh re-wrap). NB: commit_before_emit returns an error BODY on a
+            // + fresh attestation + fresh re-wrap). NB: restore_seal_attest_commit_emit returns an error BODY on a
             // commit failure (not an Err) — the retire below is EAGER (per-attempt single-use): a failed
             // commit still burns this ephemeral, forcing a fresh ceremony for the retry. That is the
             // conservative single-use choice (the ephemeral is NEVER reused); the retry-cost (re-fetch +
@@ -2865,7 +2866,7 @@ fn compute_restored_identity_set_hash(identity_set: &[RestoredKeyIdentity]) -> [
 /// NO `attempt_challenge`; `request_id` is cap-bound + high-water-bound + echoed). Key 3 is the array of
 /// restored-key identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`). Key 4 +
 /// 5 are the completion attestation (compact-9675 HIGH, option A): a fresh SNP report whose `report_data`
-/// binds (request_id, identity_set_hash, chain, env) to the attested enclave, + its cert chain. 2D
+/// binds (request_id, identity_set_hash, sealed_blob_hash, chain, env) to the attested enclave, + its
 /// verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
 /// forge the plaintext evidence. Invoked by the frame-layer seam ONLY after the anchor commit succeeds
 /// (the attestation is fetched BEFORE the commit — fail-closed: no attestation ⇒ no commit/restore).
