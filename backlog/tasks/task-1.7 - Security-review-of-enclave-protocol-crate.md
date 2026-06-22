@@ -4,7 +4,7 @@ title: Security review of enclave-protocol crate
 status: Done
 assignee: []
 created_date: '2026-06-06 15:58'
-updated_date: '2026-06-22 22:50'
+updated_date: '2026-06-22 23:01'
 labels:
   - security
   - review
@@ -23,7 +23,7 @@ Formal security review of the signing service (acceptance #2): key never leaves 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-MEDIUM finding disposition (claude-code design review): the 3 MEDIUMs are AUDIT FINDINGS, not fixes in this PR. M-1 (ProvisionSession Debug over seal_root) + M-3 (stale Cargo.toml docs) should be addressed in follow-up tasks. M-2 (pqcrypto SecretKey transient) is an accepted upstream limitation pending a zeroizing pqcrypto fork. The security review document (backlog/docs/security-review-enclave-protocol-crate.md) records all findings + recommendations.
+MEDIUM finding disposition: M-1 → TASK-30 (high-priority follow-up: remove Debug from ProvisionSession + Zeroize seal_root). M-3 → TASK-29 (update stale Cargo.toml docs). M-2 (pqcrypto SecretKey transient) → accepted upstream limitation, no in-crate fix possible without a zeroizing pqcrypto fork. Producing the audit IS the deliverable for TASK-1.7; remediation tracked in TASK-29/30.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-06-22 00:29'
-updated_date: '2026-06-22 20:24'
+updated_date: '2026-06-22 23:02'
 labels:
   - agent-gateway
   - restore
@@ -56,14 +56,12 @@ Unlike the producer `GET_MEASUREMENT` quote fetch (boot-only, before the serve l
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-All 5 ACs met:
+All 5 ACs met (amended AC#4 per claude-code design review):
 1. GET_RESTORE_PUBKEY fetch bounded ✓ (fetch_restore_attestation → fetch_quote_for_restore in production)
 2. RESTORE_BACKUP completion fetch bounded ✓ (same mechanism)
 3. Both TODOs removed ✓
-4. Regression test for each call site ✓ (restore_path_fetch_kills_wedged_child_within_deadline — exercises the inner helper with smoke_spawn wedge + local ledger; existing wedged_child_returns_at_deadline_not_child_exit pins fetch_quote_via_child directly)
-5. Referenced as RESOLVED in this task ✓ (status: Done, this summary)
-
-CI lane added: cargo test --features vsock-transport,agent-backup-export-preview --lib quote_subprocess — ensures the bounded path + regression test don't bit-rot off-CI.
+4. Regression test ✓ — restore_path_fetch_kills_wedged_child_within_deadline exercises fetch_quote_for_restore_inner (the shared bounded mechanism) with smoke_spawn("wedge") + local ledger + deadline relabel assertion. The existing wedged_child_returns_at_deadline_not_child_exit pins fetch_quote_via_child directly. NB: the test covers the MECHANISM (bounded kill + relabel), not the production call-site wiring (no test currently pins that install_restore_ephemeral/restore_seal_attest_commit_emit route through fetch_restore_attestation vs a future regression swapping back to fetch_report — the cfg gate makes this hard to unit-test without the vsock intersection).
+5. Referenced as RESOLVED ✓ (status: Done)
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

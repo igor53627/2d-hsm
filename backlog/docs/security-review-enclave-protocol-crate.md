@@ -12,13 +12,13 @@
 | Severity | Count | Status |
 |----------|-------|--------|
 | HIGH     | 0     | — |
-| MEDIUM   | 3     | Action recommended |
+| MEDIUM   | 3     | TASK-29 (M-3), TASK-30 (M-1), M-2 accepted-risk |
 | LOW      | 4     | Documented / deferred |
 | INFO     | 3     | No action |
 
 The crate demonstrates strong security discipline: fail-closed error handling on all critical paths, comprehensive AEAD sealing, zero unwrap/expect on untrusted input, sound capability verification, correct anti-rollback, and proper attestation binding. The PQ private key is correctly held in `Zeroizing<Vec<u8>>` with manual Debug redaction. No HIGH-severity exfiltration, bypass, or forge path was found.
 
-Three MEDIUM findings relate to **secret-scrubbing gaps in transient copies** (provisioning root, pqcrypto SecretKey) — real violations of the "all plaintext copies are scrubbed" invariant, but each requires a memory-disclosure side-channel to exploit inside a TEE.
+Three MEDIUM findings relate to **secret-scrubbing gaps**: M-1 (ProvisionSession `derive(Debug)` over the provisioning root — a latent leak: no current code path Debug-formats the session, but `derive(Debug)` makes it trivial for a future change to do so via a panic message to journald, which is host-readable), M-2 (pqcrypto SecretKey transient — upstream limitation, no in-crate zeroize possible), M-3 (stale Cargo.toml docs — documentation, not a vulnerability). M-1 and M-2 require either a panic path that formats the session (M-1) or freed-memory access (M-2) to exploit — neither is a live exfiltration path today, but both violate the "all plaintext copies are scrubbed" invariant. Remediation: M-1 → TASK-30, M-3 → TASK-29, M-2 → accepted-risk waiver.
 
 ---
 
