@@ -27,8 +27,8 @@ The 2D node's `RestoreWriter.verify_completion/2` expects the ceremony to have r
 | `backup_batch.artifact_uri` | `operator.agent_key_backup_batches.artifact_uri` | The URI the operator fetched the encrypted blob from |
 | `backup_batch.artifact_sha256` | `operator.agent_key_backup_batches.artifact_sha256` | Verified by the ceremony's AAD' `original_backup_digest` check |
 | `backup_batch.artifact_size_bytes` | `operator.agent_key_backup_batches.artifact_size_bytes` | Verified by the ceremony's envelope parser (trailing-bytes rejection) |
-| `attempt_started.id` | 2D audit row | The ceremony's `request_id` — binds this ceremony to this specific attempt |
-| `attempt_started.attempt_challenge` | 2D audit row (32-byte nonce) | Used by 2D as the `attempt_started` high-entropy nonce; the ceremony's `request_id` (= `attempt_started.id`) is the value bound into the cap's `payload_binding` (NOT the challenge itself) |
+| `attempt_started.id` | 2D audit row | **The ceremony's `request_id` — the SOLE replay token.** Bound into the cap's `payload_binding` AND the recovery-authority high-water signature AND echoed in the RESTORE_BACKUP response (key 2). A cap+high-water minted for one `request_id` cannot authorize/verify under another ⇒ replay of a prior ceremony output against a fresh attempt is caught at BOTH the cap verify (payload_binding mismatch → 0x43) and the high-water verify (signature bound to request_id). **Nonce model RESOLUTION (was contradictory):** `attempt_started.id` MUST be a fresh high-entropy value per attempt (2D mints it — e.g. a UUID or a CSPRNG-drawn id), so `request_id` carries the challenge entropy directly. |
+| `attempt_started.attempt_challenge` | 2D audit row (32-byte nonce) | **2D-side audit field, NOT a ceremony input.** `decode_restore_request` denies unknown fields — the RESTORE_BACKUP request carries NO `attempt_challenge` field, so the ceremony cannot consume or echo it. 2D records it for its own freshness tracking; it is not part of the ceremony's replay contract (the replay token is `request_id` above). If 2D wants the challenge on the wire, it folds it into `attempt_started.id` (= `request_id`). |
 | `attempt_started.baseline_snapshot_sha256` | 2D audit row | Verified post-restore: the restored identity-set hash must match the baseline recorded when the batch reached `identity_verified` |
 
 ### Ceremony dispatch
@@ -49,13 +49,16 @@ AGENT_ENVELOPE {
 
 ### Ceremony return (what 2D consumes)
 
-The handler returns `AgentResponse::RestoreBackup { candidate: Box<KeystoreBody>, request_id }`. The 2D side does NOT receive the candidate body directly (it stays inside the enclave); instead, the host-side frame layer extracts:
+The handler returns `AgentResponse::RestoreBackup { candidate: Box<KeystoreBody>, request_id }`. The 2D side does NOT receive the candidate body directly (it stays inside the enclave). The RESTORE_BACKUP success wire body (§10.4 of the vsock wire-format spec; TASK-24 + TASK-28) is `{1: sealed_keystore_blob, 2: request_id_echo, 3: restored_identity_set, 4: attestation_report, 5: cert_chain}`. The sealed keystore (key 1) is **XChaCha20Poly1305 AEAD-encrypted** (`agent_keystore.rs`) — the host CANNOT read plaintext `KeyEntry` fields from it. So the **enclave-side frame layer** extracts the identity evidence from the plaintext candidate (before/around the seal) and emits it on the wire. **CRITICAL (compact-9698 HIGH): keys 2 + 3 are PLAINTEXT — 2D MUST verify key 4 (the completion attestation) BEFORE trusting them**, or a compromised host can forge the evidence. The attestation is a fresh SNP report whose `report_data` binds (request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env) — the FULL 5-field tuple, including the EXACT sealed blob the host persists — to the attested enclave. **Three hash values using two algorithms are in play here — do NOT conflate them (a prior reviewer did, reading one as the other):** (a) the `report_data` ATTESTATION BINDING is **SHA3-512** (the 64-byte SNP `report_data` field, domain-separated — the exact preimage is in the table below); (b) `restored_identity_set_sha256` (one of the five fields that binding covers) is **SHA-2-256** over the §4 binary layout (what 2D recomputes from key 3 + records in the bundle); (c) `sealed_blob_sha256` (another bound field) is **SHA-2-256** of response key 1 (the persisted sealed blob). Different algorithms for (a) vs (b)/(c), different purposes — using SHA-2 for the binding or SHA-3 for the identity/blob hash makes the attestation ALWAYS fail to verify:
 
-| Return artifact | How extracted | What 2D records |
+| Return artifact | Where on the wire | What 2D records |
 |---|---|---|
-| Restored identity set | The frame layer reads each `KeyEntry.public_identity` from the sealed candidate and computes the `agent_restore_identity_set_v1` hash | `attempt_completed.restored_identity_set_sha256` |
-| Challenge echo | `request_id` in the response == `request_id` in the request == `attempt_started.id` | `attempt_completed.attempt_challenge` (proves ceremony consumed the live nonce) |
+| **Completion attestation (MUST verify first)** | **Key 4** — the SNP `attestation_report` (AMD-signed); **key 5** — its VCEK→ASK→ARK `cert_chain`. 2D verifies: the cert chain against the AMD root, the report's `measurement` == the expected enclave build, AND the report's `report_data` == `report_data_for_restore_completion(request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env)` (compact-9703 — the binding INCLUDES the sealed blob). **Only after this verifies** may 2D trust keys 2 + 3. The exact `report_data` preimage (SHA3-512, domain-separated) — both sides MUST compute identically: `RESTORE_COMPLETION_DOMAIN ‖ chain_id(u64 BE) ‖ env_len(u64 BE) ‖ env ‖ request_id_len(u64 BE) ‖ request_id ‖ identity_set_hash(32) ‖ sealed_blob_hash(32)`. | `attempt_completed.attestation_verified = true` (+ the report/cert bytes for audit) |
+| Restored identity set | Key 3 — array of `{1: key_ref(32B), 2: public_identity(65B), 3: key_purpose}`, emitted PLAINTEXT. Trusted ONLY if key 4 verifies. 2D maps to `agent_restore_identity_set_v1` (§4) + derives the Ethereum address. | `attempt_completed.restored_identity_set_sha256` |
+| Challenge echo | Key 2 — `request_id_echo` == `attempt_started.id` (cap-bound). Trusted ONLY if key 4 verifies (the attestation binds it). | `attempt_completed.request_id_echo` |
 | Ceremony success | No error code (0x00 ACK) | `attempt_completed.result = "success"` |
+
+`secret_scalar` is NEVER emitted. **A 2D implementation that records completion WITHOUT verifying key 4 leaves the host-forge attack open** — the enclave-side defense is useless if the consumer doesn't enforce it. compact-9703: the completion attestation binds the FULL tuple `(request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env)` — including the EXACT sealed blob the host persists (key 1), so a host that splices a different valid sealed blob while keeping the attested plaintext evidence fails the binding (2D MUST compute `SHA-2-256(response key 1)` and confirm it matches the attested `sealed_blob_sha256`). The anchor anti-rollback (next-boot strict_recovery_counter / structural_version reconcile) remains a defense-in-depth-of-defense-in-depth that catches a substituted older blob even if the attestation binding were somehow bypassed.
 
 ### Non-production fixture path
 
@@ -65,13 +68,13 @@ The fixture path uses the same handler (under `agent-backup-export-preview` feat
 
 ### Where the echo lives
 
-The `request_id` field of the `AGENT_ENVELOPE` is the challenge nonce. It flows:
+The ceremony's `request_id` (envelope-level) is the replay token. It flows:
 
-1. **2D commits** `attempt_started` with a high-entropy `attempt_challenge` (32-byte random nonce).
+1. **2D commits** `attempt_started` with a high-entropy `id` (this becomes `request_id`; see §2 — `attempt_challenge` is a separate 2D audit field, NOT a ceremony input).
 2. **Operator** passes `attempt_started.id` as the ceremony's `request_id`.
-3. **Ceremony** binds the `request_id` into the cap's `payload_binding` (`restore_canonical_params(requested_refs, backup_digest)` + `request_id`). A cap issued for one `request_id` cannot authorize a different one.
-4. **Ceremony** returns `AgentResponse::RestoreBackup { request_id }` — the SAME value.
-5. **2D** verifies `attempt_completed.attempt_challenge == the value it committed in attempt_started` AND `ceremony_response.request_id == attempt_started.id`.
+3. **Ceremony** binds the `request_id` into the cap's `payload_binding` (`restore_canonical_params(requested_refs, backup_digest)` + `request_id`) AND the recovery-authority high-water signature. A cap+high-water issued for one `request_id` cannot authorize/verify under another.
+4. **Ceremony** echoes `request_id` in the RESTORE_BACKUP success body (key 2 — emitted by the enclave-side frame layer; the ceremony receives no `attempt_challenge`, see §2).
+5. **2D** — AFTER the completion attestation (§2, key 4) verifies AND its `report_data` binds this same `request_id_echo` — verifies `ceremony_response.request_id_echo == attempt_started.id` (the ceremony consumed 2D's live attempt; the plaintext echo is trusted ONLY because the attestation bound it) AND records its own `attempt_completed.attempt_challenge` from its committed `attempt_started.attempt_challenge` (a 2D-side consistency record, not a ceremony echo).
 
 ### Replay prevention
 
@@ -90,8 +93,9 @@ A replay of a prior ceremony output against a fresh `attempt_started` is detecte
       "backend": "twod_hsm",
       "algorithm": "secp256k1",
       "key_ref": "hex-string",
+      "public_identity": "hex-65 (uncompressed SEC1 0x04‖X‖Y — from the RESTORE_BACKUP response key 3)",
       "status": "assigned",
-      "address": "0x..."
+      "address": "0x... (derived: keccak256(public_identity[1..65])[12..32])"
     }
   ]
 }
@@ -111,7 +115,18 @@ The ceremony's restored `KeystoreBody.entries` (type `KeyEntry`) maps to the 2D 
 | `status` | (not in KeyEntry) | Derived from the 2D batch's key-row status at baseline time (the ceremony restores the entries; the status is a 2D-side lifecycle field, not an enclave property) |
 | `address` | `KeyEntry.public_identity` | Derive the 20-byte Ethereum address from the 65-byte uncompressed SEC1 public key: `keccak256(pubkey[1..65])[12..32]` (standard Ethereum derivation — the LAST 20 bytes of the 32-byte hash, matching `secp256k1.rs:address_from_uncompressed_xy`) |
 
-The restored identity-set SHA-256 hash is computed over the canonical JSON of this entry set (sorted by `(source_table, row_id)`, lowercase strings, explicit nulls — same canonicalization as 2D's `RestoreCanonical.identity_set_hash/1`).
+**`restored_identity_set_sha256` — the EXACT pinned byte layout (compact-9675, TASK-28 attestation binding).** This hash is bound into the RESTORE_BACKUP completion attestation (§3) AND recorded in the bundle, so 2D + the enclave MUST compute it byte-identically. **Algorithm: SHA-2-256 (NIST FIPS 180-4) — NOT SHA-3 / Keccak.** Input is a fixed length-prefixed binary stream (NOT JSON — JSON canonicalization is 2D-internal only, NOT the attested form):
+
+```
+count(u64 big-endian)
+for each entry, sorted ascending by key_ref (the 32-byte opaque handle):
+    key_ref(32 bytes, raw)
+    public_identity_len(u64 big-endian)
+    public_identity(public_identity_len bytes — the 65-byte uncompressed SEC1, 0x04‖X‖Y)
+    key_purpose(u64 big-endian; 1=agent_transfer_k1, 2=agent_faucet_treasury_k1)
+```
+
+2D reimplements this exact layout (`agent_dispatch.rs::compute_restored_identity_set_hash` is the reference). A mismatch (SHA-3 instead of SHA-2, wrong endianness, wrong sort, JSON vs binary) makes the attestation ALWAYS fail to verify — the cross-repo fixture (AC#7) is the only thing that catches a divergence; the enclave's own tests are symmetric (same fn binds + verifies) and will NOT catch it.
 
 ## 5. Production-readiness evidence bundle schema (AC#5)
 
@@ -138,10 +153,14 @@ The restored identity-set SHA-256 hash is computed over the canonical JSON of th
       "artifact_size_bytes": 12345,
       "attempt_started_event_id": "uuid",
       "attempt_completed_event_id": "uuid",
-      "attempt_challenge_echo": "hex-32",
+      "request_id_echo": "hex (== attempt_started.id; from the ceremony's RESTORE_BACKUP response key 2)",
       "expected_identity_set_sha256": "hex",
       "restored_identity_set_sha256": "hex",
       "identity_match": true,
+      "attestation_verified": true,
+      "attestation_report_sha256": "hex (SHA-2-256 of the RESTORE_BACKUP response key 4 — the AMD-signed completion report; 2D verifies report_data binds (request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env) + measurement == expected, per §3)",
+      "attestation_cert_chain_sha256": "hex (SHA-2-256 of response key 5; the full cert bytes are retained for audit)",
+      "sealed_blob_sha256": "hex (SHA-2-256 of the persisted sealed keystore blob — response key 1; the attestation binds this)",
       "remediation_status": null
     }
   ],
@@ -160,6 +179,7 @@ The restored identity-set SHA-256 hash is computed over the canonical JSON of th
 - `ceremony.restore_ingress_envelope_format_version == 1`
 - Every batch entry has `identity_match == true`. A batch that FAILED the identity check must NOT appear in `batches[]` — instead it is documented in a separate `remediation_log[]` array with its `backup_batch_id` + `remediation_status`. The linked 2D rows for remediated batches MUST be disabled/retired before enforcement.
 - Every batch in `batches[]` has `expected_identity_set_sha256 == restored_identity_set_sha256`
+- Every batch in `batches[]` has `attestation_verified == true` AND `attestation_report_sha256` + `attestation_cert_chain_sha256` + `sealed_blob_sha256` non-empty (compact-9675/9703: the host-forge defense is useless if the consumer doesn't enforce the completion attestation — a batch without verified attestation MUST NOT satisfy the gate)
 - `sign_off` has both fields non-empty
 
 ## 6. Production coverage rule (AC#6)

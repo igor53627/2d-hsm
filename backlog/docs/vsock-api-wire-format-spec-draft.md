@@ -646,7 +646,7 @@ Mixed-role fixtures are permitted only in non-deployable tests.
 | 6 | `AGENT_K1_CONFIGURE_TREASURY` | treasury admin / recovery | **enclave** (AC#12) |
 | 7 | `AGENT_KEYSTORE_EXPORT_BACKUP` | backup-export admin | enclave default |
 | 8 | `AGENT_KEYSTORE_RESTORE_BACKUP` | recovery/quorum | recovery counter |
-| **9** | `AGENT_K1_SIGN_TRON_TRANSFER` | **RESERVED** (eth-MVP + reserve-TRON) — fail-closed until a future task | — |
+| **9** | `AGENT_K1_GET_RESTORE_PUBKEY` | low-privilege ceremony read | — (TASK-24: publishes the attested ephemeral ML-KEM-1024 key the operator re-wraps the DR backup to; response `{1: encaps_key(1568B), 2: measurement(48B), 3: attestation_report, 4: cert_chain}` — see §10.4. Non-mutating/NotCommitted. NB this opcode was RESERVED for a future SIGN_TRON_TRANSFER in an earlier draft; that slot is now vacant — TRON transfer, if ever added, takes a new opcode ≥ 10.) |
 | 0, 10.. | reserved; decoder fails closed on any non-allow-listed opcode | | |
 
 `CONFIGURE_TREASURY` sub-operations are an **inner discriminant** (not separate opcodes):
@@ -654,7 +654,7 @@ Mixed-role fixtures are permitted only in non-deployable tests.
 (AC#8), each validated by exhaustive allow-list and mapped to a capability tier (§10.7).
 
 **Capability requirement per opcode** (resolves the inner-envelope key-5 condition):
-- **No capability — low-privilege reads:** `PUBLIC_IDENTITY`, `PROVE_IDENTITY`.
+- **No capability — low-privilege reads:** `PUBLIC_IDENTITY`, `PROVE_IDENTITY`, `GET_RESTORE_PUBKEY` (ceremony-setup: publishes the attested ephemeral pubkey the operator re-wraps to; the pubkey is public+attested, no sealed-state mutation).
 - **No administrative capability — runtime signing:** `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE`.
   These do **not** carry capability key 5; per the threat model they are reachable by any
   vsock caller, and their bound is the enclave-built canonical preimage (no caller digest),
@@ -729,6 +729,26 @@ and error contract, with the per-command map carried at envelope key 7:
   2: eth_address (20B), 3: tron_address (Base58Check of 0x41‖body), 4: key_ref,
   5: key_purpose, 6: backend_version}`. Returning **both** address encodings reflects the
   unified-account model (TRON-reserve decision).
+- **`AGENT_KEYSTORE_RESTORE_BACKUP`** success response (TASK-24 + TASK-28) — `{1: sealed_keystore_blob,
+  2: request_id_echo, 3: restored_identity_set, 4: attestation_report, 5: cert_chain}`. Key 1 is the
+  AEAD-sealed post-restore keystore (XChaCha20Poly1305 — host-opaque). Key 2 echoes the cap-bound
+  `request_id` (the SOLE replay token — nonce model, TASK-26 §2). Key 3 is the restored-key identity
+  evidence, each entry `{1: key_ref(32B), 2: public_identity(65B uncompressed SEC1), 3: key_purpose(uint)}`,
+  emitted PLAINTEXT by the enclave-side frame layer (the host CANNOT unseal key 1). Keys 4 + 5 are the
+  **completion attestation** (compact-9675 HIGH, option A): a fresh SNP report whose `report_data` binds
+  (request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env) — the FULL 5-field tuple,
+  including the EXACT sealed blob (SHA-2-256 of key 1) the host persists — to the attested enclave + its
+  cert chain. 2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a
+  host could forge the plaintext evidence (replay a fresh request_id against an old sealed blob + expected
+  identities) OR splice a different valid sealed blob. NB three hash values using two algorithms:
+  `report_data = SHA3-512(...)` (64-byte SNP field, domain-separated); `restored_identity_set_sha256 =
+  SHA-2-256(key 3 layout, §4)`; `sealed_blob_sha256 = SHA-2-256(response key 1)`. `secret_scalar` is NEVER
+  emitted. The request payload (key 7) is
+  `{1: ingress_envelope, 2: original_backup, 3: requested_refs, 4: recovery_high_water}`. Mutating /
+  Structural; routes through the seal→anchor-commit→swap→emit seam (the attestation is fetched BEFORE the
+  commit — fail-closed); production-gated behind `agent-backup-export-preview` (TASK-27 is a hard un-gate
+  blocker for the TWO unbounded restore-path quote fetches: GET_RESTORE_PUBKEY + RESTORE_BACKUP completion).
+  Error bands: request shape → 0x40; cap tier / payload_binding → 0x43; seal/commit/attestation-fetch → 0x46.
 
 ### 10.5 Administrative / recovery capability (AC#6, AC#7, AC#11)
 
@@ -824,9 +844,9 @@ host-controlled).
   | `GENERATE_KEYS` purpose=2 (faucet treasury) | **enclave only** (`scope_class != 0` → 0x43) | ✅ `agent_dispatch.rs:949` | mints the on-chain treasury key → budget-multiplication guard (AC#12). Pinned by `generate_keys_fleet_scoped_treasury_rejected`. |
   | `CONFIGURE_TREASURY` (all sub_ops 0..=3) | **enclave only** (`scope_class != 0` → 0x43) | ✅ `agent_dispatch.rs:1157` | raises/refills/resets spend authority + lifetime breaker (AC#12). Pinned by `fleet_scope_rejected_0x43`. |
   | `EXPORT_BACKUP` | **enclave default** (issuance convention, NOT enforced) | ❌ convention | EXPORT is DR-read (not spend authority); a fleet-scoped export on a clone exports that clone's own keystore (no budget multiplication); whole-blob-copy clones are caught by the §3 anchor anti-rollback (counters travel with the blob), not by AC#1. NB this row covers the **scope_class** decision only — EXPORT ALSO has a SEPARATE rollback surface (`last_exported_seq` / AC#14 audit-completeness — a dropped EXPORT seal rolls back the audit high-water, anti-rollback §3) that is INDEPENDENT of spend authority and stays guarded by the EXPORT=Structural commit-class + the anchor, NOT by scope_class; the un-gate-time (18-6) decision must address BOTH. A future fleet-export DR scenario may legitimately want scope_class=1; this is an issuance convention — the operator MUST mint enclave-scoped EXPORT caps unless they explicitly accept the residual; if hardened to enforced, do so at/before the EXPORT un-gate (18-6) with a paired fleet-rejected test. |
-  | `RESTORE_BACKUP` | recovery tier (own counter, not a fleet/enclave policy) | n/a | no handler yet (TASK-24); restore is wholesale-replace + recovery-counter, not a fleet/enclave policy decision. |
+  | `RESTORE_BACKUP` | recovery tier (own counter, not a fleet/enclave policy) | n/a | handler landed (TASK-24, multi-vendor matrix-reviewed); restore is wholesale-replace + recovery-counter, not a fleet/enclave policy decision. Success response emits the restored identity set + request_id echo (§10.4) — the host cannot read the AEAD-sealed blob. |
   | `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE` | n/a (no capability) | n/a | runtime signing — no cap ⇒ no scope_class. SIGN_FAUCET_DISPENSE spend is bounded by the **sealed faucet caps** (`per_dispense_max_amount` / `max_gas_limit` / `max_effective_gas_fee_rate` / `cumulative_signing_budget` / `circuit_breaker_threshold`, set enclave-only via CONFIGURE_TREASURY above) + the per-dispense `cumulative_native_spend`/`lifetime_spend` debit + **seal-before-emit + the anchor commit** (anti-rollback §3) — i.e. a clone replaying a faucet dispense has NO budget to spend against (the treasury key + caps are enclave-only), so scope_class is moot. SIGN_TRANSFER is bounded by the secp256k1 key entry + the canonical payload. |
-  | `PUBLIC_IDENTITY`, `PROVE_IDENTITY` | n/a (no capability) | n/a | low-privilege reads. |
+  | `PUBLIC_IDENTITY`, `PROVE_IDENTITY`, `GET_RESTORE_PUBKEY` | n/a (no capability) | n/a | low-privilege reads / ceremony-setup (GET_RESTORE_PUBKEY publishes the attested ephemeral pubkey — no sealed-state mutation, no spend authority). |
 
   **This table IS the 18-5 completeness proof:** for every privileged/runtime opcode, the audit
   either shows the enclave-only enforcement with its paired test, or justifies (with a reason + the

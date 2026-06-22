@@ -364,6 +364,11 @@ pub enum AgentResponse {
     GetRestorePubkey {
         encaps_key: Vec<u8>,
         measurement: Vec<u8>,
+        /// The fresh SNP attestation report binding the ephemeral key to this TEE (compact 9611 HIGH #2).
+        /// The operator verifies report_data + measurement out-of-band BEFORE re-wrapping.
+        attestation_report: Vec<u8>,
+        /// The VCEK→ASK→ARK cert chain (best-effort; may be empty → operator fetches from AMD KDS).
+        cert_chain: Vec<u8>,
     },
 }
 
@@ -638,15 +643,23 @@ pub(crate) fn dispatch_agent(
 #[cfg(feature = "agent-backup-export-preview")]
 fn handle_get_restore_pubkey(
     _env: &AgentEnvelope,
-    _keystore: &KeystoreBody,
+    keystore: &KeystoreBody,
     measurement: &[u8],
 ) -> Result<AgentResponse, AgentError> {
     let pub_info = published_restore_ephemeral()
-        .or_else(|| install_restore_ephemeral(measurement))
+        .or_else(|| {
+            install_restore_ephemeral(
+                measurement,
+                keystore.config.twod_chain_id,
+                keystore.config.environment_identifier.as_bytes(),
+            )
+        })
         .ok_or(AgentError::SealFailed)?;
     Ok(AgentResponse::GetRestorePubkey {
         encaps_key: pub_info.encaps_key,
         measurement: pub_info.measurement,
+        attestation_report: pub_info.attestation_report,
+        cert_chain: pub_info.cert_chain,
     })
 }
 
@@ -1645,9 +1658,9 @@ fn handle_export_backup(
 fn restore_canonical_params(requested_refs: &[[u8; 32]], backup_digest: &[u8; 32]) -> Vec<u8> {
     use crate::agent_capability::{put_bytes, put_uint};
     let mut out = Vec::new();
-    put_uint(&mut out, 0xA0, 2); // map(2)
+    put_uint(&mut out, 5, 2); // map(2) — major type 5 (NOT the composed byte 0xA0; put_uint shifts major<<5)
     put_uint(&mut out, 0, 1); // key 1: requested_refs
-    put_uint(&mut out, 0x80, requested_refs.len() as u64); // array(n)
+    put_uint(&mut out, 4, requested_refs.len() as u64); // array(n) — major type 4 (NOT 0x80)
     for r in requested_refs {
         put_bytes(&mut out, r);
     }
@@ -1705,6 +1718,21 @@ fn handle_restore_backup(
         keystore.config.environment_identifier.as_bytes(),
     )
     .map_err(|_| AgentError::SealFailed)?;
+    // (5c) AC#10 wrapping-key separation (compact 9611 HIGH): the backup was sealed to the SAME recovery
+    //      wrapping key this enclave holds. The AAD' `original_backup_digest` check above only confirms the
+    //      operator re-wrapped the EXACT authorized backup; it does NOT confirm that backup was sealed to
+    //      this enclave's `backup_recovery_wrapping_pubkey`. A backup sealed to a different ML-KEM key
+    //      (e.g. authorized by the recovery authority but from a different fleet's wrapping key) would
+    //      otherwise decrypt to garbage here; enforcing the header's `recovery_key_id` == the sealed key's
+    //      derived id closes the AC#10 "distinct authority vs wrapping-key roles" invariant.
+    let sealed_rid = crate::agent_backup::derive_recovery_key_id(
+        &keystore.config.backup_recovery_wrapping_pubkey,
+    );
+    let backup_rid = crate::agent_backup::backup_recovery_key_id(&req.original_backup)
+        .map_err(|_| AgentError::Malformed)?;
+    if backup_rid != sealed_rid.as_slice() {
+        return Err(AgentError::SealFailed);
+    }
     // (5b) HIGH #1 (compact 9499): payload_binding — bind the cap to THIS restore's params (the key
     //      selector + the backup digest). A cap issued for one restore cannot authorize a different one.
     let canonical = restore_canonical_params(&req.requested_refs, &opened.original_backup_digest);
@@ -1870,6 +1898,15 @@ struct InstalledRestoreEphemeral {
     /// The attestation measurement this ephemeral key was published under — IS the `dest_measurement`
     /// the RESTORE handler checks against the envelope's AAD' (`opened.dest_measurement == OWN`).
     measurement: Vec<u8>,
+    /// The fresh SNP attestation report whose `report_data` binds the ephemeral key to this TEE (compact
+    /// 9611 HIGH #2). Returned by GET_RESTORE_PUBKEY so the operator verifies — BEFORE re-wrapping — that
+    /// the key came from the attested enclave (not a host-substituted key). The report echoes
+    /// `report_data_for_restore_ephemeral(encaps_key, measurement, chain, env)` and carries the AMD-signed
+    /// measurement; operator verification is out-of-band (AC#12) via the cert chain below.
+    attestation_report: Vec<u8>,
+    /// The VCEK→ASK→ARK cert chain for the attestation report (configfs-tsm `auxblob`; best-effort — may be
+    /// empty, in which case the operator fetches the chain from AMD KDS by VCEK serial).
+    cert_chain: Vec<u8>,
 }
 
 /// Process-global slot for the destination restore-ephemeral keypair. Const-init `None` ⇒ no ephemeral
@@ -1881,12 +1918,14 @@ static INSTALLED_RESTORE_EPHEMERAL: Mutex<Option<InstalledRestoreEphemeral>> = M
 
 /// The GET_RESTORE_PUBKEY opcode response: the attested ephemeral public key + the measurement it was
 /// published under (the operator verifies the attestation binds the two out-of-band — AC#12 — then
-/// re-wraps the backup to the pubkey).
-#[cfg(feature = "agent-backup-export-preview")]
-#[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
 pub(crate) struct RestoreEphemeralPub {
     pub encaps_key: Vec<u8>,
     pub measurement: Vec<u8>,
+    /// The fresh SNP attestation report binding the ephemeral key to this TEE (compact 9611 HIGH #2).
+    /// The operator verifies the report's `report_data` + measurement out-of-band BEFORE re-wrapping.
+    pub attestation_report: Vec<u8>,
+    /// The VCEK→ASK→ARK cert chain for the attestation report (best-effort; may be empty).
+    pub cert_chain: Vec<u8>,
 }
 
 /// Generate + install a FRESH attested restore-ephemeral ML-KEM-1024 keypair (the GET_RESTORE_PUBKEY
@@ -1898,7 +1937,11 @@ pub(crate) struct RestoreEphemeralPub {
 /// (`getrandom`), never host-supplied.
 #[cfg(feature = "agent-backup-export-preview")]
 #[allow(dead_code)] // primitive ahead of consumer (Sub-slice 2a-ii opcode wires it)
-pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEphemeralPub> {
+pub(crate) fn install_restore_ephemeral(
+    measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> Option<RestoreEphemeralPub> {
     use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
     // An empty measurement would make the AAD' `dest_measurement == OWN` check meaningless — reject up
     // front (mirrors `install_agent_keystore`'s empty-measurement guard).
@@ -1911,9 +1954,36 @@ pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEph
     getrandom::getrandom(&mut seed[..]).ok()?;
     let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*seed));
     let encaps_key = dk.encapsulation_key().to_bytes().as_slice().to_vec();
+    // Compact 9611 HIGH #2 (AC#1 "attested ephemeral key"): fetch a FRESH SNP attestation whose
+    // report_data binds the ephemeral key to THIS TEE (measurement + chain + env), so the operator can
+    // verify — before re-wrapping — that the key came from the attested enclave (not a host-substituted
+    // key). On a non-SNP host the fetch fails ⇒ None (fail-closed: no attestation ⇒ no ephemeral
+    // published; the restore ceremony REQUIRES a real TEE). The fixed configfs entry is safe here: the
+    // producer's boot-time fetch is long-complete by ceremony time, and fetch_report unconditionally
+    // cleans up the entry.
+    //
+    // TODO(production-un-gate, compact-9611 Med codex+gemini): `fetch_report` is UNBOUNDED (the same
+    // contract as the producer GET_MEASUREMENT boot path). Unlike GET_MEASUREMENT (boot-only, before the
+    // serve loop), GET_RESTORE_PUBKEY runs IN the serial agent serve loop — a stuck configfs-tsm read
+    // here blocks all later requests (DoS). The crate's accepted bound is the killable subprocess
+    // (quote_subprocess::HardBoundedQuoteProducer); cooperative deadlines were deliberately removed
+    // ((4a)). Routing this fetch through the bounded subprocess is tracked as TASK-27 — a HARD un-gate
+    // blocker (the `agent-backup-export-preview` release-ban was removed in TASK-18 18-9 and the
+    // `agent-gateway-release` Nix profile enables the feature, so this DoS ships the moment RESTORE is
+    // un-gated unless TASK-27 gates it). The ceremony-setup op is low-frequency (operator-called, once
+    // per restore), which limits but does not eliminate the vector.
+    let report_data = crate::snp_report::report_data_for_restore_ephemeral(
+        &encaps_key,
+        measurement,
+        chain_id,
+        environment_identifier,
+    );
+    let (attestation_report, cert_chain) = crate::snp_report::fetch_report(&report_data).ok()?;
     let pub_info = RestoreEphemeralPub {
         encaps_key: encaps_key.clone(),
         measurement: measurement.to_vec(),
+        attestation_report,
+        cert_chain,
     };
     let mut guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
     if guard.is_some() {
@@ -1923,6 +1993,8 @@ pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEph
         encaps_key,
         decaps_seed: seed,
         measurement: measurement.to_vec(),
+        attestation_report: pub_info.attestation_report.clone(),
+        cert_chain: pub_info.cert_chain.clone(),
     });
     Some(pub_info)
 }
@@ -1937,6 +2009,8 @@ pub(crate) fn install_restore_ephemeral(measurement: &[u8]) -> Option<RestoreEph
 pub(crate) fn install_restore_ephemeral_with_seed(
     measurement: &[u8],
     seed: &[u8; 64],
+    chain_id: u64,
+    environment_identifier: &[u8],
 ) -> Option<RestoreEphemeralPub> {
     use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
     if measurement.is_empty() {
@@ -1944,9 +2018,29 @@ pub(crate) fn install_restore_ephemeral_with_seed(
     }
     let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*seed));
     let encaps_key = dk.encapsulation_key().to_bytes().as_slice().to_vec();
+    // Compact 9611 HIGH #2: build a STAND-IN attestation report (the production path fetches a real SNP
+    // quote via fetch_report, unavailable in tests). The stand-in patches the binding into report_data +
+    // the measurement so the operator-verification helper runs end-to-end; the AMD-signature half of
+    // verification is out-of-crate (the operator verifies the cert chain against the AMD root offline).
+    let report_data = crate::snp_report::report_data_for_restore_ephemeral(
+        &encaps_key,
+        measurement,
+        chain_id,
+        environment_identifier,
+    );
+    let mut attestation_report = vec![0u8; crate::snp_report::MIN_REPORT_LEN];
+    let rd_off = crate::snp_report::REPORT_DATA_OFFSET;
+    attestation_report[rd_off..rd_off + 64].copy_from_slice(&report_data);
+    let m_off = crate::snp_report::MEASUREMENT_OFFSET;
+    let m_len = measurement
+        .len()
+        .min(crate::snp_report::SNP_MEASUREMENT_LEN);
+    attestation_report[m_off..m_off + m_len].copy_from_slice(&measurement[..m_len]);
     let pub_info = RestoreEphemeralPub {
         encaps_key: encaps_key.clone(),
         measurement: measurement.to_vec(),
+        attestation_report: attestation_report.clone(),
+        cert_chain: Vec::new(), // stand-in: no cert chain (operator fetches from AMD KDS in production)
     };
     let mut guard = INSTALLED_RESTORE_EPHEMERAL.lock().ok()?;
     if guard.is_some() {
@@ -1956,6 +2050,8 @@ pub(crate) fn install_restore_ephemeral_with_seed(
         encaps_key,
         decaps_seed: zeroize::Zeroizing::new(*seed),
         measurement: measurement.to_vec(),
+        attestation_report,
+        cert_chain: Vec::new(),
     });
     Some(pub_info)
 }
@@ -1983,6 +2079,8 @@ pub(crate) fn published_restore_ephemeral() -> Option<RestoreEphemeralPub> {
     guard.as_ref().map(|e| RestoreEphemeralPub {
         encaps_key: e.encaps_key.clone(),
         measurement: e.measurement.clone(),
+        attestation_report: e.attestation_report.clone(),
+        cert_chain: e.cert_chain.clone(),
     })
 }
 
@@ -2306,6 +2404,77 @@ fn commit_before_emit<F: FnOnce(&[u8]) -> Vec<u8>>(
     body
 }
 
+/// RESTORE_BACKUP commit path — a RESTORE-SPECIFIC seal→attest→commit→swap→emit (NOT the shared
+/// [`commit_before_emit`], which couples seal+commit and so can't bind the sealed blob into the completion
+/// attestation). compact-9703 (codex+grok): the attestation binds the EXACT sealed blob the host persists,
+/// so the seal must happen BEFORE the attestation fetch (which is BEFORE the commit — fail-closed: no
+/// attestation ⇒ no commit). Reuses the shared [`seal_body`] + [`commit_candidate_to_anchor`] primitives;
+/// only the orchestration order is RESTORE-specific. EVERY failure (seal / fetch / commit) ⇒ a §10.9 error
+/// body with NO swap (the live slot is untouched); the caller retires the ephemeral regardless.
+// TODO(production-un-gate, TASK-27): the fetch_report here is UNBOUNDED on the serve loop — route through
+// the bounded subprocess before un-gate (same class as GET_RESTORE_PUBKEY).
+#[cfg(feature = "agent-backup-export-preview")]
+fn restore_seal_attest_commit_emit(
+    candidate: Box<KeystoreBody>,
+    request_id: &[u8],
+    measurement: Vec<u8>,
+    guard: &mut Option<InstalledAgentKeystore>,
+) -> Vec<u8> {
+    // (1) identity evidence + chain/env from the plaintext candidate (before the move into the swap).
+    let identity_set: Vec<RestoredKeyIdentity> = candidate
+        .entries
+        .iter()
+        .map(|e| RestoredKeyIdentity {
+            key_ref: e.key_ref,
+            public_identity: e.public_identity.clone(),
+            key_purpose: key_purpose_code(e.purpose),
+        })
+        .collect();
+    let chain_id = candidate.config.twod_chain_id;
+    let env_bytes = candidate.config.environment_identifier.as_bytes().to_vec();
+    let identity_set_hash = compute_restored_identity_set_hash(&identity_set);
+    let rid_echo = request_id.to_vec();
+    // (2) seal FIRST so the attestation can bind the EXACT blob the host persists (compact-9703).
+    let sealed = match crate::seal_root::resolve_provisioning_root() {
+        Ok(root) => match seal_body(&candidate, &root, &measurement) {
+            Ok(blob) => blob,
+            Err(_) => return encode_agent_error(AgentError::SealFailed),
+        },
+        Err(_) => return encode_agent_error(AgentError::SealFailed),
+    };
+    // (3) sealed_blob_hash + the completion attestation binding (full tuple, length-prefixed).
+    use sha2::Digest;
+    let sealed_blob_hash: [u8; 32] = sha2::Sha256::digest(&sealed).into();
+    let report_data = crate::snp_report::report_data_for_restore_completion(
+        &rid_echo,
+        &identity_set_hash,
+        &sealed_blob_hash,
+        chain_id,
+        &env_bytes,
+    );
+    // (4) fetch the completion attestation — fail-closed: no attestation ⇒ no commit/swap (clean abort).
+    let (attestation_report, cert_chain) = match crate::snp_report::fetch_report(&report_data) {
+        Ok(r) => r,
+        Err(_) => return encode_agent_error(AgentError::SealFailed),
+    };
+    // (5) anchor commit (the restore's Structural bump) + swap the live slot.
+    if let Err(e) = commit_candidate_to_anchor(&candidate, request_id) {
+        return encode_agent_error(e);
+    }
+    *guard = Some(InstalledAgentKeystore {
+        body: *candidate,
+        measurement,
+    });
+    // (6) emit the full {1,2,3,4,5} body.
+    encode_restore_backup_response(
+        &sealed,
+        &rid_echo,
+        &identity_set,
+        &attestation_report,
+        &cert_chain,
+    )
+}
+
 /// Frame-layer entry point: dispatch a `0x40` inner-envelope `payload` against the installed
 /// keystore and return the encoded response BODY — a per-opcode success map or a §10.9 error map.
 /// Always returns a body (never errors out of band), so the wire layer just frames it. Profile is
@@ -2406,18 +2575,17 @@ pub fn handle_agent_gateway_frame(payload: &[u8]) -> Vec<u8> {
             request_id,
         }) => {
             // RESTORE_BACKUP (rollback-sensitive; Structural — wholesale-replaced body + local+1 structural
-            // bump) goes through the SAME shared seal-before-emit seam. After the commit succeeds the
+            // bump) uses the restore-specific seal→attest→commit→swap→emit seam so the completion
+            // attestation can bind the exact sealed blob. After the commit succeeds the
             // restore-ephemeral key is RETIRED (single-use: a second restore must re-fetch GET_RESTORE_PUBKEY
-            // + fresh attestation + fresh re-wrap). NB: commit_before_emit returns an error BODY on a
+            // + fresh attestation + fresh re-wrap). NB: restore_seal_attest_commit_emit returns an error BODY on a
             // commit failure (not an Err) — the retire below is EAGER (per-attempt single-use): a failed
             // commit still burns this ephemeral, forcing a fresh ceremony for the retry. That is the
             // conservative single-use choice (the ephemeral is NEVER reused); the retry-cost (re-fetch +
             // re-wrap) is the accepted tradeoff vs threading a success signal out of the seam.
             #[cfg(feature = "agent-backup-export-preview")]
             let body =
-                commit_before_emit(candidate, &request_id, measurement, &mut guard, |sealed| {
-                    encode_restore_backup_response(sealed)
-                });
+                restore_seal_attest_commit_emit(candidate, &request_id, measurement, &mut guard);
             #[cfg(feature = "agent-backup-export-preview")]
             retire_restore_ephemeral();
             #[cfg(not(feature = "agent-backup-export-preview"))]
@@ -2520,16 +2688,24 @@ fn encode_agent_response(resp: &AgentResponse) -> Vec<u8> {
             ),
             (Value::Integer(7.into()), Value::Bytes(t.from.to_vec())),
         ]),
-        // GET_RESTORE_PUBKEY response (TASK-24 Slice 2a-ii): the attested ephemeral pubkey + its
-        // measurement. Key 1 = encaps_key (BYTES, 1568), key 2 = measurement (BYTES). Non-mutating
-        // (NotCommitted) so it IS encoded here (unlike the mutating ops below that must go through the
-        // frame-layer seam).
+        // GET_RESTORE_PUBKEY response (TASK-24 Slice 2a-ii + compact 9611 HIGH #2): the attested ephemeral
+        // pubkey + its measurement + the fresh SNP attestation report + cert chain. Key 1 = encaps_key
+        // (BYTES, 1568), key 2 = measurement (BYTES), key 3 = attestation_report (BYTES), key 4 =
+        // cert_chain (BYTES, may be empty). Non-mutating (NotCommitted) so it IS encoded here. The report's
+        // report_data binds the ephemeral key to this TEE (operator verifies out-of-band before re-wrap).
         AgentResponse::GetRestorePubkey {
             encaps_key,
             measurement,
+            attestation_report,
+            cert_chain,
         } => encode_body(vec![
             (Value::Integer(1.into()), Value::Bytes(encaps_key.clone())),
             (Value::Integer(2.into()), Value::Bytes(measurement.clone())),
+            (
+                Value::Integer(3.into()),
+                Value::Bytes(attestation_report.clone()),
+            ),
+            (Value::Integer(4.into()), Value::Bytes(cert_chain.clone())),
         ]),
         // GENERATE_KEYS MUST be encoded by the frame layer WITH its sealed blob
         // (`encode_generate_keys_response`). Reaching the generic encoder means a mis-routed mutation;
@@ -2645,16 +2821,91 @@ fn encode_export_backup_response(backup_blob: &[u8], sealed_blob: &[u8]) -> Vec<
     ])
 }
 
-/// Encode the RESTORE_BACKUP success body (TASK-24): `{1: sealed_keystore_blob}` — the restored
-/// keystore (the host persists it). Mirrors CONFIGURE_TREASURY's single-blob response (a restore emits
-/// no separate artifact — the restored entries live in the sealed blob). Invoked by the frame-layer seam
-/// ONLY after the anchor commit succeeds, so a restore success is reported iff the post-restore state is
-/// durably committed.
-fn encode_restore_backup_response(sealed_blob: &[u8]) -> Vec<u8> {
-    encode_body(vec![(
-        Value::Integer(1.into()),
-        Value::Bytes(sealed_blob.to_vec()),
-    )])
+/// One restored key's identity evidence — the subset of [`KeyEntry`] the host/2D needs to verify the
+/// restore restored the EXPECTED keys. The sealed keystore is XChaCha20Poly1305 AEAD-encrypted, so the
+/// host CANNOT read these from the sealed blob; the enclave-side frame layer extracts them from the
+/// plaintext candidate and emits them here (TASK-28 / compact-9651 HIGH). `secret_scalar` is NEVER
+/// emitted (confidential — lives only in the sealed blob).
+#[cfg(feature = "agent-backup-export-preview")]
+#[derive(Clone)]
+struct RestoredKeyIdentity {
+    key_ref: [u8; 32],
+    /// Uncompressed SEC1 (`0x04‖X‖Y`, 65 bytes) — 2D derives the Ethereum address + binds public-key
+    /// evidence (address-only is insufficient, per TASK-26 AC#4).
+    public_identity: Vec<u8>,
+    /// 1 = agent_transfer_k1, 2 = agent_faucet_treasury_k1 (maps to 2D `source_table`).
+    key_purpose: u64,
+}
+
+/// SHA-256 over the restored identity set in a FIXED canonical form (sorted by key_ref, length-prefixed)
+/// — the hash the RESTORE_BACKUP completion attestation binds (compact-9675 HIGH). Both the enclave +
+/// 2D compute it identically over key 3's content (2D reimplements this exact layout — documented in
+/// TASK-26 contract §4): `count(u64 BE) ‖ for each entry (sorted by key_ref): key_ref(32) ‖
+/// lp64(public_identity) ‖ public_identity ‖ key_purpose(u64 BE)`. Length-prefixing makes the byte stream
+/// unambiguous (no delimiter collisions).
+#[cfg(feature = "agent-backup-export-preview")]
+fn compute_restored_identity_set_hash(identity_set: &[RestoredKeyIdentity]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut entries = identity_set.to_vec();
+    entries.sort_by_key(|e| e.key_ref);
+    let mut h = sha2::Sha256::new();
+    h.update((entries.len() as u64).to_be_bytes());
+    for e in &entries {
+        h.update(e.key_ref);
+        h.update((e.public_identity.len() as u64).to_be_bytes());
+        h.update(&e.public_identity);
+        h.update(e.key_purpose.to_be_bytes());
+    }
+    h.finalize().into()
+}
+
+#[cfg(feature = "agent-backup-export-preview")]
+/// Encode the RESTORE_BACKUP success body (TASK-24 + TASK-28): `{1: sealed_keystore_blob,
+/// 2: request_id_echo, 3: restored_identity_set, 4: attestation_report, 5: cert_chain}`. Key 2 is the
+/// `request_id` echo — the SOLE replay token (nonce-model resolution, TASK-26 §2: the ceremony receives
+/// NO `attempt_challenge`; `request_id` is cap-bound + high-water-bound + echoed). Key 3 is the array of
+/// restored-key identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`). Key 4 +
+/// 5 are the completion attestation (compact-9675 HIGH, option A): a fresh SNP report whose `report_data`
+/// binds (request_id, identity_set_hash, sealed_blob_hash, chain, env) to the attested enclave, + its
+/// cert chain. 2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
+/// forge the plaintext evidence. Invoked by the frame-layer seam ONLY after the anchor commit succeeds
+/// (the attestation is fetched BEFORE the commit — fail-closed: no attestation ⇒ no commit/restore).
+fn encode_restore_backup_response(
+    sealed_blob: &[u8],
+    request_id_echo: &[u8],
+    identity_set: &[RestoredKeyIdentity],
+    attestation_report: &[u8],
+    cert_chain: &[u8],
+) -> Vec<u8> {
+    let entries: Vec<Value> = identity_set
+        .iter()
+        .map(|e| {
+            Value::Map(vec![
+                (Value::Integer(1.into()), Value::Bytes(e.key_ref.to_vec())),
+                (
+                    Value::Integer(2.into()),
+                    Value::Bytes(e.public_identity.clone()),
+                ),
+                (
+                    Value::Integer(3.into()),
+                    Value::Integer(e.key_purpose.into()),
+                ),
+            ])
+        })
+        .collect();
+    encode_body(vec![
+        (Value::Integer(1.into()), Value::Bytes(sealed_blob.to_vec())),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(request_id_echo.to_vec()),
+        ),
+        (Value::Integer(3.into()), Value::Array(entries)),
+        (
+            Value::Integer(4.into()),
+            Value::Bytes(attestation_report.to_vec()),
+        ),
+        (Value::Integer(5.into()), Value::Bytes(cert_chain.to_vec())),
+    ])
 }
 
 /// Encode a §10.9 agent error body `{1: code, 2: reason}`. Reasons are coarse (no secret detail).
@@ -4393,8 +4644,13 @@ mod tests {
             !is_restore_ephemeral_installed(),
             "const-init None ⇒ fail-closed default"
         );
-        let pub1 =
-            install_restore_ephemeral(b"dest-measurement-v1").expect("first install succeeds");
+        let pub1 = install_restore_ephemeral_with_seed(
+            b"dest-measurement-v1",
+            &[0x6c; 64],
+            11565,
+            b"testnet",
+        )
+        .expect("first install succeeds");
         assert_eq!(pub1.measurement, b"dest-measurement-v1");
         assert_eq!(
             pub1.encaps_key.len(),
@@ -4404,7 +4660,7 @@ mod tests {
         assert!(is_restore_ephemeral_installed());
         // Install-once: a second call returns None + does NOT overwrite the published key.
         assert!(
-            install_restore_ephemeral(b"other").is_none(),
+            install_restore_ephemeral_with_seed(b"other", &[0x6c; 64], 11565, b"testnet").is_none(),
             "install-once refuses overwrite"
         );
         let still = snapshot_restore_ephemeral().unwrap();
@@ -4419,7 +4675,7 @@ mod tests {
     fn restore_ephemeral_rejects_empty_measurement() {
         let _g = lock_and_reset_agent_process_globals();
         assert!(
-            install_restore_ephemeral(b"").is_none(),
+            install_restore_ephemeral_with_seed(b"", &[0x6c; 64], 11565, b"testnet").is_none(),
             "empty measurement rejected"
         );
         assert!(
@@ -4436,7 +4692,13 @@ mod tests {
         // with the matching private half). Pins the seed↔pubkey consistency the ceremony round-trip needs.
         use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
         let _g = lock_and_reset_agent_process_globals();
-        let pub_info = install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        let pub_info = install_restore_ephemeral_with_seed(
+            b"dest-measurement-v1",
+            &[0x6c; 64],
+            11565,
+            b"testnet",
+        )
+        .unwrap();
         let snap = snapshot_restore_ephemeral().expect("snapshot after install");
         assert_eq!(snap.measurement, b"dest-measurement-v1");
         let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(*snap.decaps_seed));
@@ -4453,7 +4715,8 @@ mod tests {
         // SINGLE-USE enforcement (claude-code AC#1 review): after retire, no ephemeral is published — a
         // second restore must re-fetch GET_RESTORE_PUBKEY + fresh attestation + fresh re-wrap.
         let _g = lock_and_reset_agent_process_globals();
-        install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        install_restore_ephemeral_with_seed(b"dest-measurement-v1", &[0x6c; 64], 11565, b"testnet")
+            .unwrap();
         assert!(is_restore_ephemeral_installed());
         retire_restore_ephemeral();
         assert!(
@@ -4467,7 +4730,13 @@ mod tests {
         retire_restore_ephemeral(); // idempotent
                                     // After retire a FRESH install is allowed (the next ceremony's key).
         assert!(
-            install_restore_ephemeral(b"dest-measurement-v2").is_some(),
+            install_restore_ephemeral_with_seed(
+                b"dest-measurement-v2",
+                &[0x6c; 64],
+                11565,
+                b"testnet"
+            )
+            .is_some(),
             "fresh install allowed after retire"
         );
     }
@@ -4478,7 +4747,8 @@ mod tests {
         // A snapshot (a FAILED restore attempt) does NOT retire — the operator can retry the ceremony
         // with a corrected envelope to the SAME published key. Only a SUCCESSFUL restore retires.
         let _g = lock_and_reset_agent_process_globals();
-        install_restore_ephemeral(b"dest-measurement-v1").unwrap();
+        install_restore_ephemeral_with_seed(b"dest-measurement-v1", &[0x6c; 64], 11565, b"testnet")
+            .unwrap();
         let _snap = snapshot_restore_ephemeral().unwrap();
         assert!(
             is_restore_ephemeral_installed(),
@@ -4500,14 +4770,29 @@ mod tests {
         let _g = lock_and_reset_agent_process_globals();
         let (body, _) = body_with_key();
         let env = envelope(9, vec![]); // opcode 9, no cap, no payload
-                                       // First call generates + publishes.
+                                       // The production handler path fetches a real SNP quote in
+                                       // install_restore_ephemeral (unavailable devicelessly), so
+                                       // pre-publish via the test variant — the handler's read path
+                                       // (published_restore_ephemeral) returns it. The production
+                                       // install-on-dispatch is verified on SNP hardware (like the
+                                       // producer fetch_measurement_and_report path).
+        let pub0 = install_restore_ephemeral_with_seed(
+            b"dest-measurement",
+            &[0x6c; 64],
+            body.config.twod_chain_id,
+            body.config.environment_identifier.as_bytes(),
+        )
+        .expect("pre-install the published ephemeral");
+        // First dispatch returns the published key (read path) + its attestation report.
         let resp1 =
             dispatch_agent(Profile::AgentGateway, &env, &body, b"dest-measurement").unwrap();
-        let (ek1, meas1) = match resp1 {
+        let (ek1, meas1, report1) = match resp1 {
             AgentResponse::GetRestorePubkey {
                 encaps_key,
                 measurement,
-            } => (encaps_key, measurement),
+                attestation_report,
+                ..
+            } => (encaps_key, measurement, attestation_report),
             _ => panic!("expected GetRestorePubkey, got a different AgentResponse variant"),
         };
         assert_eq!(
@@ -4519,6 +4804,28 @@ mod tests {
             meas1, b"dest-measurement",
             "the enclave's own measurement is returned"
         );
+        // Compact 9611 HIGH #2: the response carries the attestation report whose report_data binds the
+        // ephemeral key to this TEE — the operator verifies this BEFORE re-wrapping. Assert the binding
+        // the stand-in report carries matches the recomputed one (pins the handler→install→response chain
+        // passes chain/env through to the binding).
+        let expected_rd = crate::snp_report::report_data_for_restore_ephemeral(
+            &ek1,
+            &meas1,
+            body.config.twod_chain_id,
+            body.config.environment_identifier.as_bytes(),
+        );
+        let echoed_rd =
+            crate::snp_report::report_data_from_report(&report1).expect("report_data readable");
+        assert_eq!(
+            echoed_rd[..],
+            expected_rd[..],
+            "the attestation report's report_data binds the ephemeral key + measurement + chain + env"
+        );
+        assert_eq!(
+            report1.len(),
+            pub0.attestation_report.len(),
+            "response carries the published attestation report unchanged"
+        );
         assert!(is_restore_ephemeral_installed());
         // Idempotent: a second call returns the SAME published key (no churn).
         let resp2 =
@@ -4528,8 +4835,15 @@ mod tests {
             _ => panic!("expected GetRestorePubkey"),
         };
         assert_eq!(ek1, ek2, "idempotent — same published key on re-query");
-        // After retire (a completed restore), a fresh key is generated.
+        // After retire (a completed restore), a fresh key is published (the next ceremony's key).
         retire_restore_ephemeral();
+        let _pub1 = install_restore_ephemeral_with_seed(
+            b"dest-measurement",
+            &[0x77; 64], // DISTINCT seed ⇒ a different ephemeral key
+            body.config.twod_chain_id,
+            body.config.environment_identifier.as_bytes(),
+        )
+        .expect("pre-install a fresh key after retire");
         let resp3 =
             dispatch_agent(Profile::AgentGateway, &env, &body, b"dest-measurement").unwrap();
         let ek3 = match resp3 {
@@ -7150,15 +7464,27 @@ mod tests {
         use super::*;
         use crate::agent_backup::{
             build_key_refs_manifest, build_restore_ingress_payload, compute_manifest_hash,
-            compute_original_backup_digest, seal_restore_ingress_envelope_with_m,
-            RecoveryHighWater, RECOVERY_HIGH_WATER_DOMAIN,
+            compute_original_backup_digest, derive_recovery_key_id, seal_backup_blob,
+            seal_restore_ingress_envelope_with_m, RecoveryHighWater, RECOVERY_HIGH_WATER_DOMAIN,
         };
         use ed25519_dalek::{Signer, SigningKey};
+        use ml_kem::{DecapsulationKey, KeyExport as _, MlKem1024};
 
         const RSCOPE: &[u8] = b"restore_backup";
         const DEST_MEAS: &[u8] = b"dest-tee-measurement-v1";
         const DEST_SEED: [u8; 64] = [0x6c; 64];
+        const WRAP_SEED: [u8; 64] = [0xd7; 64]; // distinct from DEST_SEED (ceremony role separation)
         const INGRESS_M: [u8; 32] = [0x43; 32];
+
+        /// The recovery wrapping encapsulation pubkey for WRAP_SEED — the ML-KEM key the original
+        /// `pq-agent-backup-v1` is sealed to. AC#10: the destination enclave's sealed
+        /// `backup_recovery_wrapping_pubkey` MUST equal this (or restore fails closed at the
+        /// `recovery_key_id` binding). Returns ONLY the pubkey (the decaps key is the operator's
+        /// offline secret — never in the enclave).
+        fn wrapping_encaps_pubkey() -> Vec<u8> {
+            let dk = DecapsulationKey::<MlKem1024>::from_seed(ml_kem::Seed::from(WRAP_SEED));
+            dk.encapsulation_key().to_bytes().as_slice().to_vec()
+        }
 
         fn recovery_key() -> SigningKey {
             SigningKey::from_bytes(&[0xa2; 32])
@@ -7206,17 +7532,34 @@ mod tests {
             n_keys: usize,
         ) -> (Vec<u8>, KeystoreBody) {
             // Publish the destination ephemeral (deterministic seed ⇒ the test knows the decaps key).
-            let dest_pub =
-                crate::agent_dispatch::install_restore_ephemeral_with_seed(&DEST_MEAS, &DEST_SEED)
-                    .unwrap();
+            let dest_pub = crate::agent_dispatch::install_restore_ephemeral_with_seed(
+                &DEST_MEAS, &DEST_SEED, 11565, b"testnet",
+            )
+            .unwrap();
             // Source body → restore-ingress payload + manifest.
-            let src = source_body(n_keys);
+            let mut src = source_body(n_keys);
             let refs: Vec<[u8; 32]> = src.entries.iter().map(|e| e.key_ref).collect();
             let payload = build_restore_ingress_payload(&src, &refs).unwrap().to_vec();
             let manifest = build_key_refs_manifest(&refs).unwrap();
             let manifest_hash = compute_manifest_hash(&manifest);
-            // Original backup blob + digest.
-            let original_backup = b"test-original-backup-blob".to_vec();
+            // Original backup blob (compact 9611 HIGH AC#10): a REAL `pq-agent-backup-v1` sealed to the
+            // recovery wrapping key (WRAP_SEED) — NOT a placeholder. The handler parses this header's
+            // `recovery_key_id` and binds it to the destination's sealed wrapping pubkey. The source
+            // body carries the matching wrapping pubkey so the success-path test can copy it onto dest.
+            let wrap_pub = wrapping_encaps_pubkey();
+            let wrap_rid = derive_recovery_key_id(&wrap_pub);
+            let original_backup = seal_backup_blob(
+                &wrap_pub,
+                &wrap_rid,
+                src.config.twod_chain_id,
+                &src.config.environment_identifier,
+                &manifest,
+                &payload,
+            )
+            .unwrap();
+            // The source body carries the wrapping pubkey the backup was sealed to (callers that reach
+            // the AC#10 check copy this onto the destination's sealed config).
+            src.config.backup_recovery_wrapping_pubkey = wrap_pub;
             let backup_digest = compute_original_backup_digest(&original_backup);
             // Seal the ingress envelope to the dest ephemeral (AAD' = measurement/chain/env/manifest/digest).
             let envelope_blob = seal_restore_ingress_envelope_with_m(
@@ -7289,6 +7632,35 @@ mod tests {
             )
         }
 
+        /// Compact 9611 MEDIUM (restore_canonical_params): pin the EXACT RFC 8949 bytes so a conformant
+        /// EXTERNAL cap issuer (computing the payload_binding preimage per the spec, not via this crate)
+        /// produces byte-identical bytes. Before this the map/array headers passed the composed byte
+        /// (0xA0/0x80) to put_uint, which expects a major-TYPE number (0-7) and shifts it `<<5`; the
+        /// result was malformed CBOR that only this crate's own (symmetric) issuer/verifier pair agreed on.
+        #[test]
+        fn restore_canonical_params_pins_rfc_8949_bytes() {
+            let refs = [[0xAA; 32], [0xBB; 32]];
+            let digest = [0xCC; 32];
+            let out = restore_canonical_params(&refs, &digest);
+            // map(2)=0xA2, key1=0x01, array(2)=0x82, bstr(32)=0x58 0x20 +32B, key2=0x02, bstr(32)=0x58 0x20 +32B.
+            let mut expect = vec![0xA2, 0x01, 0x82];
+            expect.push(0x58);
+            expect.push(0x20);
+            expect.extend_from_slice(&[0xAA; 32]);
+            expect.push(0x58);
+            expect.push(0x20);
+            expect.extend_from_slice(&[0xBB; 32]);
+            expect.push(0x02);
+            expect.push(0x58);
+            expect.push(0x20);
+            expect.extend_from_slice(&[0xCC; 32]);
+            assert_eq!(
+                out, expect,
+                "restore_canonical_params MUST emit RFC 8949 shortest-form CBOR so an external cap \
+                 issuer interoperates; a drift here silently rejects compliant externally-signed caps"
+            );
+        }
+
         /// End-to-end: a recovery-tier RESTORE_BACKUP through dispatch_agent reconstitutes the source
         /// keystore's entries into a fresh destination TEE + advances strict_recovery (AC#6) + structural
         /// (local+1, AC#4). The full ceremony path — ephemeral decap, AAD' verify, signed-high-water
@@ -7302,6 +7674,11 @@ mod tests {
                                         // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
             let (env, src) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
+            // AC#10: the destination's sealed wrapping pubkey MUST match the backup's (the handler's
+            // recovery_key_id binding, compact 9611 HIGH). restore_env sealed the backup to WRAP_SEED
+            // and set src's wrapping pubkey; copy it onto dest so the success path verifies.
+            dest.config.backup_recovery_wrapping_pubkey =
+                src.config.backup_recovery_wrapping_pubkey.clone();
             let resp = dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).unwrap();
             match resp {
                 AgentResponse::RestoreBackup { candidate, .. } => {
@@ -7374,6 +7751,173 @@ mod tests {
                 dispatch_agent(Profile::AgentGateway, &env, &dest, b"OTHER-tee-measurement").err(),
                 Some(AgentError::SealFailed),
                 "dest_measurement mismatch ⇒ fail closed (SealFailed)"
+            );
+        }
+
+        /// AC#10 fail-closed (compact 9611 HIGH): the backup was sealed to a recovery wrapping key
+        /// whose `recovery_key_id` != the destination's sealed `backup_recovery_wrapping_pubkey`'s
+        /// derived id. The handler parses the backup header + binds it to the sealed key; a mismatch
+        /// (authorized by the recovery authority but re-wrapped to a DIFFERENT ML-KEM key) ⇒
+        /// SealFailed. No partial import. Exercises the `backup_recovery_key_id` parse + compare.
+        #[test]
+        fn restore_backup_wrong_wrapping_key_fails_closed() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
+            // restore_env sealed the backup to WRAP_SEED; leave dest's wrapping key as base_body's
+            // placeholder (a DIFFERENT key) ⇒ recovery_key_id mismatch ⇒ fail closed at step 5c.
+            // (base_body's `vec![0xb0; 1568]` is intentionally not WRAP_SEED's key.)
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::SealFailed),
+                "backup sealed to a different wrapping key than the destination's sealed pubkey ⇒ \
+                 fail closed (SealFailed) — AC#10 wrapping-key separation"
+            );
+        }
+
+        /// TASK-28 / compact-9651 HIGH: the RESTORE_BACKUP success body carries the restored-key
+        /// identity set (key 3) + the request_id echo (key 2) as PLAINTEXT — the host/2D derives
+        /// `restored_identity_set_sha256` + verifies the replay-protecting echo from the response ALONE,
+        /// WITHOUT unsealing the AEAD-encrypted keystore blob (key 1). Pins the {1,2,3} wire shape.
+        #[test]
+        fn restore_backup_response_carries_identity_set_and_echo_without_unsealing() {
+            use crate::snp_report::{
+                report_data_for_restore_completion, verify_restore_completion_attestation,
+                MEASUREMENT_OFFSET, MIN_REPORT_LEN, REPORT_DATA_OFFSET, SNP_MEASUREMENT_LEN,
+            };
+            use sha2::Digest;
+            let sealed_blob = b"opaque-aead-sealed-keystore-blob".to_vec();
+            let sealed_blob_hash: [u8; 32] = sha2::Sha256::digest(&sealed_blob).into();
+            let rid = b"req-restore-task28";
+            let measurement = [0x55u8; SNP_MEASUREMENT_LEN];
+            let identity = vec![
+                RestoredKeyIdentity {
+                    key_ref: [0xAA; 32],
+                    public_identity: vec![0x04; 65],
+                    key_purpose: 1, // agent_transfer_k1
+                },
+                RestoredKeyIdentity {
+                    key_ref: [0xBB; 32],
+                    public_identity: vec![0x04; 65],
+                    key_purpose: 2, // agent_faucet_treasury_k1
+                },
+            ];
+            // Build the completion attestation's report_data + a STAND-IN report (production fetches a real
+            // AMD-signed SNP quote). report_data binds (request_id, identity_set_hash, sealed_blob_hash, chain, env).
+            let identity_set_hash = compute_restored_identity_set_hash(&identity);
+            let report_data = report_data_for_restore_completion(
+                rid,
+                &identity_set_hash,
+                &sealed_blob_hash,
+                11565,
+                b"testnet",
+            );
+            let mut attestation_report = vec![0u8; MIN_REPORT_LEN];
+            attestation_report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64]
+                .copy_from_slice(&report_data);
+            attestation_report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
+                .copy_from_slice(&measurement);
+            let cert_chain = b"vcek-ask-ark-cert-chain-stand-in".to_vec();
+            let body = encode_restore_backup_response(
+                &sealed_blob,
+                rid,
+                &identity,
+                &attestation_report,
+                &cert_chain,
+            );
+            let v = ciborium::de::from_reader::<Value, _>(body.as_slice()).unwrap();
+            let Value::Map(top) = v else {
+                panic!("response body is a CBOR map");
+            };
+            let get = |n: i64| -> Value {
+                top.iter()
+                    .find(|(k, _)| *k == Value::Integer(n.into()))
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
+            assert_eq!(
+                get(1),
+                Value::Bytes(sealed_blob.clone()),
+                "key 1 = sealed blob"
+            );
+            assert_eq!(
+                get(2),
+                Value::Bytes(rid.to_vec()),
+                "key 2 = request_id echo (plaintext, no unsealing)"
+            );
+            // Key 3: the restored identity set — host reads PLAINTEXT (never unseals key 1).
+            let Value::Array(entries) = get(3) else {
+                panic!("key 3 = restored identity-set array");
+            };
+            assert_eq!(entries.len(), 2, "two restored keys");
+            for (entry, expected) in entries.iter().zip(identity.iter()) {
+                let Value::Map(fields) = entry else {
+                    panic!("each identity entry is a map");
+                };
+                let f = |n: i64| -> Value {
+                    fields
+                        .iter()
+                        .find(|(k, _)| *k == Value::Integer(n.into()))
+                        .map(|(_, v)| v.clone())
+                        .unwrap()
+                };
+                assert_eq!(
+                    f(1),
+                    Value::Bytes(expected.key_ref.to_vec()),
+                    "key_ref plaintext"
+                );
+                assert_eq!(
+                    f(2),
+                    Value::Bytes(expected.public_identity.clone()),
+                    "public_identity plaintext (address-only insufficient; TASK-26 AC#4)"
+                );
+                assert_eq!(
+                    f(3),
+                    Value::Integer(expected.key_purpose.into()),
+                    "key_purpose plaintext (maps to 2D source_table)"
+                );
+            }
+            // Keys 4 + 5: the completion attestation + cert chain. 2D verifies key 4 (AMD-signed) BEFORE
+            // trusting keys 2 + 3 — the binding defeats a host forge (compact-9675 HIGH).
+            let Value::Bytes(report_bytes) = get(4) else {
+                panic!("key 4 = attestation report bytes");
+            };
+            assert_eq!(
+                get(5),
+                Value::Bytes(cert_chain.clone()),
+                "key 5 = cert chain"
+            );
+            let verified = verify_restore_completion_attestation(
+                &report_bytes,
+                rid,
+                &identity_set_hash,
+                &sealed_blob_hash,
+                &measurement,
+                11565,
+                b"testnet",
+            )
+            .expect("the completion attestation binds (request_id, identity_set_hash, sealed_blob_hash, chain, env)");
+            assert_eq!(
+                verified[..],
+                measurement[..],
+                "attestation measurement == expected (the host/2D verifies against the enclave build)"
+            );
+            // A FORGED response (host rewrites key 2 to a fresh rid, reuses the attestation) fails: the
+            // attestation's report_data was bound to the ORIGINAL rid ⇒ verify under the forged rid ⇒ Err.
+            assert!(
+                verify_restore_completion_attestation(
+                    &report_bytes,
+                    b"FORGED-fresh-rid",
+                    &identity_set_hash,
+                    &sealed_blob_hash,
+                    &measurement,
+                    11565,
+                    b"testnet",
+                )
+                .is_err(),
+                "a host forging key 2 (request_id) fails attestation verification — the binding is the defense"
             );
         }
 

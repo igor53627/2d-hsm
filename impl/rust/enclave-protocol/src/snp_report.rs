@@ -149,6 +149,162 @@ pub fn report_data_for_pubkey(pq_pubkey: &[u8]) -> [u8; REPORT_DATA_LEN] {
     h.finalize().into()
 }
 
+/// Domain separation for the restore-ephemeral `report_data` binding — DISTINCT from the producer
+/// [`REPORT_DATA_DOMAIN`] so a producer-key report cannot be replayed as a restore-ephemeral binding
+/// (and vice versa). The GET_RESTORE_PUBKEY attestation binds the ephemeral ML-KEM key to the TEE so the
+/// operator (performing the offline re-wrap) can verify the key came from the attested enclave, not a
+/// host-substituted key (compact 9611 HIGH #2: AC#1 "attested ephemeral key").
+const RESTORE_REPORT_DATA_DOMAIN: &[u8] = b"2d-hsm-restore-ephemeral-v1";
+
+/// 64-byte `report_data` binding the GET_RESTORE_PUBKEY ephemeral ML-KEM-1024 key into a fresh SNP
+/// attestation. Domain-separated from the producer binding ([`report_data_for_pubkey`]) and committing
+/// to the ephemeral key + the TEE measurement + chain + environment, so the operator verifies the
+/// re-wrap target key came from THIS attested TEE for THIS chain/env (a host substituting its own key
+/// breaks the binding; a host cannot forge the AMD-signed report). Mirrors [`report_data_for_pubkey`]'s
+/// SHA3-512 shape.
+pub fn report_data_for_restore_ephemeral(
+    encaps_key: &[u8],
+    measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> [u8; REPORT_DATA_LEN] {
+    use sha3::{Digest, Sha3_512};
+    let mut h = Sha3_512::new();
+    h.update(RESTORE_REPORT_DATA_DOMAIN);
+    h.update(encaps_key);
+    h.update(measurement);
+    h.update(chain_id.to_be_bytes());
+    h.update((environment_identifier.len() as u64).to_be_bytes()); // length-prefix (consistency with report_data_for_restore_completion)
+    h.update(environment_identifier);
+    h.finalize().into()
+}
+
+/// Operator-side verification of the GET_RESTORE_PUBKEY attestation binding (compact 9611 HIGH #2 / AC#1
+/// "attested ephemeral key"). The operator calls this BEFORE re-wrapping the backup to the ephemeral key:
+/// it confirms the SNP report's `report_data` binds the EXACT ephemeral encaps key + the TEE measurement +
+/// chain + environment the operator intends to restore into — so a host that substituted its own key
+/// (and replayed a valid AMD-signed report) is caught here (the report_data won't match), and a host that
+/// forged the report is caught by the AMD-signature check (out-of-crate: the operator verifies the cert
+/// chain against the AMD root separately). Returns the report's launch measurement on success (the operator
+/// compares it against the expected measurement for this enclave build).
+///
+/// `report` is the raw `ATTESTATION_REPORT` bytes from the GET_RESTORE_PUBKEY response (key 3).
+pub fn verify_restore_ephemeral_attestation(
+    report: &[u8],
+    encaps_key: &[u8],
+    expected_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
+    let echoed = report_data_from_report(report)?;
+    let expected = report_data_for_restore_ephemeral(
+        encaps_key,
+        expected_measurement,
+        chain_id,
+        environment_identifier,
+    );
+    if echoed != expected {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-ephemeral attestation: report_data does not bind the ephemeral key + TEE identity \
+             (host may have substituted the key or replayed a foreign report)",
+        ));
+    }
+    // gemini 9632 Med: verify the report's HARDWARE-SIGNED measurement equals the expected enclave
+    // measurement — report_data is guest-chosen, so an attacker who boots a different/compromised enclave
+    // build (different measurement) could request a report with the correct report_data. Checking the
+    // signed measurement field here (rather than just returning it for the caller to compare) removes the
+    // footgun where a caller treats Ok as full verification.
+    let report_measurement = measurement_from_report(report)?;
+    if report_measurement[..] != *expected_measurement {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-ephemeral attestation: the report's hardware-signed measurement does not match the \
+             expected enclave measurement (the key may be from a different/compromised TEE build)",
+        ));
+    }
+    Ok(report_measurement)
+}
+
+/// Domain separation for the RESTORE_BACKUP completion-evidence attestation (compact-9675 HIGH):
+/// binds the enclave to the restored identity set + the request_id it processed, so 2D can verify the
+/// completion evidence was cryptographically produced by the attested enclave (not forged by the host).
+/// Distinct from the ephemeral-key + producer bindings.
+const RESTORE_COMPLETION_DOMAIN: &[u8] = b"2d-hsm-restore-completion-v1";
+
+/// 64-byte `report_data` binding the RESTORE_BACKUP completion evidence to the attested enclave
+/// (compact-9675 HIGH). The enclave attests the FULL tuple `(request_id, identity_set_hash,
+/// sealed_blob_hash, chain, env)` — including the EXACT sealed blob the host persists
+/// (`sealed_blob_hash = SHA-2-256(key 1)`, compact-9703 codex+grok), so a host cannot splice a different
+/// valid sealed blob while keeping the attested plaintext evidence. The frame layer seals the candidate
+/// FIRST, hashes the sealed blob, fetches the attestation over this tuple, THEN commits + emits (the
+/// attestation is fetched BEFORE the commit — fail-closed: no attestation ⇒ no commit). 2D verifies this
+/// BEFORE recording completion — a host cannot forge the AMD-signed report, and a mismatched
+/// (request_id, identity_set, sealed_blob, chain, env) breaks the binding. NB three hash values using two
+/// algorithms: `report_data` is SHA3-512 (the 64-byte SNP field); `identity_set_hash` is SHA-2-256 (the §4
+/// layout 2D recomputes); `sealed_blob_hash` is SHA-2-256 (response key 1) — do not conflate them. The
+/// anchor anti-rollback (next-boot
+/// strict_recovery_counter/structural_version reconcile) is additional defense-in-depth that catches a
+/// substituted older blob even if this binding were bypassed.
+pub fn report_data_for_restore_completion(
+    request_id_echo: &[u8],
+    identity_set_hash: &[u8; 32],
+    sealed_blob_hash: &[u8; 32],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> [u8; REPORT_DATA_LEN] {
+    use sha3::{Digest, Sha3_512};
+    let mut h = Sha3_512::new();
+    h.update(RESTORE_COMPLETION_DOMAIN);
+    h.update(chain_id.to_be_bytes());
+    h.update((environment_identifier.len() as u64).to_be_bytes()); // length-prefix (compact-9698 Med)
+    h.update(environment_identifier);
+    h.update((request_id_echo.len() as u64).to_be_bytes()); // length-prefix (no (env,rid) tuple collision)
+    h.update(request_id_echo);
+    h.update(identity_set_hash);
+    h.update(sealed_blob_hash); // compact-9703: bind the EXACT persisted blob (no host splicing)
+    h.finalize().into()
+}
+
+/// 2D-side verification of the RESTORE_BACKUP completion attestation (compact-9675 HIGH). Confirms the
+/// SNP report's `report_data` binds the enclave to the EXACT (request_id, identity_set_hash,
+/// sealed_blob_hash, chain, env) 2D is recording — so a host that forged the plaintext echo/identity
+/// fields (key 2/3) OR spliced a different sealed blob is caught here (the report_data won't match), and a
+/// forged report is caught by the AMD-signature check (out-of-crate: 2D verifies the cert chain against the
+/// AMD root). Verifies the hardware-signed measurement field == `expected_measurement`. Returns the
+/// measurement on success.
+pub fn verify_restore_completion_attestation(
+    report: &[u8],
+    request_id_echo: &[u8],
+    identity_set_hash: &[u8; 32],
+    sealed_blob_hash: &[u8; 32],
+    expected_measurement: &[u8],
+    chain_id: u64,
+    environment_identifier: &[u8],
+) -> Result<[u8; SNP_MEASUREMENT_LEN], ProtocolError> {
+    let echoed = report_data_from_report(report)?;
+    let expected = report_data_for_restore_completion(
+        request_id_echo,
+        identity_set_hash,
+        sealed_blob_hash,
+        chain_id,
+        environment_identifier,
+    );
+    if echoed != expected {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-completion attestation: report_data does not bind (request_id, identity_set, \
+             sealed_blob, chain, env) — the host may have forged the plaintext evidence, spliced a \
+             different sealed blob, or replayed a foreign report",
+        ));
+    }
+    let report_measurement = measurement_from_report(report)?;
+    if report_measurement[..] != *expected_measurement {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-completion attestation: the report's hardware-signed measurement does not match the \
+             expected enclave measurement",
+        ));
+    }
+    Ok(report_measurement)
+}
+
 /// The configfs-tsm filesystem operations, behind a seam so the cleanup orchestration in
 /// [`fetch_report_with`] is unit-testable WITHOUT a live `/sys/kernel/config/tsm` (the cleanup-on-error
 /// invariant — entry removed even when a step fails mid-sequence — is the defect-prone part and the
@@ -463,6 +619,214 @@ mod tests {
         use sha3::{Digest, Sha3_512};
         let bare: [u8; 64] = Sha3_512::digest(b"producer-pubkey-bytes").into();
         assert_ne!(a, bare);
+    }
+
+    /// Compact 9611 HIGH #2: the restore-ephemeral report_data binding is deterministic, distinct from
+    /// the producer binding, and sensitive to EVERY bound field (encaps key, measurement, chain, env) —
+    /// so a host substituting any of them breaks the binding the operator verifies before re-wrapping.
+    #[test]
+    fn restore_ephemeral_binding_is_deterministic_distinct_and_field_sensitive() {
+        let ek = [0xAAu8; 32];
+        let meas = [0xBBu8; 48];
+        let a = report_data_for_restore_ephemeral(&ek, &meas, 11565, b"testnet");
+        let b = report_data_for_restore_ephemeral(&ek, &meas, 11565, b"testnet");
+        assert_eq!(a, b, "deterministic");
+        assert_eq!(a.len(), REPORT_DATA_LEN);
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&[0xCC; 32], &meas, 11565, b"testnet"),
+            "encaps-key substitution breaks the binding"
+        );
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&ek, &[0xDD; 48], 11565, b"testnet"),
+            "measurement substitution breaks the binding"
+        );
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&ek, &meas, 1, b"testnet"),
+            "chain substitution breaks the binding"
+        );
+        assert_ne!(
+            a,
+            report_data_for_restore_ephemeral(&ek, &meas, 11565, b"mainnet"),
+            "env substitution breaks the binding"
+        );
+        // Domain separation: distinct from the producer binding (a producer report cannot be replayed).
+        assert_ne!(
+            a[..],
+            report_data_for_pubkey(&ek)[..],
+            "restore-ephemeral binding is domain-separated from the producer binding"
+        );
+    }
+
+    /// The operator verification helper accepts a report whose report_data matches the recomputed binding
+    /// + returns the measurement; it REJECTS a report whose binding was minted for a DIFFERENT (substituted)
+    /// ephemeral key. (The AMD-signature half is verified by the operator out-of-crate via the cert chain.)
+    #[test]
+    fn verify_restore_ephemeral_attestation_rejects_substituted_key() {
+        let ek = [0xAAu8; 32];
+        let meas = [0xBBu8; 48];
+        let rd = report_data_for_restore_ephemeral(&ek, &meas, 11565, b"testnet");
+        // Stand-in report: zeroed, with report_data patched at 0x50 + measurement at 0x90.
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        let extracted =
+            verify_restore_ephemeral_attestation(&report, &ek, &meas, 11565, b"testnet")
+                .expect("matching binding verifies");
+        assert_eq!(
+            extracted[..],
+            meas[..],
+            "measurement returned for operator comparison"
+        );
+        // A report minted for a DIFFERENT key (host substitution) is rejected.
+        let bad_rd = report_data_for_restore_ephemeral(&[0xCC; 32], &meas, 11565, b"testnet");
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&bad_rd);
+        assert!(
+            verify_restore_ephemeral_attestation(&report, &ek, &meas, 11565, b"testnet").is_err(),
+            "a report bound to a different key MUST fail operator verification"
+        );
+    }
+
+    /// gemini 9632 Med (Fix B): a report whose report_data binds the EXPECTED measurement but whose
+    /// HARDWARE-SIGNED measurement field is DIFFERENT (an attacker booted a wrong-measurement enclave,
+    /// then requested a report with report_data forged to the expected binding) MUST be rejected. Before
+    /// Fix B the helper returned this measurement for the caller to compare — a footgun; now it verifies.
+    #[test]
+    fn verify_restore_ephemeral_attestation_rejects_measurement_field_mismatch() {
+        let ek = [0xAAu8; 32];
+        let expected_meas = [0xBBu8; 48];
+        let wrong_meas = [0xCCu8; 48]; // the attacker's actual enclave measurement
+                                       // report_data is guest-chosen: the attacker forges it to bind the EXPECTED measurement (which
+                                       // they know), so the report_data check alone would PASS.
+        let forged_rd = report_data_for_restore_ephemeral(&ek, &expected_meas, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&forged_rd);
+        // …but the hardware-signed measurement field carries the attacker's WRONG measurement.
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
+            .copy_from_slice(&wrong_meas);
+        assert!(
+            verify_restore_ephemeral_attestation(&report, &ek, &expected_meas, 11565, b"testnet")
+                .is_err(),
+            "a report whose signed measurement field != expected MUST fail (forged report_data is not enough)"
+        );
+    }
+
+    /// compact-9698: the completion attestation verify REJECT path (advisory — the positive TASK-28 test
+    /// is symmetric + would pass with inverted reject logic). A report whose report_data binds a DIFFERENT
+    /// identity_set_hash → Err (a host forging the identity set fails the binding).
+    #[test]
+    fn verify_restore_completion_rejects_substituted_identity_set() {
+        let rid = b"req-completion-1";
+        let meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let real_hash = [0xAAu8; 32];
+        let wrong_hash = [0xBBu8; 32];
+        let rd =
+            report_data_for_restore_completion(rid, &real_hash, &[0xCC; 32], 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        // Verify under a DIFFERENT identity_set_hash than the report was minted for ⇒ Err.
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                rid,
+                &wrong_hash,
+                &[0xCC; 32],
+                &meas,
+                11565,
+                b"testnet"
+            )
+            .is_err(),
+            "a report bound to a different identity_set_hash MUST fail (host identity-set forge)"
+        );
+    }
+
+    /// compact-9698: a report whose report_data binds a DIFFERENT request_id → Err (the replay/echo forge).
+    #[test]
+    fn verify_restore_completion_rejects_substituted_request_id() {
+        let rid = b"req-completion-1";
+        let meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let hash = [0xAAu8; 32];
+        let rd = report_data_for_restore_completion(rid, &hash, &[0xCC; 32], 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                b"FORGED-rid",
+                &hash,
+                &[0xCC; 32],
+                &meas,
+                11565,
+                b"testnet"
+            )
+            .is_err(),
+            "a report bound to a different request_id MUST fail (the replay/echo defense)"
+        );
+    }
+
+    /// compact-9698: a report with the correct report_data but a WRONG hardware-signed measurement field
+    /// → Err (a wrong-measurement enclave with forged report_data is rejected, mirroring the ephemeral test).
+    #[test]
+    fn verify_restore_completion_rejects_measurement_field_mismatch() {
+        let rid = b"req-completion-1";
+        let expected_meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let wrong_meas = [0x66u8; SNP_MEASUREMENT_LEN];
+        let hash = [0xAAu8; 32];
+        let rd = report_data_for_restore_completion(rid, &hash, &[0xCC; 32], 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
+            .copy_from_slice(&wrong_meas);
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                rid,
+                &hash,
+                &[0xCC; 32],
+                &expected_meas,
+                11565,
+                b"testnet"
+            )
+                .is_err(),
+            "a report whose signed measurement field != expected MUST fail (forged report_data is not enough)"
+        );
+    }
+
+    /// compact-9703: a report whose report_data binds a DIFFERENT sealed_blob_hash → Err. The attestation
+    /// binds the EXACT persisted blob (the compact-9703 fix); a host splicing a different sealed blob while
+    /// keeping the attestation fails here. Exercises the NEW sealed_blob_hash reject path (the other reject
+    /// tests use a matching sealed_blob_hash on both sides, so they don't cover this).
+    #[test]
+    fn verify_restore_completion_rejects_substituted_sealed_blob_hash() {
+        let rid = b"req-completion-1";
+        let meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let hash = [0xAAu8; 32];
+        let real_blob_hash = [0x11u8; 32];
+        let wrong_blob_hash = [0x22u8; 32];
+        // Build the report binding the REAL sealed_blob_hash.
+        let rd = report_data_for_restore_completion(rid, &hash, &real_blob_hash, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        // Verify expecting a DIFFERENT sealed_blob_hash than the report was minted for ⇒ Err (host spliced
+        // a different valid sealed blob while keeping the attestation — the binding catches it).
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                rid,
+                &hash,
+                &wrong_blob_hash,
+                &meas,
+                11565,
+                b"testnet"
+            )
+            .is_err(),
+            "a report bound to a different sealed_blob_hash MUST fail (host sealed-blob splice)"
+        );
     }
 
     // ---- fetch orchestration + unconditional cleanup over the TsmFs seam (TASK-7.7 5b-2; no live configfs needed) ----

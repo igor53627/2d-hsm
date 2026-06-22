@@ -3,9 +3,10 @@ id: TASK-26
 title: >-
   Production restore-drill evidence handoff for Agent Gateway funding-gate
   provenance (cross-repo bridge to 2D TASK-132.5.3.3 / .4)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-06-19'
+updated_date: '2026-06-22 01:03'
 labels:
   - agent-gateway
   - restore
@@ -17,9 +18,15 @@ dependencies:
   - TASK-24
   - TASK-13
 references:
-  - ../2d/backlog/tasks/task-132.5.3.3 - Implement-restore-provenance-loader-config-and-inventory.md
-  - ../2d/backlog/tasks/task-132.5.3.4 - Execute-restore-drill-and-break-glass-remediation-runbook.md
-  - ../2d/backlog/tasks/task-132.5.3 - Execute-agent-signer-restore-drill-verification-before-production-funding.md
+  - >-
+    ../2d/backlog/tasks/task-132.5.3.3 -
+    Implement-restore-provenance-loader-config-and-inventory.md
+  - >-
+    ../2d/backlog/tasks/task-132.5.3.4 -
+    Execute-restore-drill-and-break-glass-remediation-runbook.md
+  - >-
+    ../2d/backlog/tasks/task-132.5.3 -
+    Execute-agent-signer-restore-drill-verification-before-production-funding.md
   - ../2d/docs/specs/2026-06-07-agent-gateway-signer-2d-hsm-key-pool-design.md
 priority: high
 ordinal: 28500
@@ -43,9 +50,40 @@ Defines the **cross-repo handoff artifact contract** between the `2d-hsm` restor
 - [ ] #4 **Restored identity-set evidence shape.** Restored key refs must derive a public identity set comparable to 2D's `agent_restore_identity_set_v1` canonical encoding (per entry: `source_table`, `row_id`, `backend`, `algorithm`, `key_ref`, `status`, `address`, `public_identity`) so expected vs restored identity-set SHA-256 hashes can be compared on 2D's `attempt_completed` row. Address-only evidence is insufficient (mirrors 2D `TASK-132.5.3` AC#8). Document the field-level mapping from the ceremony's restored key material to the 2D identity-set entry shape.
 - [ ] #5 **Production-readiness evidence bundle schema.** Define the exact bundle schema that satisfies 2D `TASK-132.5.3.4`'s bundle contract: production environment + chain/network identity, 2d-hsm ceremony version, artifact format version, per-batch artifact URI/hash/size, the 2D-committed audit started/completed event ids, challenge/nonce echo evidence, expected + restored identity-set hashes, remediation status for any failed batches, and dual sign-off (Agent Gateway operator owner + recovery-material custodian). The schema must be machine-checkable so 2D's gate can refuse an incomplete or unsigned bundle.
 - [ ] #6 **Production coverage rule.** The bundle must cover EVERY active production backup batch linked to an enabled faucet treasury row or an assigned transfer key row in 2D, OR name a documented operator-approved exclusion whose linked 2D rows were disabled/retired BEFORE 2D sets `:agent_restore_provenance_enforced = true`. Partial coverage cannot enable enforcement for the uncovered rows; this mirrors 2D `TASK-132.5.3.4` DoD#1 and `TASK-132.5.3` AC#10.
-- [ ] #7 **Cross-repo handoff fixture.** An automated fixture drives the full cross-repo path end-to-end against a non-production backup: 2D commits `attempt_started` → a restore ceremony (the real TASK-24 `RESTORE_BACKUP(8)` handler where available, otherwise a documented non-production stand-in that preserves the AC#1–#4 contract) echoes the challenge + restores the identity set → 2D records `attempt_completed` and `Chain.AgentGateway.RestoreWriter.verify_completion/2` links provenance → the resulting bundle is validated against the AC#5 schema AND 2D's `Chain.AgentGateway.RestoreProvenance.validator_for/3` returns `true` for the restored batch. This is the proof that the handoff contract is internally consistent and that 2D can flip provenance on once production evidence is produced.
+- [x] #7 **Cross-repo handoff fixture.** An automated fixture drives the full cross-repo path end-to-end against a non-production backup: 2D commits `attempt_started` → a restore ceremony (the real TASK-24 `RESTORE_BACKUP(8)` handler where available, otherwise a documented non-production stand-in that preserves the AC#1–#4 contract) echoes the challenge + restores the identity set → 2D records `attempt_completed` and `Chain.AgentGateway.RestoreWriter.verify_completion/2` links provenance → the resulting bundle is validated against the AC#5 schema AND 2D's `Chain.AgentGateway.RestoreProvenance.validator_for/3` returns `true` for the restored batch. This is the proof that the handoff contract is internally consistent and that 2D can flip provenance on once production evidence is produced.
 - [ ] #8 **Scope exclusions (explicit).** Out of scope and explicitly owned elsewhere: the 2D-side audit schema, controlled writer, config loader, inventory monitor, and provenance validator (2D `TASK-132.5.3.1`/`.2`/`.3.3`, merged); the enclave-local `RESTORE_BACKUP(8)` handler internals (TASK-24); the on-chain `RecoveryTicket` / `MeasurementRegistry` (2d-solidity `TASK-1.4`, disjoint per TASK-24 AC#12); quorum / M-of-N recovery (single-key MVP). TASK-26 owns ONLY the cross-repo handoff artifact contract + the production ceremony execution evidence.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:IMPL_NOTES:BEGIN -->
+AC#1-#8 contract document landed via PR #107 (merged into main). The contract covers: ceremony+artifact version pins, restore command contract, challenge/nonce echo binding, identity-set field mapping, evidence bundle schema, coverage rule, cross-repo fixture design, scope exclusions. Round-1 (cursor+greptile): fixed Ethereum address derivation [12..32 not 0..20], clarified payload_binding vs attempt_challenge, separated remediation_log from batches[] in the schema. AC#7 fixture test (the 2D-side end-to-end test) is a follow-up PR in the 2d repo — it was split out because it drives 2D-side code paths (RestoreWriter, validator, audit evidence).
+
+**AC#7 stand-in caveat (claude-code design review job 9839, MEDIUM finding #3 — deferred, not dropped):** AC#7 permits "a documented non-production stand-in that preserves the AC#1–#4 contract" in place of the real enclave handler. Contract §4 states the cross-repo fixture (AC#7) is "the only thing that catches a divergence" between the enclave's `compute_restored_identity_set_hash` and 2D's reimplementation — but if the stand-in does not exercise the real enclave hash function, it cannot detect a SHA-2-vs-SHA-3 / endianness / sort mismatch, making the named safety net illusory. **Resolution:** the 2d-hsm side now exposes `compute_restored_identity_set_hash` + the §4 byte layout as a pinned known-answer vector (contract §4 + `agent_dispatch.rs:2847`). The 2D-side fixture (AC#7, landed as PR #218) MUST assert byte-equality against this pinned vector — not a stand-in reimplementation. Upgrading the fixture to call the real enclave hash (or assert the KAV) is a 2D-repo follow-up; the contract + code now provide the ground truth to pin against. The §4 claim is accurate once the fixture asserts against the real layout; until then the risk is a cross-repo hash mismatch that would surface as "attestation ALWAYS fails to verify" at integration, not a silent forge.
+<!-- SECTION:IMPL_NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-06-22 01:03
+---
+Re-opened (was Done): compact 9651 surfaced verified HIGH findings in docs/restore-drill-evidence-handoff-contract.md that the Done flip did not address:
+
+1. HIGH (§3): the contract says the host-side frame layer reads KeyEntry.public_identity from the sealed candidate, but the sealed keystore is XChaCha20Poly1305 AEAD-encrypted (agent_keystore.rs:9,194) — the host CANNOT read plaintext identities. The restored identity set + request_id echo must be EMITTED by the enclave-side frame layer in the RESTORE_BACKUP response. Tracked as TASK-28 (the response-shape gap, jointly with TASK-24).
+
+2. HIGH (§2/§3 nonce model): attempt_challenge is described as the high-entropy nonce, but the ceremony binds/echoes request_id (= attempt_started.id) as the challenge — internally inconsistent.
+
+3. MED (§4): agent_restore_identity_set_v1 entry omits public_identity.
+
+4. MED (§5): schema carries batches[].remediation_status while constraints require a separate undefined remediation_log[].
+
+The contract AC#1-#8 document is merged (PR #107) but these content issues mean the Done claim was premature. Keeping In Progress until the contract is aligned to the live code (TASK-28 owns the response-shape half; the nonce/schema fixes are TASK-26-internal).
+---
+<!-- COMMENTS:END -->
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+PR #107 (2d-hsm, contract doc AC#1-8) + PR #218 (2d, fixture test AC#7). **Status: In Progress** — the contract doc + fixture landed, but compact-9651 surfaced HIGH content issues (AEAD-encrypted keystore means the host cannot read identities; nonce model contradiction; missing public_identity field; remediation_log schema). TASK-28 addressed the response-shape half; the nonce/schema fixes + AC re-verification remain before this task flips to Done.
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Notes
 <!-- SECTION:NOTES:BEGIN -->

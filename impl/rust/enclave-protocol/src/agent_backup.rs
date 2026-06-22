@@ -370,6 +370,15 @@ fn strict_parse(blob: &[u8]) -> Result<ParsedBackup<'_>, BackupError> {
     })
 }
 
+/// Extract the backup header's `recovery_key_id` — the ML-KEM wrapping key id the backup was sealed
+/// to — WITHOUT decapsulating. Used by the RESTORE handler (AC#10) to enforce wrapping-key
+/// separation: a backup sealed to a key whose id != `derive_recovery_key_id(this_enclave's sealed
+/// backup_recovery_wrapping_pubkey)` MUST fail (authorized by the recovery authority but re-wrapped
+/// to the wrong ML-KEM key). Pure framing parse; fails closed on any malformed blob.
+pub(crate) fn backup_recovery_key_id(blob: &[u8]) -> Result<&[u8], BackupError> {
+    Ok(strict_parse(blob)?.recovery_key_id)
+}
+
 // ===========================================================================================
 // restore-ingress-v1 — the EXPORT_BACKUP payload (TASK-13b slice 4c-2a). This is the OPAQUE
 // `payload` that [`seal_backup_blob`] wraps in the KEM-DEM envelope: the RESTORABLE agent state a
@@ -3056,6 +3065,45 @@ mod tests {
         assert_eq!(
             target, pre,
             "NO partial mutation on the capacity-overflow path"
+        );
+    }
+
+    /// Compact 9611 Med: the audit-seq MonotonicOverflow path (max record seq == u64::MAX ⇒
+    /// next_seq checked_add overflows) fails closed with NO partial mutation — HIGH #3 (compact 9516)
+    /// computes ALL fallible values before any write.
+    #[test]
+    fn apply_restore_audit_seq_overflow_fails_closed_no_mutation() {
+        let mut target = restore_target_body();
+        let pre = target.clone();
+        let mut data = sample_restore_data();
+        data.audit_records[0].seq = u64::MAX; // max seq ⇒ next_seq = MAX+1 overflows
+        assert_eq!(
+            apply_restore_to_body(&mut target, &data, 64),
+            Err(RestoreApplyError::MonotonicOverflow),
+            "audit-seq overflow ⇒ fail closed"
+        );
+        assert_eq!(
+            target, pre,
+            "NO partial mutation on the audit-seq-overflow path (compute-before-write)"
+        );
+    }
+
+    /// Compact 9611 Med: the strict-recovery MonotonicOverflow path (max(local, backup) ==
+    /// u64::MAX ⇒ strict_recovery checked_add overflows) fails closed with NO partial mutation.
+    #[test]
+    fn apply_restore_strict_recovery_overflow_fails_closed_no_mutation() {
+        let mut target = restore_target_body();
+        target.strict_recovery_counter = u64::MAX; // local high-water at the monotonic ceiling
+        let pre = target.clone();
+        let data = sample_restore_data(); // data.strict_recovery_counter (0) ≤ MAX ⇒ max == MAX
+        assert_eq!(
+            apply_restore_to_body(&mut target, &data, 64),
+            Err(RestoreApplyError::MonotonicOverflow),
+            "strict-recovery overflow ⇒ fail closed"
+        );
+        assert_eq!(
+            target, pre,
+            "NO partial mutation on the strict-recovery-overflow path (compute-before-write)"
         );
     }
 
