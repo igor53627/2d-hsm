@@ -54,7 +54,7 @@ The handler returns `AgentResponse::RestoreBackup { candidate: Box<KeystoreBody>
 | Return artifact | Where on the wire | What 2D records |
 |---|---|---|
 | Restored identity set | Key 3 — array of `{1: key_ref(32B), 2: public_identity(65B uncompressed SEC1), 3: key_purpose(1=transfer,2=faucet)}`, emitted PLAINTEXT by the enclave-side frame layer (the host cannot unseal key 1). 2D maps these to `agent_restore_identity_set_v1` (§4) + derives the Ethereum address from `public_identity`. | `attempt_completed.restored_identity_set_sha256` |
-| Challenge echo | Key 2 — `request_id_echo` == the request's `request_id` == `attempt_started.id` (bound into the cap's `payload_binding`). Emitted PLAINTEXT. | `attempt_completed.attempt_challenge` (proves ceremony consumed the live nonce) |
+| Challenge echo | Key 2 — `request_id_echo` == the request's `request_id` == `attempt_started.id` (bound into the cap's `payload_binding`). Emitted PLAINTEXT. | `attempt_completed.request_id_echo` (proves ceremony consumed 2D's live attempt). NB distinct from `attempt_completed.attempt_challenge`, which 2D records from its OWN committed `attempt_started.attempt_challenge` (a 2D-side consistency field, NOT a ceremony echo). |
 | Ceremony success | No error code (0x00 ACK) | `attempt_completed.result = "success"` |
 
 `secret_scalar` is NEVER emitted (lives only in the sealed blob).
@@ -141,7 +141,7 @@ The restored identity-set SHA-256 hash is computed over the canonical JSON of th
       "artifact_size_bytes": 12345,
       "attempt_started_event_id": "uuid",
       "attempt_completed_event_id": "uuid",
-      "attempt_challenge_echo": "hex-32",
+      "request_id_echo": "hex (== attempt_started.id; from the ceremony's RESTORE_BACKUP response key 2)",
       "expected_identity_set_sha256": "hex",
       "restored_identity_set_sha256": "hex",
       "identity_match": true,
