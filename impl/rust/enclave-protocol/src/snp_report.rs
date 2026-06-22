@@ -174,7 +174,7 @@ pub fn report_data_for_restore_ephemeral(
     h.update(encaps_key);
     h.update(measurement);
     h.update(chain_id.to_be_bytes());
-    h.update(&(environment_identifier.len() as u64).to_be_bytes()); // length-prefix (consistency with report_data_for_restore_completion)
+    h.update((environment_identifier.len() as u64).to_be_bytes()); // length-prefix (consistency with report_data_for_restore_completion)
     h.update(environment_identifier);
     h.finalize().into()
 }

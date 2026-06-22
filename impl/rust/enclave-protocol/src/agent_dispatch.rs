@@ -2867,7 +2867,7 @@ fn compute_restored_identity_set_hash(identity_set: &[RestoredKeyIdentity]) -> [
 /// restored-key identity evidence (each `{1: key_ref(32B), 2: public_identity, 3: key_purpose}`). Key 4 +
 /// 5 are the completion attestation (compact-9675 HIGH, option A): a fresh SNP report whose `report_data`
 /// binds (request_id, identity_set_hash, sealed_blob_hash, chain, env) to the attested enclave, + its
-/// verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
+/// cert chain. 2D verifies key 4 (AMD-signed, measurement-bound) BEFORE trusting keys 2 + 3 — without it a host could
 /// forge the plaintext evidence. Invoked by the frame-layer seam ONLY after the anchor commit succeeds
 /// (the attestation is fetched BEFORE the commit — fail-closed: no attestation ⇒ no commit/restore).
 fn encode_restore_backup_response(
