@@ -3,10 +3,10 @@ id: TASK-26
 title: >-
   Production restore-drill evidence handoff for Agent Gateway funding-gate
   provenance (cross-repo bridge to 2D TASK-132.5.3.3 / .4)
-status: Done
+status: In Progress
 assignee: []
 created_date: '2026-06-19'
-updated_date: '2026-06-21 21:26'
+updated_date: '2026-06-22 01:03'
 labels:
   - agent-gateway
   - restore
@@ -59,6 +59,25 @@ Defines the **cross-repo handoff artifact contract** between the `2d-hsm` restor
 <!-- SECTION:NOTES:BEGIN -->
 AC#1-#8 contract document landed via PR #107 (merged into main). The contract covers: ceremony+artifact version pins, restore command contract, challenge/nonce echo binding, identity-set field mapping, evidence bundle schema, coverage rule, cross-repo fixture design, scope exclusions. Round-1 (cursor+greptile): fixed Ethereum address derivation [12..32 not 0..20], clarified payload_binding vs attempt_challenge, separated remediation_log from batches[] in the schema. AC#7 fixture test (the 2D-side end-to-end test) is a follow-up PR in the 2d repo — it was split out because it drives 2D-side code paths (RestoreWriter, validator, audit evidence).
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-06-22 01:03
+---
+Re-opened (was Done): compact 9651 surfaced verified HIGH findings in docs/restore-drill-evidence-handoff-contract.md that the Done flip did not address:
+
+1. HIGH (§3): the contract says the host-side frame layer reads KeyEntry.public_identity from the sealed candidate, but the sealed keystore is XChaCha20Poly1305 AEAD-encrypted (agent_keystore.rs:9,194) — the host CANNOT read plaintext identities. The restored identity set + request_id echo must be EMITTED by the enclave-side frame layer in the RESTORE_BACKUP response. Tracked as TASK-28 (the response-shape gap, jointly with TASK-24).
+
+2. HIGH (§2/§3 nonce model): attempt_challenge is described as the high-entropy nonce, but the ceremony binds/echoes request_id (= attempt_started.id) as the challenge — internally inconsistent.
+
+3. MED (§4): agent_restore_identity_set_v1 entry omits public_identity.
+
+4. MED (§5): schema carries batches[].remediation_status while constraints require a separate undefined remediation_log[].
+
+The contract AC#1-#8 document is merged (PR #107) but these content issues mean the Done claim was premature. Keeping In Progress until the contract is aligned to the live code (TASK-28 owns the response-shape half; the nonce/schema fixes are TASK-26-internal).
+---
+<!-- COMMENTS:END -->
 
 ## Final Summary
 

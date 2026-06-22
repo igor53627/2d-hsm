@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-06-18 21:28'
-updated_date: '2026-06-22 00:47'
+updated_date: '2026-06-22 01:04'
 labels:
   - agent-gateway
   - restore
@@ -72,6 +72,8 @@ RESTORE_BACKUP(8) recovery-ceremony handler landed (slices 2a/2b/2c) + multi-ven
 **Deferred coverage gap:** cap-counter-max regression test (compact round-2 Med) — the handler's anti-replay max-path (highest_accepted_counter.max(verified.counter)) lacks an e2e test where authenticated marks carry a higher counter than the cap. Simple, well-commented code; testing it through the ceremony setup requires modifying the shared restore_env helper (risk to 5 other tests) or duplicating the complex setup — disproportionate for Med coverage. Noted here for a future test pass.
 
 **Verification:** 644 crate tests pass (--features agent-gateway agent-backup-export-preview); cargo fmt clean. Production install fetch_report path is CI-untested (requires SNP hardware, like the producer fetch_measurement_and_report — tested on-device, not in unit tests).
+
+**CROSS-REPO FOLLOW-UP (HIGH, tracked — not silently closed):** compact 9651 verified that encode_restore_backup_response emits ONLY {1: sealed_keystore_blob} — it does NOT carry the restored identity set or the request_id echo that TASK-26's contract (docs/restore-drill-evidence-handoff-contract.md §3) requires 2D to consume. The sealed keystore is XChaCha20Poly1305 AEAD-encrypted, so the host cannot extract KeyEntry.public_identity — the enclave-side frame layer must emit them. TASK-24's 12 ACs are met (the handler restores correctly), but the ceremony's downstream response shape is incomplete vs the contract. Tracked as TASK-28 (response-shape gap, joint with TASK-26 which is re-opened for the matching contract-doc fixes). This does NOT block TASK-24's Done (its ACs are satisfied) but the cross-repo gap has a durable tracker, not a silent drop.
 <!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Notes
