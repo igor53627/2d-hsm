@@ -246,7 +246,9 @@ pub fn report_data_for_restore_completion(
     let mut h = Sha3_512::new();
     h.update(RESTORE_COMPLETION_DOMAIN);
     h.update(chain_id.to_be_bytes());
+    h.update(&(environment_identifier.len() as u64).to_be_bytes()); // length-prefix (compact-9698 Med)
     h.update(environment_identifier);
+    h.update(&(request_id_echo.len() as u64).to_be_bytes()); // length-prefix (no (env,rid) tuple collision)
     h.update(request_id_echo);
     h.update(identity_set_hash);
     h.finalize().into()
@@ -693,6 +695,78 @@ mod tests {
             .copy_from_slice(&wrong_meas);
         assert!(
             verify_restore_ephemeral_attestation(&report, &ek, &expected_meas, 11565, b"testnet")
+                .is_err(),
+            "a report whose signed measurement field != expected MUST fail (forged report_data is not enough)"
+        );
+    }
+
+    /// compact-9698: the completion attestation verify REJECT path (advisory — the positive TASK-28 test
+    /// is symmetric + would pass with inverted reject logic). A report whose report_data binds a DIFFERENT
+    /// identity_set_hash → Err (a host forging the identity set fails the binding).
+    #[test]
+    fn verify_restore_completion_rejects_substituted_identity_set() {
+        let rid = b"req-completion-1";
+        let meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let real_hash = [0xAAu8; 32];
+        let wrong_hash = [0xBBu8; 32];
+        let rd = report_data_for_restore_completion(rid, &real_hash, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        // Verify under a DIFFERENT identity_set_hash than the report was minted for ⇒ Err.
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                rid,
+                &wrong_hash,
+                &meas,
+                11565,
+                b"testnet"
+            )
+            .is_err(),
+            "a report bound to a different identity_set_hash MUST fail (host identity-set forge)"
+        );
+    }
+
+    /// compact-9698: a report whose report_data binds a DIFFERENT request_id → Err (the replay/echo forge).
+    #[test]
+    fn verify_restore_completion_rejects_substituted_request_id() {
+        let rid = b"req-completion-1";
+        let meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let hash = [0xAAu8; 32];
+        let rd = report_data_for_restore_completion(rid, &hash, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN].copy_from_slice(&meas);
+        assert!(
+            verify_restore_completion_attestation(
+                &report,
+                b"FORGED-rid",
+                &hash,
+                &meas,
+                11565,
+                b"testnet"
+            )
+            .is_err(),
+            "a report bound to a different request_id MUST fail (the replay/echo defense)"
+        );
+    }
+
+    /// compact-9698: a report with the correct report_data but a WRONG hardware-signed measurement field
+    /// → Err (a wrong-measurement enclave with forged report_data is rejected, mirroring the ephemeral test).
+    #[test]
+    fn verify_restore_completion_rejects_measurement_field_mismatch() {
+        let rid = b"req-completion-1";
+        let expected_meas = [0x55u8; SNP_MEASUREMENT_LEN];
+        let wrong_meas = [0x66u8; SNP_MEASUREMENT_LEN];
+        let hash = [0xAAu8; 32];
+        let rd = report_data_for_restore_completion(rid, &hash, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&rd);
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
+            .copy_from_slice(&wrong_meas);
+        assert!(
+            verify_restore_completion_attestation(&report, rid, &hash, &expected_meas, 11565, b"testnet")
                 .is_err(),
             "a report whose signed measurement field != expected MUST fail (forged report_data is not enough)"
         );
