@@ -1,9 +1,10 @@
 ---
 id: TASK-1.7
 title: Security review of enclave-protocol crate
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-06 15:58'
+updated_date: '2026-06-22 22:48'
 labels:
   - security
   - review
@@ -18,3 +19,9 @@ ordinal: 11000
 <!-- SECTION:DESCRIPTION:BEGIN -->
 Formal security review of the signing service (acceptance #2): key never leaves the TEE in plaintext, correct sealing/attestation usage, no obvious exfiltration paths, fail-closed on RNG/seal/attestation errors. Run /security-review on the crate + a focused threat-model pass (malicious host over vsock; supply-chain on the public image).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+PR #110. Full security audit of enclave-protocol crate (~52k lines, 5 parallel tracks). 0 HIGH, 3 MEDIUM (ProvisionSession Debug over seal_root; pqcrypto SecretKey transient not scrubbed; stale Cargo.toml docs), 4 LOW, 3 INFO. 15 clean areas verified PASS. 2D type-0x19 reservation confirmed merged.
+<!-- SECTION:FINAL_SUMMARY:END -->
