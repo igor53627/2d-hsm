@@ -53,7 +53,7 @@ The handler returns `AgentResponse::RestoreBackup { candidate: Box<KeystoreBody>
 
 | Return artifact | Where on the wire | What 2D records |
 |---|---|---|
-| **Completion attestation (MUST verify first)** | **Key 4** — the SNP `attestation_report` (AMD-signed); **key 5** — its VCEK→ASK→ARK `cert_chain`. 2D verifies: the cert chain against the AMD root, the report's `measurement` == the expected enclave build, AND the report's `report_data` == `report_data_for_restore_completion(request_id_echo, restored_identity_set_sha256, chain, env)` (compact-9675 option A). **Only after this verifies** may 2D trust keys 2 + 3. | `attempt_completed.attestation_verified = true` (+ the report/cert bytes for audit) |
+| **Completion attestation (MUST verify first)** | **Key 4** — the SNP `attestation_report` (AMD-signed); **key 5** — its VCEK→ASK→ARK `cert_chain`. 2D verifies: the cert chain against the AMD root, the report's `measurement` == the expected enclave build, AND the report's `report_data` == `report_data_for_restore_completion(request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env)` (compact-9703 — the binding INCLUDES the sealed blob). **Only after this verifies** may 2D trust keys 2 + 3. The exact `report_data` preimage (SHA3-512, domain-separated) — both sides MUST compute identically: `RESTORE_COMPLETION_DOMAIN ‖ chain_id(u64 BE) ‖ env_len(u64 BE) ‖ env ‖ request_id_len(u64 BE) ‖ request_id ‖ identity_set_hash(32) ‖ sealed_blob_hash(32)`. | `attempt_completed.attestation_verified = true` (+ the report/cert bytes for audit) |
 | Restored identity set | Key 3 — array of `{1: key_ref(32B), 2: public_identity(65B), 3: key_purpose}`, emitted PLAINTEXT. Trusted ONLY if key 4 verifies. 2D maps to `agent_restore_identity_set_v1` (§4) + derives the Ethereum address. | `attempt_completed.restored_identity_set_sha256` |
 | Challenge echo | Key 2 — `request_id_echo` == `attempt_started.id` (cap-bound). Trusted ONLY if key 4 verifies (the attestation binds it). | `attempt_completed.request_id_echo` |
 | Ceremony success | No error code (0x00 ACK) | `attempt_completed.result = "success"` |
@@ -157,6 +157,10 @@ for each entry, sorted ascending by key_ref (the 32-byte opaque handle):
       "expected_identity_set_sha256": "hex",
       "restored_identity_set_sha256": "hex",
       "identity_match": true,
+      "attestation_verified": true,
+      "attestation_report_sha256": "hex (SHA-2-256 of the RESTORE_BACKUP response key 4 — the AMD-signed completion report; 2D verifies report_data binds (request_id_echo, restored_identity_set_sha256, sealed_blob_sha256, chain, env) + measurement == expected, per §3)",
+      "attestation_cert_chain_sha256": "hex (SHA-2-256 of response key 5; the full cert bytes are retained for audit)",
+      "sealed_blob_sha256": "hex (SHA-2-256 of the persisted sealed keystore blob — response key 1; the attestation binds this)",
       "remediation_status": null
     }
   ],
@@ -175,6 +179,7 @@ for each entry, sorted ascending by key_ref (the 32-byte opaque handle):
 - `ceremony.restore_ingress_envelope_format_version == 1`
 - Every batch entry has `identity_match == true`. A batch that FAILED the identity check must NOT appear in `batches[]` — instead it is documented in a separate `remediation_log[]` array with its `backup_batch_id` + `remediation_status`. The linked 2D rows for remediated batches MUST be disabled/retired before enforcement.
 - Every batch in `batches[]` has `expected_identity_set_sha256 == restored_identity_set_sha256`
+- Every batch in `batches[]` has `attestation_verified == true` AND `attestation_report_sha256` + `attestation_cert_chain_sha256` + `sealed_blob_sha256` non-empty (compact-9675/9703: the host-forge defense is useless if the consumer doesn't enforce the completion attestation — a batch without verified attestation MUST NOT satisfy the gate)
 - `sign_off` has both fields non-empty
 
 ## 6. Production coverage rule (AC#6)
