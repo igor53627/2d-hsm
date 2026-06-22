@@ -236,6 +236,14 @@ const RESTORE_COMPLETION_DOMAIN: &[u8] = b"2d-hsm-restore-completion-v1";
 /// chain, env) breaks the binding. NB this binds the IDENTITY SET (the evidence 2D consumes), NOT the
 /// sealed blob directly — the sealed blob is the host's persistence; its content integrity is the AEAD
 /// tag on next-boot unseal, and the attested identity_set is what 2D verifies against its baseline.
+/// DEFENSE-IN-DEPTH DEFERRED (compact-9698/9703, codex+grok): the binding does NOT include
+/// `sha256(sealed_blob)`, so a host could in principle splice a DIFFERENT valid sealed blob while keeping
+/// the attested identity evidence. claude-code verified the realistic instance of this (replaying an older
+/// valid blob) is caught by the anchor anti-rollback at next-boot reconcile (strict_recovery_counter /
+/// structural_version reject the lower-counter blob). Binding sealed_blob_hash is the robust close but
+/// requires splitting the shared commit_before_emit seam (seal→attest→commit) — risk to the 5 other ops
+/// that share it; tracked as a TASK-28 follow-up, not worth the seam refactor for a defense-in-depth the
+/// anchor already mitigates.
 pub fn report_data_for_restore_completion(
     request_id_echo: &[u8],
     identity_set_hash: &[u8; 32],

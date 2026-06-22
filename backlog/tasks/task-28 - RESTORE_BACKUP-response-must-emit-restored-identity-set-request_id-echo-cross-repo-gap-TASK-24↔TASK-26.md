@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-06-22 01:02'
-updated_date: '2026-06-22 07:38'
+updated_date: '2026-06-22 08:38'
 labels:
   - agent-gateway
   - restore
@@ -65,5 +65,15 @@ The authentication binding is a design decision (which enclave key signs — att
 created: 2026-06-22 07:38
 ---
 Also fixed (compact 9675 Med): the nonce-field naming — the ceremony echo is now consistently `request_id_echo` (was contradictory `attempt_challenge`/`attempt_challenge_echo` in §3 + the bundle schema); resolved per §2 (attempt_challenge is a 2D-side field, not a ceremony echo).
+---
+
+created: 2026-06-22 08:38
+---
+Option-A matrix (jobs 9693-9697) + compacts 9698/9703: the attestation binding is in + multi-vendor-reviewed. Findings closed: contract §3 now requires 2D to verify key 4 before trusting keys 2/3 (claude-code HIGH — the consumer-side enforcement); length-prefix env/request_id in report_data_for_restore_completion (codex Med — tuple-collision); 3 reject-path tests for verify_restore_completion_attestation (advisory — the positive test was symmetric).
+---
+
+created: 2026-06-22 08:38
+---
+DEFENSE-IN-DEPTH DEFERRED (codex+grok, compact 9703): report_data_for_restore_completion binds the identity set but NOT sha256(sealed_blob) — a host could in principle splice a different valid sealed blob. claude-code verified the realistic instance (replaying an older valid blob) is caught by the anchor anti-rollback at next-boot (strict_recovery_counter/structural_version). Binding sealed_blob_hash is the robust close but requires splitting the shared commit_before_emit seam (risk to the 5 other ops); deferred to a TASK-28 follow-up — documented inline + here, the anchor mitigates the realistic attack. NB: the compact will keep re-verifying this until either the binding lands or the finding is closed with this rationale — it is a tracked defense-in-depth, not a realistic-attack gap.
 ---
 <!-- COMMENTS:END -->
