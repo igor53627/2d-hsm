@@ -1961,6 +1961,17 @@ pub(crate) fn install_restore_ephemeral(
     // published; the restore ceremony REQUIRES a real TEE). The fixed configfs entry is safe here: the
     // producer's boot-time fetch is long-complete by ceremony time, and fetch_report unconditionally
     // cleans up the entry.
+    //
+    // TODO(production-un-gate, compact-9611 Med codex+gemini): `fetch_report` is UNBOUNDED (the same
+    // contract as the producer GET_MEASUREMENT boot path). Unlike GET_MEASUREMENT (boot-only, before the
+    // serve loop), GET_RESTORE_PUBKEY runs IN the serial agent serve loop — a stuck configfs-tsm read
+    // here blocks all later requests (DoS). The crate's accepted bound is the killable subprocess
+    // (quote_subprocess::HardBoundedQuoteProducer); cooperative deadlines were deliberately removed
+    // ((4a)). Routing this fetch through the bounded subprocess is tracked as TASK-27 — a HARD un-gate
+    // blocker (the `agent-backup-export-preview` release-ban was removed in TASK-18 18-9 and the
+    // `agent-gateway-release` Nix profile enables the feature, so this DoS ships the moment RESTORE is
+    // un-gated unless TASK-27 gates it). The ceremony-setup op is low-frequency (operator-called, once
+    // per restore), which limits but does not eliminate the vector.
     let report_data = crate::snp_report::report_data_for_restore_ephemeral(
         &encaps_key,
         measurement,

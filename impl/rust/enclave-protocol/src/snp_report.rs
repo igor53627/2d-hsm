@@ -208,7 +208,19 @@ pub fn verify_restore_ephemeral_attestation(
              (host may have substituted the key or replayed a foreign report)",
         ));
     }
-    measurement_from_report(report)
+    // gemini 9632 Med: verify the report's HARDWARE-SIGNED measurement equals the expected enclave
+    // measurement — report_data is guest-chosen, so an attacker who boots a different/compromised enclave
+    // build (different measurement) could request a report with the correct report_data. Checking the
+    // signed measurement field here (rather than just returning it for the caller to compare) removes the
+    // footgun where a caller treats Ok as full verification.
+    let report_measurement = measurement_from_report(report)?;
+    if report_measurement[..] != *expected_measurement {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "restore-ephemeral attestation: the report's hardware-signed measurement does not match the \
+             expected enclave measurement (the key may be from a different/compromised TEE build)",
+        ));
+    }
+    Ok(report_measurement)
 }
 
 /// The configfs-tsm filesystem operations, behind a seam so the cleanup orchestration in
@@ -592,6 +604,30 @@ mod tests {
         assert!(
             verify_restore_ephemeral_attestation(&report, &ek, &meas, 11565, b"testnet").is_err(),
             "a report bound to a different key MUST fail operator verification"
+        );
+    }
+
+    /// gemini 9632 Med (Fix B): a report whose report_data binds the EXPECTED measurement but whose
+    /// HARDWARE-SIGNED measurement field is DIFFERENT (an attacker booted a wrong-measurement enclave,
+    /// then requested a report with report_data forged to the expected binding) MUST be rejected. Before
+    /// Fix B the helper returned this measurement for the caller to compare — a footgun; now it verifies.
+    #[test]
+    fn verify_restore_ephemeral_attestation_rejects_measurement_field_mismatch() {
+        let ek = [0xAAu8; 32];
+        let expected_meas = [0xBBu8; 48];
+        let wrong_meas = [0xCCu8; 48]; // the attacker's actual enclave measurement
+                                       // report_data is guest-chosen: the attacker forges it to bind the EXPECTED measurement (which
+                                       // they know), so the report_data check alone would PASS.
+        let forged_rd = report_data_for_restore_ephemeral(&ek, &expected_meas, 11565, b"testnet");
+        let mut report = vec![0u8; MIN_REPORT_LEN];
+        report[REPORT_DATA_OFFSET..REPORT_DATA_OFFSET + 64].copy_from_slice(&forged_rd);
+        // …but the hardware-signed measurement field carries the attacker's WRONG measurement.
+        report[MEASUREMENT_OFFSET..MEASUREMENT_OFFSET + SNP_MEASUREMENT_LEN]
+            .copy_from_slice(&wrong_meas);
+        assert!(
+            verify_restore_ephemeral_attestation(&report, &ek, &expected_meas, 11565, b"testnet")
+                .is_err(),
+            "a report whose signed measurement field != expected MUST fail (forged report_data is not enough)"
         );
     }
 
