@@ -654,7 +654,7 @@ Mixed-role fixtures are permitted only in non-deployable tests.
 (AC#8), each validated by exhaustive allow-list and mapped to a capability tier (§10.7).
 
 **Capability requirement per opcode** (resolves the inner-envelope key-5 condition):
-- **No capability — low-privilege reads:** `PUBLIC_IDENTITY`, `PROVE_IDENTITY`.
+- **No capability — low-privilege reads:** `PUBLIC_IDENTITY`, `PROVE_IDENTITY`, `GET_RESTORE_PUBKEY` (ceremony-setup: publishes the attested ephemeral pubkey the operator re-wraps to; the pubkey is public+attested, no sealed-state mutation).
 - **No administrative capability — runtime signing:** `SIGN_TRANSFER`, `SIGN_FAUCET_DISPENSE`.
   These do **not** carry capability key 5; per the threat model they are reachable by any
   vsock caller, and their bound is the enclave-built canonical preimage (no caller digest),
