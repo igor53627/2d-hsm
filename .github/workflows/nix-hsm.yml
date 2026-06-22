@@ -144,6 +144,15 @@ jobs:
       - name: Agent Gateway incl. EXPORT_BACKUP KEM-DEM preview (TASK-13b slice 1)
         run: cargo test --features agent-backup-export-preview --lib agent_backup
 
+      # TASK-27: the bounded restore quote fetch (fetch_quote_for_restore + the regression test
+      # restore_path_fetch_kills_wedged_child_within_deadline) requires the cfg intersection
+      # linux+vsock-transport+agent-gateway (quote_subprocess module) AND agent-backup-export-preview.
+      # NO other lane combines vsock-transport + agent-backup-export-preview, so without this lane
+      # the bounded production path + its regression test bit-rot off-CI. The wedge test is deviceless
+      # (smoke_spawn sleeps; killed at the 400ms deadline), so it runs on ubuntu-latest.
+      - name: Restore bounded quote fetch (TASK-27, vsock + backup-export intersection)
+        run: cargo test --features vsock-transport,agent-backup-export-preview --lib quote_subprocess
+
       # TASK-23 Slice 3: the deviceless contract-test server's MUTATING lane (ReferenceCommitChannel + the
       # mock anchor commit channel) ships behind agent-contract-server + the mutating previews — an
       # intersection NO other lane builds (the nix prod build is preview-off AND contract-server-off; the

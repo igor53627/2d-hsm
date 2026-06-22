@@ -853,7 +853,10 @@ const RESTORE_QUOTE_DEADLINE: Duration = Duration::from_secs(5);
 /// The restore-path abandoned-child ledger — process-global, lazily initialized on first use.
 /// SEPARATE from the boot-relay's ledger (which is dropped after boot, its zombies reaped by Drop).
 /// Same [`ABANDONED_CHILD_BUDGET`] cap: the restore path is low-frequency (operator-called, once per
-/// restore), so the practical zombie accumulation risk is negligible.
+/// restore), so the practical zombie accumulation risk is negligible. NB: because this is a SECOND
+/// process-global ledger (the boot-relay's is dropped before this one initializes), the worst-case
+/// zombie ceiling for the process is 2 × ABANDONED_CHILD_BUDGET — acceptable given restore is
+/// operator-frequency and the two ledgers never coexist.
 #[cfg(feature = "agent-backup-export-preview")]
 static RESTORE_QUOTE_LEDGER: std::sync::OnceLock<
     std::sync::Mutex<AbandonedLedger<StdChildHandle>>,
@@ -871,6 +874,10 @@ fn fetch_quote_for_restore_inner<S: QuoteChildSpawn>(
 ) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
     fetch_quote_via_child(spawn, ledger, report_data, deadline).map_err(|e| match e {
         // Relabel the boot-relay's triage string to the restore-path context.
+        // NB: this matches the INTERMEDIATE string produced by fetch_quote_via_child's own relabel
+        // (of DEADLINE_LAPSED_MSG → "anchor relay: quote pipe deadline lapsed"). If that intermediate
+        // literal changes, this arm silently falls through — pinned by
+        // restore_path_fetch_kills_wedged_child_within_deadline.
         ProtocolError::WireProtocol("anchor relay: quote pipe deadline lapsed") => {
             ProtocolError::WireProtocol(
                 "restore quote: pipe deadline lapsed (configfs-tsm provider may be wedged)",

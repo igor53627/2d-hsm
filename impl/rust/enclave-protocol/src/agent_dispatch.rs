@@ -1933,6 +1933,14 @@ pub(crate) struct RestoreEphemeralPub {
 /// falling back to the unbounded in-process `fetch_report` in non-production builds (tests, non-linux).
 /// A wedged configfs-tsm provider is SIGKILLed within the deadline (5s) in production; in tests the
 /// fetch fails immediately (no configfs-tsm on macOS), so the fallback is safe.
+///
+/// **Why no compile_error guard on the fallback** (claude-code design review): the production bin
+/// (`twod-hsm-agent-gateway`) declares `required-features = ["agent-gateway", "vsock-transport"]`
+/// (Cargo.toml), so no production binary can compile `agent-backup-export-preview` without
+/// vsock-transport — the unbounded fallback is structurally unreachable in production. A
+/// `compile_error!` keyed on `linux + backup-export + not(vsock-transport)` would break the existing
+/// CI lane `cargo test --features agent-backup-export-preview` (Linux runner, no vsock-transport),
+/// where the fallback is harmless (no real configfs-tsm on the CI host).
 #[cfg(feature = "agent-backup-export-preview")]
 fn fetch_restore_attestation(
     report_data: &[u8; 64],
