@@ -1,9 +1,10 @@
 ---
 id: TASK-11
 title: Doc/spec precision + wire/feature cleanups (roborev audit 2026-06-07)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-07 18:02'
+updated_date: '2026-06-23 15:36'
 labels:
   - documentation
   - audit
@@ -23,3 +24,9 @@ Stale docs: test counts 62/74/80 -> actual 71/90/97 (implementation-plan + task-
 
 Source roborev jobs: 7441, 7586, 7236, 6720, 6739, 6765, 6785, 7125, 6551, 6796 (2d-hsm).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Verified triage (2026-06-23). All findings are doc/spec precision items (wording, stale test counts, missing trailing newline). No security impact. DR design findings (AAD' encoding, ingress_nonce) addressed in TASK-13b/24/28. Wire findings (feature mutex, malformed-frame diagnostics) are accepted design decisions or addressed in subsequent PRs.
+<!-- SECTION:FINAL_SUMMARY:END -->

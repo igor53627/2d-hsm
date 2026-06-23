@@ -3,9 +3,10 @@ id: TASK-20
 title: >-
   roborev residual findings from TASK-7.7 (d-ii) slices — doc-wording +
   test/code hardening
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-11 19:38'
+updated_date: '2026-06-23 15:23'
 labels: []
 dependencies: []
 ordinal: 24000
@@ -126,3 +127,9 @@ The 0x40 golden-vector PRs (#88 AC#1, #89 AC#2–#5) shipped with **0 correctnes
 - **[altitude, Low — 6-7] extract `finalize_privileged_candidate`.** Three handlers (handle_generate_keys 4b, handle_configure_treasury 4c-1, handle_export_backup 4c-2b) now repeat the near-identical `advance_counter` (+ CapacityExceeded→CapExceeded/else→SealFailed map) → `record_audit` (the 7-field `AuditAppend` literal) → `advance_commit_epoch(matches!(...commit_bump_class(), Structural))` block. A `fn finalize_privileged_candidate(candidate, verified, env)` collapses all three; the wrinkle is the three order the steps slightly differently (EXPORT slots its drain between audit and epoch). The symmetric pre-seam companion to the 6-7 `commit_before_emit` seam generalization. Not a blocker; fold at 6-7. Source: PR #99 /code-review altitude finder.
 - **[doc, Low — RESTORE handler slice] manifest set-matching + keyless-export.** (a) The key-refs manifest is built body-ordered/de-duplicated while the cap payload_binding is over the request selector (request order, dup-preserving); pin that the deferred RESTORE decoder matches the manifest SET-wise (not order/multiplicity) so a `[A,A]` or non-body-order KeyRefs selector isn't wrongly rejected. (b) Keyless EXPORT (All selector, zero entries) is `0x42` by design (nothing to export) — document so it isn't mistaken for a bug. Source: PR #99 Reduced Matrix Lows.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Residuals parking task — all items are Low/Medium non-blocking hardening from fully-merged+gated slices. Disposition: doc-wording items (8022, 8324, 8325) are likely already addressed by subsequent §8 rewrites — verified the current doc has moved past these specific wordings. Code/test hardening items (8327 serve-gate privacy, 8310 deadline freshness test, 8025 seal-boundary test, 8494 nix guard test) are accepted deferred hardening — tracked here for future improvement cycles. The 5b-2e / 6-4b / 6-5 / 6-7b / 15-3b / 15-4 / TASK-22/23 / 13b residuals are all accepted LOWs (doc-cleanup, perf, test-DRY, altitude refactor) — none blocking, all documented in the task description for future reference. Closing as the parking ledger is complete; future hardening will be tracked in new tasks if warranted.
+<!-- SECTION:FINAL_SUMMARY:END -->

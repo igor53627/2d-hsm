@@ -4038,8 +4038,9 @@ mod tests {
         let temp_dir = solidity_dir.join(".forge-crosscheck");
         fs::create_dir_all(&temp_dir).ok()?;
         let seq = FORGE_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let input_path = temp_dir.join(format!("input-{seq}.json"));
-        let output_path = temp_dir.join(format!("output-{seq}.json"));
+        let pid = std::process::id();
+        let input_path = temp_dir.join(format!("input-{pid}-{seq}.json"));
+        let output_path = temp_dir.join(format!("output-{pid}-{seq}.json"));
 
         // Build input JSON in the exact format the script expects
         let input_json = serde_json::json!({
@@ -4063,6 +4064,9 @@ mod tests {
             .args(["script", "CanonicalTicketHash.s.sol", "--silent"])
             .output()
             .ok()?;
+
+        // Remove any stale output file before running (the dir is never cleaned — TASK-19).
+        let _ = fs::remove_file(&output_path);
 
         if !output.status.success() {
             eprintln!("Forge script failed while computing canonical hash for test vector.");

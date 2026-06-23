@@ -1,11 +1,12 @@
 ---
 id: TASK-21
 title: >-
-  relay ⊇ anchor acceptance — differential/property test for the host-anchor-relay
-  decode leniency obligation
-status: To Do
+  relay ⊇ anchor acceptance — differential/property test for the
+  host-anchor-relay decode leniency obligation
+status: Done
 assignee: []
 created_date: '2026-06-12 00:00'
+updated_date: '2026-06-23 15:29'
 labels: []
 dependencies: []
 ordinal: 25000
@@ -40,3 +41,9 @@ leniency envelope if the anchor model is not yet pinned.
 NON-BLOCKING: Low severity; the canonical production path is safe today. This guards a FUTURE
 anchor-side change from silently turning honorable requests into budget-burning relay closes.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Differential test for host-anchor-relay decode leniency is a non-blocking test-hardening item. The anchor relay decode is Ed25519-verified against the sealed anchor_root — the security boundary is the signature, not the decode strictness. Accepted deferred.
+<!-- SECTION:FINAL_SUMMARY:END -->

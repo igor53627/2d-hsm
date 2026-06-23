@@ -1,9 +1,10 @@
 ---
 id: TASK-9
 title: Provisioning & attestation tooling security (roborev audit 2026-06-07)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-07 18:02'
+updated_date: '2026-06-23 15:34'
 labels:
   - security
   - audit
@@ -25,3 +26,9 @@ Pre-existing findings from the 2026-06-07 roborev audit on task-7.1 consolidatio
 
 Source roborev jobs: 7380, 7385, 7386, 7388 (2d-hsm).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Verified triage (2026-06-23). Finding 1 (root in python3 argv): CONFIRMED, LOW — ceremony script on trusted host, root already operator-owned. Finding 2 (prevalidate_report None): CONFIRMED, LOW — valid API design, no production caller uses None. Findings 3-6: LOW ceremony/tooling concerns. None are HIGH in context — all are ceremony scripts or external verifier tooling, not enclave production code.
+<!-- SECTION:FINAL_SUMMARY:END -->
