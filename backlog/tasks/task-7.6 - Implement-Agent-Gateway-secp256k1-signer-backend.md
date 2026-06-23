@@ -1,10 +1,10 @@
 ---
 id: TASK-7.6
 title: Implement Agent Gateway secp256k1 signer backend
-status: Done
+status: In Progress
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-23 13:56'
+updated_date: '2026-06-23 14:51'
 labels:
   - agent-gateway
   - secp256k1
@@ -45,13 +45,9 @@ Implementation placeholder for the reviewed Agent Gateway secp256k1 signer backe
 
 <!-- SECTION:NOTES:BEGIN -->
 TASK-7.6 is an implementation umbrella and should normally be split before code starts. Its ACs are umbrella-level invariants that replacement child tasks must preserve: producer compatibility, no plaintext private-key export, no generic digest signing, key-purpose enforcement, capability replay rejection, backup opacity, and 2D golden-vector compatibility. Concrete protocol, keystore, keygen, signing, and host-integration work should migrate into narrower child tasks unless roborev explicitly approves one small implementation PR.
+
+REOPENED (compact-10268): TASK-15 (faucet/transfer signing impl) and TASK-16 (host integration + funding gate) are still To Do. These are implementation children of TASK-7.6. The design sub-tasks 7.1-7.5 + 7.7 are Done; the implementation sub-tasks (TASK-12/13/14 sealed keystore + keygen/identity + 0x40 dispatch) are Done; but the faucet/transfer signing handlers + the production-funding gate are not. TASK-7.6 stays In Progress until TASK-15/16 land or are explicitly superseded.
 <!-- SECTION:NOTES:END -->
-
-## Final Summary
-
-<!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Umbrella task for agent Gateway secp256k1 signer. All sub-tasks Done: 7.1 (opcodes + domain separation), 7.2 (persistent keystore + DR design), 7.3 (keygen + public identity), 7.4 (structured transfer signing), 7.5 (host policy + capability contract).
-<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
