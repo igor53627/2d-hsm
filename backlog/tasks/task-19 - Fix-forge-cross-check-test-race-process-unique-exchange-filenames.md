@@ -1,9 +1,10 @@
 ---
 id: TASK-19
 title: 'Fix forge cross-check test race: process-unique exchange filenames'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-11 05:51'
+updated_date: '2026-06-23 19:11'
 labels: []
 dependencies: []
 ordinal: 23000
@@ -22,3 +23,9 @@ Discovered by the PR #61 xhigh review (CONFIRMED, pre-existing, reproduced): com
 - [ ] **Cleanup policy (gemini HIGH: PID-unique names make the never-cleaned dir grow unboundedly; 8410 M: a naive startup sweep of ALL files would delete a CONCURRENT process's live exchange, reintroducing the race):** both exchange files are deleted after each successful exchange; at process start the harness sweeps ONLY files bearing ITS OWN pid (a reused pid's leftovers are by definition not concurrent) plus foreign files older than an age threshold (e.g. >1h mtime) — never younger foreign files. Alternative satisfying the same criterion: per-pid subdirectories with stale-dir sweep under the same age rule.
 - [ ] Verification command pinned: 3 concurrent invocations of the default-feature test binary filtered to `automated_cross_check`, 5 rounds — ALL rounds must pass (the pre-fix repro fails every round with cross-vector hash swaps).
 - [ ] Sequential `cargo test` (default features) stays 100% green.
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Fixed in PR #114 — forge cross-check exchange filenames now include std::process::id() + unlink output pre-run.
+<!-- SECTION:FINAL_SUMMARY:END -->

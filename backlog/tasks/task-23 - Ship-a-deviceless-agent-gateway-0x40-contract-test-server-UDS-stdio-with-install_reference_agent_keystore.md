@@ -3,9 +3,10 @@ id: TASK-23
 title: >-
   Ship a deviceless agent-gateway 0x40 contract-test server (UDS/stdio) with
   install_reference_agent_keystore
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-16 21:30'
+updated_date: '2026-06-23 19:16'
 labels:
   - agent-gateway
   - contract-test
@@ -30,3 +31,9 @@ Downstream 2d (TASK-132.5.2 slice 4 live identity, slice 2 privileged opcodes, A
 - [ ] #4 Documented invocation (how 2d CI starts it) and its trust boundary vs the production AF_VSOCK/SNP serve path, so it is never mistaken for a production endpoint
 - [ ] #5 The contract-test server is debug/test-only: when the preview-only signing/capability/configure paths are enabled it is NEVER built or promoted as a release artifact (release-banned the same way as the preview features it exposes — a release build with these paths must fail to compile / not ship the binary)
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Shipped in PR #90 (MVP: PUBLIC_IDENTITY over UDS + install_reference_agent_keystore) + PR #91 (Slice 3: mutating ops GENERATE_KEYS/CONFIGURE_TREASURY/SIGN_FAUCET_DISPENSE via ReferenceCommitChannel). All 5 ACs met: cross-platform UDS server, reference keystore helper, 0x40 round-trip tested, documented invocation + trust boundary, release-banned via compile_error (lib.rs:107).
+<!-- SECTION:FINAL_SUMMARY:END -->
