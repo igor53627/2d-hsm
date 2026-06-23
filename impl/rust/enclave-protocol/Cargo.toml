@@ -64,53 +64,37 @@ default = []
 # Agent Gateway secp256k1 signer backend (TASK-7.6). Reuses the already-optional zeroize/getrandom
 # (otherwise only pulled by ml-dsa-65) for the CSPRNG keygen; does not embed any key by itself.
 agent-gateway = ["dep:k256", "dep:bs58", "dep:sha2", "dep:zeroize", "dep:getrandom", "dep:chacha20poly1305", "dep:x509-cert"]
-# Enables AGENT_K1_PROVE_IDENTITY signing. **Production-gated OFF** until the 2D side pins the
-# EIP-2718 transaction-type 0x19 reservation in a MERGED commit (2D PR #144 / TASK-132.5) — until
-# then identity-proof signing is non-collision-unproven against typed txs (vsock spec §10.8). With
-# `agent-gateway` but WITHOUT this, PROVE_IDENTITY fails closed (AGENT_NOT_CONFIGURED). Never enable
-# in a production build before that reservation merges; production fund custody is TASK-7.7-gated too.
+# Enables AGENT_K1_PROVE_IDENTITY signing. UN-GATED: 2D type-0x19 reservation MERGED (commit f3908deb
+# in 2D main, 2026-06); the collision concern is resolved (see lib.rs). The compile_error! release ban
+# is REMOVED. With `agent-gateway` but WITHOUT this, PROVE_IDENTITY fails closed (AGENT_NOT_CONFIGURED).
 agent-prove-identity-preview = ["agent-gateway"]
 # Enables LIVE AGENT_K1_GENERATE_KEYS execution (key minting + counter advance + re-seal/swap).
-# **Production-gated OFF**: a live, host-rollback-replayable key-minting mutation is unsafe until the
-# TASK-7.7 anti-rollback binding, scope_target↔sealed-enclave-id binding, and the AC#14 audit record
-# land. Without this feature GENERATE_KEYS verifies the capability then fails closed
-# (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs). Never enable in production.
+# UN-GATED (TASK-18 18-6): anti-rollback (TASK-7.7 commit_before_emit), scope_identity binding (18-2),
+# and AC#14 audit record are ALL DONE. The compile_error! release ban is REMOVED (see lib.rs).
 agent-keygen-exec-preview = ["agent-gateway"]
 # Enables LIVE AGENT_K1_SIGN_TRANSFER execution (structured EIP-155 ordinary-transfer signing with an
-# `agent_transfer_k1` key). **Production-gated OFF** as a fund-CUSTODY-readiness gate: SIGN_TRANSFER
-# mutates no sealed state (it is NOT rollback-sensitive, so it carries no TASK-7.7 anti-rollback
-# obligation), but it emits fund-moving signatures, so it stays fail-closed in production until the
-# AC#5 production funding profile is provisioned (TASK-15) and TASK-18 un-gates. Without this feature
-# SIGN_TRANSFER fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs). Never enable
-# in production.
+# `agent_transfer_k1` key). UN-GATED (TASK-18 18-7): NOT rollback-sensitive (mutates no sealed state);
+# the AC#5 funding profile is a runtime provisioning concern. The compile_error! release ban is REMOVED.
 agent-sign-transfer-preview = ["agent-gateway"]
 # Enables LIVE AGENT_K1_SIGN_FAUCET_DISPENSE execution (treasury→known-transfer-key native dispense with
-# the §2 spend caps + atomic dual-counter debit through the seal-before-emit seam). **Production-gated
-# OFF**: on top of the AC#5 fund-CUSTODY-readiness gate it is ROLLBACK-SENSITIVE (it debits sealed faucet
-# spend counters), so it ALSO carries the TASK-7.7 anti-rollback obligation — the runtime dispatch gate
-# already fails it closed (AGENT_NOT_CONFIGURED) when the anti-rollback binding is unconfigured. Without
-# this feature SIGN_FAUCET_DISPENSE fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see
-# lib.rs). Never enable in production.
+# the §2 spend caps + atomic dual-counter debit through the seal-before-emit seam). UN-GATED (TASK-18
+# 18-8): rollback-sensitive (debits sealed spend counters); anti-rollback + scope_identity + G3 provenance
+# all DONE. The compile_error! release ban is REMOVED.
 agent-sign-faucet-preview = ["agent-gateway"]
 # Enables LIVE AGENT_K1_CONFIGURE_TREASURY execution (the faucet treasury config mutators —
 # `set_limits` / `refill_budget` / `raise_lifetime_breaker` (admin) + `reset_lifetime_breaker`
-# (recovery) — committed through the seal-before-emit seam, slice 15-4). **Production-gated OFF**: it is
-# ROLLBACK-SENSITIVE (mutates sealed faucet config / spend / breaker + the monotonic
-# `config_version`), so the runtime dispatch gate ALSO fails it closed (AGENT_NOT_CONFIGURED) when the
-# anti-rollback binding is unconfigured. Without this feature CONFIGURE_TREASURY verifies the capability
-# then fails closed (AGENT_NOT_CONFIGURED). Banned in release builds (see lib.rs): stays fail-closed
-# until the AC#5 production funding profile is armed, the independent recovery-counter rule + the AC#14
-# audit record land, and TASK-18 un-gates. Never enable in production.
+# (recovery) — committed through the seal-before-emit seam). UN-GATED (TASK-18 18-7): rollback-sensitive
+# (mutates sealed faucet config); scope_identity binding + recovery-counter + AC#14 audit + G3 provenance
+# all DONE. The compile_error! release ban is REMOVED.
 agent-configure-treasury-preview = ["agent-gateway"]
 # TASK-13b: EXPORT_BACKUP(7) / RESTORE_BACKUP(8) DR-backup path. EXPORT produces the `pq-agent-backup-v1`
 # blob — the ML-KEM-1024 KEM-DEM envelope wrapped to the operator's OFFLINE recovery public key (domain
 # `2d-hsm-agent-backup-v1-key`). RESTORE is a SEPARATE construction: the recovery ceremony re-encrypts to
 # the destination TEE's attested EPHEMERAL key via the distinct `2d-hsm-agent-restore-ingress-v1` ingress
-# envelope (NOT this blob) — Slice 1 ships only the export primitive; RESTORE stays a fail-closed reserved
-# stub. Pulls the pure-Rust `ml-kem` crate (NOT pqcrypto/ml-dsa-65 — independent, so role isolation holds).
-# Without this feature EXPORT/RESTORE verify the capability then fail closed (AGENT_NOT_CONFIGURED). Banned
-# in release builds (see lib.rs): stays fail-closed until the anti-rollback last_exported_seq coverage +
-# audit-ring write path land and TASK-18 un-gates. Never enable in production.
+# envelope. Pulls the pure-Rust `ml-kem` crate (NOT pqcrypto/ml-dsa-65 — role isolation holds).
+# UN-GATED (TASK-18 18-9): anti-rollback last_exported_seq coverage + audit-ring write path landed;
+# TASK-27 bounded the restore quote fetch. Both EXPORT and RESTORE are LIVE under this feature
+# (TASK-24/28: handler + attested response). The compile_error! release ban is REMOVED (see lib.rs).
 agent-backup-export-preview = ["agent-gateway", "dep:ml-kem"]
 # TASK-23: deviceless UDS 0x40 contract-test server (twod-hsm-agent-contract-server) — installs a
 # reference keystore (PUBLIC test keys) + serves the agent protocol over AF_UNIX WITHOUT SNP/anti-rollback,

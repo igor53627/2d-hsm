@@ -956,10 +956,25 @@ pub(crate) fn seal_provisioned_keystore(
 /// driver (the `twod-hsm-agent-gateway` bootstrap bin) owns the AF_VSOCK listener + the SNP report
 /// fetch and calls [`ProvisionSession::on_m1`] / [`ProvisionSession::on_m3`]; this struct holds ONLY
 /// the session state, so the handshake logic is CI-testable without SNP/transport.
-#[derive(Debug)]
+impl std::fmt::Debug for ProvisionSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual Debug: redacts seal_root (the keystore AEAD master — TASK-1.7 M-1). Never derive
+        // Debug on a struct holding secret material — a panic message to journald (host-readable)
+        // would leak the root and decrypt all sealed scalars offline.
+        f.debug_struct("ProvisionSession")
+            .field("pinned_root", &self.pinned_root)
+            .field("seal_root", &"<redacted>")
+            .field("measurement", &self.measurement)
+            .field("n_p", &self.n_p)
+            .field("n_e", &self.n_e)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 pub(crate) struct ProvisionSession {
     pinned_root: ed25519_dalek::VerifyingKey,
-    seal_root: [u8; 32],
+    seal_root: zeroize::Zeroizing<[u8; 32]>,
     measurement: Vec<u8>,
     n_p: Option<[u8; DIGEST_LEN]>,
     n_e: Option<[u8; DIGEST_LEN]>,
@@ -991,7 +1006,7 @@ impl ProvisionSession {
     ) -> Self {
         Self {
             pinned_root,
-            seal_root,
+            seal_root: zeroize::Zeroizing::new(seal_root),
             measurement,
             n_p: None,
             n_e: None,
@@ -2197,6 +2212,28 @@ mod tests {
         let body = crate::agent_keystore::unseal_body(&blob, &root, meas).unwrap();
         assert_eq!(body.config.enclave_scope_id, scope_id);
         assert_eq!(body.config.twod_chain_id, cfg.twod_chain_id);
+    }
+
+    /// TASK-1.7 M-1 regression: ProvisionSession Debug must NEVER emit seal_root bytes.
+    /// A future derive(Debug) reintroduction or a field rename would silently restore the
+    /// host-readable leak — this test locks the redaction invariant.
+    #[test]
+    fn provision_session_debug_redacts_seal_root() {
+        let root = [0xABu8; 32]; // distinctive non-zero pattern
+        let session = ProvisionSession::new(
+            ed25519_dalek::VerifyingKey::from_bytes(&[0xCDu8; 32]).unwrap(),
+            root,
+            b"measurement".to_vec(),
+        );
+        let dbg = format!("{session:?}");
+        assert!(
+            !dbg.contains("171"),
+            "Debug output must not contain seal_root byte value 0xAB"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output must contain the <redacted> marker for seal_root"
+        );
     }
 
     /// Build a ProvisionSession driven against a minted-M3 happy path; returns (session, m3, report).

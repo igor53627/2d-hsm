@@ -253,8 +253,8 @@ pub mod secp256k1;
 pub mod agent_keystore;
 // TASK-13b: the pq-agent-backup-v1 DR-backup KEM-DEM primitive (ML-KEM-1024 Encaps → SHA3-256 KDF →
 // ChaCha20Poly1305) wrapping an opaque payload to the operator's offline recovery public key. Pure crypto,
-// no dispatch coupling; compiled only under the release-banned `agent-backup-export-preview` (which pulls
-// the `ml-kem` crate). The EXPORT_BACKUP handler + audit drain + golden vector land in later 13b slices.
+// no dispatch coupling; compiled only under the un-gated `agent-backup-export-preview` (TASK-18 18-9,
+// which pulls the `ml-kem` crate). The EXPORT_BACKUP handler + audit drain + golden vector are landed.
 #[cfg(feature = "agent-backup-export-preview")]
 pub(crate) mod agent_backup;
 // Agent Gateway sealed-keystore unseal-at-boot loader (TASK-7.7 5b-2d): the agent twin of

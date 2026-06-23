@@ -8,15 +8,12 @@
 //!   here end-to-end against the unsealed keystore.
 //! - **Privileged** opcodes `{GENERATE_KEYS(1), CONFIGURE_TREASURY(6), EXPORT_BACKUP(7),
 //!   RESTORE_BACKUP(8)}` are verified by [`verify_capability`] (Ed25519 + authority tier + opcode/
-//!   request binding + contiguous-counter CHECK, via [`crate::agent_capability`]). **GENERATE_KEYS
-//!   executes** (key mint + counter advance + candidate re-seal/swap) ONLY under the off-by-default,
-//!   release-banned `agent-keygen-exec-preview` feature — live, host-rollback-replayable key minting
-//!   must wait for anti-rollback (TASK-7.7) + `scope_target`↔sealed-enclave-id binding + the AC#14
-//!   audit record. Without that feature (and for CONFIGURE_TREASURY/EXPORT/RESTORE) a verified
-//!   privileged request **fails closed** with `AGENT_NOT_CONFIGURED`. Capability *failures* collapse
-//!   to `AGENT_CAPABILITY_REJECTED` (0x43).
-//! - **Runtime signing** `{SIGN_TRANSFER(4), SIGN_FAUCET_DISPENSE(5)}` is TASK-7.6.4; not in this
-//!   slice → `AGENT_NOT_CONFIGURED`.
+//!   request binding + contiguous-counter CHECK, via [`crate::agent_capability`]). Each privileged
+//!   opcode executes under its off-by-default preview feature (all UN-GATED under TASK-18 — see lib.rs);
+//!   without the feature a verified privileged request **fails closed** with `AGENT_NOT_CONFIGURED`.
+//!   Capability *failures* collapse to `AGENT_CAPABILITY_REJECTED` (0x43).
+//! - **Runtime signing** `{SIGN_TRANSFER(4), SIGN_FAUCET_DISPENSE(5)}` is TASK-7.6.4, UN-GATED under
+//!   TASK-18 (18-7/18-8); without the corresponding preview feature → `AGENT_NOT_CONFIGURED`.
 //!
 //! All failures map to the §10.9 agent error band `0x40..=0x46` with the anti-oracle collapsing
 //! rules (key-not-found and wrong-purpose both → `0x42`; every capability failure → `0x43`).
@@ -530,20 +527,19 @@ pub(crate) fn dispatch_agent(
         let verified = verify_capability(&env, keystore)?;
         return match opcode {
             // GENERATE_KEYS executes ONLY under the off-by-default `agent-keygen-exec-preview`
-            // feature (release-banned): live key minting must wait for anti-rollback (TASK-7.7) +
-            // scope_target-binding + the AC#14 audit record. Production verifies the cap then fails
-            // closed (no mutation).
+            // feature (un-gated TASK-18 18-6): anti-rollback (TASK-7.7) + scope_target-binding (18-2) +
+            // AC#14 audit record are DONE. The compile_error! release ban is REMOVED (see lib.rs).
             #[cfg(feature = "agent-keygen-exec-preview")]
             AgentOpcode::GenerateKeys => handle_generate_keys(&env, keystore, &verified),
             // CONFIGURE_TREASURY executes ONLY under the off-by-default `agent-configure-treasury-preview`
-            // feature (release-banned): live faucet-config mutation must wait for the AC#5 funding profile,
-            // the independent recovery-counter rule + AC#14 audit record, and TASK-18. Without the feature
-            // it falls through to the privileged default arm below (verify cap, then fail closed).
+            // feature (un-gated TASK-18 18-7): scope_identity binding + recovery-counter + AC#14 audit +
+            // G3 provenance are DONE. The compile_error! release ban is REMOVED. Without the feature it
+            // falls through to the privileged default arm below (verify cap, then fail closed).
             #[cfg(feature = "agent-configure-treasury-preview")]
             AgentOpcode::ConfigureTreasury => handle_configure_treasury(&env, keystore, &verified),
             // EXPORT_BACKUP executes ONLY under the off-by-default `agent-backup-export-preview` feature
-            // (release-banned, pulls ml-kem): live DR-backup minting + the audit-ring drain wait for TASK-18.
-            // Without the feature it falls through to the privileged default arm below (verify, fail closed).
+            // (un-gated TASK-18 18-9, pulls ml-kem): anti-rollback + audit-ring + TASK-27 bounded restore
+            // quote fetch are DONE. The compile_error! release ban is REMOVED.
             #[cfg(feature = "agent-backup-export-preview")]
             AgentOpcode::ExportBackup => handle_export_backup(&env, keystore, &verified),
             #[cfg(feature = "agent-backup-export-preview")]
@@ -581,10 +577,9 @@ pub(crate) fn dispatch_agent(
             }
         }
         // SIGN_TRANSFER(4): structured EIP-155 ordinary-transfer signing (TASK-7.6.4 / slice 15-1).
-        // PRODUCTION-GATED as a fund-custody-readiness gate (it is NOT rollback-sensitive, so this is
-        // NOT an anti-rollback gate): fund-moving signing stays fail-closed until the AC#5 funding
-        // profile is provisioned and TASK-18 un-gates. Enabled only via `agent-sign-transfer-preview`;
-        // otherwise fail closed.
+        // UN-GATED (TASK-18 18-7): NOT rollback-sensitive (mutates no sealed state); the AC#5 funding
+        // profile is a runtime provisioning concern. The compile_error! release ban is REMOVED.
+        // Enabled only via `agent-sign-transfer-preview`; otherwise fail closed.
         AgentOpcode::SignTransfer => {
             #[cfg(feature = "agent-sign-transfer-preview")]
             {
@@ -599,8 +594,8 @@ pub(crate) fn dispatch_agent(
         // SIGN_FAUCET_DISPENSE(5): treasury→known-transfer-key native dispense (TASK-15 slice 15-3b). It
         // is ROLLBACK-SENSITIVE (debits sealed faucet counters), so the anti-rollback fund-custody gate
         // above ALREADY fails it closed (NotConfigured) when the boot binding is unconfigured — this arm
-        // is reached only past that gate. PRODUCTION-GATED behind `agent-sign-faucet-preview` (fund-custody
-        // readiness, on top of the runtime gate); otherwise fail closed. Mirrors the SIGN_TRANSFER arm.
+        // is reached only past that gate. UN-GATED (TASK-18 18-8): anti-rollback + scope_identity + G3
+        // provenance are DONE. Enabled only via `agent-sign-faucet-preview`; otherwise fail closed.
         AgentOpcode::SignFaucetDispense => {
             #[cfg(feature = "agent-sign-faucet-preview")]
             {
@@ -1533,8 +1528,8 @@ fn decode_export_selector(payload: &[(Value, Value)]) -> Result<ExportSelector, 
 /// (emitted alongside the new sealed keystore). EXPORT does NOT bump `config_version` (so the audit
 /// `config_version` reads live==candidate). Any failure ⇒ `SealFailed` (0x46) before the seam — no commit.
 ///
-/// Compiled + CALLED only under `agent-backup-export-preview` (release-banned); without it EXPORT routes to
-/// NotConfigured (the deferred-stub path). `crate::agent_backup` itself only exists under this feature.
+/// Compiled + CALLED only under `agent-backup-export-preview` (un-gated TASK-18 18-9); without it EXPORT
+/// routes to NotConfigured (the deferred-stub path).
 #[cfg(feature = "agent-backup-export-preview")]
 fn handle_export_backup(
     env: &AgentEnvelope,
