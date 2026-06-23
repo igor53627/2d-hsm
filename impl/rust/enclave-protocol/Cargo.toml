@@ -93,7 +93,8 @@ agent-configure-treasury-preview = ["agent-gateway"]
 # the destination TEE's attested EPHEMERAL key via the distinct `2d-hsm-agent-restore-ingress-v1` ingress
 # envelope. Pulls the pure-Rust `ml-kem` crate (NOT pqcrypto/ml-dsa-65 — role isolation holds).
 # UN-GATED (TASK-18 18-9): anti-rollback last_exported_seq coverage + audit-ring write path landed;
-# TASK-27 bounded the restore quote fetch. The compile_error! release ban is REMOVED (see lib.rs).
+# TASK-27 bounded the restore quote fetch. Both EXPORT and RESTORE are LIVE under this feature
+# (TASK-24/28: handler + attested response). The compile_error! release ban is REMOVED (see lib.rs).
 agent-backup-export-preview = ["agent-gateway", "dep:ml-kem"]
 # TASK-23: deviceless UDS 0x40 contract-test server (twod-hsm-agent-contract-server) — installs a
 # reference keystore (PUBLIC test keys) + serves the agent protocol over AF_UNIX WITHOUT SNP/anti-rollback,

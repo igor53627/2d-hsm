@@ -2214,6 +2214,28 @@ mod tests {
         assert_eq!(body.config.twod_chain_id, cfg.twod_chain_id);
     }
 
+    /// TASK-1.7 M-1 regression: ProvisionSession Debug must NEVER emit seal_root bytes.
+    /// A future derive(Debug) reintroduction or a field rename would silently restore the
+    /// host-readable leak — this test locks the redaction invariant.
+    #[test]
+    fn provision_session_debug_redacts_seal_root() {
+        let root = [0xABu8; 32]; // distinctive non-zero pattern
+        let session = ProvisionSession::new(
+            ed25519_dalek::VerifyingKey::from_bytes(&[0xCDu8; 32]).unwrap(),
+            root,
+            b"measurement".to_vec(),
+        );
+        let dbg = format!("{session:?}");
+        assert!(
+            !dbg.contains("171"),
+            "Debug output must not contain seal_root byte value 0xAB"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output must contain the <redacted> marker for seal_root"
+        );
+    }
+
     /// Build a ProvisionSession driven against a minted-M3 happy path; returns (session, m3, report).
     /// `on_m1` is called, so the session is in AwaitingM3 with N_e set; the M3 is signed over that N_e.
     fn session_at_awaiting_m3(
