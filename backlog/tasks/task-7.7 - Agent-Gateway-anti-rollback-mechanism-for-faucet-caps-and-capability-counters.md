@@ -1,10 +1,10 @@
 ---
 id: TASK-7.7
 title: Agent Gateway anti-rollback mechanism for faucet caps and capability counters
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-08 19:37'
+updated_date: '2026-06-23 13:56'
 labels:
   - agent-gateway
   - tee
@@ -71,7 +71,7 @@ Review evidence for THIS implementation slice (PR #45, AGENTS.md Full Matrix on 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Design delivered in backlog/docs/agent-gateway-anti-rollback.md (PR #33, squash e5d3213). Production anti-rollback for sealed replay counters + faucet spend caps. Platform: SEV-SNP has NO per-enclave hardware monotonic counter -> external anchor required. Selected Option A = remote monotonic counter + epoch-lease: freshness_epoch in the pq-agent-keystore-v1 encrypted body (format extension, version bump per 7.2 AC#16); mutual-authenticated anchor handshake (agent-domain SNP report_data + Ed25519-signed anchor response vs pinned anchor_root); on epoch != anchor-current never trust the stale blob's own marks (anti-rollback): ADOPT the anchor's counter/spend marks when they fully resolve the gap (bounded crash-reconcile), else FAIL CLOSED (epoch > anchor-current anchor-rollback, structural key/config gap -> restore, or anchor unavailable); per-dispense bump+seal-before-emit; default lease=1, safe lease=N only via per-spend anchor-ack (count-bounded, never time); crash-reconcile keyed by request_id. Covers cap counters + faucet cumulative/lifetime spend + strict recovery counter (AC#2); boot/restore seed from authenticated marks never-zero (AC#3); active-active operator-procedural under A, enforced only by Option B global ledger (AC#4); AC#5 funding gate = 2-layer fail-closed (Nix assertion with explicit opt-out term + derived enabled, Rust block on rollback-sensitive commands with SIGN_TRANSFER excluded/EXPORT+RESTORE included) + hard-block-default + measured/sealed audited opt-out. Verified by roborev 3x3 + compact + the /code-review skill (40->15) + all 9 PR bot comments resolved/replied (CodeRabbit confirmed). The DESIGN above is complete; the **anti-rollback anchor implementation is owned by TASK-7.7 itself** (slices tracked in the Implementation Notes — slice 1 `agent_anchor.rs` verify+reconcile landed), while TASK-7.6 owns the Agent Gateway secp256k1 signer backend it binds onto.
+All 9 ACs met. Anti-rollback mechanism fully implemented: commit_before_emit seam, anchor reconcile (epoch/structural/marks), strict_recovery_counter, EnclaveState, boot handshake, bounded quote subprocess, agent-gateway serve loop. Reviewed via multi-round matrix.
 <!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done

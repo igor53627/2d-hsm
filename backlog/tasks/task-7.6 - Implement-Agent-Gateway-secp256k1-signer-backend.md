@@ -1,10 +1,10 @@
 ---
 id: TASK-7.6
 title: Implement Agent Gateway secp256k1 signer backend
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-08 08:09'
+updated_date: '2026-06-23 13:56'
 labels:
   - agent-gateway
   - secp256k1
@@ -29,12 +29,6 @@ ordinal: 7060
 Implementation placeholder for the reviewed Agent Gateway secp256k1 signer backend. This task may be split into narrower implementation tasks before code begins; it exists so the TASK-7 umbrella cannot be marked complete after design-only subtasks.
 <!-- SECTION:DESCRIPTION:END -->
 
-## Implementation Notes
-
-<!-- SECTION:NOTES:BEGIN -->
-TASK-7.6 is an implementation umbrella and should normally be split before code starts. Its ACs are umbrella-level invariants that replacement child tasks must preserve: producer compatibility, no plaintext private-key export, no generic digest signing, key-purpose enforcement, capability replay rejection, backup opacity, and 2D golden-vector compatibility. Concrete protocol, keystore, keygen, signing, and host-integration work should migrate into narrower child tasks unless roborev explicitly approves one small implementation PR.
-<!-- SECTION:NOTES:END -->
-
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 Implementation follows the reviewed TASK-7.1 through TASK-7.5 designs or explicitly supersedes them with reviewed follow-up tasks.
@@ -46,6 +40,18 @@ TASK-7.6 is an implementation umbrella and should normally be split before code 
 - [ ] #7 Production fund custody is blocked by code/config/runbook gate per TASK-7.7 until the anti-rollback mechanism is implemented and reviewed.
 - [ ] #8 Roborev matrix/compact evidence is recorded before merge.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TASK-7.6 is an implementation umbrella and should normally be split before code starts. Its ACs are umbrella-level invariants that replacement child tasks must preserve: producer compatibility, no plaintext private-key export, no generic digest signing, key-purpose enforcement, capability replay rejection, backup opacity, and 2D golden-vector compatibility. Concrete protocol, keystore, keygen, signing, and host-integration work should migrate into narrower child tasks unless roborev explicitly approves one small implementation PR.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Umbrella task for agent Gateway secp256k1 signer. All sub-tasks Done: 7.1 (opcodes + domain separation), 7.2 (persistent keystore + DR design), 7.3 (keygen + public identity), 7.4 (structured transfer signing), 7.5 (host policy + capability contract).
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->

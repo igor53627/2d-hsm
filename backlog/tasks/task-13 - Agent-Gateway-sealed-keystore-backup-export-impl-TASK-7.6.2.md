@@ -1,10 +1,10 @@
 ---
 id: TASK-13
 title: Agent Gateway sealed keystore + backup export impl (TASK-7.6.2)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-08 08:09'
-updated_date: '2026-06-08 11:34'
+updated_date: '2026-06-23 13:57'
 labels:
   - agent-gateway
   - keystore
@@ -27,3 +27,9 @@ Sliced for the Full-Matrix gate: **13a — sealed keystore core** (envelope + CB
 <!-- SECTION:NOTES:BEGIN -->
 Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) — the Full Matrix (Reduced Matrix + the 2×3 concurrency floor from ~/pse/roborev/pse-review-2x3.sh; 3×3 vendor sign-off optional) + compact is mandatory before merge per AGENTS.md and the .roborev.toml high_risk_paths (impl/, src/, backlog/docs/*agent-gateway*).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Agent Gateway sealed keystore + backup export fully implemented: agent_backup.rs (KEM-DEM envelope, seal/unseal, golden vectors), agent_keystore.rs (AEAD seal, format versioning, counters), TASK-24 (RESTORE_BACKUP handler), TASK-27 (bounded quote fetch), TASK-28 (response attestation). All reviewed via multi-round matrix.
+<!-- SECTION:FINAL_SUMMARY:END -->

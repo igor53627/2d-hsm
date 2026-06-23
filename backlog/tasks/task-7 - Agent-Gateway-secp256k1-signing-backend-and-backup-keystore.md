@@ -1,10 +1,10 @@
 ---
 id: TASK-7
 title: Agent Gateway secp256k1 signing backend and backup keystore
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-08 07:53'
+updated_date: '2026-06-23 13:56'
 labels:
   - agent-gateway
   - secp256k1
@@ -49,14 +49,6 @@ This task is intentionally split into smaller reviewable subtasks because it tou
 - [ ] #10 High-risk review follows this repo's AGENTS.md roborev matrix rules before merge.
 <!-- AC:END -->
 
-
-
-
-
-
-
-
-
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
@@ -64,6 +56,12 @@ Created as the 2d-hsm side of 2D `TASK-132.5`. The preferred Agent Gateway signe
 
 The expected host-side pipeline remains similar to the existing bridge signer pattern: local validation -> OPA agent policy -> Vault capability lookup -> signer backend. For `2d-hsm`, this is only the host-side gate. The TEE must still enforce command capabilities, key purpose, role/profile, and minimal spending policy internally because the host/vsock client can be compromised.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Umbrella for Agent Gateway secp256k1 signing backend + backup keystore. All children Done: 7.1-7.5 (signer), 7.6 (umbrella), 7.7 (anti-rollback). TASK-13 (sealed keystore + backup export) also Done.
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
