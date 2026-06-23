@@ -90,8 +90,9 @@ collide with the producer `2d-hsm-pq-seal-v1-key` material derived from the same
    (uncompressed 65-byte SEC1, TASK-7.1), creation_metadata (config-version + counter
    snapshot, batch_id), backup_export_metadata }`. Private scalars held as `Zeroizing<…>` in
    memory. Singleton treasury vs batch transfer keys distinguished by `purpose`. Capacity
-   (AC#5): `max_batch_size` + `total_capacity` enforced before seal; fail-closed on overflow
-   or persist-write failure.
+   (AC#5): `max_batch_size` enforced at GENERATE_KEYS (agent_keygen.rs, before the caller seals);
+   seal-layer limits are total entry count (`MAX_TOTAL_KEY_ENTRIES`) + blob-size ceiling
+   (`MAX_KEYSTORE_BLOB_SIZE`). Fail-closed on overflow or persist-write failure.
 3. **Counter high-water table** (AC#8/#11): `(authority, environment_identifier,
    scope_class, scope_target) -> highest_accepted_counter`. Acceptance (TASK-7.1):
    `incoming == highest+1`; reject lower (replay) and gaps.
@@ -163,11 +164,13 @@ RESTORE ceremony re-derives or freshly-seeds them enclave-locally:
 - `structural_version`/`freshness_epoch` = enclave-local (see `agent-gateway-anti-rollback.md` — local+1
   vs a `strict_recovery_counter`-seeded value), never the source's; `anchor_root` is the restoring
   enclave's own. These rules are enforced by the (deferred) RESTORE handler slice.
-
-**Forward-migration** (AC#16): the enclave reads a bounded window of prior versions during a
-migration window and re-seals to current on the next privileged mutation; any version
-outside the known set ⇒ fail-closed (no zero-init, no truncation tolerance). A version bump
-requires a reviewed, vector-backed change.
+**Forward-migration** (AC#16, FUTURE DESIGN): the current implementation is v1-strict — `unseal`
+rejects any version ≠ `KEYSTORE_FORMAT_VERSION` (agent_keystore.rs, fail-closed `UnsupportedVersion`).
+No prior version has ever shipped, so the hard v1-only check IS the migration story. The bounded-
+window read+re-seal described below is the TARGET design for when a production keystore exists and
+a version bump is needed (read old → re-seal new, preserving keys/counters/audit/spend state):
+the enclave would read a bounded window of prior versions during a migration window and re-seal
+to current on the next privileged mutation. A version bump requires a reviewed, vector-backed change.
 
 **Slice-4b `AuditRecord` provenance widening (`scope_class`/`scope_target`/`request_id`) — no
 version bump, no migration owed.** Reasoning (precise, because the widening landed mid-PR):
