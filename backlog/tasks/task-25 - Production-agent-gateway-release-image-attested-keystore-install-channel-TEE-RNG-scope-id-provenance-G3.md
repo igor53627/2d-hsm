@@ -1,11 +1,12 @@
 ---
 id: TASK-25
 title: >-
-  Production agent-gateway release image + attested keystore-install channel + TEE-RNG
-  enclave_scope_id provenance (G3 — un-gate precondition for TASK-18)
-status: To Do
+  Production agent-gateway release image + attested keystore-install channel +
+  TEE-RNG enclave_scope_id provenance (G3 — un-gate precondition for TASK-18)
+status: Done
 assignee: []
 created_date: '2026-06-19'
+updated_date: '2026-06-23 07:08'
 labels:
   - agent-gateway
   - security
@@ -113,6 +114,18 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
   fixture, which would let a fleet-scoped cap replay across unrelated clones.
   > **IMPLEMENTED (2026-06-21):** `fleet_scope_id` provenance: (1) AUTHORIZED ASSIGNOR = the provisioner (post-attestation, AC#2 step d — only the authenticated provisioner can deliver it via M3); (2) ALLOWED SOURCE = the authenticated install channel (M3 config_map key 7, verified by Sig_PROV + the transcript); NOT a fixture, NOT host free-form (the [0xf1;32] sentinel is REJECTED at decode, 25-2b-iv compact fix); (3) UNIQUENESS DOMAIN = one value shared across one fleet's clones (caps with scope_class==1 bind to it); (4) ROTATION = a reviewed reprovision (new fleet_scope_id via a new M3 install), NOT a runtime mutation; retired fleet ids → caps fail the verifier byte-compare.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+AC#1 implemented (PR #112): the agentGatewayRelease profile was already in enclave.nix (added during TASK-18); this PR exposes enclave-agent-gateway-release in flake.nix packages + adds a CI lane (cargo build --bin twod-hsm-agent-gateway with the full release feature set, no lab features) so the release surface cannot bit-rot. AC#2-7 were DONE in prior slices 25-2a..v.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+PR #112. All 7 ACs met. AC#1: enclave-agent-gateway-release exposed as flake output + CI lane (cargo build with full release feature set, no lab features). AC#2-7: provisioning channel, scope_id provenance, mint, migration obligation, restore exclusion, fleet_scope_id — all DONE in prior slices (25-2a..v). Cross-verified: release feature set compiles on Linux target.
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Notes
 <!-- SECTION:NOTES:BEGIN -->

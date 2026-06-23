@@ -3,9 +3,10 @@ id: TASK-30
 title: >-
   Fix M-1: remove Debug from ProvisionSession + Zeroize seal_root (TASK-1.7
   security audit)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-22 23:00'
+updated_date: '2026-06-23 06:54'
 labels:
   - security
   - hardening

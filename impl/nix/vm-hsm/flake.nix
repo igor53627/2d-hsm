@@ -38,6 +38,14 @@
         enclave-agent-gateway = pkgs.callPackage ./enclave.nix {
           profile = "agent-gateway";
         };
+        # TASK-25 AC#1: the PRODUCTION agent-gateway serve bin — RELEASE build (debugBuild=false),
+        # NO lab features (no lab-agent-keystore-from-file — uses the platform-derived provisioning
+        # root + sealed blob path, not the lab file loader). All agent-*-preview features enabled
+        # (all UN-GATED under TASK-18 18-6..9). SEPARATE derivation from the debug profiles (role
+        # isolation). Reproducible (nix).
+        enclave-agent-gateway-release = pkgs.callPackage ./enclave.nix {
+          profile = "agent-gateway-release";
+        };
         # TASK-7.7 6-7b-ii: the SAME serve bin built WITH agent-keygen-exec-preview — so the guest
         # executes GENERATE_KEYS (write-path smoke). SEPARATE derivation (preview is release-banned).
         enclave-agent-gateway-keygen = pkgs.callPackage ./enclave.nix {
@@ -234,6 +242,8 @@
           # TASK-15 combined faucet write-path live smoke: all-three-previews serve bin + bootable image.
           inherit enclave-agent-gateway-faucet;
           disk-production-lab-agent-faucet-smoke = diskProductionLabAgentFaucetSmoke;
+          # TASK-25 AC#1: production agent-gateway RELEASE build (no lab features; all previews un-gated).
+          inherit enclave-agent-gateway-release;
           # qemu-vm: runner creates $NIX_DISK_IMAGE qcow2 on first boot (see run-vm-hsm.sh).
           vm = nixosVmStaging.config.system.build.vm;
           vm-production = nixosVmProduction.config.system.build.vm;

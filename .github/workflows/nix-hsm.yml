@@ -169,6 +169,12 @@ jobs:
           cargo test --features agent-contract-server,agent-keygen-exec-preview --test twod_hsm_agent_contract_server_seal
           cargo build --features agent-contract-server,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview --bin twod-hsm-agent-contract-server
 
+      # TASK-25 AC#1: the production agent-gateway release feature set (all previews, NO lab features)
+      # must compile as a bin — no other lane combines all previews without lab-agent-keystore-from-file.
+      # This catches a preview feature that silently depends on a lab-only path.
+      - name: Production agent-gateway release build (TASK-25 AC#1, no lab features)
+        run: cargo build --bin twod-hsm-agent-gateway --features agent-gateway,vsock-transport,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview,agent-sign-transfer-preview,agent-backup-export-preview,agent-prove-identity-preview
+
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 
