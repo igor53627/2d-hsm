@@ -173,6 +173,10 @@ jobs:
       # must compile as a bin — no other lane combines all previews without lab-agent-keystore-from-file.
       # This catches a preview feature that silently depends on a lab-only path.
       - name: Production agent-gateway release build (TASK-25 AC#1, no lab features)
+        env:
+          # Activate the release_build compile_error! guards (lib.rs:62/71/80) so a preview that
+          # transitively pulls a lab-only feature fails the build, not just a real Nix release.
+          TWOD_HSM_STRICT_RELEASE_GUARDS: "1"
         run: cargo build --bin twod-hsm-agent-gateway --features agent-gateway,vsock-transport,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview,agent-sign-transfer-preview,agent-backup-export-preview,agent-prove-identity-preview
 
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)

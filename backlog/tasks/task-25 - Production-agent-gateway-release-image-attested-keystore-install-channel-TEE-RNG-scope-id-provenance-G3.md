@@ -117,9 +117,9 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
 
 ## Implementation Notes
 
-<!-- SECTION:NOTES:BEGIN -->
-AC#1 implemented (PR #112): the agentGatewayRelease profile was already in enclave.nix (added during TASK-18); this PR exposes enclave-agent-gateway-release in flake.nix packages + adds a CI lane (cargo build --bin twod-hsm-agent-gateway with the full release feature set, no lab features) so the release surface cannot bit-rot. AC#2-7 were DONE in prior slices 25-2a..v.
-<!-- SECTION:NOTES:END -->
+<!-- SECTION:IMPL_NOTES:BEGIN -->
+AC#1 implemented (PR #112): the agentGatewayRelease profile was already in enclave.nix (added during TASK-18); this PR exposes enclave-agent-gateway-release in flake.nix packages + adds a CI lane (cargo build --bin twod-hsm-agent-gateway with the full release feature set + TWOD_HSM_STRICT_RELEASE_GUARDS=1 env, no lab features) so the release surface cannot bit-rot. AC#2-7 were DONE in prior slices 25-2a..v.
+<!-- SECTION:IMPL_NOTES:END -->
 
 ## Final Summary
 
