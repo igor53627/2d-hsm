@@ -3,9 +3,10 @@ id: TASK-10
 title: >-
   Staging UDS transport + release-guard + CI artifact gate (roborev audit
   2026-06-07)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-07 18:02'
+updated_date: '2026-06-23 15:36'
 labels:
   - security
   - audit
@@ -26,3 +27,9 @@ Pre-existing findings from the 2026-06-07 roborev audit on feat/task-1 consolida
 
 Source roborev jobs: 6813, 6824, 6831, 6968, 7043, 7049 (2d-hsm).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Verified triage (2026-06-23). UDS bind→chmod race (finding 1): CONFIRMED, LOW — parent dir set to 0700 BEFORE bind mitigates the race window; staging-only transport (production uses AF_VSOCK). Release guard PROFILE check (finding 2): documented gap, README covers it. CI artifact gate (finding 3): documented future work. vm-production build config (finding 4) + nix cache validation (finding 5): LOW staging concerns. All findings are staging-tier, not production enclave code.
+<!-- SECTION:FINAL_SUMMARY:END -->

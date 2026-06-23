@@ -1,9 +1,10 @@
 ---
 id: TASK-8
 title: Producer/hard-fork signing hardening (roborev audit 2026-06-07)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-07 18:02'
+updated_date: '2026-06-23 15:28'
 labels:
   - security
   - audit
@@ -26,3 +27,9 @@ Pre-existing findings surfaced by the 2026-06-07 roborev audit of open consolida
 
 Source roborev jobs: 6589, 6509, 6624, 6656 (2d-hsm).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Triage complete. Findings 1 (pq_pubkey enforcement) + 4 (zeroize) + 5 (reference keys cfg-gated) ADDRESSED. Finding 3 (sig byte length): ML_DSA65_SIGNATURE_LEN=3309 constant exists, wire decode validates. Findings 2, 6, 7 are accepted low-severity design decisions/residuals.
+<!-- SECTION:FINAL_SUMMARY:END -->
