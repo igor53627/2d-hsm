@@ -3,9 +3,10 @@ id: TASK-29
 title: >-
   Fix M-3: update stale Cargo.toml doc-comments for all agent-*-preview features
   (TASK-1.7 security audit)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-22 23:00'
+updated_date: '2026-06-23 06:54'
 labels:
   - security
   - documentation

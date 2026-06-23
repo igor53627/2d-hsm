@@ -169,6 +169,16 @@ jobs:
           cargo test --features agent-contract-server,agent-keygen-exec-preview --test twod_hsm_agent_contract_server_seal
           cargo build --features agent-contract-server,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview --bin twod-hsm-agent-contract-server
 
+      # TASK-25 AC#1: the production agent-gateway release feature set (all previews, NO lab features)
+      # must compile as a bin — no other lane combines all previews without lab-agent-keystore-from-file.
+      # This catches a preview feature that silently depends on a lab-only path.
+      - name: Production agent-gateway release build (TASK-25 AC#1, no lab features)
+        env:
+          # Activate the release_build compile_error! guards (lib.rs:62/71/80) so a preview that
+          # transitively pulls a lab-only feature fails the build, not just a real Nix release.
+          TWOD_HSM_STRICT_RELEASE_GUARDS: "1"
+        run: cargo build --bin twod-hsm-agent-gateway --features agent-gateway,vsock-transport,agent-keygen-exec-preview,agent-configure-treasury-preview,agent-sign-faucet-preview,agent-sign-transfer-preview,agent-backup-export-preview,agent-prove-identity-preview
+
       - name: ML-DSA-65 perf bench compiles (TASK-1 AC#7)
         run: cargo build --example bench_mldsa65 --features ml-dsa-65,pq-seal-provisioning
 
@@ -277,6 +287,9 @@ jobs:
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-keygen-smoke.drvPath
           # TASK-15: the combined faucet WRITE-path smoke image (same agent unit, all-3-previews build).
           nix eval --no-update-lock-file --raw .#packages.x86_64-linux.disk-production-lab-agent-faucet-smoke.drvPath
+          # TASK-25 AC#1: the production agent-gateway RELEASE derivation must evaluate (catches
+          # plumbing/profile-string/feature-list typos without the full Nix build).
+          nix eval --no-update-lock-file --raw .#packages.x86_64-linux.enclave-agent-gateway-release.drvPath
 
       # TASK-5 AC#10: exercise the mainnet-gate logic (no productionMode=true output ships, so
       # this check is the only place the gate is evaluated; catches labFixtures/override regressions).
