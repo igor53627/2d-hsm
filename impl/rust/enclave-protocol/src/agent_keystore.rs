@@ -40,9 +40,9 @@ pub const KEYSTORE_MAGIC: &[u8; 8] = b"2DAGTKS\0";
 /// CEILING the §2 faucet gate checks `cumulative_native_spend + worst_case ≤ cumulative_signing_budget`
 /// against (a STRUCTURAL config cap set by CONFIGURE_TREASURY `refill_budget`, **not** a marks/spend
 /// surface). **MIGRATION SAFETY: NEITHER `1` NOR `2` ever sealed a deployed/production blob** — the only
-/// seal sites are the release-banned `agent-keygen-exec-preview` GENERATE_KEYS path and the lab test
-/// fixtures (the whole agent-gateway serving + keygen path stays preview-gated until TASK-18), so there
-/// is **no fielded keystore to migrate** and the v2→v3 bump cannot lose keys/counters/audit/spend state.
+/// seal sites are the un-gated `agent-keygen-exec-preview` GENERATE_KEYS path (TASK-18 18-6) and the
+/// lab test fixtures, so there is **no fielded keystore to migrate** and the v2→v3 bump cannot lose
+/// keys/counters/audit/spend state.
 /// Each bump is therefore a HARD one with **no reader for the prior version**: the pre-decrypt
 /// `UnsupportedVersion` rejection (version is AAD-bound) is the entire "migration" — a fresh provision,
 /// never an in-place upgrade. (When production keygen un-gates at TASK-18, any future bump MUST first

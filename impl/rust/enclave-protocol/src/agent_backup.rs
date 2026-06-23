@@ -24,8 +24,8 @@
 //! fails. The seal and the offline-open use the IDENTICAL header bytes as AAD, so they cannot diverge.
 //!
 //! Slice 1 (this module): the primitive + its tests. The EXPORT_BACKUP dispatch handler, the audit-ring
-//! drain, and the frozen golden vector land in later 13b slices. Release-banned behind
-//! `agent-backup-export-preview` until TASK-18 (see lib.rs).
+//! drain, and the frozen golden vector land in later 13b slices. Un-gated (TASK-18 18-9 — see lib.rs);
+//! the `agent-backup-export-preview` feature pulls `ml-kem`.
 
 // Slice 1 ships the primitive ahead of its only non-test consumer (the EXPORT_BACKUP handler, 13b Slice 4),
 // so the `pub(crate)` seal fns + constants are exercised by this module's tests but otherwise un-called in a
