@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-06-19'
-updated_date: '2026-06-23 07:08'
+updated_date: '2026-06-23 07:22'
 labels:
   - agent-gateway
   - security
@@ -117,9 +117,13 @@ ACs reference. This task is **provisionally one ticket**; at implementation time
 
 ## Implementation Notes
 
+<!-- SECTION:NOTES:BEGIN -->
 <!-- SECTION:IMPL_NOTES:BEGIN -->
 AC#1 implemented (PR #112): the agentGatewayRelease profile was already in enclave.nix (added during TASK-18); this PR exposes enclave-agent-gateway-release in flake.nix packages + adds a CI lane (cargo build --bin twod-hsm-agent-gateway with the full release feature set + TWOD_HSM_STRICT_RELEASE_GUARDS=1 env, no lab features) so the release surface cannot bit-rot. AC#2-7 were DONE in prior slices 25-2a..v.
 <!-- SECTION:IMPL_NOTES:END -->
+
+AC#1 scope clarification (compact-10251 HIGH): the release image is COMPILE-ONLY — it builds + is reproducible (Nix), but the bootstrap bin's provisioning DRIVER (wiring ProvisionSession::on_m1/on_m3 to the AF_VSOCK listener + SNP fetch) is deferred (25-2b-iv Notes: 'Driver contract, deferred'). The bin boots through run_agent_gateway_boot → boot_configure_agent_seal_root → unseal_agent_keystore_at_boot, which is fail-closed without a sealed blob until the provisioning driver wires the attested install path. This is BY DESIGN — AC#1 says the BUILD SURFACE exists ('the enclave.nix buildFeatures surface does not yet exist' — now it does); the runtime boot path is a separate concern tracked in the task notes as the deferred driver contract. The image is a compile target for measurement/inspection, not a deployable artifact until the driver lands.
+<!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
