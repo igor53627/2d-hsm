@@ -8,15 +8,12 @@
 //!   here end-to-end against the unsealed keystore.
 //! - **Privileged** opcodes `{GENERATE_KEYS(1), CONFIGURE_TREASURY(6), EXPORT_BACKUP(7),
 //!   RESTORE_BACKUP(8)}` are verified by [`verify_capability`] (Ed25519 + authority tier + opcode/
-//!   request binding + contiguous-counter CHECK, via [`crate::agent_capability`]). **GENERATE_KEYS
-//!   executes** (key mint + counter advance + candidate re-seal/swap) ONLY under the off-by-default,
-//!   un-gated `agent-keygen-exec-preview` feature (TASK-18 18-6 — anti-rollback + scope_identity +
-//!   must wait for anti-rollback (TASK-7.7) + `scope_target`↔sealed-enclave-id binding + the AC#14
-//!   audit record. Without that feature (and for CONFIGURE_TREASURY/EXPORT/RESTORE) a verified
-//!   privileged request **fails closed** with `AGENT_NOT_CONFIGURED`. Capability *failures* collapse
-//!   to `AGENT_CAPABILITY_REJECTED` (0x43).
-//! - **Runtime signing** `{SIGN_TRANSFER(4), SIGN_FAUCET_DISPENSE(5)}` is TASK-7.6.4; not in this
-//!   slice → `AGENT_NOT_CONFIGURED`.
+//!   request binding + contiguous-counter CHECK, via [`crate::agent_capability`]). Each privileged
+//!   opcode executes under its off-by-default preview feature (all UN-GATED under TASK-18 — see lib.rs);
+//!   without the feature a verified privileged request **fails closed** with `AGENT_NOT_CONFIGURED`.
+//!   Capability *failures* collapse to `AGENT_CAPABILITY_REJECTED` (0x43).
+//! - **Runtime signing** `{SIGN_TRANSFER(4), SIGN_FAUCET_DISPENSE(5)}` is TASK-7.6.4, UN-GATED under
+//!   TASK-18 (18-7/18-8); without the corresponding preview feature → `AGENT_NOT_CONFIGURED`.
 //!
 //! All failures map to the §10.9 agent error band `0x40..=0x46` with the anti-oracle collapsing
 //! rules (key-not-found and wrong-purpose both → `0x42`; every capability failure → `0x43`).
@@ -536,7 +533,8 @@ pub(crate) fn dispatch_agent(
             AgentOpcode::GenerateKeys => handle_generate_keys(&env, keystore, &verified),
             // CONFIGURE_TREASURY executes ONLY under the off-by-default `agent-configure-treasury-preview`
             // feature (un-gated TASK-18 18-7): scope_identity binding + recovery-counter + AC#14 audit +
-            // G3 provenance are DONE. The compile_error! release ban is REMOVED. Without the feature
+            // G3 provenance are DONE. The compile_error! release ban is REMOVED. Without the feature it
+            // falls through to the privileged default arm below (verify cap, then fail closed).
             #[cfg(feature = "agent-configure-treasury-preview")]
             AgentOpcode::ConfigureTreasury => handle_configure_treasury(&env, keystore, &verified),
             // EXPORT_BACKUP executes ONLY under the off-by-default `agent-backup-export-preview` feature
@@ -1531,6 +1529,7 @@ fn decode_export_selector(payload: &[(Value, Value)]) -> Result<ExportSelector, 
 /// `config_version` reads live==candidate). Any failure ⇒ `SealFailed` (0x46) before the seam — no commit.
 ///
 /// Compiled + CALLED only under `agent-backup-export-preview` (un-gated TASK-18 18-9); without it EXPORT
+/// routes to NotConfigured (the deferred-stub path).
 #[cfg(feature = "agent-backup-export-preview")]
 fn handle_export_backup(
     env: &AgentEnvelope,

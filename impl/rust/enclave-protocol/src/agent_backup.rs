@@ -26,11 +26,10 @@
 //! The EXPORT_BACKUP dispatch handler, the audit-ring drain, and the frozen golden vector are all
 //! landed (TASK-18 18-9 un-gated). The `agent-backup-export-preview` feature pulls `ml-kem`.
 
-// Slice 1 ships the primitive ahead of its only non-test consumer (the EXPORT_BACKUP handler, 13b Slice 4),
-// so the `pub(crate)` seal fns + constants are exercised by this module's tests but otherwise un-called in a
-// non-test build. Remove this allow when Slice 4 wires `seal_backup_blob` into `handle_export_backup`.
+// The primitive is exercised by this module's tests and by the EXPORT_BACKUP handler
+// (handle_export_backup → seal_backup_blob). The allow(dead_code) stays because the module is
+// compiled under agent-backup-export-preview which is not the default feature set.
 #![allow(dead_code)]
-
 use crate::agent_keystore::ML_KEM_1024_ENCAPS_KEY_LEN;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
