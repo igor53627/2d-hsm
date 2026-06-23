@@ -1,9 +1,10 @@
 ---
 id: TASK-17
 title: Keystore residual hardening + doc accuracy (roborev audit 2026-06-08)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 16:19'
+updated_date: '2026-06-23 14:09'
 labels:
   - agent-gateway
   - roborev
@@ -26,3 +27,9 @@ Two verified STILL_OPEN findings from the roborev audit/compact of the PR #37 (T
 - [ ] #2 Doc: max_batch_size enforcement wording clarified. agent-gateway-keystore-backup-format.md:90 says 'max_batch_size + total_capacity enforced before seal'. MAX_BATCH_SIZE IS enforced — at key-generation time (agent_keygen.rs:90, `count > MAX_BATCH_SIZE`), which runs before the caller seals — so 'before seal' is technically true; but it is NOT a seal-layer check in validate()/seal_body (agent_keystore.rs enforces only MAX_TOTAL_KEY_ENTRIES count at :457 and MAX_KEYSTORE_BLOB_SIZE/framing-reserve at :533). Tighten the doc to say: batch cap enforced at GENERATE_KEYS, seal-layer limits are total entry count + blob-size ceiling (the binding limit). NOTE: the earlier 'declared-and-unused' framing was wrong (it is used in agent_keygen.rs) — corrected here.
 - [ ] #3 Doc: forward-migration vs v1-strict reconciled. agent-gateway-keystore-backup-format.md:104 describes reading a bounded window of prior versions + re-seal, but unseal rejects any version != KEYSTORE_FORMAT_VERSION(1) (agent_keystore.rs:192-194). Mark the bounded-window migration as target/future design (no prior version has ever shipped) so the doc matches the current v1-only strict check.
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+All 3 ACs met. AC#1: DuplicateCounterTuple validation + test (already landed in TASK-7.7 5b-2e marks-grammar work). AC#2: max_batch_size wording tightened (enforced at GENERATE_KEYS, not seal-layer). AC#3: forward-migration marked as FUTURE DESIGN (current is v1-strict fail-closed).
+<!-- SECTION:FINAL_SUMMARY:END -->
