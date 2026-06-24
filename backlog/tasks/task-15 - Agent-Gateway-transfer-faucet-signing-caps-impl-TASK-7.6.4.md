@@ -1,10 +1,10 @@
 ---
 id: TASK-15
 title: Agent Gateway transfer + faucet signing + caps impl (TASK-7.6.4)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:09'
-updated_date: '2026-06-08 08:46'
+updated_date: '2026-06-24 21:52'
 labels:
   - agent-gateway
   - implementation
@@ -37,3 +37,19 @@ Roborev: high-risk Agent Gateway implementation slice (impl/rust/ signing path) 
 
 **TASK-18 UN-GATE CHECKLIST (before removing `agent-sign-transfer-preview` / `agent-keygen-exec-preview` from production).** SIGN_TRANSFER is NOT rollback-sensitive, so anti-rollback alone does NOT satisfy its gate — the preview MUST stay until ALL of: (a) the **AC#5 production funding profile** is provisioned (15-5: signer via `agentTransferFaucetSignerPackage` + the `usesLab` endpoint downgrade) and the Layer-1 Nix gate is ARMED (builds fail without a sanctioned anti-rollback mode); (b) the AC#10 measured/sealed opt-out's Rust verbatim-text + operator-sig verification lands (`sealed_optout_acknowledged` is a `false` stub today); (c) host-side credential-tier separation + OPA/Vault policy (TASK-16 remainder) gates who may invoke fund-moving opcodes; (d) production transfer/large-`u256` vector coverage + a release-build feature-behavior test (the preview-OFF NotConfigured posture); (e) the Full Matrix + compact recorded on the un-gate PR. Removing the gate after (only) anti-rollback is a fail-open.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+All slices implemented + tested + shipped in prior PRs:
+- 15-1 SIGN_TRANSFER: handler (agent_dispatch.rs:746) + EIP-155 RLP encoder (agent_transfer.rs) + low-S + golden vector. PR landed.
+- 15-2 u256 arithmetic: u256.rs module + FaucetState cumulative_signing_budget. KEYSTORE_FORMAT_VERSION 3.
+- 15-3 SIGN_FAUCET_DISPENSE: handler (agent_dispatch.rs:870) + accept_and_debit checked u256 + recipient allowlist (is_known_transfer_recipient) + dual-counter debit via commit_before_emit (EpochOnly) + golden vector. PR #85 Full Matrix clean.
+- 15-4 CONFIGURE_TREASURY: all 4 sub-ops (set_limits/refill_budget/raise_lifetime_breaker/reset_lifetime_breaker) + monotonic config_version + configure_treasury_sub_op_bump_class (all Structural) + golden vectors. PR #87.
+- 15-5 AC#5 Nix gate: armed via agentTransferFaucetSignerPackage derivation + ac5-funding-gate.nix predicate + usesLab downgrade pattern. guest-profile.nix + nixos-module.nix + flake.nix checks.
+- 15-6 Faucet smoke: CI lane (cargo test --lib lab_agent_smoke + bin build) + nix eval (disk-production-lab-agent-faucet-smoke) + aya SNP smoke validated (PR #79).
+
+607 tests pass with all 3 preview features. All preview features UN-GATED under TASK-18 18-7/18-8.
+
+Residuals (all Low, non-blocking) tracked in TASK-20: decode_and_sign_eip155_transfer seam extraction (altitude), encode_agent_response fail-closed-arm fragility, recipient-allowlist perf.
+<!-- SECTION:FINAL_SUMMARY:END -->
