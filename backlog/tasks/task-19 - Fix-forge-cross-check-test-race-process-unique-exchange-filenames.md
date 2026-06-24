@@ -4,7 +4,7 @@ title: 'Fix forge cross-check test race: process-unique exchange filenames'
 status: Done
 assignee: []
 created_date: '2026-06-11 05:51'
-updated_date: '2026-06-23 19:11'
+updated_date: '2026-06-24 01:16'
 labels: []
 dependencies: []
 ordinal: 23000
@@ -27,5 +27,5 @@ Discovered by the PR #61 xhigh review (CONFIRMED, pre-existing, reproduced): com
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Fixed in PR #114 — forge cross-check exchange filenames now include std::process::id() + unlink output pre-run.
+Race fix delivered (PR #114): process-unique filenames (pid-tagged) + pre-run unlink. The unbounded `.forge-crosscheck` dir growth cleanup policy is an accepted deferred follow-up — the pid-tagged filenames prevent cross-process collision but files accumulate. Not blocking (dir is gitignored, sizes are ~200 bytes each).
 <!-- SECTION:FINAL_SUMMARY:END -->

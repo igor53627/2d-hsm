@@ -4,7 +4,7 @@ title: Bind hard-fork AuthorizationTicket contextHash to producer epoch
 status: To Do
 assignee: []
 created_date: '2026-06-23 23:34'
-updated_date: '2026-06-24 00:42'
+updated_date: '2026-06-24 01:13'
 labels:
   - authorization-ticket
   - 2d-solidity
@@ -17,8 +17,11 @@ references:
 documentation:
   - backlog/docs/authorization-tickets-precompile-spec-draft.md
   - backlog/docs/permissionless-blockproducer-recovery-tickets.md
+modified_files:
+  - backlog/docs/authorization-tickets-precompile-spec-draft.md
+  - impl/rust/enclave-protocol/src/lib.rs
 priority: high
-ordinal: 33500
+ordinal: 33600
 ---
 
 ## Description
@@ -34,12 +37,14 @@ Important constraints:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Hard-fork AuthorizationTicket contextHash semantics explicitly bind the ticket to the intended producer authorization epoch.
-- [ ] #2 Canonical ticketHash preimage remains unambiguous and has updated test vectors/examples for enclave and Solidity implementations.
-- [ ] #3 2d-hsm signing service/enclave ticket generation is updated to compute the same contextHash/preimage.
-- [ ] #4 Replay/withheld-ticket scenario A -> B -> A is covered: a hard-fork ticket signed in the old A epoch cannot activate in a later A epoch.
-- [ ] #5 Docs call out compatibility/migration impact for existing Solidity reference and native precompile.
+- [ ] #1 #1 DONE: contextHash for HARD_FORK includes producerEpochBinding = keccak256(pqPubkey || currentProducerActivatedAtHeight). Spec §4 + §8 updated.
+- [ ] #2 #2 PARTIAL: spec updated; needs a Rust↔Solidity consistency test for contextHash derivation (separate from the ticketHash forge cross-check). Deferred.
+- [ ] #3 #3 N/A (rewritten): context_hash is caller-provided opaque bytes32 in the enclave (lib.rs:875). The off-enclave CALLER (host/producer software) must compute contextHash with the epoch binding. No enclave code change needed. A future Rust↔Solidity contextHash derivation test should pin the derivation formula.
+- [ ] #4 #4 NOT MET — BLOCKED on 2d-solidity task-10: the precompile MUST recompute expected contextHash from current (pqPubkey, activatedAtHeight) and reject mismatches. Currently treats contextHash as opaque. The A→B→A withheld-ticket replay is NOT prevented until this lands.
+- [ ] #5 #5 DONE: spec §8 marks the rule as PLANNED (not yet enforced) + documents the 2d-solidity gap.
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 
