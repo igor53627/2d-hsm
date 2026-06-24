@@ -53,11 +53,15 @@ struct AuthorizationTicket {
 
     // === Context (interpretation depends on ticketType) ===
     bytes32  contextHash;          // For RECOVERY: last_good_tip_hash
-                                   // For HARD_FORK: keccak256(forkSpecHash || previousMeasurement ||
-                                   //                 activationHeight || producerEpochBinding)
-                                   // where producerEpochBinding = keccak256(pqPubkey || currentProducerActivatedAtHeight)
+                                   // For HARD_FORK: keccak256(abi.encode(forkSpecHash, previousMeasurement,
+                                   //                 activationHeight, producerEpochBinding))
+                                   // where producerEpochBinding = keccak256(abi.encode(pqPubkey, currentProducerActivatedAtHeight))
                                    // — binds the ticket to the SPECIFIC producer epoch that authorized it,
                                    // preventing withheld-ticket replay across a rotation A → B → A (TASK-32).
+                                   // Encoding is abi.encode (typed, non-malleable) to match the normative
+                                   // ticketHash construction in §5; never abi.encodePacked (adjacent dynamic
+                                   // bytes would be ambiguous). The off-chain caller and the on-chain
+                                   // verifier MUST use this identical preimage.
 
     uint64   activationHeight;     // For PRODUCER_RECOVERY: height from which the new producer is authorized
                                    // For HARD_FORK_ACTIVATION: **must** be a specific future block number (like in Ethereum).
@@ -243,23 +247,24 @@ In the first version, a `HARD_FORK_ACTIVATION` ticket is only accepted by the pr
 - `activationHeight` is strictly greater than the current block height (future block scheduling, Ethereum style).
 - `forkSpecHash` is non-zero.
 - `newMeasurement` is different from the current one.
-- `contextHash` epoch binding — **REQUIRED ENFORCEMENT, not yet implemented.**
+- `contextHash` epoch binding — **REQUIRED ENFORCEMENT.**
   The precompile/contract MUST recompute the expected contextHash from the CURRENT
   producer's `(pqPubkey, activatedAtHeight)` and reject any ticket whose contextHash
   does not match. This is the **PRIMARY enforcement** against withheld-ticket replay
   across a rotation A→B→A: a ticket signed when A was active at height H1 carries
-  `producerEpochBinding = keccak256(A_pqPubkey, H1)`; after rotation A→B→A the current
-  producer is A at height H3, so the recomputed binding is
-  `keccak256(A_pqPubkey, H3)` which differs from H1's → mismatch → rejected. Without
-  this recompute, the replay is NOT prevented: the Solidity `_producerEpochId` storage
-  scoping (line 439) keys off the SUBMISSION-TIME producer epoch (not the signing-time
-  epoch), so a withheld epoch-1 ticket submitted fresh in epoch-3 passes the
-  producer-key check (same pqPubkey) and is stored + activated under epoch-3.
-  **⚠ NOT YET IMPLEMENTED:** the landed `RecoveryTicket.sol` (PR #18) treats
-  contextHash as opaque bytes32 (only checks non-zero at line 281). The contextHash
-  recomputation is REQUIRED and MUST be added to `_submitHardForkActivation` in
-  2d-solidity (tracked in 2d-solidity TASK-10, a HARD BLOCKER for TASK-32). Until it
-  lands, the A→B→A replay is NOT prevented and TASK-32 AC#4 is NOT met.
+  `producerEpochBinding = keccak256(abi.encode(A_pqPubkey, H1))`; after rotation A→B→A the
+  current producer is A at height H3, so the recomputed binding is
+  `keccak256(abi.encode(A_pqPubkey, H3))` which differs from H1's → mismatch → rejected.
+  Without this recompute, the replay is NOT prevented: `_producerEpochId` storage scoping
+  keys off the SUBMISSION-TIME producer epoch (not the signing-time epoch), so a withheld
+  epoch-1 ticket submitted fresh in epoch-3 would pass the producer-key check (same
+  pqPubkey) and be stored + activated under epoch-3.
+  **✅ IMPLEMENTED (2d-solidity TASK-10):** `RecoveryTicket._submitHardForkActivation`
+  recomputes `keccak256(abi.encode(forkSpecHash, previousMeasurement, activationHeight,
+  producerEpochBinding))` and reverts `ContextHashEpochMismatch` on any divergence;
+  regression tests cover the explicit mismatch and the A→B→A withheld-ticket replay.
+  This satisfies TASK-32 AC#4 for the Solidity reference. The native precompile MUST
+  enforce the identical recompute when implemented.
 
 This means hard forks in v1 are **producer-driven scheduled announcements**, not fully permissionless events.
 
