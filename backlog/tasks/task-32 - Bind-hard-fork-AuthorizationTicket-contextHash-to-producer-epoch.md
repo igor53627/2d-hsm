@@ -1,10 +1,10 @@
 ---
 id: TASK-32
 title: Bind hard-fork AuthorizationTicket contextHash to producer epoch
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-23 23:34'
-updated_date: '2026-06-24 01:13'
+updated_date: '2026-06-24 19:45'
 labels:
   - authorization-ticket
   - 2d-solidity
@@ -37,14 +37,12 @@ Important constraints:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 #1 DONE: contextHash for HARD_FORK includes producerEpochBinding = keccak256(pqPubkey || currentProducerActivatedAtHeight). Spec §4 + §8 updated.
-- [ ] #2 #2 PARTIAL: spec updated; needs a Rust↔Solidity consistency test for contextHash derivation (separate from the ticketHash forge cross-check). Deferred.
-- [ ] #3 #3 N/A (rewritten): context_hash is caller-provided opaque bytes32 in the enclave (lib.rs:875). The off-enclave CALLER (host/producer software) must compute contextHash with the epoch binding. No enclave code change needed. A future Rust↔Solidity contextHash derivation test should pin the derivation formula.
-- [ ] #4 #4 NOT MET — BLOCKED on 2d-solidity task-10: the precompile MUST recompute expected contextHash from current (pqPubkey, activatedAtHeight) and reject mismatches. Currently treats contextHash as opaque. The A→B→A withheld-ticket replay is NOT prevented until this lands.
-- [ ] #5 #5 DONE: spec §8 marks the rule as PLANNED (not yet enforced) + documents the 2d-solidity gap.
+- [ ] #1 #1 DONE: contextHash for HARD_FORK includes producerEpochBinding. Spec §4 + §8 updated.
+- [ ] #2 #2 PARTIAL: spec updated; Rust↔Solidity contextHash derivation consistency test deferred.
+- [ ] #3 #3 N/A: context_hash is caller-provided opaque bytes32; off-enclave caller computes it.
+- [ ] #4 #4 DONE: 2d-solidity commit 00e3497 implements _requireHardForkContextHash recompute in _submitHardForkActivation + test_hardForkActivation_rejectsContextHashEpochMismatch + test_hardForkActivation_rejectsWithheldTicketAfterProducerKeyReturns (A→B→A replay). 133 forge tests pass.
+- [ ] #5 #5 DONE: spec §8 marks as REQUIRED ENFORCEMENT + documents implementation status.
 <!-- AC:END -->
-
-
 
 ## Implementation Notes
 
@@ -63,3 +61,9 @@ AC#5 (compatibility/migration docs): DONE — spec §8 documents the gap (⚠ NO
 
 Bug fix included: forge cross-check unlink was placed AFTER forge output (deleting fresh output before read) — moved to BEFORE the forge call so the Rust↔Solidity preimage cross-check actually executes.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Spec + Solidity implementation done. AC#4 MET (2d-solidity 00e3497). LIVE OBLIGATION: the off-enclave producer (2D BlockProducer signing path, task-122) MUST compute contextHash = keccak256(abi.encode(forkSpecHash, measurement, activationHeight, keccak256(abi.encode(pqPubkey, activatedAtHeight)))) — the Solidity contract hard-reverts ContextHashEpochMismatch on any divergence. AC#2 (Rust↔Solidity contextHash derivation parity test) is deferred but MUST land before the first real hard-fork ticket: without it, a preimage divergence between the producer's contextHash and the contract's recompute silently rejects all legitimate hard-fork tickets. Tracked: 2d task-122 owns the producer signing path; the parity vector is a cross-repo consistency obligation on whoever wires the hard-fork ticket generation.
+<!-- SECTION:FINAL_SUMMARY:END -->
