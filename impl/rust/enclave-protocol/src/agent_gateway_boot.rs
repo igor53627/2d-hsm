@@ -330,7 +330,6 @@ pub fn run_agent_gateway_boot() -> Result<std::convert::Infallible, ProtocolErro
 // ---------------------------------------------------------------------------------------------------
 
 /// 4-byte big-endian length-prefixed frame read (matches the 0x40 serve framing).
-#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 fn recv_frame<R: std::io::Read>(stream: &mut R) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).map_err(|_e| ProtocolError::PqSigningUnavailable(
@@ -350,7 +349,6 @@ fn recv_frame<R: std::io::Read>(stream: &mut R) -> Result<Vec<u8>, ProtocolError
 }
 
 /// 4-byte big-endian length-prefixed frame write.
-#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
 fn send_frame<W: std::io::Write>(stream: &mut W, data: &[u8]) -> Result<(), ProtocolError> {
     let len = (data.len() as u32).to_be_bytes();
     stream.write_all(&len).map_err(|_e| ProtocolError::PqSigningUnavailable(
@@ -363,6 +361,36 @@ fn send_frame<W: std::io::Write>(stream: &mut W, data: &[u8]) -> Result<(), Prot
         "provisioning: frame flush failed",
     ))?;
     Ok(())
+}
+
+/// The testable handshake seam: M1→on_m1→fetch_report→M2→M3→on_m3→M4.
+/// Generic over the stream (Read+Write) and the report fetcher so tests can drive
+/// it over in-memory buffers + a mock report.
+fn drive_provisioning_handshake<S, F>(
+    stream: &mut S,
+    session: &mut crate::agent_provision::ProvisionSession,
+    fetch_report: F,
+) -> Result<Vec<u8>, ProtocolError>
+where
+    S: std::io::Read + std::io::Write,
+    F: FnOnce(&[u8; 64]) -> Result<(Vec<u8>, Vec<u8>), ProtocolError>,
+{
+    let m1_frame = recv_frame(stream)?;
+    let m1 = crate::agent_provision::decode_m1(&m1_frame)
+        .map_err(|_| ProtocolError::PqSigningUnavailable("provisioning: M1 decode failed"))?;
+    let (n_e, report_data) = session.on_m1(m1.n_p)
+        .map_err(|_| ProtocolError::PqSigningUnavailable("provisioning: on_m1 failed"))?;
+    let (report, _) = fetch_report(&report_data)?;
+    let m2 = crate::agent_provision::encode_m2(&n_e, &report);
+    send_frame(stream, &m2)?;
+    let m3_frame = recv_frame(stream)?;
+    let (_config, sealed_blob) = session.on_m3(&m3_frame, &report)
+        .map_err(|_| ProtocolError::PqSigningUnavailable(
+            "provisioning: on_m3 failed — session consumed (restart required)",
+        ))?;
+    let m4 = crate::agent_provision::encode_m4(&sealed_blob);
+    send_frame(stream, &m4)?;
+    Ok(sealed_blob)
 }
 
 /// The production provisioning bootstrap driver. Returns the freshly-provisioned keystore body
@@ -443,50 +471,13 @@ fn run_provisioning_bootstrap(
     })?;
     let _ = writeln!(std::io::stderr(), "[info] provisioning: provisioner connected");
 
-    // (6) M1: receive the provisioner's challenge.
-    let m1_frame = recv_frame(&mut stream)?;
-
-    let m1 = crate::agent_provision::decode_m1(&m1_frame).map_err(|e| {
-        let _ = writeln!(std::io::stderr(), "[err] provisioning: M1 decode failed: {e:?}");
-        ProtocolError::PqSigningUnavailable("provisioning: M1 decode failed")
-    })?;
-    let _ = writeln!(std::io::stderr(), "[info] provisioning: M1 received");
-
-    // (7) on_m1: mint enclave nonce N_e + compute report_data.
-    let (n_e, report_data) = session.on_m1(m1.n_p).map_err(|e| {
-        let _ = writeln!(std::io::stderr(), "[err] provisioning: on_m1 failed: {e:?}");
-        ProtocolError::PqSigningUnavailable("provisioning: on_m1 failed")
-    })?;
-
-    // (8) Fetch the M2 SNP attestation report (report_data binds N_p + N_e + measurement).
-    let _ = writeln!(std::io::stderr(), "[info] provisioning: fetching SNP report");
-    let (report, _cert_chain) = crate::snp_report::fetch_report(&report_data)
-        .map_err(|e| {
-            let _ = writeln!(std::io::stderr(), "[err] provisioning: SNP report fetch failed: {e}");
-            ProtocolError::PqSigningUnavailable("provisioning: SNP report fetch failed")
-        })?;
-
-    // (9) M2: send N_e + report to the provisioner.
-    let m2 = crate::agent_provision::encode_m2(&n_e, &report);
-    send_frame(&mut stream, &m2)?;
-    let _ = writeln!(std::io::stderr(), "[info] provisioning: M2 sent (report {}B)", report.len());
-
-    // (10) M3: receive the provisioner's config + signature.
-    let m3_frame = recv_frame(&mut stream)?;
-    let _ = writeln!(std::io::stderr(), "[info] provisioning: M3 received");
-
-    // (11) on_m3: verify provisioner cert + transcript + sig, mint enclave_scope_id (getrandom),
-    //      seal the keystore. One-shot failure: ANY error consumes the session (Failed terminal).
-    let (_config, sealed_blob) = session.on_m3(&m3_frame, &report).map_err(|e| {
-        let _ = writeln!(std::io::stderr(), "[err] provisioning: on_m3 failed (session consumed): {e:?}");
-        ProtocolError::PqSigningUnavailable("provisioning: on_m3 failed — session consumed (restart required)")
-    })?;
-    let _ = writeln!(std::io::stderr(), "[info] provisioning: keystore sealed ({}B)", sealed_blob.len());
-
-    // (12) M4: send the sealed keystore blob to the provisioner (for the host to persist).
-    let m4 = crate::agent_provision::encode_m4(&sealed_blob);
-    send_frame(&mut stream, &m4)?;
-    let _ = writeln!(std::io::stderr(), "[info] provisioning: M4 sent — handshake complete");
+    // (6-12) Drive the M1→M2→M3→M4 handshake via the testable seam.
+    let sealed_blob = drive_provisioning_handshake(
+        &mut stream,
+        &mut session,
+        |report_data| crate::snp_report::fetch_report(report_data),
+    )?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: handshake complete (sealed {}B)", sealed_blob.len());
 
     // (13) Unseal the freshly-provisioned blob for in-enclave installation.
     let body = crate::agent_keystore::unseal_body(&sealed_blob, seal_root, &measurement)
@@ -1756,5 +1747,88 @@ mod tests {
             "epipe"
         ))));
         assert!(!is_peer_protocol_reject(&ProtocolError::MessageTooLarge(1)));
+    }
+}
+
+#[cfg(test)]
+mod provisioning_driver_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    struct MockStream { input: Vec<u8>, pos: usize, output: Vec<u8> }
+    impl MockStream { fn new(input: Vec<u8>) -> Self { Self { input, pos: 0, output: Vec::new() } } }
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.input.len() {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "exhausted"));
+            }
+            let n = std::cmp::min(buf.len(), self.input.len() - self.pos);
+            buf[..n].copy_from_slice(&self.input[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.output.extend_from_slice(buf); Ok(buf.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    fn frame(data: &[u8]) -> Vec<u8> {
+        let mut v = (data.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(data);
+        v
+    }
+
+    #[test]
+    fn frame_round_trip() {
+        let payload = b"hello";
+        let mut s = MockStream::new(frame(payload));
+        assert_eq!(recv_frame(&mut s).unwrap(), payload);
+        send_frame(&mut s, b"resp").unwrap();
+        assert_eq!(s.output, frame(b"resp"));
+    }
+
+    #[test]
+    fn handshake_sequencing_invalid_m3_fails_at_on_m3() {
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let mut session = crate::agent_provision::ProvisionSession::new(
+            ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
+        );
+        let m1 = frame(&crate::agent_provision::encode_m1(&[0xAAu8; 32]));
+        let m3 = frame(&vec![0xFFu8; 64]); // garbage M3
+        let mut stream = MockStream::new([m1, m3].concat());
+        let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
+            Ok((vec![0xCDu8; 1184], Vec::new()))
+        });
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("on_m3 failed"), "must fail at on_m3, got: {msg}");
+        assert!(stream.output.len() > 4, "M2 must have been written before M3 error");
+    }
+
+    #[test]
+    fn handshake_malformed_m1_fails_at_decode() {
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let mut session = crate::agent_provision::ProvisionSession::new(
+            ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
+        );
+        let mut stream = MockStream::new(frame(&vec![0xFFu8; 32]));
+        let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
+            Ok((vec![0xCDu8; 1184], Vec::new()))
+        });
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("M1 decode failed"), "must fail at decode, got: {msg}");
+    }
+
+    #[test]
+    fn handshake_empty_stream_fails_at_recv() {
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let mut session = crate::agent_provision::ProvisionSession::new(
+            ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
+        );
+        let mut stream = MockStream::new(Vec::new());
+        let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
+            Ok((vec![0xCDu8; 1184], Vec::new()))
+        });
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("frame header read failed"), "must fail at recv, got: {msg}");
     }
 }
