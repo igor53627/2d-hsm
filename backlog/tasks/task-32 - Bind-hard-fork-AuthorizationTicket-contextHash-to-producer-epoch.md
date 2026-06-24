@@ -4,7 +4,7 @@ title: Bind hard-fork AuthorizationTicket contextHash to producer epoch
 status: Done
 assignee: []
 created_date: '2026-06-23 23:34'
-updated_date: '2026-06-24 19:45'
+updated_date: '2026-06-24 19:46'
 labels:
   - authorization-ticket
   - 2d-solidity
@@ -47,19 +47,17 @@ Important constraints:
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-TASK-32 progress (2026-06-23):
+AC#1 (contextHash binds to producer epoch): DONE — spec updated (§4 + §8). producerEpochBinding = keccak256(abi.encode(pqPubkey, activatedAtHeight)).
 
-AC#1 (contextHash binds to producer epoch): DONE — spec updated (§4 field definition + §8 verification rule). contextHash for HARD_FORK now includes producerEpochBinding = keccak256(pqPubkey || currentProducerActivatedAtHeight).
+AC#2 (updated test vectors): PARTIAL — spec updated. Rust↔Solidity contextHash derivation parity test deferred — MUST land before first real hard-fork ticket. The off-enclave producer (2D task-122) must compute the identical preimage as the Solidity recompute.
 
-AC#2 (updated test vectors): PARTIAL — spec updated. Rust test vectors use opaque context_hash values (the enclave doesn't compute contextHash, the caller does). The contextHash derivation needs its own Rust↔Solidity consistency check (separate from the ticketHash forge cross-check) — deferred.
+AC#3 (2d-hsm enclave): N/A — context_hash is caller-provided opaque bytes32 (lib.rs:875). No enclave code change.
 
-AC#3 (2d-hsm enclave updated): N/A — context_hash is caller-provided opaque bytes32 (AuthorizationTicketPayload.context_hash, lib.rs:875). The enclave signs whatever contextHash it receives; the CALLER must compute it with the epoch binding. No enclave code change needed.
+AC#4 (A→B→A replay): DONE — 2d-solidity commit 00e3497 implements _requireHardForkContextHash in _submitHardForkActivation. Tests: test_hardForkActivation_rejectsContextHashEpochMismatch + test_hardForkActivation_rejectsWithheldTicketAfterProducerKeyReturns. 133 forge tests pass.
 
-AC#4 (A→B→A replay covered): NOT MET — the PRIMARY enforcement (contextHash recompute in _submitHardForkActivation) is NOT implemented in 2d-solidity RecoveryTicket.sol. The landed code (PR #18) treats contextHash as opaque bytes32 (line 281: only checks non-zero). The _producerEpochId storage scoping (line 439) keys off SUBMISSION-TIME producer, not signing-time epoch — so a withheld epoch-1 ticket submitted fresh in epoch-3 passes all checks and activates. BLOCKED on 2d-solidity task-10 implementing contextHash recompute+verify.
+AC#5 (compat docs): DONE — spec §8 is REQUIRED ENFORCEMENT, now ✅ IMPLEMENTED (2d-solidity TASK-10).
 
-AC#5 (compatibility/migration docs): DONE — spec §8 documents the gap (⚠ NOT YET IMPLEMENTED) + 2d-solidity task-10 follow-up requirement.
-
-Bug fix included: forge cross-check unlink was placed AFTER forge output (deleting fresh output before read) — moved to BEFORE the forge call so the Rust↔Solidity preimage cross-check actually executes.
+Bug fix: forge cross-check unlink moved BEFORE forge call (was no-op).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
