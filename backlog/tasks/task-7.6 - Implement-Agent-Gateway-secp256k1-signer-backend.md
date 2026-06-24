@@ -1,10 +1,10 @@
 ---
 id: TASK-7.6
 title: Implement Agent Gateway secp256k1 signer backend
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-24 21:53'
+updated_date: '2026-06-24 22:12'
 labels:
   - agent-gateway
   - secp256k1
@@ -52,7 +52,7 @@ REOPENED (compact-10268): TASK-15 (faucet/transfer signing impl) and TASK-16 (ho
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-All implementation sub-tasks Done: 7.1-7.5 (design), TASK-12 (primitives), TASK-13 (sealed keystore + backup), TASK-14 (keygen + identity + 0x40 dispatch), TASK-15 (transfer + faucet + configure), TASK-7.7 (anti-rollback). Only remaining child: TASK-16 (host integration + production-funding gate).
+All implementation children Done: 7.1-7.5 (design), TASK-12 (primitives), TASK-13 (sealed keystore + backup), TASK-14 (keygen + identity + 0x40 dispatch), TASK-15 (transfer + faucet + configure signing), TASK-16 (host integration + funding gate), TASK-7.7 (anti-rollback). All ACs met. Umbrella complete.
 <!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done

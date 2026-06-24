@@ -1,10 +1,10 @@
 ---
 id: TASK-7
 title: Agent Gateway secp256k1 signing backend and backup keystore
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-07 00:00'
-updated_date: '2026-06-23 14:52'
+updated_date: '2026-06-24 22:12'
 labels:
   - agent-gateway
   - secp256k1
@@ -56,6 +56,12 @@ Created as the 2d-hsm side of 2D `TASK-132.5`. The preferred Agent Gateway signe
 
 The expected host-side pipeline remains similar to the existing bridge signer pattern: local validation -> OPA agent policy -> Vault capability lookup -> signer backend. For `2d-hsm`, this is only the host-side gate. The TEE must still enforce command capabilities, key purpose, role/profile, and minimal spending policy internally because the host/vsock client can be compromised.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+All children Done: 7.1-7.7 (design + implementation), TASK-12-16 (impl slices), TASK-13 (backup), TASK-24/27/28 (restore), TASK-25 (release image), TASK-7.7 (anti-rollback). The agent gateway secp256k1 signing backend + backup keystore is fully implemented and reviewed.
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
