@@ -82,6 +82,18 @@ pub fn transport_only_mode_enabled() -> bool {
         == Some("1")
 }
 
+/// TASK-18 AC#1: when `1`, the bin boots in provisioning mode — runs the attested install
+/// handshake (M1→M2→M3→M4) instead of unsealing a pre-sealed keystore. First boot only.
+pub const TWOD_HSM_PROVISIONING_MODE: &str = "TWOD_HSM_PROVISIONING_MODE";
+pub const LEGACY_HSM_PROVISIONING_MODE: &str = "2D_HSM_PROVISIONING_MODE";
+
+pub fn provisioning_mode_enabled() -> bool {
+    var_twod(TWOD_HSM_PROVISIONING_MODE, LEGACY_HSM_PROVISIONING_MODE)
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 // TASK-7.7 5b-2c: the agent-gateway boot-budget triplet (max_attempts, per_leg_timeout,
 // overall_boot_budget) the bin parses for `ValidatedBootBudget::validate`. The connect-timeout and the
 // per-socket SO_*TIMEO are DERIVED from per_leg_timeout (§8: derived, not separate operator knobs) —

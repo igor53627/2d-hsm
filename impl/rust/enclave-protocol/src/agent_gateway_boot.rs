@@ -320,13 +320,200 @@ pub fn run_agent_gateway_boot() -> Result<std::convert::Infallible, ProtocolErro
     })
 }
 
+// ---------------------------------------------------------------------------------------------------
+// TASK-18 AC#1: the production provisioning bootstrap driver (25-2b-iv Driver Contract).
+// Listens on the provisioning vsock port, runs the M1→M2→M3→M4 attested install handshake,
+// then returns the freshly-sealed keystore body + measurement for installation. One-connection
+// only (Q5); a Failed session tears down the listener (the host must re-connect for any retry).
+// The measurement passed to ProvisionSession::new is the SAME hardware measurement that appears
+// in the M2 SNP report (fetched from the enclave's own configfs-tsm).
+// ---------------------------------------------------------------------------------------------------
+
+/// 4-byte big-endian length-prefixed frame read (matches the 0x40 serve framing).
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+fn recv_frame<R: std::io::Read>(stream: &mut R) -> Result<Vec<u8>, ProtocolError> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).map_err(|_e| ProtocolError::PqSigningUnavailable(
+        "provisioning: frame header read failed",
+    ))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > crate::MAX_MESSAGE_SIZE as usize {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "provisioning: frame too large",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).map_err(|_e| ProtocolError::PqSigningUnavailable(
+        "provisioning: frame body read failed",
+    ))?;
+    Ok(buf)
+}
+
+/// 4-byte big-endian length-prefixed frame write.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+fn send_frame<W: std::io::Write>(stream: &mut W, data: &[u8]) -> Result<(), ProtocolError> {
+    let len = (data.len() as u32).to_be_bytes();
+    stream.write_all(&len).map_err(|_e| ProtocolError::PqSigningUnavailable(
+        "provisioning: frame header write failed",
+    ))?;
+    stream.write_all(data).map_err(|_e| ProtocolError::PqSigningUnavailable(
+        "provisioning: frame body write failed",
+    ))?;
+    stream.flush().map_err(|_e| ProtocolError::PqSigningUnavailable(
+        "provisioning: frame flush failed",
+    ))?;
+    Ok(())
+}
+
+/// The production provisioning bootstrap driver. Returns the freshly-provisioned keystore body
+/// + the enclave measurement. Called ONLY on first boot (no pre-sealed keystore); subsequent boots
+/// unseal from the persisted blob via `unseal_agent_keystore_at_boot`.
+#[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+fn run_provisioning_bootstrap(
+    seal_root: &[u8; 32],
+) -> Result<(crate::agent_keystore::KeystoreBody, Vec<u8>), ProtocolError> {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: fetching enclave measurement");
+    // Get the hardware measurement from a zero-report_data SNP report (the measurement field
+    // is hardware-signed and identical regardless of report_data — we verify it matches later
+    // in the M2 report).
+    let (dummy_report, _) = crate::snp_report::fetch_report(&[0u8; 64])?;
+    let measurement = crate::snp_report::measurement_from_report(&dummy_report)?;
+
+    // (2) Parse the pinned operator CA root (hex → Ed25519 VerifyingKey).
+    let ca_root_hex = crate::env_config::var_twod(
+        crate::env_config::TWOD_HSM_OPERATOR_CA_ROOT_HEX,
+        crate::env_config::LEGACY_HSM_OPERATOR_CA_ROOT_HEX,
+    ).map_err(|_| ProtocolError::PqSigningUnavailable(
+        "provisioning: TWOD_HSM_OPERATOR_CA_ROOT_HEX not set",
+    ))?;
+    let ca_root_bytes = {
+        let h = ca_root_hex.trim();
+        if h.len() != 64 {
+            return Err(ProtocolError::PqSigningUnavailable(
+                "provisioning: operator CA root hex must be 64 chars (32 bytes)",
+            ));
+        }
+        let mut out = [0u8; 32];
+        for (i, chunk) in h.as_bytes().chunks(2).enumerate() {
+            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or(""), 16)
+                .map_err(|_| ProtocolError::PqSigningUnavailable(
+                    "provisioning: operator CA root hex decode failed",
+                ))?;
+        }
+        out.to_vec()
+    };
+    let ca_root_arr: [u8; 32] = ca_root_bytes.as_slice().try_into().map_err(|_| ProtocolError::PqSigningUnavailable(
+        "provisioning: operator CA root must be exactly 32 bytes",
+    ))?;
+    let ca_root = ed25519_dalek::VerifyingKey::from_bytes(&ca_root_arr).map_err(|_| ProtocolError::PqSigningUnavailable(
+        "provisioning: operator CA root is not a valid Ed25519 verifying key",
+    ))?;
+
+    // (3) Create the session.
+    let mut session = crate::agent_provision::ProvisionSession::new(
+        ca_root,
+        *seal_root,
+        measurement.to_vec(),
+    );
+
+    // (4) Bind the provisioning vsock listener (one connection — Q5).
+    let port = crate::vsock_addr::provisioning_vsock_port_from_env().map_err(|msg| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: {msg}");
+        ProtocolError::PqSigningUnavailable(
+            "provisioning: invalid provisioning vsock port (see prior log line)",
+        )
+    })?;
+    let listener = crate::vsock_listen::bind_vsock_listener(
+        crate::vsock_addr::DEFAULT_VSOCK_CID,
+        port,
+    ).map_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: vsock bind failed: {e}");
+        ProtocolError::PqSigningUnavailable(
+            "provisioning: vsock bind failed (see prior log line)",
+        )
+    })?;
+
+    // (5) Accept ONE connection.
+    let (mut stream, _peer) = listener.accept().map_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: accept failed: {e}");
+        ProtocolError::PqSigningUnavailable(
+            "provisioning: accept failed (see prior log line)",
+        )
+    })?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: provisioner connected");
+
+    // (6) M1: receive the provisioner's challenge.
+    let m1_frame = recv_frame(&mut stream)?;
+
+    let m1 = crate::agent_provision::decode_m1(&m1_frame).map_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: M1 decode failed: {e:?}");
+        ProtocolError::PqSigningUnavailable("provisioning: M1 decode failed")
+    })?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: M1 received");
+
+    // (7) on_m1: mint enclave nonce N_e + compute report_data.
+    let (n_e, report_data) = session.on_m1(m1.n_p).map_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: on_m1 failed: {e:?}");
+        ProtocolError::PqSigningUnavailable("provisioning: on_m1 failed")
+    })?;
+
+    // (8) Fetch the M2 SNP attestation report (report_data binds N_p + N_e + measurement).
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: fetching SNP report");
+    let (report, _cert_chain) = crate::snp_report::fetch_report(&report_data)
+        .map_err(|e| {
+            let _ = writeln!(std::io::stderr(), "[err] provisioning: SNP report fetch failed: {e}");
+            ProtocolError::PqSigningUnavailable("provisioning: SNP report fetch failed")
+        })?;
+
+    // (9) M2: send N_e + report to the provisioner.
+    let m2 = crate::agent_provision::encode_m2(&n_e, &report);
+    send_frame(&mut stream, &m2)?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: M2 sent (report {}B)", report.len());
+
+    // (10) M3: receive the provisioner's config + signature.
+    let m3_frame = recv_frame(&mut stream)?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: M3 received");
+
+    // (11) on_m3: verify provisioner cert + transcript + sig, mint enclave_scope_id (getrandom),
+    //      seal the keystore. One-shot failure: ANY error consumes the session (Failed terminal).
+    let (_config, sealed_blob) = session.on_m3(&m3_frame, &report).map_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: on_m3 failed (session consumed): {e:?}");
+        ProtocolError::PqSigningUnavailable("provisioning: on_m3 failed — session consumed (restart required)")
+    })?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: keystore sealed ({}B)", sealed_blob.len());
+
+    // (12) M4: send the sealed keystore blob to the provisioner (for the host to persist).
+    let m4 = crate::agent_provision::encode_m4(&sealed_blob);
+    send_frame(&mut stream, &m4)?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: M4 sent — handshake complete");
+
+    // (13) Unseal the freshly-provisioned blob for in-enclave installation.
+    let body = crate::agent_keystore::unseal_body(&sealed_blob, seal_root, &measurement)
+        .map_err(|e| {
+            let _ = writeln!(std::io::stderr(), "[err] provisioning: unseal of freshly-provisioned blob failed: {e:?}");
+            ProtocolError::PqSigningUnavailable("provisioning: unseal of freshly-provisioned blob failed")
+        })?;
+    let _ = writeln!(std::io::stderr(), "[info] provisioning: keystore installed");
+
+    Ok((body, measurement.to_vec()))
+}
+
 fn run_agent_gateway_boot_inner() -> Result<std::convert::Infallible, ProtocolError> {
     use std::io::Write as _;
     // (A) agent provisioning root FIRST (install-once).
     crate::boot_agent_keystore::boot_configure_agent_seal_root()?;
-    // (B) PURE source→unseal→return — does NOT install, does NOT judge freshness (the handshake's
-    //     reconcile does, on &mut body, BEFORE install). `mut` (5b-2e): a successful AdoptForward SEEDS
-    //     `body` forward in place inside the handshake, so install MOVES the (possibly-seeded) body.
+    // (B) Keystore source: provisioning mode (first boot — attested install handshake) or
+    //     unseal mode (subsequent boots — pre-sealed blob from file). The provisioning driver
+    //     is the runtime path that mints a getrandom enclave_scope_id (TASK-18 AC#1).
+    #[cfg(all(target_os = "linux", feature = "vsock-transport"))]
+    let (mut body, measurement) = if crate::env_config::provisioning_mode_enabled() {
+        let root = crate::seal_root::resolve_provisioning_root()?;
+        run_provisioning_bootstrap(&root)?
+    } else {
+        crate::boot_agent_keystore::unseal_agent_keystore_at_boot()?
+    };
+    #[cfg(not(all(target_os = "linux", feature = "vsock-transport")))]
     let (mut body, measurement) = crate::boot_agent_keystore::unseal_agent_keystore_at_boot()?;
     // (C) operator-config → budget triplet (validate() PARAM ORDER; parse + derive-by-default only —
     //     ValidatedBootBudget::validate inside the handshake is the sole fail-closed band judge).
