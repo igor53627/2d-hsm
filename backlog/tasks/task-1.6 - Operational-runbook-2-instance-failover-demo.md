@@ -4,7 +4,7 @@ title: Operational runbook + 2-instance failover demo
 status: Done
 assignee: []
 created_date: '2026-06-06 15:58'
-updated_date: '2026-06-23 19:27'
+updated_date: '2026-06-24 01:16'
 labels:
   - ops
   - docs
@@ -24,5 +24,5 @@ ordinal: 10000
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Operational runbook delivered (backlog/docs/operational-runbook.md, 232 lines): deployment, key provisioning/rotation, attestation verification, monitoring, incident response (TEE compromise/unavailability/key compromise), failover design (active-passive MVP). Failover demo (§6.4) requires aya hardware — documented but not executable from macOS.
+Runbook delivered (PR #115, 232 lines): deployment, provisioning, attestation, monitoring, incident response, failover design. The aya failover DEMO (§6.4) requires ≥2 SNP hosts and was not executed — deferred to a follow-up ops task when hardware is available.
 <!-- SECTION:FINAL_SUMMARY:END -->

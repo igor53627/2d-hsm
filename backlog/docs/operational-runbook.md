@@ -119,7 +119,7 @@ The enclave measurement MUST be recorded on-chain before the key is trusted:
 
 ### 4.2 Health check
 
-The 2D bridge signer should periodically send `GET_STATUS` (opcode 0x00) over vsock. A healthy enclave responds within ~1ms. Timeout = 5s → alert.
+The 2D bridge signer should periodically send `GET_STATUS` (opcode 0x30) over vsock. A healthy enclave responds within ~1ms. Timeout = 5s → alert.
 
 ### 4.3 Audit trail
 
