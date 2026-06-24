@@ -1825,11 +1825,14 @@ mod provisioning_driver_tests {
         });
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("on_m3 failed"), "must fail at on_m3, got: {msg}");
-        assert!(stream.output.len() > 4, "M2 must have been written before M3 error");
+        // M2 was emitted as an enveloped frame — decode and assert MSG_M2_ATTEST.
+        let m2_frame = recv_frame(&mut std::io::Cursor::new(&stream.output)).unwrap();
+        let (m2_type, _) = crate::agent_provision::decode_envelope(&m2_frame).unwrap();
+        assert_eq!(m2_type, crate::agent_provision::MSG_M2_ATTEST, "M2 must be enveloped");
     }
 
     #[test]
-    fn handshake_malformed_m1_fails_at_decode() {
+    fn handshake_malformed_m1_envelope_fails_at_envelope_decode() {
         let ca = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
         let mut session = crate::agent_provision::ProvisionSession::new(
             ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
@@ -1841,14 +1844,31 @@ mod provisioning_driver_tests {
         });
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("envelope decode failed") || msg.contains("M1 decode failed"),
-            "must fail at M1 envelope/decode, got: {msg}"
+            msg.contains("envelope decode failed"),
+            "must fail at envelope decode, got: {msg}"
         );
+    }
+
+    #[test]
+    fn handshake_valid_envelope_garbage_m1_payload_fails_at_decode() {
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let mut session = crate::agent_provision::ProvisionSession::new(
+            ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
+        );
+        // Valid envelope wrapping a garbage M1 payload → envelope passes, decode_m1 fails.
+        let bad_payload = vec![0xFFu8; 8];
+        let m1_env = crate::agent_provision::encode_envelope(
+            crate::agent_provision::MSG_M1_CHALLENGE, &bad_payload,
+        );
+        let mut stream = MockStream::new(frame(&m1_env));
         let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
             Ok((vec![0xCDu8; 1184], Vec::new()))
         });
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("M1 decode failed"), "must fail at decode, got: {msg}");
+        assert!(
+            msg.contains("M1 decode failed"),
+            "must fail at M1 payload decode (not envelope), got: {msg}"
+        );
     }
 
     #[test]
