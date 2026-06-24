@@ -375,21 +375,35 @@ where
     S: std::io::Read + std::io::Write,
     F: FnOnce(&[u8; 64]) -> Result<(Vec<u8>, Vec<u8>), ProtocolError>,
 {
-    let m1_frame = recv_frame(stream)?;
-    let m1 = crate::agent_provision::decode_m1(&m1_frame)
+    use crate::agent_provision::{
+        decode_envelope, decode_m1, encode_envelope, encode_m2, encode_m4,
+        validate_inbound, HandshakeStep, MSG_M1_CHALLENGE, MSG_M2_ATTEST, MSG_M4_SEALED,
+    };
+    // M1: receive envelope → decode → validate msg_type → decode payload → on_m1.
+    let m1_raw = recv_frame(stream)?;
+    let (m1_type, m1_payload) = decode_envelope(&m1_raw)
+        .map_err(|_| ProtocolError::PqSigningUnavailable("provisioning: M1 envelope decode failed"))?;
+    validate_inbound(HandshakeStep::AwaitingM1, m1_type)
+        .map_err(|_| ProtocolError::PqSigningUnavailable("provisioning: M1 wrong msg_type"))?;
+    let m1 = decode_m1(m1_payload)
         .map_err(|_| ProtocolError::PqSigningUnavailable("provisioning: M1 decode failed"))?;
     let (n_e, report_data) = session.on_m1(m1.n_p)
         .map_err(|_| ProtocolError::PqSigningUnavailable("provisioning: on_m1 failed"))?;
+    // Fetch report + send M2 (enveloped).
     let (report, _) = fetch_report(&report_data)?;
-    let m2 = crate::agent_provision::encode_m2(&n_e, &report);
-    send_frame(stream, &m2)?;
-    let m3_frame = recv_frame(stream)?;
-    let (_config, sealed_blob) = session.on_m3(&m3_frame, &report)
+    let m2_payload = encode_m2(&n_e, &report);
+    let m2_env = encode_envelope(MSG_M2_ATTEST, &m2_payload);
+    send_frame(stream, &m2_env)?;
+    // M3: receive envelope → on_m3 (on_m3 calls decode_envelope internally).
+    let m3_raw = recv_frame(stream)?;
+    let (_config, sealed_blob) = session.on_m3(&m3_raw, &report)
         .map_err(|_| ProtocolError::PqSigningUnavailable(
             "provisioning: on_m3 failed — session consumed (restart required)",
         ))?;
-    let m4 = crate::agent_provision::encode_m4(&sealed_blob);
-    send_frame(stream, &m4)?;
+    // M4: send sealed blob (enveloped).
+    let m4_payload = encode_m4(&sealed_blob);
+    let m4_env = encode_envelope(MSG_M4_SEALED, &m4_payload);
+    send_frame(stream, &m4_env)?;
     Ok(sealed_blob)
 }
 
@@ -468,6 +482,11 @@ fn run_provisioning_bootstrap(
         ProtocolError::PqSigningUnavailable(
             "provisioning: accept failed (see prior log line)",
         )
+    })?;
+    // Configure session I/O timeouts so a stalled peer can't hang the one-shot boot.
+    crate::vsock_listen::configure_vsock_session_timeouts(&mut stream).map_err(|e| {
+        let _ = writeln!(std::io::stderr(), "[err] provisioning: session timeout config failed: {e}");
+        ProtocolError::PqSigningUnavailable("provisioning: session timeout config failed")
     })?;
     let _ = writeln!(std::io::stderr(), "[info] provisioning: provisioner connected");
 
@@ -1793,8 +1812,13 @@ mod provisioning_driver_tests {
         let mut session = crate::agent_provision::ProvisionSession::new(
             ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
         );
-        let m1 = frame(&crate::agent_provision::encode_m1(&[0xAAu8; 32]));
-        let m3 = frame(&vec![0xFFu8; 64]); // garbage M3
+        let m1_payload = crate::agent_provision::encode_m1(&[0xAAu8; 32]);
+        let m1_env = crate::agent_provision::encode_envelope(
+            crate::agent_provision::MSG_M1_CHALLENGE, &m1_payload,
+        );
+        let m1 = frame(&m1_env);
+        // Garbage M3 (raw bytes, not a valid envelope — on_m3 will reject).
+        let m3 = frame(&vec![0xFFu8; 64]);
         let mut stream = MockStream::new([m1, m3].concat());
         let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
             Ok((vec![0xCDu8; 1184], Vec::new()))
@@ -1810,7 +1834,16 @@ mod provisioning_driver_tests {
         let mut session = crate::agent_provision::ProvisionSession::new(
             ca.verifying_key(), [0x55u8; 32], b"m".to_vec(),
         );
+        // Raw garbage (not an envelope) → envelope decode fails.
         let mut stream = MockStream::new(frame(&vec![0xFFu8; 32]));
+        let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
+            Ok((vec![0xCDu8; 1184], Vec::new()))
+        });
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("envelope decode failed") || msg.contains("M1 decode failed"),
+            "must fail at M1 envelope/decode, got: {msg}"
+        );
         let result = drive_provisioning_handshake(&mut stream, &mut session, |_| {
             Ok((vec![0xCDu8; 1184], Vec::new()))
         });
