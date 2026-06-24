@@ -57,7 +57,7 @@ struct AuthorizationTicket {
                                    //                 activationHeight || producerEpochBinding)
                                    // where producerEpochBinding = keccak256(pqPubkey || currentProducerActivatedAtHeight)
                                    // — binds the ticket to the SPECIFIC producer epoch that authorized it,
-                                   // preventing withheld-ticket replay across a rotation A → B → A (TASK-31).
+                                   // preventing withheld-ticket replay across a rotation A → B → A (TASK-32).
 
     uint64   activationHeight;     // For PRODUCER_RECOVERY: height from which the new producer is authorized
                                    // For HARD_FORK_ACTIVATION: **must** be a specific future block number (like in Ethereum).
@@ -259,7 +259,7 @@ In the first version, a `HARD_FORK_ACTIVATION` ticket is only accepted by the pr
   **⚠ NOT YET IMPLEMENTED:** the landed `RecoveryTicket.sol` (PR #18) treats
   contextHash as opaque bytes32 (only checks non-zero at line 281). The contextHash
   recomputation MUST be added to `_submitHardForkActivation` in 2d-solidity
-  (tracked in 2d-solidity TASK-10). TASK-31 AC#4 (replay scenario A→B→A covered)
+  (tracked in 2d-solidity TASK-10). TASK-32 AC#4 (replay scenario A→B→A covered)
   is NOT met until this lands.
 
 This means hard forks in v1 are **producer-driven scheduled announcements**, not fully permissionless events.
