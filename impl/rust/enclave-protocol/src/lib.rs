@@ -4056,6 +4056,10 @@ mod tests {
 
         fs::write(&input_path, serde_json::to_string_pretty(&input_json).ok()?).ok()?;
 
+        // Remove any stale output file BEFORE running (the dir is never cleaned — TASK-19).
+        // NB: must be BEFORE the forge call, not after — otherwise it deletes the fresh output.
+        let _ = fs::remove_file(&output_path);
+
         // Run the script with environment variables (from the solidity dir so foundry.toml is found)
         let output = Command::new("forge")
             .current_dir(&solidity_dir)
@@ -4064,9 +4068,6 @@ mod tests {
             .args(["script", "CanonicalTicketHash.s.sol", "--silent"])
             .output()
             .ok()?;
-
-        // Remove any stale output file before running (the dir is never cleaned — TASK-19).
-        let _ = fs::remove_file(&output_path);
 
         if !output.status.success() {
             eprintln!("Forge script failed while computing canonical hash for test vector.");

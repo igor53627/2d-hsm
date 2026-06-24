@@ -53,7 +53,11 @@ struct AuthorizationTicket {
 
     // === Context (interpretation depends on ticketType) ===
     bytes32  contextHash;          // For RECOVERY: last_good_tip_hash
-                                   // For HARD_FORK: keccak256(forkSpec || previousMeasurement || activationHeight)
+                                   // For HARD_FORK: keccak256(forkSpecHash || previousMeasurement ||
+                                   //                 activationHeight || producerEpochBinding)
+                                   // where producerEpochBinding = keccak256(pqPubkey || currentProducerActivatedAtHeight)
+                                   // — binds the ticket to the SPECIFIC producer epoch that authorized it,
+                                   // preventing withheld-ticket replay across a rotation A → B → A (TASK-31).
 
     uint64   activationHeight;     // For PRODUCER_RECOVERY: height from which the new producer is authorized
                                    // For HARD_FORK_ACTIVATION: **must** be a specific future block number (like in Ethereum).
@@ -239,6 +243,24 @@ In the first version, a `HARD_FORK_ACTIVATION` ticket is only accepted by the pr
 - `activationHeight` is strictly greater than the current block height (future block scheduling, Ethereum style).
 - `forkSpecHash` is non-zero.
 - `newMeasurement` is different from the current one.
+- `contextHash` MUST bind to the current producer epoch via `producerEpochBinding`
+  (see §4 field definition). The on-chain precompile/contract MUST recompute the
+  expected contextHash from the CURRENT producer's `(pqPubkey, activatedAtHeight)`
+  and reject any ticket whose contextHash does not match. This is the **PRIMARY
+  enforcement** against withheld-ticket replay across a rotation A→B→A: a ticket
+  signed when A was active at height H1 carries `producerEpochBinding =
+  keccak256(A_pqPubkey, H1)`; after rotation A→B→A the current producer is A at
+  height H3, so the recomputed binding is `keccak256(A_pqPubkey, H3)` which differs
+  from H1's → mismatch → rejected. Without this recompute, the replay is NOT
+  prevented: the Solidity `_producerEpochId` storage scoping (line 439) keys off
+  the SUBMISSION-TIME producer epoch (not the signing-time epoch), so a withheld
+  epoch-1 ticket submitted fresh in epoch-3 passes the producer-key check (same
+  pqPubkey) and is stored + activated under epoch-3.
+  **⚠ NOT YET IMPLEMENTED:** the landed `RecoveryTicket.sol` (PR #18) treats
+  contextHash as opaque bytes32 (only checks non-zero at line 281). The contextHash
+  recomputation MUST be added to `_submitHardForkActivation` in 2d-solidity
+  (tracked in 2d-solidity TASK-10). TASK-31 AC#4 (replay scenario A→B→A covered)
+  is NOT met until this lands.
 
 This means hard forks in v1 are **producer-driven scheduled announcements**, not fully permissionless events.
 
