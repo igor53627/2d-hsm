@@ -84,7 +84,29 @@ fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
     })
 }
 
-#[cfg(not(feature = "lab-agent-keystore-from-file"))]
+#[cfg(all(
+    feature = "platform-root-from-boot-file",
+    not(feature = "lab-agent-keystore-from-file")
+))]
+fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
+    // Production: read from the FIXED path written by `snp-derive-root --out` at boot.
+    // NOT a host-settable env var — the host cannot redirect to a known root.
+    let bytes = crate::boot_input::read_boot_file_capped(
+        std::path::Path::new("/run/twod-hsm/pq-seal-root.bin"),
+        32,
+        "agent keystore: failed to read /run/twod-hsm/pq-seal-root.bin (snp-derive-root oneshot)",
+    )?;
+    bytes.try_into().map_err(|_| {
+        ProtocolError::PqSigningUnavailable(
+            "agent keystore: provisioning root file must be exactly 32 bytes",
+        )
+    })
+}
+
+#[cfg(not(any(
+    feature = "lab-agent-keystore-from-file",
+    feature = "platform-root-from-boot-file"
+)))]
 fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
         "agent keystore: platform seal root hook not configured (integrate vTPM/SNP VMPL/Nitro \
