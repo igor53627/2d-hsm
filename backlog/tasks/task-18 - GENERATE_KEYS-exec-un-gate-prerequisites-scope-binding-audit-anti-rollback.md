@@ -3,10 +3,10 @@ id: TASK-18
 title: >-
   GENERATE_KEYS exec un-gate prerequisites (scope-binding + audit +
   anti-rollback)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-08 19:05'
-updated_date: '2026-06-23 14:00'
+updated_date: '2026-06-25 00:13'
 labels:
   - agent-gateway
   - security
@@ -32,9 +32,19 @@ GENERATE_KEYS live execution is implemented behind the off-by-default, release-b
 
 ## Implementation Notes
 
+<!-- SECTION:NOTES:BEGIN -->
 <!-- SECTION:IMPL_NOTES:BEGIN -->
 REOPENED (advisory 2026-06-23): AC#1 scope_target↔enclave_scope_id binding code + mint_enclave_scope_id (getrandom) exist + reviewed, but the provisioning DRIVER (wiring ProvisionSession::on_m1/on_m3 to the bootstrap bin's AF_VSOCK listener + SNP fetch) is deferred (TASK-25 25-2b-iv Notes). No production keystore with a getrandom-minted scope_id exists yet. The compile_error! bans ARE removed (lib.rs:86-95), but the runtime path to actually provision a production keystore is not live. AC#1 is CODE-COMPLETE but NOT RUNTIME-COMPLETE — the security guarantee requires the driver to wire the attested install channel before it is delivered in production. AC#2 (audit record) + AC#3 (anti-rollback durable commit, TASK-7.7 Done) ARE fully met.
 <!-- SECTION:IMPL_NOTES:END -->
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+AC#1 NOW RUNTIME-COMPLETE: provisioning bootstrap driver (PR #119) wires ProvisionSession to the agent-gateway bin. TWOD_HSM_PROVISIONING_MODE=1 → run_provisioning_bootstrap (M1→M2→M3→M4 attested install handshake over vsock port 5002). enclave_scope_id minted via getrandom inside the TEE over the attested install channel. AC#2 (audit record) + AC#3 (anti-rollback durable commit) already met. All 3 ACs satisfied.
+
+Matrix: envelope wire-format HIGH fixed (M1 decode_envelope→validate→decode_m1; M2/M4 encode_envelope). Session timeouts added. Testable seam (drive_provisioning_handshake) with 5 orchestration tests. Compact clean. CI green (rust-test ✓, elixir-test ✓, build ✓).
+<!-- SECTION:FINAL_SUMMARY:END -->
 
 ## Notes
 <!-- SECTION:NOTES:BEGIN -->
