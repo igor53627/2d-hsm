@@ -52,8 +52,13 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
 }
 
 #[cfg(feature = "ml-dsa-65")]
+#[allow(dead_code)] // dead when neither file-source feature is active
 fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], ProtocolError> {
-    let bytes = crate::boot_input::read_boot_file(path, "failed to read provisioning root file")?;
+    let bytes = crate::boot_input::read_boot_file_capped(
+        path,
+        32,
+        "failed to read provisioning root file",
+    )?;
     bytes.try_into().map_err(|_| {
         ProtocolError::PqSigningUnavailable("provisioning root file must be exactly 32 bytes")
     })
