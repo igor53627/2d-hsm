@@ -20,6 +20,15 @@ pub fn boot_configure_pq_seal_v1_platform_root() -> Result<(), ProtocolError> {
 
 #[cfg(feature = "ml-dsa-65")]
 fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
+    // Production: read from the FIXED path written by `snp-derive-root --out` at boot.
+    // NOT a host-settable env var — the host cannot redirect to a known root.
+    #[cfg(feature = "platform-root-from-boot-file")]
+    {
+        return read_provisioning_root_file(std::path::Path::new(
+            "/run/twod-hsm/pq-seal-root.bin",
+        ));
+    }
+    // Lab: read from a host-settable env var (lab feature, release-banned).
     #[cfg(feature = "platform-provisioning-from-file")]
     {
         use crate::env_config::{
@@ -33,20 +42,19 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
             })?;
         return read_provisioning_root_file(path.as_ref());
     }
-    #[cfg(not(feature = "platform-provisioning-from-file"))]
+    #[cfg(not(any(feature = "platform-provisioning-from-file", feature = "platform-root-from-boot-file")))]
     {
-        let _ = ();
         Err(ProtocolError::PqSigningUnavailable(
-            "platform PQ seal v1 provisioning root hook not configured (integrate vTPM/SNP/Nitro or enable platform-provisioning-from-file for labs)",
+            "platform PQ seal v1 provisioning root hook not configured (integrate vTPM/SNP/Nitro, enable platform-root-from-boot-file for the snp-derive-root boot path, or platform-provisioning-from-file for labs)",
         ))
     }
 }
 
-#[cfg(all(feature = "ml-dsa-65", feature = "platform-provisioning-from-file"))]
+#[cfg(feature = "ml-dsa-65")]
 fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], ProtocolError> {
     let bytes = crate::boot_input::read_boot_file(
         path,
-        "failed to read TWOD_HSM_PQ_SEAL_V1_ROOT_FILE provisioning root",
+        "failed to read provisioning root file",
     )?;
     bytes.try_into().map_err(|_| {
         ProtocolError::PqSigningUnavailable("provisioning root file must be exactly 32 bytes")
@@ -59,7 +67,6 @@ mod tests {
     use super::*;
     #[cfg(feature = "ml-dsa-65")]
     use crate::pq_signer::SealedSignerTestGuard;
-    #[cfg(feature = "ml-dsa-65")]
     use crate::seal_root::is_platform_pq_seal_v1_provisioning_root_set;
 
     #[cfg(all(

@@ -160,6 +160,12 @@ lab-production-vsock = [
     "platform-provisioning-from-file",
     "lab-pq-seal-from-file",
 ]
+# TASK-1.1: production-safe reader for the SNP-derived root written by `snp-derive-root --out` at
+# boot (default path: /run/twod-hsm/pq-seal-root.bin). NOT a lab/debug feature — the file is written
+# INSIDE the guest from the SNP firmware (a platform-attested source). Uses a FIXED hardcoded path
+# (not a host-settable env var) so the host cannot redirect to a known root. Safety rests on measured
+# boot (the NixOS image + snp-derive-root oneshot are part of the measured launch).
+platform-root-from-boot-file = []
 enforce-forge-crosscheck = []
 #   When enabled, the automated cross-check tests (that verify
 #   `compute_canonical_ticket_hash` against the Solidity `abi.encode` + keccak256
