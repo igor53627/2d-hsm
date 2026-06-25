@@ -193,7 +193,10 @@ fn resp_sign_authorization_ticket_error_decodes_as_wire_error() {
         "must classify as wire error"
     );
     let (code, reason) = decode_wire_error(&payload).unwrap();
-    assert_eq!(code, 7, "PqSigningUnavailable error code");
+    assert_eq!(
+        code, 2,
+        "PqSigningUnavailable error code (protocol_error_to_wire_body maps it to 2)"
+    );
     assert!(
         reason.contains("PqSigningUnavailable"),
         "reason text: {reason}"

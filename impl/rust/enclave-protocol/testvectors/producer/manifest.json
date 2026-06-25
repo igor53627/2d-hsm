@@ -43,7 +43,7 @@
     },
     {
       "byte_count": 50,
-      "description": "SIGN_AUTHORIZATION_TICKET wire-error response (code=7 PqSigningUnavailable). Frame echoes 0x10; CBOR body is the {1:int,2:tstr} error map.",
+      "description": "SIGN_AUTHORIZATION_TICKET wire-error response (code=2 PqSigningUnavailable — matches protocol_error_to_wire_body in lib.rs). Frame echoes 0x10; CBOR body is the {1:int,2:tstr} error map.",
       "file": "resp_sign_authorization_ticket_error_v1.bin"
     },
     {

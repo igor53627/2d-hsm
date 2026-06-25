@@ -194,7 +194,7 @@ fn main() {
 
     // Error response (PqSigningUnavailable) — wire error CBOR under the request type byte.
     let sat_resp_err_payload =
-        encode_wire_error(7, "PqSigningUnavailable: no sealed signer").unwrap();
+        encode_wire_error(2, "PqSigningUnavailable: no sealed signer").unwrap();
     let sat_resp_err_frame =
         encode_message(MessageType::SignAuthorizationTicket, &sat_resp_err_payload).unwrap();
     write_bin(
@@ -205,7 +205,7 @@ fn main() {
     record(
         &mut manifest,
         "resp_sign_authorization_ticket_error_v1.bin",
-        "SIGN_AUTHORIZATION_TICKET wire-error response (code=7 PqSigningUnavailable). Frame echoes 0x10; CBOR body is the {1:int,2:tstr} error map.",
+        "SIGN_AUTHORIZATION_TICKET wire-error response (code=2 PqSigningUnavailable — matches protocol_error_to_wire_body in lib.rs). Frame echoes 0x10; CBOR body is the {1:int,2:tstr} error map.",
         &sat_resp_err_frame,
     );
 
