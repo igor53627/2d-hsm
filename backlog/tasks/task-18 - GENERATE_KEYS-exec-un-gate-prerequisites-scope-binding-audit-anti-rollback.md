@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-06-08 19:05'
-updated_date: '2026-06-25 00:13'
+updated_date: '2026-06-25 08:44'
 labels:
   - agent-gateway
   - security
@@ -33,9 +33,13 @@ GENERATE_KEYS live execution is implemented behind the off-by-default, release-b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-<!-- SECTION:IMPL_NOTES:BEGIN -->
-REOPENED (advisory 2026-06-23): AC#1 scope_target↔enclave_scope_id binding code + mint_enclave_scope_id (getrandom) exist + reviewed, but the provisioning DRIVER (wiring ProvisionSession::on_m1/on_m3 to the bootstrap bin's AF_VSOCK listener + SNP fetch) is deferred (TASK-25 25-2b-iv Notes). No production keystore with a getrandom-minted scope_id exists yet. The compile_error! bans ARE removed (lib.rs:86-95), but the runtime path to actually provision a production keystore is not live. AC#1 is CODE-COMPLETE but NOT RUNTIME-COMPLETE — the security guarantee requires the driver to wire the attested install channel before it is delivered in production. AC#2 (audit record) + AC#3 (anti-rollback durable commit, TASK-7.7 Done) ARE fully met.
-<!-- SECTION:IMPL_NOTES:END -->
+AC#1 (scope_target↔enclave_scope_id binding): DONE — binding code (18-2 byte-compare) + mint_enclave_scope_id (getrandom) + provisioning driver (PR #119, run_provisioning_bootstrap) all landed. enclave_scope_id is minted in-TEE over the attested install channel.
+
+AC#2 (audit record): DONE — record_audit wired into GENERATE_KEYS (TASK-13b slice 4b).
+
+AC#3 (anti-rollback durable commit): DONE — commit_before_emit seal→anchor→swap (TASK-7.7).
+
+All compile_error! release bans REMOVED (lib.rs:86-95). All three ACs satisfied.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
