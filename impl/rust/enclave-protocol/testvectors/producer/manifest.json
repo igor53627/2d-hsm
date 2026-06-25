@@ -1,0 +1,97 @@
+{
+  "cbor_library": "ciborium 0.2 (default serialization; shortest-form definite-length, insertion-order map keys)",
+  "generated_by": "examples/gen_producer_vectors.rs",
+  "message_types": {
+    "0x01": "GET_MEASUREMENT",
+    "0x10": "SIGN_AUTHORIZATION_TICKET",
+    "0x20": "ARM_FOR_PRODUCTION",
+    "0x30": "GET_STATUS"
+  },
+  "protocol_version": 1,
+  "provenance": "Emitted by the reference Rust encoder (enclave-protocol::wire). 2D Elixir client must produce/consume byte-identical frames.",
+  "spec": "backlog/docs/vsock-api-wire-format-spec-draft.md §7 (framing) + §8 (schemas)",
+  "vectors": [
+    {
+      "byte_count": 9,
+      "description": "GET_MEASUREMENT request frame ({1:1}).",
+      "file": "req_get_measurement_v1.bin"
+    },
+    {
+      "byte_count": 2124,
+      "description": "GET_MEASUREMENT response — operational (pq_signing_ready=true, 1952-byte pubkey, cert_chain present).",
+      "file": "resp_get_measurement_operational_v1.bin"
+    },
+    {
+      "byte_count": 105,
+      "description": "GET_MEASUREMENT response — transport-only (pq_signing_ready=false, empty pubkey/cert_chain). Hosts MUST NOT arm or treat as producer.",
+      "file": "resp_get_measurement_transport_v1.bin"
+    },
+    {
+      "byte_count": 2067,
+      "description": "SIGN_AUTHORIZATION_TICKET request — PRODUCER_RECOVERY (type=0, fork fields null).",
+      "file": "req_sign_authorization_ticket_recovery_v1.bin"
+    },
+    {
+      "byte_count": 2103,
+      "description": "SIGN_AUTHORIZATION_TICKET request — HARD_FORK_ACTIVATION (type=1, fork fields bound).",
+      "file": "req_sign_authorization_ticket_hardfork_v1.bin"
+    },
+    {
+      "byte_count": 3357,
+      "description": "SIGN_AUTHORIZATION_TICKET success response (3309-byte signature, 32-byte ticket_hash).",
+      "file": "resp_sign_authorization_ticket_v1.bin"
+    },
+    {
+      "byte_count": 50,
+      "description": "SIGN_AUTHORIZATION_TICKET wire-error response (code=7 PqSigningUnavailable). Frame echoes 0x10; CBOR body is the {1:int,2:tstr} error map.",
+      "file": "resp_sign_authorization_ticket_error_v1.bin"
+    },
+    {
+      "byte_count": 2202,
+      "description": "ARM_FOR_PRODUCTION request (authorized_state + RecentChainProof with Ed25519 signature).",
+      "file": "req_arm_for_production_v1.bin"
+    },
+    {
+      "byte_count": 14,
+      "description": "ARM_FOR_PRODUCTION success response ({1:\"armed\"}).",
+      "file": "resp_arm_for_production_armed_v1.bin"
+    },
+    {
+      "byte_count": 33,
+      "description": "ARM_FOR_PRODUCTION refuse response (wire error code=2, reason text).",
+      "file": "resp_arm_for_production_refused_v1.bin"
+    },
+    {
+      "byte_count": 9,
+      "description": "GET_STATUS request frame ({1:1}).",
+      "file": "req_get_status_v1.bin"
+    },
+    {
+      "byte_count": 2064,
+      "description": "GET_STATUS response — armed session (all fields populated).",
+      "file": "resp_get_status_armed_v1.bin"
+    },
+    {
+      "byte_count": 25,
+      "description": "GET_STATUS response — disarmed (armed=false, optional fields null, empty bytes).",
+      "file": "resp_get_status_disarmed_v1.bin"
+    },
+    {
+      "byte_count": 7,
+      "description": "Negative: valid frame structure with an UNKNOWN message-type byte (0x99). Frame layer MUST reject as unknown_message_type_byte; never defaults to a producer type.",
+      "file": "neg_unknown_message_type_v1.bin"
+    },
+    {
+      "byte_count": 7,
+      "description": "Negative: valid frame structure with WRONG protocol_version byte (99). MUST reject as unsupported_protocol_version.",
+      "file": "neg_wrong_protocol_version_v1.bin"
+    },
+    {
+      "byte_count": 7,
+      "description": "Negative: total_length prefix (100) does not match actual body size (3). MUST reject as frame_length_mismatch / Io error.",
+      "file": "neg_frame_length_mismatch_v1.bin"
+    }
+  ],
+  "vectors_version": "1",
+  "wire_layout": "[u32 total_length BE][u8 protocol_version=1][u8 message_type][CBOR payload]; total_length = 2 + payload.len(), excludes the 4-byte prefix"
+}

@@ -40,22 +40,45 @@ fn main() {
 
     // POSITIVE vectors
     let payloads: &[(&str, AuthorizationTicketPayload)] = &[
-        ("recovery", AuthorizationTicketPayload {
-            ticket_type: 0, nonce: 1, context_hash: [0xAB; 32],
-            activation_height: 1000, new_measurement: vec![0x55; 48],
-            pq_pubkey: pk_bytes.clone(), fork_spec_hash: None, new_header_version: None,
-        }),
-        ("hardfork", AuthorizationTicketPayload {
-            ticket_type: 1, nonce: 42, context_hash: [0xCD; 32],
-            activation_height: 5000, new_measurement: vec![0x77; 48],
-            pq_pubkey: pk_bytes.clone(),
-            fork_spec_hash: Some([0xEE; 32]), new_header_version: Some(2),
-        }),
-        ("recovery2", AuthorizationTicketPayload {
-            ticket_type: 0, nonce: 999999, context_hash: [0x11; 32],
-            activation_height: 0, new_measurement: vec![],
-            pq_pubkey: pk_bytes.clone(), fork_spec_hash: None, new_header_version: None,
-        }),
+        (
+            "recovery",
+            AuthorizationTicketPayload {
+                ticket_type: 0,
+                nonce: 1,
+                context_hash: [0xAB; 32],
+                activation_height: 1000,
+                new_measurement: vec![0x55; 48],
+                pq_pubkey: pk_bytes.clone(),
+                fork_spec_hash: None,
+                new_header_version: None,
+            },
+        ),
+        (
+            "hardfork",
+            AuthorizationTicketPayload {
+                ticket_type: 1,
+                nonce: 42,
+                context_hash: [0xCD; 32],
+                activation_height: 5000,
+                new_measurement: vec![0x77; 48],
+                pq_pubkey: pk_bytes.clone(),
+                fork_spec_hash: Some([0xEE; 32]),
+                new_header_version: Some(2),
+            },
+        ),
+        (
+            "recovery2",
+            AuthorizationTicketPayload {
+                ticket_type: 0,
+                nonce: 999999,
+                context_hash: [0x11; 32],
+                activation_height: 0,
+                new_measurement: vec![],
+                pq_pubkey: pk_bytes.clone(),
+                fork_spec_hash: None,
+                new_header_version: None,
+            },
+        ),
     ];
 
     for (name, payload) in payloads {
@@ -64,7 +87,10 @@ fn main() {
         assert_eq!(sig.len(), 3309);
         assert!(verify(&hash, &sig));
         write_vec(out_dir, &format!("pos_{name}"), &hash, &sig);
-        eprintln!("pos_{name}: type={} nonce={} → MUST verify", payload.ticket_type, payload.nonce);
+        eprintln!(
+            "pos_{name}: type={} nonce={} → MUST verify",
+            payload.ticket_type, payload.nonce
+        );
     }
 
     // NEGATIVE: (a) flipped byte

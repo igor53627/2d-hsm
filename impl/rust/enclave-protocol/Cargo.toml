@@ -293,3 +293,13 @@ required-features = ["test-support"]
 [[example]]
 name = "bench_mldsa65"
 required-features = ["ml-dsa-65", "pq-seal-provisioning"]
+
+[[example]]
+name = "gen_golden_vectors"
+required-features = ["ml-dsa-65", "pq-seal-provisioning", "reference-test-key"]
+
+[[example]]
+name = "gen_producer_vectors"
+# No required-features — the producer wire layer is plain CBOR (ciborium + serde_json),
+# available with default features. Declared explicitly so `cargo test` (default features)
+# discovers it deterministically and contributors find it in the manifest.
