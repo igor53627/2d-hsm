@@ -24,9 +24,7 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
     // NOT a host-settable env var — the host cannot redirect to a known root.
     #[cfg(feature = "platform-root-from-boot-file")]
     {
-        return read_provisioning_root_file(std::path::Path::new(
-            "/run/twod-hsm/pq-seal-root.bin",
-        ));
+        return read_provisioning_root_file(std::path::Path::new("/run/twod-hsm/pq-seal-root.bin"));
     }
     // Lab: read from a host-settable env var (lab feature, release-banned).
     #[cfg(feature = "platform-provisioning-from-file")]
@@ -42,7 +40,10 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
             })?;
         return read_provisioning_root_file(path.as_ref());
     }
-    #[cfg(not(any(feature = "platform-provisioning-from-file", feature = "platform-root-from-boot-file")))]
+    #[cfg(not(any(
+        feature = "platform-provisioning-from-file",
+        feature = "platform-root-from-boot-file"
+    )))]
     {
         Err(ProtocolError::PqSigningUnavailable(
             "platform PQ seal v1 provisioning root hook not configured (integrate vTPM/SNP/Nitro, enable platform-root-from-boot-file for the snp-derive-root boot path, or platform-provisioning-from-file for labs)",
@@ -52,10 +53,7 @@ fn derive_platform_provisioning_root_v1() -> Result<[u8; 32], ProtocolError> {
 
 #[cfg(feature = "ml-dsa-65")]
 fn read_provisioning_root_file(path: &std::path::Path) -> Result<[u8; 32], ProtocolError> {
-    let bytes = crate::boot_input::read_boot_file(
-        path,
-        "failed to read provisioning root file",
-    )?;
+    let bytes = crate::boot_input::read_boot_file(path, "failed to read provisioning root file")?;
     bytes.try_into().map_err(|_| {
         ProtocolError::PqSigningUnavailable("provisioning root file must be exactly 32 bytes")
     })

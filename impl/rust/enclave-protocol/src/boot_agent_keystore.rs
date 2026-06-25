@@ -84,7 +84,10 @@ fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
     })
 }
 
-#[cfg(all(feature = "platform-root-from-boot-file", not(feature = "lab-agent-keystore-from-file")))]
+#[cfg(all(
+    feature = "platform-root-from-boot-file",
+    not(feature = "lab-agent-keystore-from-file")
+))]
 fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
     // Production: read from the FIXED path written by `snp-derive-root --out` at boot.
     // NOT a host-settable env var — the host cannot redirect to a known root.
@@ -100,7 +103,10 @@ fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
     })
 }
 
-#[cfg(not(any(feature = "lab-agent-keystore-from-file", feature = "platform-root-from-boot-file")))]
+#[cfg(not(any(
+    feature = "lab-agent-keystore-from-file",
+    feature = "platform-root-from-boot-file"
+)))]
 fn derive_agent_provisioning_root() -> Result<[u8; 32], ProtocolError> {
     Err(ProtocolError::PqSigningUnavailable(
         "agent keystore: platform seal root hook not configured (integrate vTPM/SNP VMPL/Nitro \
