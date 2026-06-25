@@ -23,7 +23,8 @@ use enclave_protocol::{
     encode_arm_for_production_request, encode_arm_for_production_response,
     encode_get_measurement_request, encode_get_measurement_response, encode_get_status_request,
     encode_get_status_response, encode_sign_authorization_ticket_request,
-    encode_sign_authorization_ticket_response, is_wire_error_payload, MessageType, ProtocolError,
+    encode_sign_authorization_ticket_response, encode_wire_error, is_wire_error_payload,
+    MessageType, ProtocolError,
 };
 use std::path::PathBuf;
 
@@ -207,6 +208,19 @@ fn resp_sign_authorization_ticket_error_decodes_as_wire_error() {
     assert!(
         resp.is_err(),
         "success response decoder must reject a wire-error body"
+    );
+    // Byte-identity: re-encoding the decoded wire error must reproduce the
+    // frozen payload (roborev 10787 gap — every other response vector has
+    // this assertion; the error vector now does too).
+    let re_enc = encode_wire_error(code, &reason).unwrap();
+    assert_eq!(
+        payload, re_enc,
+        "wire-error payload must round-trip byte-identical"
+    );
+    assert_frame_byte_identical(
+        "resp_sign_authorization_ticket_error_v1.bin",
+        MessageType::SignAuthorizationTicket,
+        &re_enc,
     );
 }
 
