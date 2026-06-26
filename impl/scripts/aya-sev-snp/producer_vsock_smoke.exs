@@ -93,7 +93,8 @@ defmodule Smoke do
       else
         {:ok, sat} = Wire.decode_sign_authorization_ticket_response(sat_resp)
         IO.puts("  SUCCESS: signature=#{byte_size(sat.signature)} bytes!")
-        {true, check("SIGN_AUTH: 3309-byte signature", byte_size(sat.signature) == 3309)}
+        sig_ok = byte_size(sat.signature) == 3309
+        {sig_ok, check("SIGN_AUTH: 3309-byte signature", sig_ok)}
       end
 
     results = [sat_ok | results]
