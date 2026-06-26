@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-26 15:39'
-updated_date: '2026-06-26 16:31'
+updated_date: '2026-06-26 16:36'
 labels:
   - security
   - constant-time
@@ -42,8 +42,9 @@ Traceability: dependencies: [TASK-33]; mldsa65.rs cross-references this task. NB
 <!-- AC:BEGIN -->
 - [ ] #1 Select a maintained, constant-time-hardened ML-DSA-65 implementation (PQ Code Package / PQCA or an audited equivalent); justify over pqcrypto-mldsa AND state the integration boundary preserving enclave-protocol's #![forbid(unsafe_code)] (safe-Rust crate, or isolated audited FFI shim)
 - [ ] #2 Define + execute a side-channel acceptance test: leakage model (host vsock latency + secret-dependent control/memory), tooling (dudect and/or ctgrind on the sign path), pass threshold, and an explicit ruling on residual Fiat-Shamir iteration-count variance (the hedged CSPRNG draw is expected variance, not leakage)
-- [ ] #3 Preserve cross-repo verify interop: the existing testvectors/mldsa65_crosscheck/ verifier-acceptance triples must still pass 2D TASK-122 AC#2 under the migrated signer (FIPS 204 verification is signer-independent, so NO re-pin is expected); keep the hedged signing profile unless a deliberate, separately-specified deterministic-mode change is coordinated
-- [ ] #4 Migrate mldsa65.rs producer signing to the new implementation behind the existing feature gating + reproducible NixOS enclave packaging; all ml-dsa-65 feature tests pass
-- [ ] #5 Update or retire the mldsa65.rs accepted-risk note and close the TASK-33 waiver linkage
-- [ ] #6 Split this task into the five reviewable stages listed in the description before implementation starts
+- [ ] #3 Static-triple verifier regression: the existing testvectors/mldsa65_crosscheck/ triples must still pass 2D TASK-122 AC#2 (accept pos_/reject neg_); they are frozen one-shot verifier fixtures (gen_golden_vectors.rs uses an unseeded keypair), so NO re-pin unless verify/wire/hash semantics change (then coordinate a 2D vector update)
+- [ ] #4 Fresh-signer parameter/domain acceptance: the migrated signer signs canonical ticket hashes and the outputs verify under an independent FIPS 204 verifier; assert it keeps ML-DSA-65, EMPTY ctx, NO pre-hash, over the raw 32-byte ticket_hash (a HashML-DSA / non-empty-ctx lib emits signatures the 2D NIF REJECTS, invisible to a static-triple-only check). No byte-exact signing-output requirement
+- [ ] #5 Migrate mldsa65.rs producer signing to the new implementation behind the existing feature gating + reproducible NixOS enclave packaging; all ml-dsa-65 feature tests pass
+- [ ] #6 Update or retire the mldsa65.rs accepted-risk note and close the TASK-33 waiver linkage
+- [ ] #7 Split this task into the five reviewable stages listed in the description before implementation starts
 <!-- AC:END -->
