@@ -2,12 +2,13 @@
 //! cross-check (TASK-122 AC#3 / Step 3).
 //!
 //! Emits frozen, byte-exact vsock request/response FRAMES (4-byte length prefix
-//! + protocol_version + message_type + CBOR payload) for the four producer
+//! + protocol_version + message_type + CBOR payload) for the five producer
 //! commands in `vsock-api-wire-format-spec-draft.md` §8:
 //!   - GET_MEASUREMENT             (message_type = 0x01)
 //!   - SIGN_AUTHORIZATION_TICKET   (message_type = 0x10)
 //!   - ARM_FOR_PRODUCTION          (message_type = 0x20)
 //!   - GET_STATUS                  (message_type = 0x30)
+//!   - SIGN_BLOCK_ROOT             (message_type = 0x50)
 //!
 //! Unlike `gen_golden_vectors.rs` (which produces raw ML-DSA-65 signature/hash
 //! triples for the AC#2 NIF cross-check), this generator produces the full
@@ -29,13 +30,16 @@
 //! ciborium, available with default features.)
 
 use enclave_protocol::{
-    encode_arm_for_production_request, encode_arm_for_production_response,
-    encode_get_measurement_request, encode_get_measurement_response, encode_get_status_request,
-    encode_get_status_response, encode_message, encode_sign_authorization_ticket_request,
-    encode_sign_authorization_ticket_response, encode_wire_error, ArmForProductionRequest,
+    compute_block_root_signing_hash, encode_arm_for_production_request,
+    encode_arm_for_production_response, encode_get_measurement_request,
+    encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
+    encode_message, encode_sign_authorization_ticket_request,
+    encode_sign_authorization_ticket_response, encode_sign_block_root_request,
+    encode_sign_block_root_response, encode_wire_error, ArmForProductionRequest,
     ArmForProductionResponse, AuthorizationTicketPayload, AuthorizedProducerState,
     GetMeasurementRequest, GetMeasurementResponse, GetStatusRequest, GetStatusResponse,
     MessageType, RecentChainProof, SignAuthorizationTicketRequest, SignAuthorizationTicketResponse,
+    SignBlockRootRequest, SignBlockRootResponse,
 };
 use std::fs;
 use std::path::Path;
@@ -347,6 +351,40 @@ fn main() {
     );
 
     // ----------------------------------------------------------------------
+    // SIGN_BLOCK_ROOT (0x50) — block-producer PQ signing (TASK-122 AC#3)
+    // ----------------------------------------------------------------------
+    let sbr_req = SignBlockRootRequest {
+        block_hash: [0xB1; 32],
+    };
+    let sbr_req_payload = encode_sign_block_root_request(&sbr_req).unwrap();
+    let sbr_req_frame = encode_message(MessageType::SignBlockRoot, &sbr_req_payload).unwrap();
+    write_bin(out_dir, "req_sign_block_root_v1.bin", &sbr_req_frame);
+    record(
+        &mut manifest,
+        "req_sign_block_root_v1.bin",
+        "SIGN_BLOCK_ROOT request frame ({1:version, 2:block_hash}).",
+        &sbr_req_frame,
+    );
+
+    // Success response: 3309-byte ML-DSA-65 signature + 32-byte DOMAIN-SEPARATED signed_hash.
+    // signed_hash = keccak256("2D_BLOCK_ROOT_V1" || block_hash) — pins the domain binding the 2D
+    // verifier MUST reproduce (placeholder signature; real signatures live in mldsa65_crosscheck/).
+    let sbr_resp_ok = SignBlockRootResponse {
+        signature: vec![0x88; 3309],
+        signed_hash: compute_block_root_signing_hash(&[0xB1; 32]),
+    };
+    let sbr_resp_ok_payload = encode_sign_block_root_response(&sbr_resp_ok).unwrap();
+    let sbr_resp_ok_frame =
+        encode_message(MessageType::SignBlockRoot, &sbr_resp_ok_payload).unwrap();
+    write_bin(out_dir, "resp_sign_block_root_v1.bin", &sbr_resp_ok_frame);
+    record(
+        &mut manifest,
+        "resp_sign_block_root_v1.bin",
+        "SIGN_BLOCK_ROOT success response (3309-byte signature + 32-byte signed_hash = keccak256(\"2D_BLOCK_ROOT_V1\"||block_hash)).",
+        &sbr_resp_ok_frame,
+    );
+
+    // ----------------------------------------------------------------------
     // Negative framing vectors (no CBOR payload decode — frame-layer only).
     // ----------------------------------------------------------------------
     // Unknown message-type byte: valid frame structure, type byte 0x99.
@@ -427,7 +465,8 @@ fn main() {
             "0x01": "GET_MEASUREMENT",
             "0x10": "SIGN_AUTHORIZATION_TICKET",
             "0x20": "ARM_FOR_PRODUCTION",
-            "0x30": "GET_STATUS"
+            "0x30": "GET_STATUS",
+            "0x50": "SIGN_BLOCK_ROOT"
         },
         "cbor_library": "ciborium 0.2 (default serialization; shortest-form definite-length, insertion-order map keys)",
         "provenance": "Emitted by the reference Rust encoder (enclave-protocol::wire). 2D Elixir client must produce/consume byte-identical frames.",

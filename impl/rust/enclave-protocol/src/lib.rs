@@ -412,11 +412,13 @@ pub use wire::{
     decode_arm_for_production_request, decode_arm_for_production_response,
     decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
     decode_get_status_response, decode_sign_authorization_ticket_request,
-    decode_sign_authorization_ticket_response, decode_wire_error,
-    encode_arm_for_production_request, encode_arm_for_production_response,
-    encode_get_measurement_request, encode_get_measurement_response, encode_get_status_request,
-    encode_get_status_response, encode_sign_authorization_ticket_request,
-    encode_sign_authorization_ticket_response, encode_wire_error, is_wire_error_payload,
+    decode_sign_authorization_ticket_response, decode_sign_block_root_request,
+    decode_sign_block_root_response, decode_wire_error, encode_arm_for_production_request,
+    encode_arm_for_production_response, encode_get_measurement_request,
+    encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
+    encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
+    encode_sign_block_root_request, encode_sign_block_root_response, encode_wire_error,
+    is_wire_error_payload,
 };
 // Shared provisioning-root API — available to both the producer and the agent profile so each can
 // set/check the platform root at boot (the secret + KDFs stay role-separated; see `seal_root`).
@@ -637,6 +639,8 @@ pub fn decode_message(data: &[u8]) -> Result<FramedMessage, ProtocolError> {
         0x41 => MessageType::AgentBootRelay,
         0x44 => MessageType::AgentAnchorMarksRelay,
         0x45 => MessageType::AgentAnchorCommitRelay,
+        // 0x50 SIGN_BLOCK_ROOT (producer family 0x50..0x7F) — block-root PQ signing (TASK-122 AC#3).
+        0x50 => MessageType::SignBlockRoot,
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
 
@@ -4189,9 +4193,52 @@ mod agent_gateway_framing_tests {
             MessageType::SignAuthorizationTicket,
             MessageType::ArmForProduction,
             MessageType::GetStatus,
+            MessageType::SignBlockRoot,
         ] {
             let frame = encode_message(t, &[]).unwrap();
             assert_eq!(decode_message(&frame).unwrap().msg_type, t);
+        }
+    }
+
+    /// Regression (Greptile P1 / the decode_message 0x50 gap): a SIGN_BLOCK_ROOT frame must
+    /// ROUTE through the serve path (decode_message -> decode_wire_command -> dispatch), not be
+    /// rejected at decode_message as UnknownMessageType. The OLD buggy path also returns a
+    /// 0x50-typed wire-error (peek_msg_type_from_frame re-frames it), so msg_type alone does NOT
+    /// distinguish — the REASON must name `sign_block_root` (i.e. it reached handle_sign_block_root),
+    /// never a decode-time `unknown message type`.
+    #[test]
+    fn sign_block_root_frame_routes_to_handler_not_unknown_type() {
+        use ed25519_dalek::SigningKey;
+        let trust = ProducerAttestationTrust {
+            attestation_verifying_key: SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
+        };
+        let mut state = EnclaveState::Unarmed;
+        let payload = crate::wire::encode_sign_block_root_request(&crate::SignBlockRootRequest {
+            block_hash: [0x11; 32],
+        })
+        .unwrap();
+        let frame = encode_message(MessageType::SignBlockRoot, &payload).unwrap();
+
+        let resp = process_framed_with_shared_state(&frame, &mut state, trust).unwrap();
+        let decoded = decode_message(&resp).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::SignBlockRoot);
+        if crate::wire::is_wire_error_payload(&decoded.payload) {
+            let (_code, reason) = crate::wire::decode_wire_error(&decoded.payload).unwrap();
+            assert!(
+                reason.contains("sign_block_root"),
+                "0x50 must route to handle_sign_block_root, not be rejected at decode_message; got: {reason}"
+            );
+            assert!(
+                !reason.to_lowercase().contains("unknown message type"),
+                "0x50 wrongly rejected at decode_message: {reason}"
+            );
+        } else {
+            // A signer happens to be installed (ml-dsa-65 + reference key): a real success response.
+            let r = crate::wire::decode_sign_block_root_response(&decoded.payload).unwrap();
+            assert_eq!(
+                r.signed_hash,
+                crate::compute_block_root_signing_hash(&[0x11; 32])
+            );
         }
     }
 

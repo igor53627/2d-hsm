@@ -30,7 +30,7 @@ cargo run --example gen_producer_vectors
 
 Output is deterministic (all field values are hardcoded constants, no key
 generation or randomness); re-running produces byte-identical files. The Rust
-parity oracle is `tests/producer_vectors.rs` (17 tests): every happy-path
+parity oracle is `tests/producer_vectors.rs` (19 tests): every happy-path
 vector is round-tripped through `decode_message` + the per-command decoder and
 re-encoded to assert byte-identity with the frozen `.bin`; every negative
 vector is rejected at the appropriate layer (frame version / message-type
@@ -83,6 +83,13 @@ dispatch / length-mismatch).
 | `req_get_status_v1.bin` | Request frame `{1:1}`. |
 | `resp_get_status_armed_v1.bin` | Armed session: all fields populated (1952-byte `authorized_pq_pubkey`, full heights + `source_ticket_hash`). |
 | `resp_get_status_disarmed_v1.bin` | Disarmed: `armed=false`, empty bytes, all optional fields null. |
+
+### SIGN_BLOCK_ROOT (message_type = 0x50)
+
+| File | What it pins |
+|------|--------------|
+| `req_sign_block_root_v1.bin` | Request frame `{1:version, 2:block_hash}` (32-byte `block_hash`). |
+| `resp_sign_block_root_v1.bin` | Success response: 3309-byte ML-DSA-65 `signature` + 32-byte domain-separated `signed_hash` = `keccak256("2D_BLOCK_ROOT_V1" \|\| block_hash)`. |
 
 ### Negative framing vectors (rejected at the frame layer)
 

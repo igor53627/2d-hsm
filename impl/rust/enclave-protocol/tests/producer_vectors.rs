@@ -19,12 +19,13 @@ use enclave_protocol::{
     decode_arm_for_production_request, decode_arm_for_production_response,
     decode_get_measurement_request, decode_get_measurement_response, decode_get_status_request,
     decode_get_status_response, decode_message, decode_sign_authorization_ticket_request,
-    decode_sign_authorization_ticket_response, decode_wire_error,
-    encode_arm_for_production_request, encode_arm_for_production_response,
-    encode_get_measurement_request, encode_get_measurement_response, encode_get_status_request,
-    encode_get_status_response, encode_sign_authorization_ticket_request,
-    encode_sign_authorization_ticket_response, encode_wire_error, is_wire_error_payload,
-    MessageType, ProtocolError,
+    decode_sign_authorization_ticket_response, decode_sign_block_root_request,
+    decode_sign_block_root_response, decode_wire_error, encode_arm_for_production_request,
+    encode_arm_for_production_response, encode_get_measurement_request,
+    encode_get_measurement_response, encode_get_status_request, encode_get_status_response,
+    encode_sign_authorization_ticket_request, encode_sign_authorization_ticket_response,
+    encode_sign_block_root_request, encode_sign_block_root_response, encode_wire_error,
+    is_wire_error_payload, MessageType, ProtocolError,
 };
 use std::path::PathBuf;
 
@@ -343,6 +344,42 @@ fn resp_get_status_disarmed_roundtrips_byte_identical() {
     assert_frame_byte_identical(
         "resp_get_status_disarmed_v1.bin",
         MessageType::GetStatus,
+        &re_enc,
+    );
+}
+
+// =============================================================================
+// SIGN_BLOCK_ROOT (0x50)
+// =============================================================================
+
+#[test]
+fn req_sign_block_root_roundtrips_byte_identical() {
+    let payload = decode_happy("req_sign_block_root_v1.bin", MessageType::SignBlockRoot);
+    let req = decode_sign_block_root_request(&payload).unwrap();
+    assert_eq!(req.block_hash, [0xB1; 32]);
+    let re_enc = encode_sign_block_root_request(&req).unwrap();
+    assert_frame_byte_identical(
+        "req_sign_block_root_v1.bin",
+        MessageType::SignBlockRoot,
+        &re_enc,
+    );
+}
+
+#[test]
+fn resp_sign_block_root_roundtrips_byte_identical() {
+    let payload = decode_happy("resp_sign_block_root_v1.bin", MessageType::SignBlockRoot);
+    let resp = decode_sign_block_root_response(&payload).unwrap();
+    assert_eq!(resp.signature.len(), 3309);
+    // Domain-separated hash = keccak256("2D_BLOCK_ROOT_V1" || block_hash) — the binding the
+    // 2D verifier MUST reproduce.
+    assert_eq!(
+        resp.signed_hash,
+        enclave_protocol::compute_block_root_signing_hash(&[0xB1; 32])
+    );
+    let re_enc = encode_sign_block_root_response(&resp).unwrap();
+    assert_frame_byte_identical(
+        "resp_sign_block_root_v1.bin",
+        MessageType::SignBlockRoot,
         &re_enc,
     );
 }

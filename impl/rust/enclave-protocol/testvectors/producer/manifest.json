@@ -5,7 +5,8 @@
     "0x01": "GET_MEASUREMENT",
     "0x10": "SIGN_AUTHORIZATION_TICKET",
     "0x20": "ARM_FOR_PRODUCTION",
-    "0x30": "GET_STATUS"
+    "0x30": "GET_STATUS",
+    "0x50": "SIGN_BLOCK_ROOT"
   },
   "protocol_version": 1,
   "provenance": "Emitted by the reference Rust encoder (enclave-protocol::wire). 2D Elixir client must produce/consume byte-identical frames.",
@@ -75,6 +76,16 @@
       "byte_count": 25,
       "description": "GET_STATUS response — disarmed (armed=false, optional fields null, empty bytes).",
       "file": "resp_get_status_disarmed_v1.bin"
+    },
+    {
+      "byte_count": 44,
+      "description": "SIGN_BLOCK_ROOT request frame ({1:version, 2:block_hash}).",
+      "file": "req_sign_block_root_v1.bin"
+    },
+    {
+      "byte_count": 3357,
+      "description": "SIGN_BLOCK_ROOT success response (3309-byte signature + 32-byte signed_hash = keccak256(\"2D_BLOCK_ROOT_V1\"||block_hash)).",
+      "file": "resp_sign_block_root_v1.bin"
     },
     {
       "byte_count": 7,
