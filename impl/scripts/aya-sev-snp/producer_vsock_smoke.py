@@ -187,6 +187,7 @@ def test_arm_for_production() -> None:
     payload = cbor2.dumps({1: 1, 2: authorized_state, 3: recent_chain_proof})
     mt, resp = send_recv(ARM_FOR_PRODUCTION, payload, "ARM_FOR_PRODUCTION")
     check(mt == ARM_FOR_PRODUCTION, f"response type=0x{mt:02x} (expected 0x20)")
+    m = cbor2.loads(resp)
     if m.get(1) == "armed":
         check(False, "ARM should NOT succeed with a bogus RecentChainProof (security regression)")
     elif isinstance(m.get(1), int) and isinstance(m.get(2), str):
