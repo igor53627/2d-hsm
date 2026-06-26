@@ -528,6 +528,10 @@ pub enum MessageType {
     /// anchor durably records the commit and returns a signed ACK. Like `0x41`/`0x44` it is NEVER
     /// serve-dispatched — a hostile inbound `0x45` fails closed in `decode_wire_command`.
     AgentAnchorCommitRelay = 0x45,
+    /// Producer block-root signing (TASK-122 AC#3). Reserved outer band
+    /// `0x50..0x7F` (producer family). Signs the canonical block_hash (32 bytes)
+    /// with the enclave's ML-DSA-65 key. Requires pq_signing_ready.
+    SignBlockRoot = 0x50,
 }
 
 /// Простой диспетчер команд (скелет).
@@ -538,6 +542,7 @@ pub enum MessageType {
 pub enum Command {
     GetMeasurement(GetMeasurementRequest),
     SignAuthorizationTicket(SignAuthorizationTicketRequest),
+    SignBlockRoot(SignBlockRootRequest),
     ArmForProduction(ArmForProductionRequest),
     GetStatus(GetStatusRequest),
     /// Agent Gateway (0x40) — carries the raw inner-envelope CBOR; decoded/routed by
@@ -550,6 +555,7 @@ pub enum Command {
 pub enum Response {
     GetMeasurement(GetMeasurementResponse),
     SignAuthorizationTicket(SignAuthorizationTicketResponse),
+    SignBlockRoot(SignBlockRootResponse),
     ArmForProduction(ArmForProductionResponse),
     GetStatus(GetStatusResponse),
     Error(String),
@@ -886,6 +892,43 @@ pub struct AuthorizationTicketPayload {
 pub struct SignAuthorizationTicketResponse {
     pub signature: Vec<u8>,
     pub ticket_hash: [u8; 32], // The exact canonical hash that was signed
+}
+
+// -----------------------------------------------------------------------------
+// SignBlockRoot (TASK-122 AC#3) — block-producer PQ signing
+// -----------------------------------------------------------------------------
+
+/// Request to sign a block root (canonical block_hash, 32 bytes).
+///
+/// The enclave signs a DOMAIN-SEPARATED hash to prevent cross-protocol
+/// confusion with SIGN_AUTHORIZATION_TICKET signatures:
+///   signed_hash = keccak256("2D_BLOCK_ROOT_V1" || block_hash)
+/// This ensures a ticket_hash cannot be replayed as a block root and vice versa.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignBlockRootRequest {
+    pub block_hash: [u8; 32],
+}
+
+/// Response after successful block-root signing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignBlockRootResponse {
+    pub signature: Vec<u8>,    // ML-DSA-65 detached signature (3309 bytes)
+    pub signed_hash: [u8; 32], // keccak256("2D_BLOCK_ROOT_V1" || block_hash)
+}
+
+/// Domain-separation prefix for block-root signing (MUST match the 2D verifier).
+pub const BLOCK_ROOT_SIGNING_DOMAIN: &[u8] = b"2D_BLOCK_ROOT_V1";
+
+/// Compute the domain-separated hash for block-root signing.
+pub fn compute_block_root_signing_hash(block_hash: &[u8; 32]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(BLOCK_ROOT_SIGNING_DOMAIN);
+    hasher.update(block_hash);
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
 }
 
 // -----------------------------------------------------------------------------
@@ -1547,6 +1590,32 @@ pub fn handle_sign_authorization_ticket(
     sign_recovery_ticket(&req.ticket)
 }
 
+/// Sign a block root with the enclave's ML-DSA-65 key (TASK-122 AC#3).
+///
+/// The signed message is DOMAIN-SEPARATED from ticket signatures:
+///   signed_hash = keccak256("2D_BLOCK_ROOT_V1" || block_hash)
+/// This prevents cross-protocol confusion (a ticket_hash cannot be replayed
+/// as a block root, and vice versa).
+///
+/// Requires pq_signing_ready (an operational ML-DSA-65 key must be installed).
+pub fn handle_sign_block_root(
+    req: SignBlockRootRequest,
+) -> Result<SignBlockRootResponse, ProtocolError> {
+    if !pq_signing_ready() {
+        return Err(ProtocolError::PqSigningUnavailable(
+            "block-root signing requires an operational PQ signer (install a sealed key at boot)",
+        ));
+    }
+    let signed_hash = compute_block_root_signing_hash(&req.block_hash);
+    // Reuse the existing produce_pq_signature wrapper (same cfg ladder as
+    // ticket signing — nonce=0 because signed_hash is already unique per block).
+    let signature = produce_pq_signature(&signed_hash, 0)?;
+    Ok(SignBlockRootResponse {
+        signature,
+        signed_hash,
+    })
+}
+
 /// Stateful signing entry point — the recommended path for all ticket types.
 ///
 /// - type=0 (recovery): allowed when armed or unarmed.
@@ -1672,6 +1741,9 @@ fn decode_wire_command(msg_type: MessageType, payload: &[u8]) -> Result<Command,
         MessageType::GetStatus => Ok(Command::GetStatus(decode_get_status_request(payload)?)),
         // Agent Gateway (0x40): carry the raw inner envelope; agent_dispatch decodes + routes it
         // (self-describing — opcode is inside). Built only under the `agent-gateway` feature; a
+        MessageType::SignBlockRoot => Ok(Command::SignBlockRoot(
+            crate::wire::decode_sign_block_root_request(payload)?,
+        )),
         // build without it keeps the fail-closed reserved behavior.
         #[cfg(feature = "agent-gateway")]
         MessageType::AgentGateway => Ok(Command::AgentGateway(payload.to_vec())),
@@ -1713,6 +1785,9 @@ fn encode_wire_response(
         (MessageType::SignAuthorizationTicket, Response::SignAuthorizationTicket(r)) => {
             encode_sign_authorization_ticket_response(r)
         }
+        (MessageType::SignBlockRoot, Response::SignBlockRoot(r)) => {
+            crate::wire::encode_sign_block_root_response(r)
+        }
         // Agent Gateway body is pre-encoded by agent_dispatch (success map or §10.9 error map).
         #[cfg(feature = "agent-gateway")]
         (MessageType::AgentGateway, Response::AgentGateway(body)) => Ok(body.clone()),
@@ -1733,6 +1808,7 @@ fn encode_wire_response(
 /// producer message type (that was a fail-**open** routing bug; TASK-7.1 AC#20).
 pub fn peek_msg_type_from_frame(frame: &[u8]) -> Option<MessageType> {
     match frame.get(5) {
+        Some(0x50) => Some(MessageType::SignBlockRoot),
         Some(0x01) => Some(MessageType::GetMeasurement),
         Some(0x10) => Some(MessageType::SignAuthorizationTicket),
         Some(0x20) => Some(MessageType::ArmForProduction),
@@ -1975,6 +2051,10 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
+        Command::SignBlockRoot(req) => match handle_sign_block_root(req) {
+            Ok(resp) => Response::SignBlockRoot(resp),
+            Err(e) => Response::Error(format!("sign_block_root failed: {}", e)),
+        },
         Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
         Command::ArmForProduction(_) => Response::Error(
             "ARM_FOR_PRODUCTION requires dispatch_command_with_state and an enclave-held ProducerAttestationTrust (host cannot supply the trust anchor)".to_string(),
@@ -2009,6 +2089,10 @@ pub fn dispatch_command_with_state(
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
+        Command::SignBlockRoot(req) => match handle_sign_block_root(req) {
+            Ok(resp) => Response::SignBlockRoot(resp),
+            Err(e) => Response::Error(format!("sign_block_root failed: {}", e)),
+        },
         Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
         Command::ArmForProduction(req) => match arm_for_production(state, req, attestation_trust) {
             Ok(new_state) => {
