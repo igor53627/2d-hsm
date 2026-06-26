@@ -16,6 +16,10 @@ import struct
 import sys
 import time
 
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    print(__doc__)
+    sys.exit(0)
+
 try:
     import cbor2  # type: ignore
 except ImportError:
@@ -100,7 +104,7 @@ def test_get_measurement() -> None:
     mt, resp = send_recv(GET_MEASUREMENT, payload, "GET_MEASUREMENT")
     check(mt == GET_MEASUREMENT, f"response type=0x{mt:02x} (expected 0x01)")
     m = cbor2.loads(resp)
-    check(isinstance(m, dict), f"response is CBOR map")
+    check(isinstance(m, dict), "response is CBOR map")
     check(m.get(1) == 1, f"version=1 (got {m.get(1)})")
     pubkey = m.get(4, b"")
     check(len(pubkey) == 1952, f"pq_pubkey is 1952 bytes ML-DSA-65 (got {len(pubkey)})")
@@ -119,7 +123,7 @@ def test_get_status() -> None:
     mt, resp = send_recv(GET_STATUS, payload, "GET_STATUS")
     check(mt == GET_STATUS, f"response type=0x{mt:02x} (expected 0x30)")
     m = cbor2.loads(resp)
-    check(isinstance(m, dict), f"response is CBOR map")
+    check(isinstance(m, dict), "response is CBOR map")
     check(m.get(1) == 1, f"version=1 (got {m.get(1)})")
     armed = m.get(2)
     check(armed is False, f"armed=False (not armed yet; got {armed})")

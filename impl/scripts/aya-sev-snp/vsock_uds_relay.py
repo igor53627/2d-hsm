@@ -13,6 +13,10 @@ import struct
 import sys
 import threading
 
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    print(__doc__)
+    sys.exit(0)
+
 UDS_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/phsm.sock"
 VSOCK_CID = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 VSOCK_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 5000

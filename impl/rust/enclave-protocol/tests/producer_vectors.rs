@@ -42,7 +42,8 @@ fn read(name: &str) -> Vec<u8> {
 /// CBOR payload bytes (for per-command decoding by the caller).
 fn decode_happy(name: &str, expected_type: MessageType) -> Vec<u8> {
     let bytes = read(name);
-    let framed = decode_message(&bytes).expect(&format!("{name}: frame must decode"));
+    let framed =
+        decode_message(&bytes).unwrap_or_else(|e| panic!("{name}: frame must decode: {e:?}"));
     assert_eq!(framed.version, 1, "{name}: protocol_version byte must be 1");
     assert_eq!(
         framed.msg_type, expected_type,

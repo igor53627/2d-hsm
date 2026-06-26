@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+case "${1:-}" in
+  -h|--help)
+    cat <<'USAGE'
+Loopback producer smoke (TASK-122 AC#3 staging). Starts the staging enclave on
+vsock CID=1:5000 plus a vsock<->UDS relay, then drives all 4 producer commands
+via the Elixir client. Hard-coded /root/producer_smoke paths — run on the staging host.
+USAGE
+    exit 0
+    ;;
+esac
 trap 'pkill -f "[/]enclave-vsock-staging" 2>/dev/null || true; pkill -f vsock_uds_relay 2>/dev/null || true; rm -f /tmp/phsm.sock' EXIT
 cd /root/producer_smoke
 
@@ -26,8 +37,8 @@ sleep 1
 cat /tmp/relay.log
 
 echo "=== Run Elixir producer smoke ==="
-/opt/elixir-1.16/bin/elixir producer_vsock_smoke.exs
-SMOKE_EXIT=$?
+SMOKE_EXIT=0
+/opt/elixir-1.16/bin/elixir producer_vsock_smoke.exs || SMOKE_EXIT=$?
 
 echo "=== Cleanup ==="
 pkill -f '[/]enclave-vsock-staging' 2>/dev/null || true

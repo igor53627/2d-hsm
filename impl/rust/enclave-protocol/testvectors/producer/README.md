@@ -38,7 +38,7 @@ dispatch / length-mismatch).
 
 ## Wire layout (spec §7)
 
-```
+```text
 [u32 total_length BE][u8 protocol_version = 1][u8 message_type][CBOR payload]
 ```
 

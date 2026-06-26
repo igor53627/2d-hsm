@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-06-26 14:57'
-updated_date: '2026-06-26 15:42'
+updated_date: '2026-06-26 16:43'
 labels:
   - security
   - constant-time
@@ -42,8 +42,10 @@ Polarity invariant: ct_eq returns subtle::Choice; the fail-closed form is `if !b
 - [x] #2 Each converted gate has a negative test asserting mismatch produces CapabilityRejected (guards against polarity inversion)
 - [x] #3 ML-DSA-65 variable-time signing recorded as accepted-risk with threat model in mldsa65.rs
 - [x] #4 cargo test passes for the agent-gateway feature set (capability + dispatch + relevant preview features)
-- [ ] #5 Full Matrix + roborev compact return clean (no open issues)
+- [x] #5 Full Matrix + roborev compact return clean (no open issues)
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 

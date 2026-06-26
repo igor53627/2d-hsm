@@ -45,7 +45,10 @@ use std::path::Path;
 const PQ_PUBKEY_1952: [u8; 1952] = [0x42; 1952];
 
 fn main() {
-    let out_dir = Path::new("testvectors/producer");
+    let out_dir_arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "testvectors/producer".to_string());
+    let out_dir = Path::new(&out_dir_arg);
     fs::create_dir_all(out_dir).unwrap();
 
     let mut manifest: Vec<serde_json::Value> = Vec::new();
