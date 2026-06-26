@@ -1087,7 +1087,12 @@ fn handle_generate_keys(
         &env.request_id,
         &generate_keys_canonical_params(purpose_code, count),
     );
-    if computed != verified.payload_binding {
+    use subtle::ConstantTimeEq;
+    if !bool::from(
+        computed
+            .as_slice()
+            .ct_eq(verified.payload_binding.as_slice()),
+    ) {
         return Err(AgentError::CapabilityRejected);
     }
 
@@ -1319,7 +1324,12 @@ fn handle_configure_treasury(
         &env.request_id,
         &canonical_params,
     );
-    if computed != verified.payload_binding {
+    use subtle::ConstantTimeEq;
+    if !bool::from(
+        computed
+            .as_slice()
+            .ct_eq(verified.payload_binding.as_slice()),
+    ) {
         return Err(AgentError::CapabilityRejected);
     }
     // (4c) Financial scope policy (§10.5/§10.6 AC#12): treasury config MUST be enclave-scoped
@@ -1547,7 +1557,12 @@ fn handle_export_backup(
         &env.request_id,
         &export_canonical_params(&selector),
     );
-    if computed != verified.payload_binding {
+    use subtle::ConstantTimeEq;
+    if !bool::from(
+        computed
+            .as_slice()
+            .ct_eq(verified.payload_binding.as_slice()),
+    ) {
         return Err(AgentError::CapabilityRejected);
     }
 
@@ -1733,7 +1748,12 @@ fn handle_restore_backup(
     let canonical = restore_canonical_params(&req.requested_refs, &opened.original_backup_digest);
     let expected_binding =
         crate::agent_capability::payload_binding(8, None, &env.request_id, &canonical);
-    if expected_binding != verified.payload_binding {
+    use subtle::ConstantTimeEq;
+    if !bool::from(
+        expected_binding
+            .as_slice()
+            .ct_eq(verified.payload_binding.as_slice()),
+    ) {
         return Err(AgentError::CapabilityRejected);
     }
     // (6) Verify the recovery-authority-signed high-water (AC#6 source (a): signature vs recovery_authority_pk
@@ -7543,6 +7563,7 @@ mod tests {
             request_id: &[u8],
             counter: u64,
             n_keys: usize,
+            pb_override: Option<[u8; 32]>,
         ) -> (Vec<u8>, KeystoreBody) {
             // Publish the destination ephemeral (deterministic seed ⇒ the test knows the decaps key).
             let dest_pub = crate::agent_dispatch::install_restore_ephemeral_with_seed(
@@ -7610,14 +7631,17 @@ mod tests {
                     ]),
                 ),
             ];
-            // Compute the REAL payload_binding (HIGH #1) — the cap is bound to THIS restore's key
-            // selector + the backup digest, not a placeholder.
-            let pb = crate::agent_capability::payload_binding(
-                8,
-                None,
-                request_id,
-                &restore_canonical_params(&refs, &backup_digest),
-            );
+            // payload_binding (HIGH #1): negative tests inject a mismatching binding via `pb_override`;
+            // otherwise compute the REAL binding over THIS restore's key selector + backup digest, so a
+            // conformant cap is bound to exactly this restore (not a placeholder).
+            let pb = pb_override.unwrap_or_else(|| {
+                crate::agent_capability::payload_binding(
+                    8,
+                    None,
+                    request_id,
+                    &restore_canonical_params(&refs, &backup_digest),
+                )
+            });
             let cap = crate::agent_capability::test_signed_capability(
                 cap_signer,
                 8,
@@ -7674,6 +7698,38 @@ mod tests {
             );
         }
 
+        /// §10.5 payload_binding gate (handler step 5b): a recovery cap whose SIGNED payload_binding
+        /// does not bind THIS restore's refs+digest ⇒ 0x43. Every prior gate (ephemeral, AAD'
+        /// measurement, recovery_key_id, cap signature/counter/scope) passes — the cap is validly
+        /// signed over the WRONG binding — so the ONLY rejection reason is the constant-time
+        /// payload_binding compare. Guards the ct_eq conversion against a polarity inversion (TASK-33).
+        #[test]
+        fn restore_backup_payload_binding_mismatch_rejected() {
+            let _g = gate_configured();
+            let recovery = recovery_key();
+            let mut dest = base_body();
+            dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
+            // Cap signed over a payload_binding that does NOT match this restore's refs+digest;
+            // the request itself carries valid refs (an altered ref set would fail earlier at the
+            // AC#9 set-match, not the pb gate).
+            let (env, src) = restore_env(
+                &recovery,
+                true,
+                &recovery,
+                &[0x11; 16],
+                1,
+                2,
+                Some([0xAB; 32]),
+            );
+            dest.config.backup_recovery_wrapping_pubkey =
+                src.config.backup_recovery_wrapping_pubkey.clone();
+            assert_eq!(
+                dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
+                Some(AgentError::CapabilityRejected),
+                "a cap whose signed payload_binding does not bind THIS restore ⇒ 0x43"
+            );
+        }
+
         /// End-to-end: a recovery-tier RESTORE_BACKUP through dispatch_agent reconstitutes the source
         /// keystore's entries into a fresh destination TEE + advances strict_recovery (AC#6) + structural
         /// (local+1, AC#4). The full ceremony path — ephemeral decap, AAD' verify, signed-high-water
@@ -7686,7 +7742,7 @@ mod tests {
                                         // The cap + high-water signatures both verify against the sealed recovery_authority_pk — set it
                                         // to the recovery key's DERIVED pubkey (base_body's [0xa2;32] is a seed, not a pubkey).
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let (env, src) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
+            let (env, src) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2, None);
             // AC#10: the destination's sealed wrapping pubkey MUST match the backup's (the handler's
             // recovery_key_id binding, compact 9611 HIGH). restore_env sealed the backup to WRAP_SEED
             // and set src's wrapping pubkey; copy it onto dest so the success path verifies.
@@ -7741,7 +7797,7 @@ mod tests {
             let recovery = recovery_key();
             let mut dest = base_body();
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2); // builds + installs the ephemeral
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2, None); // builds + installs the ephemeral
             retire_restore_ephemeral(); // …then retire it ⇒ the handler finds no ephemeral
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
@@ -7758,8 +7814,8 @@ mod tests {
             let recovery = recovery_key();
             let mut dest = base_body();
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2); // envelope AAD' measurement = DEST_MEAS
-                                                                                       // Dispatch claiming a DIFFERENT measurement ⇒ opened.dest_measurement != OWN ⇒ SealFailed.
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2, None); // envelope AAD' measurement = DEST_MEAS
+                                                                                             // Dispatch claiming a DIFFERENT measurement ⇒ opened.dest_measurement != OWN ⇒ SealFailed.
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &dest, b"OTHER-tee-measurement").err(),
                 Some(AgentError::SealFailed),
@@ -7778,7 +7834,7 @@ mod tests {
             let recovery = recovery_key();
             let mut dest = base_body();
             dest.config.recovery_authority_pk = recovery.verifying_key().to_bytes();
-            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2);
+            let (env, _) = restore_env(&recovery, true, &recovery, &[0x11; 16], 1, 2, None);
             // restore_env sealed the backup to WRAP_SEED; leave dest's wrapping key as base_body's
             // placeholder (a DIFFERENT key) ⇒ recovery_key_id mismatch ⇒ fail closed at step 5c.
             // (base_body's `vec![0xb0; 1568]` is intentionally not WRAP_SEED's key.)
@@ -7948,7 +8004,7 @@ mod tests {
             // An ADMIN-signed cap (is_recovery=false) for opcode 8 — the tier check rejects BEFORE the
             // handler. The high-water is correctly recovery-signed, so if the tier check regressed, the
             // handler would proceed + succeed (the test would FAIL, catching the regression).
-            let (env, _) = restore_env(&admin, false, &recovery, &[0x11; 16], 1, 2);
+            let (env, _) = restore_env(&admin, false, &recovery, &[0x11; 16], 1, 2, None);
             assert_eq!(
                 dispatch_agent(Profile::AgentGateway, &env, &dest, DEST_MEAS).err(),
                 Some(AgentError::CapabilityRejected),

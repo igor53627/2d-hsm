@@ -1,4 +1,31 @@
 //! ML-DSA-65 (FIPS 204) signing inside the enclave boundary.
+//!
+//! ## Side-channels — constant-time posture (accepted risk)
+//!
+//! Producer signing here is **not constant-time** — and not merely in wall-clock terms: the chosen
+//! library offers no constant-time guarantee at all. `detached_sign` comes from PQClean's *clean*
+//! ML-DSA-65 (Dilithium) reference via `pqcrypto-mldsa`. PQClean's own README lists "No branching on
+//! secret data" and "No access to secret memory locations" as **unchecked, still-in-development**
+//! goals, so the clean implementation may branch on — and index memory with — secret-derived values.
+//! Separately, ML-DSA signing is Fiat-Shamir-with-aborts, so the number of rejection-sampling
+//! iterations (hence the signing time) is data-dependent. The enclave threat model assumes the
+//! untrusted host observes request→response latency over vsock, so this variance is observable.
+//!
+//! This is an **accepted risk**, not a defect fixable in this module. The ML-DSA/Dilithium design
+//! argument is only that the *published signature distribution* is independent of the secret key
+//! (zero-knowledge); it bounds, but does not eliminate, the wall-clock / micro-architectural timing
+//! exposure of a non-hardened reference implementation. No code path relies on signing latency being
+//! uniform. Eliminating this needs a constant-time-hardened ML-DSA — a library swap, not a local
+//! change. Migration path: PQClean is deprecated (archived read-only ~July 2026); its successor is
+//! the PQ Code Package (PQCA). Revisit this waiver when migrating off `pqcrypto-mldsa` (tracked: TASK-34).
+//!
+//! Everything *around* signing is constant-time where it matters: sealed-key AEAD open
+//! (ChaCha20Poly1305 / XChaCha20Poly1305 — the Poly1305 tag check is `subtle`-backed), and the
+//! secret-adjacent equality gates use `subtle::ct_eq` (the capability `payload_binding` /
+//! `scope_identity` checks in `agent_dispatch`/`agent_capability` and the fund-custody digest gate in
+//! `agent_boot`). The Agent Gateway secp256k1 signer (`k256`, RFC 6979) is constant-time with a
+//! deterministic nonce. Signature *verification* here (`verify_ticket_hash`) operates only on public
+//! inputs, so its timing carries no secret.
 
 use crate::{ProtocolError, ML_DSA65_SECRETKEY_LEN, ML_DSA65_SIGNATURE_LEN};
 use pqcrypto_mldsa::mldsa65::{detached_sign, PublicKey, SecretKey};

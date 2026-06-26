@@ -478,7 +478,12 @@ fn verify_capability_extract_inner(
     } else {
         &config.fleet_scope_id
     };
-    if &cap.scope_identity != sealed_scope_id {
+    use subtle::ConstantTimeEq;
+    if !bool::from(
+        cap.scope_identity
+            .as_slice()
+            .ct_eq(sealed_scope_id.as_slice()),
+    ) {
         return Err(AgentError::CapabilityRejected);
     }
 
