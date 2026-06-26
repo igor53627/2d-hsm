@@ -66,7 +66,7 @@ dispatch / length-mismatch).
 | `req_sign_authorization_ticket_recovery_v1.bin` | PRODUCER_RECOVERY (type=0) request — `fork_spec_hash` + `new_header_version` null. |
 | `req_sign_authorization_ticket_hardfork_v1.bin` | HARD_FORK_ACTIVATION (type=1) request — `fork_spec_hash=[0xEE;32]`, `new_header_version=2`. |
 | `resp_sign_authorization_ticket_v1.bin` | Success response: 3309-byte ML-DSA-65 `signature`, 32-byte `ticket_hash`. |
-| `resp_sign_authorization_ticket_error_v1.bin` | Wire-error response: code=7 `PqSigningUnavailable`. Frame echoes `0x10`; CBOR body is the `{1:int, 2:tstr}` error map. |
+| `resp_sign_authorization_ticket_error_v1.bin` | Wire-error response: code=2 `PqSigningUnavailable`. Frame echoes `0x10`; CBOR body is the `{1:int, 2:tstr}` error map. |
 
 ### ARM_FOR_PRODUCTION (message_type = 0x20)
 
