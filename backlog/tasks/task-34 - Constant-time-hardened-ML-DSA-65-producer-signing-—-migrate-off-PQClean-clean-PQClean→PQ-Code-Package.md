@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-26 15:39'
-updated_date: '2026-06-26 16:36'
+updated_date: '2026-06-26 16:39'
 labels:
   - security
   - constant-time
@@ -27,13 +27,13 @@ Residual risk (impact, not just mechanism): producer ticket signing runs through
 
 Forcing function (soft): PQClean is scheduled to be archived read-only ~July 2026. read-only != removed — the pinned source keeps building but gets no further fixes (incl. the unchecked constant-time items). Treat ~July 2026 as a soft review-by for this waiver, not a hard deadline; re-evaluate priority at that point. Successor: PQ Code Package (PQCA).
 
-Downstream interop contract (compact Medium — corrected): the vectors in testvectors/mldsa65_crosscheck/ are VERIFIER ACCEPTANCE TRIPLES (ticket_hash, signature, pubkey) that 2D TASK-122 AC#2's verify NIF must accept (pos_*) / reject (neg_*) — NOT byte-exact signing-output reproductions (confirmed: gen_golden_vectors.rs builds them via verify_detached_signature(...).is_ok()). Producer signing is HEDGED FIPS 204 (in-TEE CSPRNG; pqcrypto-mldsa detached_sign, no rnd override), so signing output is NOT byte-deterministic and there is no byte-exact signing contract. Consequence for the migration: a CT-hardened SIGNER swap keeps cross-repo interop automatically — any conformant ML-DSA signer emits signatures any conformant verifier (the 2D NIF) accepts, so the existing crosscheck triples stay valid WITHOUT a re-pin. Keep the hedged profile; only a deliberate, separately-specified protocol change to deterministic signing would alter this, and that is out of scope for a library swap.
+Downstream interop contract (compact-corrected): the vectors in testvectors/mldsa65_crosscheck/ are VERIFIER ACCEPTANCE TRIPLES (ticket_hash, signature, pubkey) that 2D TASK-122 AC#2's verify NIF must accept (pos_*) / reject (neg_*) — NOT byte-exact signing-output reproductions (confirmed: gen_golden_vectors.rs builds them via verify_detached_signature(...).is_ok() with an unseeded keypair). Producer signing is HEDGED FIPS 204 (in-TEE CSPRNG; pqcrypto-mldsa detached_sign, no rnd override), so signing output is NOT byte-deterministic and there is no byte-exact signing contract. Consequence for the migration: the existing crosscheck triples stay valid WITHOUT a re-pin (verification is signer-independent), BUT interop is NOT automatic — the migrated signer MUST preserve the exact parameter set + domain: ML-DSA-65, EMPTY ctx, NO pre-hash, signing over the raw 32-byte ticket_hash (per sign_ticket_hash's own contract). A conformant lib that defaulted to HashML-DSA or a non-empty ctx would emit signatures the 2D NIF REJECTS, so a FRESH-signer acceptance test (AC#4) is required in addition to the static-triple regression (AC#3). Keep the hedged profile; only a deliberate, separately-specified protocol change to deterministic signing would alter this, and that is out of scope for a library swap.
 
 Integration constraint: enclave-protocol is #![forbid(unsafe_code)]. The replacement must arrive as a safe-Rust crate OR behind an isolated, audited FFI boundary (a separate unsafe-allowed shim crate), with reproducible builds, feature-gated like the current ml-dsa-65 path, and packaged into the NixOS enclave image.
 
 Side-channel acceptance: "verify CT posture" must define the leakage model (host-observable signing wall-clock over vsock + secret-dependent control-flow/memory), tested variables (secret key, message), tooling (dudect and/or valgrind ctgrind on the sign path), the pass threshold, and an explicit ruling on whether residual Fiat-Shamir rejection-loop iteration-count variance is acceptable (with rationale) — not a narrow run that misses the described threat. NB the hedged in-TEE CSPRNG draw is an EXPECTED per-signature variance, distinct from secret-dependent leakage.
 
-Staging (too broad as one task): split when actioned into (1) candidate selection + integration design; (2) integration spike (FFI/safe-crate boundary, build, feature gate); (3) side-channel validation harness + acceptance; (4) mldsa65.rs migration + crosscheck-triple re-verification; (5) downstream 2D coordination + retire the TASK-33 waiver.
+Staging (too broad as one task): split when actioned into (1) candidate selection + integration design; (2) integration spike (FFI/safe-crate boundary, build, feature gate); (3) side-channel validation harness + acceptance; (4) mldsa65.rs migration + static-triple regression + fresh-signer parameter/domain acceptance; (5) downstream 2D coordination + retire the TASK-33 waiver.
 
 Traceability: dependencies: [TASK-33]; mldsa65.rs cross-references this task. NB backlog/tasks/* is intentionally NOT in .roborev.toml high_risk_paths — task files are planning artifacts and the code they describe is reviewed via impl/; task-only edits do not auto-trigger the matrix by design.
 <!-- SECTION:DESCRIPTION:END -->
