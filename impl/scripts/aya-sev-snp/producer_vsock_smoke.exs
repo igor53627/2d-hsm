@@ -85,15 +85,18 @@ defmodule Smoke do
     {:ok, sat_payload} = Wire.encode_sign_authorization_ticket_request(%{ticket: ticket})
     {0x10, sat_resp} = round_trip(s, 0x10, sat_payload)
 
-    if Wire.wire_error?(sat_resp) do
-      {:ok, code, reason} = Wire.decode_wire_error(sat_resp)
-      IO.puts("  wire error (expected): code=#{code} reason=#{reason}")
-      results = [check("SIGN_AUTH: wire-error code=2", code == 2) | results]
-    else
-      {:ok, sat} = Wire.decode_sign_authorization_ticket_response(sat_resp)
-      IO.puts("  SUCCESS: signature=#{byte_size(sat.signature)} bytes!")
-      results = [check("SIGN_AUTH: 3309-byte signature", byte_size(sat.signature) == 3309) | results]
-    end
+    sat_ok =
+      if Wire.wire_error?(sat_resp) do
+        {:ok, code, reason} = Wire.decode_wire_error(sat_resp)
+        IO.puts("  wire error (expected): code=#{code} reason=#{reason}")
+        check("SIGN_AUTH: wire-error code=2", code == 2)
+      else
+        {:ok, sat} = Wire.decode_sign_authorization_ticket_response(sat_resp)
+        IO.puts("  SUCCESS: signature=#{byte_size(sat.signature)} bytes!")
+        check("SIGN_AUTH: 3309-byte signature", byte_size(sat.signature) == 3309)
+      end
+
+    results = [sat_ok | results]
 
     # 4. ARM_FOR_PRODUCTION (bogus proof → refused)
     IO.puts("\n=== ARM_FOR_PRODUCTION (0x20) ===")
@@ -126,7 +129,9 @@ defmodule Smoke do
     total = length(results)
     IO.puts("#{passed}/#{total} checks passed")
     IO.puts("Producer signer client (Chain.ProducerHsm.Wire) drove the real")
-    IO.puts("2d-hsm staging enclave via AF_VSOCK — TASK-122 AC#3 staging evidence.")
+    IO.puts("2d-hsm enclave via vsock — real ML-DSA-65 signing demonstrated.")
+    IO.puts("NOTE: vsock LOOPBACK (CID=1, host process). Attested SEV-SNP")
+    IO.puts("guest run (CID=42, real launch measurement) remains for full staging.")
 
     if passed < total, do: System.halt(1)
   end
@@ -135,6 +140,7 @@ defmodule Smoke do
     IO.puts("  [PASS] #{label}")
     true
   end
+
   defp check(label, false) do
     IO.puts("  [FAIL] #{label}")
     false
