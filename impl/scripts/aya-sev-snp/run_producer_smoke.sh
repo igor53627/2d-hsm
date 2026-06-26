@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap "pkill -f x27[/]enclave-vsock-stagingx27 2>/dev/null; pkill -f vsock_uds_relay 2>/dev/null; rm -f /tmp/phsm.sock" EXIT
 cd /root/producer_smoke
 
 echo "=== Cleanup ==="

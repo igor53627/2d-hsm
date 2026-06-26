@@ -104,6 +104,8 @@ def test_get_measurement() -> None:
     check(m.get(1) == 1, f"version=1 (got {m.get(1)})")
     pubkey = m.get(4, b"")
     check(len(pubkey) == 1952, f"pq_pubkey is 1952 bytes ML-DSA-65 (got {len(pubkey)})")
+    global ENCLAVE_PUBKEY
+    ENCLAVE_PUBKEY = pubkey
     ready = m.get(6)
     check(ready is True, f"pq_signing_ready=True (got {ready})")
     types = m.get(5, [])
@@ -124,17 +126,21 @@ def test_get_status() -> None:
     print(f"  armed={armed}, last_known_block={m.get(9)}")
 
 
+ENCLAVE_PUBKEY = None  # populated by test_get_measurement; used by test_sign_authorization_ticket
+
+
 def test_sign_authorization_ticket() -> None:
     print("\n=== SIGN_AUTHORIZATION_TICKET (0x10) ===")
-    # A PRODUCER_RECOVERY ticket (type=0). The enclave will either sign it
-    # (if pq_signing_ready) or return PqSigningUnavailable (code=2).
+    # Use the REAL enclave pubkey from GET_MEASUREMENT (roborev 10811: using a
+    # placeholder pubkey but accepting a signature could bless a mismatched-key bug).
+    pubkey = ENCLAVE_PUBKEY or b"\x42" * 1952
     ticket = {
         1: 0,  # ticket_type = PRODUCER_RECOVERY
         2: 1,  # nonce
         3: b"\xAB" * 32,  # context_hash
         4: 1000,  # activation_height
         5: b"\x55" * 48,  # new_measurement
-        6: b"\x42" * 1952,  # pq_pubkey (placeholder; enclave uses its own key)
+        6: pubkey,  # pq_pubkey (real enclave key from GET_MEASUREMENT)
         7: None,  # fork_spec_hash (null for recovery)
         8: None,  # new_header_version (null for recovery)
         9: None,  # governance_ref (always null in v1)
@@ -148,8 +154,6 @@ def test_sign_authorization_ticket() -> None:
         # Wire error shape {1: code, 2: reason}
         code = m[1]
         reason = m[2]
-        # Code 2 = PqSigningUnavailable or InvalidTicket (expected if not armed
-        # or if the pq_pubkey doesn't match the enclave's key).
         check(code == 2, f"wire error code=2 (semantic error; got code={code})")
         print(f"  wire error (expected — enclave rejects unsigned ticket): code={code} reason={reason}")
     elif m.get(1) == 1 and isinstance(m.get(2), bytes):
@@ -183,10 +187,8 @@ def test_arm_for_production() -> None:
     payload = cbor2.dumps({1: 1, 2: authorized_state, 3: recent_chain_proof})
     mt, resp = send_recv(ARM_FOR_PRODUCTION, payload, "ARM_FOR_PRODUCTION")
     check(mt == ARM_FOR_PRODUCTION, f"response type=0x{mt:02x} (expected 0x20)")
-    m = cbor2.loads(resp)
-
     if m.get(1) == "armed":
-        print("  armed (unexpected without a valid RecentChainProof)")
+        check(False, "ARM should NOT succeed with a bogus RecentChainProof (security regression)")
     elif isinstance(m.get(1), int) and isinstance(m.get(2), str):
         code = m[1]
         reason = m[2]
