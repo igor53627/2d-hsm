@@ -532,11 +532,18 @@ root). The 2D verifier MUST reproduce this exact preimage.
   `PqSigningUnavailable`.
 - The host supplies only the 32-byte `block_hash`; the enclave fixes the domain prefix and signs the
   derived hash.
+- **Precedence:** the stateful dispatcher rejects an unarmed enclave with `ARM_FOR_PRODUCTION` before
+  the handler's `pq_signing_ready` check runs — an unarmed caller never learns signer presence.
+- **Length:** a `block_hash` that is not exactly 32 bytes is rejected at CBOR decode, before signing.
 
 **Deferred (cross-repo 2D TASK-203/204):** per-block CONTENT validation (state_root / chain
 consistency / binding the `block_hash` to a height) is out of scope for v1 — arming is the
 AUTHORIZATION gate; content validation is follow-up. v1 signs whatever 32-byte hash the armed host
 submits (a signing oracle bounded by the arming gate, not a validator).
+
+**Rate limiting (deferred):** v1 has no per-session signature volume bound — an armed host may request
+unbounded block-root signatures over arbitrary 32-byte hashes (revisit alongside the content
+validation above).
 
 **Reference encoding:** `encode_sign_block_root_request` / `decode_sign_block_root_response` in
 `wire.rs`; handler `handle_sign_block_root` (stateful dispatch, `Armed`-gated; stateless dispatch

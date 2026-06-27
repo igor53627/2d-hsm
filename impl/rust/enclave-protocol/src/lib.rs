@@ -3679,6 +3679,52 @@ mod tests {
         assert_eq!(resp.signature.len(), ML_DSA65_SIGNATURE_LEN);
     }
 
+    /// Positive path (closes the symmetric blind spot of the refusal-only tests): an ARMED enclave
+    /// with an installed signer actually SIGNS a block root, and the signed preimage is the
+    /// domain-separated keccak256("2D_BLOCK_ROOT_V1" || block_hash) — proving the gate does not
+    /// break legitimate signing and pinning the domain.
+    #[test]
+    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
+    fn sign_block_root_armed_with_signer_signs_over_domain_hash() {
+        let _guard = install_reference_sealed_signer_for_tests();
+        let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
+        let trust = reference_test_attestation_trust();
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pk.clone(),
+            measurement: b"m".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
+        let proof =
+            signed_recent_chain_proof(10_000_050, [0xFE; 32], vec![[0xAA; 32]], &authorized);
+        let mut state = EnclaveState::Armed(EnclaveArmedState {
+            proof,
+            attestation_trust: trust,
+            authorized_activated_at_height: authorized.activated_at_height,
+            authorized_measurement: authorized.measurement,
+            authorized_pq_pubkey: authorized.pq_pubkey,
+            source_ticket_hash: authorized.source_ticket_hash,
+            pending_hard_fork_height: None,
+        });
+        let block_hash = [0x11u8; 32];
+        let frame = encode_message(
+            MessageType::SignBlockRoot,
+            &crate::wire::encode_sign_block_root_request(&SignBlockRootRequest { block_hash })
+                .unwrap(),
+        )
+        .unwrap();
+        let resp = process_framed_with_shared_state(&frame, &mut state, trust).unwrap();
+        let decoded = decode_message(&resp).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::SignBlockRoot);
+        assert!(
+            !crate::wire::is_wire_error_payload(&decoded.payload),
+            "armed enclave with an installed signer must SIGN, not error"
+        );
+        let r = crate::wire::decode_sign_block_root_response(&decoded.payload).unwrap();
+        assert_eq!(r.signature.len(), ML_DSA65_SIGNATURE_LEN);
+        assert_eq!(r.signed_hash, compute_block_root_signing_hash(&block_hash));
+    }
+
     #[test]
     fn dispatch_get_measurement_works() {
         #[cfg(feature = "ml-dsa-65")]
