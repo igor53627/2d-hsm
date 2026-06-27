@@ -674,6 +674,82 @@ pub fn decode_sign_authorization_ticket_response(
     })
 }
 
+// ===========================================================================
+// SIGN_BLOCK_ROOT (0x50) — block-producer PQ signing (TASK-122 AC#3)
+// ===========================================================================
+
+/// CBOR-encode SIGN_BLOCK_ROOT request: `{1: version, 2: block_hash}`.
+pub fn encode_sign_block_root_request(
+    req: &crate::SignBlockRootRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    let value = Value::Map(vec![
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(req.block_hash.to_vec()),
+        ),
+    ]);
+    encode_value(&value)
+}
+
+/// CBOR-decode SIGN_BLOCK_ROOT request.
+pub fn decode_sign_block_root_request(
+    bytes: &[u8],
+) -> Result<crate::SignBlockRootRequest, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol(
+            "SIGN_BLOCK_ROOT request must be a CBOR map",
+        ));
+    };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
+    let block_hash = value_to_bytes32(map_get(&map, 2)?)?;
+    Ok(crate::SignBlockRootRequest { block_hash })
+}
+
+/// CBOR-encode SIGN_BLOCK_ROOT success response: `{1: version, 2: signature, 3: signed_hash}`.
+pub fn encode_sign_block_root_response(
+    resp: &crate::SignBlockRootResponse,
+) -> Result<Vec<u8>, ProtocolError> {
+    let value = Value::Map(vec![
+        (
+            Value::Integer(1.into()),
+            Value::Integer(PROTOCOL_VERSION.into()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Bytes(resp.signature.clone()),
+        ),
+        (
+            Value::Integer(3.into()),
+            Value::Bytes(resp.signed_hash.to_vec()),
+        ),
+    ]);
+    encode_value(&value)
+}
+
+/// CBOR-decode SIGN_BLOCK_ROOT success response.
+pub fn decode_sign_block_root_response(
+    bytes: &[u8],
+) -> Result<crate::SignBlockRootResponse, ProtocolError> {
+    let value = decode_value(bytes)?;
+    let Value::Map(map) = value else {
+        return Err(ProtocolError::WireProtocol(
+            "SIGN_BLOCK_ROOT response must be a CBOR map",
+        ));
+    };
+    let version = value_to_u64(map_get(&map, 1)?)?;
+    require_protocol_version(version)?;
+    Ok(crate::SignBlockRootResponse {
+        signature: value_to_bytes(map_get(&map, 2)?)?,
+        signed_hash: value_to_bytes32(map_get(&map, 3)?)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
