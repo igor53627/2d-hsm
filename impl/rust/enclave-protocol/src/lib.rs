@@ -3723,6 +3723,22 @@ mod tests {
         let r = crate::wire::decode_sign_block_root_response(&decoded.payload).unwrap();
         assert_eq!(r.signature.len(), ML_DSA65_SIGNATURE_LEN);
         assert_eq!(r.signed_hash, compute_block_root_signing_hash(&block_hash));
+        // Cryptographically verify the signature actually binds the domain-separated hash — not the
+        // raw block_hash. A regression that signed the raw block_hash while still echoing the correct
+        // signed_hash would pass the length/echo asserts above, but fail HERE (closes test vacuity).
+        mldsa65::ReferenceMlDsa65Signer::global()
+            .verify_ticket_hash(&r.signed_hash, &r.signature)
+            .expect("signature must verify over the domain-separated signed_hash");
+        assert_ne!(
+            r.signed_hash, block_hash,
+            "domain hash must differ from the raw block_hash"
+        );
+        assert!(
+            mldsa65::ReferenceMlDsa65Signer::global()
+                .verify_ticket_hash(&block_hash, &r.signature)
+                .is_err(),
+            "signature must NOT verify over the raw block_hash (proves it binds the domain hash)"
+        );
     }
 
     #[test]
