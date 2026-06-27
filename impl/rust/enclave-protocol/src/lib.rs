@@ -3679,6 +3679,68 @@ mod tests {
         assert_eq!(resp.signature.len(), ML_DSA65_SIGNATURE_LEN);
     }
 
+    /// Positive path (closes the symmetric blind spot of the refusal-only tests): an ARMED enclave
+    /// with an installed signer actually SIGNS a block root, and the signed preimage is the
+    /// domain-separated keccak256("2D_BLOCK_ROOT_V1" || block_hash) — proving the gate does not
+    /// break legitimate signing and pinning the domain.
+    #[test]
+    #[cfg(all(feature = "ml-dsa-65", feature = "reference-test-key"))]
+    fn sign_block_root_armed_with_signer_signs_over_domain_hash() {
+        let _guard = install_reference_sealed_signer_for_tests();
+        let pk = pq_signer::sealed_signer_public_key_bytes().expect("sealed pk");
+        let trust = reference_test_attestation_trust();
+        let authorized = AuthorizedProducerState {
+            pq_pubkey: pk.clone(),
+            measurement: b"m".to_vec(),
+            activated_at_height: 100,
+            source_ticket_hash: [0xAA; 32],
+        };
+        let proof =
+            signed_recent_chain_proof(10_000_050, [0xFE; 32], vec![[0xAA; 32]], &authorized);
+        let mut state = EnclaveState::Armed(EnclaveArmedState {
+            proof,
+            attestation_trust: trust,
+            authorized_activated_at_height: authorized.activated_at_height,
+            authorized_measurement: authorized.measurement,
+            authorized_pq_pubkey: authorized.pq_pubkey,
+            source_ticket_hash: authorized.source_ticket_hash,
+            pending_hard_fork_height: None,
+        });
+        let block_hash = [0x11u8; 32];
+        let frame = encode_message(
+            MessageType::SignBlockRoot,
+            &crate::wire::encode_sign_block_root_request(&SignBlockRootRequest { block_hash })
+                .unwrap(),
+        )
+        .unwrap();
+        let resp = process_framed_with_shared_state(&frame, &mut state, trust).unwrap();
+        let decoded = decode_message(&resp).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::SignBlockRoot);
+        assert!(
+            !crate::wire::is_wire_error_payload(&decoded.payload),
+            "armed enclave with an installed signer must SIGN, not error"
+        );
+        let r = crate::wire::decode_sign_block_root_response(&decoded.payload).unwrap();
+        assert_eq!(r.signature.len(), ML_DSA65_SIGNATURE_LEN);
+        assert_eq!(r.signed_hash, compute_block_root_signing_hash(&block_hash));
+        // Cryptographically verify the signature actually binds the domain-separated hash — not the
+        // raw block_hash. A regression that signed the raw block_hash while still echoing the correct
+        // signed_hash would pass the length/echo asserts above, but fail HERE (closes test vacuity).
+        mldsa65::ReferenceMlDsa65Signer::global()
+            .verify_ticket_hash(&r.signed_hash, &r.signature)
+            .expect("signature must verify over the domain-separated signed_hash");
+        assert_ne!(
+            r.signed_hash, block_hash,
+            "domain hash must differ from the raw block_hash"
+        );
+        assert!(
+            mldsa65::ReferenceMlDsa65Signer::global()
+                .verify_ticket_hash(&block_hash, &r.signature)
+                .is_err(),
+            "signature must NOT verify over the raw block_hash (proves it binds the domain hash)"
+        );
+    }
+
     #[test]
     fn dispatch_get_measurement_works() {
         #[cfg(feature = "ml-dsa-65")]
@@ -4209,14 +4271,12 @@ mod agent_gateway_framing_tests {
         }
     }
 
-    /// Regression (Greptile P1 / the decode_message 0x50 gap): a SIGN_BLOCK_ROOT frame must
-    /// ROUTE through the serve path (decode_message -> decode_wire_command -> dispatch), not be
-    /// rejected at decode_message as UnknownMessageType. The OLD buggy path also returns a
-    /// 0x50-typed wire-error (peek_msg_type_from_frame re-frames it), so msg_type alone does NOT
-    /// distinguish — the REASON must name `sign_block_root` (i.e. it reached handle_sign_block_root),
-    /// never a decode-time `unknown message type`.
+    /// Regression (Greptile P1 / the decode_message 0x50 gap): a SIGN_BLOCK_ROOT frame ROUTES through
+    /// the serve path (decode_message -> decode_wire_command -> dispatch) and is then POSITIVELY
+    /// refused for arming — proving both that 0x50 is no longer rejected as UnknownMessageType AND that
+    /// an unarmed enclave cannot sign block roots (the ARM_FOR_PRODUCTION network second factor).
     #[test]
-    fn sign_block_root_frame_routes_to_handler_not_unknown_type() {
+    fn sign_block_root_unarmed_frame_is_refused_for_arming() {
         use ed25519_dalek::SigningKey;
         let trust = ProducerAttestationTrust {
             attestation_verifying_key: SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
@@ -4230,24 +4290,40 @@ mod agent_gateway_framing_tests {
 
         let resp = process_framed_with_shared_state(&frame, &mut state, trust).unwrap();
         let decoded = decode_message(&resp).unwrap();
+        // Routed (0x50 decoded, not a decode-time UnknownMessageType)...
         assert_eq!(decoded.msg_type, MessageType::SignBlockRoot);
-        if crate::wire::is_wire_error_payload(&decoded.payload) {
-            let (_code, reason) = crate::wire::decode_wire_error(&decoded.payload).unwrap();
-            assert!(
-                reason.contains("sign_block_root"),
-                "0x50 must route to handle_sign_block_root, not be rejected at decode_message; got: {reason}"
-            );
-            assert!(
-                !reason.to_lowercase().contains("unknown message type"),
-                "0x50 wrongly rejected at decode_message: {reason}"
-            );
-        } else {
-            // A signer happens to be installed (ml-dsa-65 + reference key): a real success response.
-            let r = crate::wire::decode_sign_block_root_response(&decoded.payload).unwrap();
-            assert_eq!(
-                r.signed_hash,
-                crate::compute_block_root_signing_hash(&[0x11; 32])
-            );
+        assert!(crate::wire::is_wire_error_payload(&decoded.payload));
+        let (_code, reason) = crate::wire::decode_wire_error(&decoded.payload).unwrap();
+        // ...and POSITIVELY refused for arming (network second factor) — NOT silently signed, and
+        // distinct from a no-signer error. This is the gate the Greptile HIGH required; a bare
+        // `contains("sign_block_root")` would false-green (it matches the no-signer path too).
+        assert!(
+            reason.contains("ARM_FOR_PRODUCTION"),
+            "unarmed SIGN_BLOCK_ROOT must be refused for arming, got: {reason}"
+        );
+        assert!(
+            !reason.to_lowercase().contains("unknown message type"),
+            "0x50 wrongly rejected at decode_message: {reason}"
+        );
+        assert!(
+            !reason.to_lowercase().contains("signer"),
+            "unarmed refusal must be the arming gate, not a signer-readiness error: {reason}"
+        );
+    }
+
+    #[test]
+    fn sign_block_root_stateless_dispatch_is_hard_rejected() {
+        // The stateless dispatcher carries no EnclaveState, so it MUST hard-reject block-root
+        // signing (which requires an armed session) instead of routing to the signer.
+        let resp = dispatch_command(Command::SignBlockRoot(SignBlockRootRequest {
+            block_hash: [0x22; 32],
+        }));
+        match resp {
+            Response::Error(msg) => assert!(
+                msg.contains("requires dispatch_command_with_state"),
+                "stateless SIGN_BLOCK_ROOT must hard-reject directing to the stateful (armed) path, got: {msg}"
+            ),
+            _ => panic!("expected Response::Error for stateless SIGN_BLOCK_ROOT"),
         }
     }
 
