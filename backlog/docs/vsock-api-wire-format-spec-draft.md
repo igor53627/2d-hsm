@@ -550,7 +550,8 @@ submits (a signing oracle bounded by the arming gate, not a validator).
 unbounded block-root signatures over arbitrary 32-byte hashes (tracked with the content-validation
 deferral, 2D TASK-203/204).
 
-**Reference encoding:** `encode_sign_block_root_request` / `decode_sign_block_root_response` in
+**Reference encoding:** `encode_sign_block_root_request` / `decode_sign_block_root_request` /
+`encode_sign_block_root_response` / `decode_sign_block_root_response` in
 `wire.rs`. Arming is enforced by the stateful `dispatch_command_with_state` (the stateless
 `dispatch_command` hard-rejects); `handle_sign_block_root` itself checks only `pq_signing_ready`.
 Golden frames: `testvectors/producer/req_sign_block_root_v1.bin` +

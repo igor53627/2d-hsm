@@ -41,13 +41,27 @@ fi
 VM_PIDFILE="$RUNTIME_DIR/vm.pid"
 VM_PID=""
 RELAY_PID=""
+# Signal the real process GROUP of $1 (SIGTERM the whole group), best-effort. Resolves the PGID via
+# `ps -o pgid=` (a recycled/non-leader PID may differ from its group), falling back to the bare PID.
+# Callers that read $1 from disk (the prior-run reap) MUST verify process identity (pid+starttime)
+# BEFORE calling this; the EXIT trap passes its own setsid child (PID==PGID), which needs no check.
+kill_group() {
+  _kg_pid=$1
+  printf '%s' "$_kg_pid" | grep -qE '^[0-9]+$' || return 0
+  _kg_pgid=$(ps -o pgid= -p "$_kg_pid" 2>/dev/null | tr -d '[:space:]')
+  if printf '%s' "$_kg_pgid" | grep -qE '^[0-9]+$'; then
+    kill -- -"$_kg_pgid" 2>/dev/null || true
+  else
+    kill -- -"$_kg_pid" 2>/dev/null || kill "$_kg_pid" 2>/dev/null || true
+  fi
+}
 # Tear down via tracked PIDs (the VM is setsid-launched, so VM_PID is its process
 # group leader) — never a global `pkill qemu`, which would also kill unrelated SNP
 # guests that share the qemu cmdline (guest CID cannot disambiguate them).
 cleanup() {
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
   if [ -n "$VM_PID" ]; then
-    kill -- -"$VM_PID" 2>/dev/null || kill "$VM_PID" 2>/dev/null || true
+    kill_group "$VM_PID"
   fi
   rm -f "$VM_PIDFILE"
 }
@@ -55,12 +69,19 @@ trap cleanup EXIT
 
 echo "=== Tear down a prior run of THIS smoke (tracked pid-file, not global pkill) ==="
 if [ -f "$VM_PIDFILE" ]; then
-  prev_pid=$(cat "$VM_PIDFILE" 2>/dev/null || true)
-  # Only signal a prior run if the stored PID is numeric AND its process is actually this
-  # smoke's guest VM (run-guest-vm.sh / qemu) — never blind-kill an arbitrary/recycled PID group.
+  # Pidfile format "<pid> <starttime>" (see write below). Reap a prior run ONLY when the stored
+  # starttime still matches /proc/<pid>/stat field 22 — i.e. the SAME process, never a reused PID.
+  # A bare PID is ambiguous after reuse; the (pid,starttime) pair is a race-free identity. Signal
+  # the real process GROUP (`ps -o pgid=`), not the PID-as-PGID. Legacy single-field pidfiles are
+  # not reaped (starttime missing -> skip; just remove the file).
+  read -r prev_pid prev_start _ <"$VM_PIDFILE" 2>/dev/null || true
   if printf '%s' "$prev_pid" | grep -qE '^[0-9]+$' \
-     && tr '\0' ' ' <"/proc/$prev_pid/cmdline" 2>/dev/null | grep -qE 'run-guest-vm\.sh|qemu-system'; then
-    kill -- -"$prev_pid" 2>/dev/null || true
+     && printf '%s' "$prev_start" | grep -qE '^[0-9]+$'; then
+    # comm (field 2) can contain spaces/')', so strip through the last ") " before counting fields.
+    cur_start=$(awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[20]}' "/proc/$prev_pid/stat" 2>/dev/null || true)
+    if [ -n "$cur_start" ] && [ "$cur_start" = "$prev_start" ]; then
+      kill_group "$prev_pid"
+    fi
   fi
   rm -f "$VM_PIDFILE"
 fi
@@ -72,7 +93,11 @@ DISK=vm-disk.qcow2 CLOUDINIT=cloud-init.iso \
   SEV_MODE=snp MEMORY=4096 VCPUS=2 \
   setsid ./run-guest-vm.sh >/tmp/guest-vm.log 2>&1 </dev/null &
 VM_PID=$!
-echo "$VM_PID" > "$VM_PIDFILE"
+# Record "<pid> <starttime>": starttime = field 22 of /proc/PID/stat (clock ticks since boot).
+# The (pid,starttime) pair is a race-free identity so the reap above never hits a reused PID.
+# comm (field 2) can contain spaces/')', so strip through the last ") " before counting fields.
+vm_start=$(awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[20]}' "/proc/$VM_PID/stat" 2>/dev/null || true)
+echo "$VM_PID $vm_start" > "$VM_PIDFILE"
 echo "Guest VM PID: $VM_PID"
 sleep 5
 if ! kill -0 "$VM_PID" 2>/dev/null; then

@@ -4289,6 +4289,10 @@ mod agent_gateway_framing_tests {
             !reason.to_lowercase().contains("unknown message type"),
             "0x50 wrongly rejected at decode_message: {reason}"
         );
+        assert!(
+            !reason.to_lowercase().contains("signer"),
+            "unarmed refusal must be the arming gate, not a signer-readiness error: {reason}"
+        );
     }
 
     #[test]
