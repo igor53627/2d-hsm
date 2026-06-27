@@ -87,6 +87,7 @@ if [ -f "$VM_PIDFILE" ]; then
   # Pidfile format "<pid> <starttime>" (see write below). kill_tracked reaps the prior run ONLY if
   # that PID's live starttime still matches the recorded one — a reused PID has a different
   # starttime, and legacy single-field pidfiles (no starttime) never match, so they are skipped.
+  prev_pid=""; prev_start=""  # set -u: a failed read redirect (file vanished post -f) must not leave these unset
   read -r prev_pid prev_start _ <"$VM_PIDFILE" 2>/dev/null || true
   kill_tracked "$prev_pid" "$prev_start"
   rm -f "$VM_PIDFILE"
