@@ -2055,10 +2055,9 @@ pub fn dispatch_command(cmd: Command) -> Response {
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
-        Command::SignBlockRoot(req) => match handle_sign_block_root(req) {
-            Ok(resp) => Response::SignBlockRoot(resp),
-            Err(e) => Response::Error(format!("sign_block_root failed: {}", e)),
-        },
+        Command::SignBlockRoot(_) => Response::Error(
+            "SIGN_BLOCK_ROOT requires dispatch_command_with_state (armed enclave required)".to_string(),
+        ),
         Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
         Command::ArmForProduction(_) => Response::Error(
             "ARM_FOR_PRODUCTION requires dispatch_command_with_state and an enclave-held ProducerAttestationTrust (host cannot supply the trust anchor)".to_string(),
@@ -2093,10 +2092,20 @@ pub fn dispatch_command_with_state(
                 Err(e) => Response::Error(format!("sign_authorization_ticket failed: {}", e)),
             }
         }
-        Command::SignBlockRoot(req) => match handle_sign_block_root(req) {
-            Ok(resp) => Response::SignBlockRoot(resp),
-            Err(e) => Response::Error(format!("sign_block_root failed: {}", e)),
-        },
+        Command::SignBlockRoot(req) => {
+            // Greptile P1: block-root signing requires armed state — an
+            // unarmed enclave with an installed key should not sign blocks.
+            let EnclaveState::Armed(_) = state else {
+                return Response::Error(
+                    "sign_block_root requires ARM_FOR_PRODUCTION first (enclave not armed)"
+                        .to_string(),
+                );
+            };
+            match handle_sign_block_root(req) {
+                Ok(resp) => Response::SignBlockRoot(resp),
+                Err(e) => Response::Error(format!("sign_block_root failed: {}", e)),
+            }
+        }
         Command::GetMeasurement(_req) => Response::GetMeasurement(measurement_response()),
         Command::ArmForProduction(req) => match arm_for_production(state, req, attestation_trust) {
             Ok(new_state) => {
