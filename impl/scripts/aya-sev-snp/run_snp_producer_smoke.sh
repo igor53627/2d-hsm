@@ -41,10 +41,18 @@ fi
 VM_PIDFILE="$RUNTIME_DIR/vm.pid"
 VM_PID=""
 RELAY_PID=""
+# Echo field 22 (starttime, clock ticks since boot) of /proc/$1/stat, or nothing if unreadable.
+# starttime is fixed at fork and survives exec, so it pins identity across run-guest-vm.sh's exec
+# into qemu and distinguishes a reused PID. comm (field 2) can contain spaces and ')', so strip
+# through the LAST ") " before counting fields.
+proc_starttime() {
+  awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[20]}' "/proc/$1/stat" 2>/dev/null || true
+}
 # Signal the real process GROUP of $1 (SIGTERM the whole group), best-effort. Resolves the PGID via
-# `ps -o pgid=` (a recycled/non-leader PID may differ from its group), falling back to the bare PID.
-# Callers that read $1 from disk (the prior-run reap) MUST verify process identity (pid+starttime)
-# BEFORE calling this; the EXIT trap passes its own setsid child (PID==PGID), which needs no check.
+# `ps -o pgid=` (a recycled/non-leader PID may differ from its group); if the PGID can't be resolved
+# it signals only the single PID, never assuming PID==PGID via a negative-PID kill.
+# All callers MUST verify process identity (the recorded starttime still matches proc_starttime)
+# BEFORE calling this — a PID can be reused once the original process exits and is reaped.
 kill_group() {
   _kg_pid=$1
   printf '%s' "$_kg_pid" | grep -qE '^[0-9]+$' || return 0
@@ -52,7 +60,9 @@ kill_group() {
   if printf '%s' "$_kg_pgid" | grep -qE '^[0-9]+$'; then
     kill -- -"$_kg_pgid" 2>/dev/null || true
   else
-    kill -- -"$_kg_pid" 2>/dev/null || kill "$_kg_pid" 2>/dev/null || true
+    # ps gave no numeric PGID (process already gone, or ps unavailable): signal the single PID
+    # only, best-effort — never a negative PID (that would assume PID==PGID, the flagged pattern).
+    kill "$_kg_pid" 2>/dev/null || true
   fi
 }
 # Tear down via tracked PIDs (the VM is setsid-launched, so VM_PID is its process
@@ -60,7 +70,11 @@ kill_group() {
 # guests that share the qemu cmdline (guest CID cannot disambiguate them).
 cleanup() {
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
-  if [ -n "$VM_PID" ]; then
+  # Kill our VM only if VM_PID STILL refers to it: bash can async-reap an exited background qemu
+  # (via its SIGCHLD handler, freeing the PID for reuse) before this trap runs, so verify the
+  # recorded starttime still matches before signalling — never blind-kill a possibly-reused PID.
+  if [ -n "$VM_PID" ] && [ -n "$vm_start" ] \
+     && [ "$(proc_starttime "$VM_PID")" = "$vm_start" ]; then
     kill_group "$VM_PID"
   fi
   rm -f "$VM_PIDFILE"
@@ -77,8 +91,7 @@ if [ -f "$VM_PIDFILE" ]; then
   read -r prev_pid prev_start _ <"$VM_PIDFILE" 2>/dev/null || true
   if printf '%s' "$prev_pid" | grep -qE '^[0-9]+$' \
      && printf '%s' "$prev_start" | grep -qE '^[0-9]+$'; then
-    # comm (field 2) can contain spaces/')', so strip through the last ") " before counting fields.
-    cur_start=$(awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[20]}' "/proc/$prev_pid/stat" 2>/dev/null || true)
+    cur_start=$(proc_starttime "$prev_pid")
     if [ -n "$cur_start" ] && [ "$cur_start" = "$prev_start" ]; then
       kill_group "$prev_pid"
     fi
@@ -93,10 +106,16 @@ DISK=vm-disk.qcow2 CLOUDINIT=cloud-init.iso \
   SEV_MODE=snp MEMORY=4096 VCPUS=2 \
   setsid ./run-guest-vm.sh >/tmp/guest-vm.log 2>&1 </dev/null &
 VM_PID=$!
-# Record "<pid> <starttime>": starttime = field 22 of /proc/PID/stat (clock ticks since boot).
-# The (pid,starttime) pair is a race-free identity so the reap above never hits a reused PID.
-# comm (field 2) can contain spaces/')', so strip through the last ") " before counting fields.
-vm_start=$(awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[20]}' "/proc/$VM_PID/stat" 2>/dev/null || true)
+# Record "<pid> <starttime>" — a race-free identity (a reused PID has a different starttime) so both
+# the reap above and the EXIT trap never signal an unrelated process.
+vm_start=$(proc_starttime "$VM_PID")
+if ! printf '%s' "$vm_start" | grep -qE '^[0-9]+$'; then
+  # Could not read our own VM's starttime (procfs anomaly): kill it now (safe — no PID-reuse window
+  # yet, this is our just-forked child) and bail rather than record an unverifiable pid.
+  echo "FATAL: could not read starttime for VM pid $VM_PID" >&2
+  kill_group "$VM_PID"
+  exit 1
+fi
 echo "$VM_PID $vm_start" > "$VM_PIDFILE"
 echo "Guest VM PID: $VM_PID"
 sleep 5
