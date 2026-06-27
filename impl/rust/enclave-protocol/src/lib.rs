@@ -4300,8 +4300,8 @@ mod agent_gateway_framing_tests {
         }));
         match resp {
             Response::Error(msg) => assert!(
-                msg.contains("dispatch_command_with_state") || msg.contains("armed"),
-                "stateless SIGN_BLOCK_ROOT must hard-reject, got: {msg}"
+                msg.contains("requires dispatch_command_with_state"),
+                "stateless SIGN_BLOCK_ROOT must hard-reject directing to the stateful (armed) path, got: {msg}"
             ),
             _ => panic!("expected Response::Error for stateless SIGN_BLOCK_ROOT"),
         }
