@@ -49,21 +49,24 @@ vm_start=""  # recorded at launch; init here so cleanup() (EXIT trap) can refere
 proc_starttime() {
   awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[20]}' "/proc/$1/stat" 2>/dev/null || true
 }
-# Signal the real process GROUP of $1 (SIGTERM the whole group), best-effort. Resolves the PGID via
-# `ps -o pgid=` (a recycled/non-leader PID may differ from its group); if the PGID can't be resolved
-# it signals only the single PID, never assuming PID==PGID via a negative-PID kill.
-# All callers MUST verify process identity (the recorded starttime still matches proc_starttime)
-# BEFORE calling this — a PID can be reused once the original process exits and is reaped.
-kill_group() {
-  _kg_pid=$1
-  printf '%s' "$_kg_pid" | grep -qE '^[0-9]+$' || return 0
-  _kg_pgid=$(ps -o pgid= -p "$_kg_pid" 2>/dev/null | tr -d '[:space:]')
-  if printf '%s' "$_kg_pgid" | grep -qE '^[0-9]+$'; then
-    kill -- -"$_kg_pgid" 2>/dev/null || true
+# kill_tracked <pid> <expected_starttime>: signal the process GROUP of <pid> — but ONLY if it is
+# still the SAME process. Reads pgrp (field 5) and starttime (field 22) from ONE /proc/<pid>/stat
+# snapshot and signals the group only when the live starttime equals <expected_starttime>. Doing
+# both from a single read closes the TOCTOU where the verified PID could exit and be reused before
+# a separate `ps`/kill. Mismatch (process gone / reused / wrong starttime) -> skip, never signal.
+# comm (field 2) can contain spaces and ')', so strip through the LAST ") " before counting fields.
+kill_tracked() {
+  _kt_pid=$1; _kt_want=$2
+  printf '%s' "$_kt_pid"  | grep -qE '^[0-9]+$' || return 0
+  printf '%s' "$_kt_want" | grep -qE '^[0-9]+$' || return 0
+  _kt_snap=$(awk '{s=$0; sub(/^.*\) /,"",s); split(s,f," "); print f[3], f[20]}' "/proc/$_kt_pid/stat" 2>/dev/null || true)
+  _kt_pgrp=${_kt_snap%% *}
+  _kt_start=${_kt_snap##* }
+  [ "$_kt_start" = "$_kt_want" ] || return 0   # gone / reused / wrong starttime -> never signal
+  if printf '%s' "$_kt_pgrp" | grep -qE '^[0-9]+$' && [ "$_kt_pgrp" != 0 ]; then
+    kill -- -"$_kt_pgrp" 2>/dev/null || true   # SIGTERM the whole group (pgrp from the same snapshot)
   else
-    # ps gave no numeric PGID (process already gone, or ps unavailable): signal the single PID
-    # only, best-effort — never a negative PID (that would assume PID==PGID, the flagged pattern).
-    kill "$_kg_pid" 2>/dev/null || true
+    kill "$_kt_pid" 2>/dev/null || true        # no usable pgrp -> single PID; never PID-as-PGID
   fi
 }
 # Tear down via tracked PIDs (the VM is setsid-launched, so VM_PID is its process
@@ -71,32 +74,21 @@ kill_group() {
 # guests that share the qemu cmdline (guest CID cannot disambiguate them).
 cleanup() {
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
-  # Kill our VM only if VM_PID STILL refers to it: bash can async-reap an exited background qemu
-  # (via its SIGCHLD handler, freeing the PID for reuse) before this trap runs, so verify the
-  # recorded starttime still matches before signalling — never blind-kill a possibly-reused PID.
-  if [ -n "$VM_PID" ] && [ -n "$vm_start" ] \
-     && [ "$(proc_starttime "$VM_PID")" = "$vm_start" ]; then
-    kill_group "$VM_PID"
-  fi
+  # Kill our VM only if VM_PID STILL refers to it. bash can async-reap an exited background qemu
+  # (freeing the PID for reuse) before this trap runs; kill_tracked re-verifies the recorded
+  # starttime against a fresh /proc snapshot and signals the group from that SAME snapshot.
+  kill_tracked "$VM_PID" "$vm_start"
   rm -f "$VM_PIDFILE"
 }
 trap cleanup EXIT
 
 echo "=== Tear down a prior run of THIS smoke (tracked pid-file, not global pkill) ==="
 if [ -f "$VM_PIDFILE" ]; then
-  # Pidfile format "<pid> <starttime>" (see write below). Reap a prior run ONLY when the stored
-  # starttime still matches /proc/<pid>/stat field 22 — i.e. the SAME process, never a reused PID.
-  # A bare PID is ambiguous after reuse; the (pid,starttime) pair is a race-free identity. Signal
-  # the real process GROUP (`ps -o pgid=`), not the PID-as-PGID. Legacy single-field pidfiles are
-  # not reaped (starttime missing -> skip; just remove the file).
+  # Pidfile format "<pid> <starttime>" (see write below). kill_tracked reaps the prior run ONLY if
+  # that PID's live starttime still matches the recorded one — a reused PID has a different
+  # starttime, and legacy single-field pidfiles (no starttime) never match, so they are skipped.
   read -r prev_pid prev_start _ <"$VM_PIDFILE" 2>/dev/null || true
-  if printf '%s' "$prev_pid" | grep -qE '^[0-9]+$' \
-     && printf '%s' "$prev_start" | grep -qE '^[0-9]+$'; then
-    cur_start=$(proc_starttime "$prev_pid")
-    if [ -n "$cur_start" ] && [ "$cur_start" = "$prev_start" ]; then
-      kill_group "$prev_pid"
-    fi
-  fi
+  kill_tracked "$prev_pid" "$prev_start"
   rm -f "$VM_PIDFILE"
 fi
 sleep 1
@@ -114,7 +106,7 @@ if ! printf '%s' "$vm_start" | grep -qE '^[0-9]+$'; then
   # Could not read our own VM's starttime (procfs anomaly): kill it now (safe — no PID-reuse window
   # yet, this is our just-forked child) and bail rather than record an unverifiable pid.
   echo "FATAL: could not read starttime for VM pid $VM_PID" >&2
-  kill_group "$VM_PID"
+  kill "$VM_PID" 2>/dev/null || true
   exit 1
 fi
 echo "$VM_PID $vm_start" > "$VM_PIDFILE"
