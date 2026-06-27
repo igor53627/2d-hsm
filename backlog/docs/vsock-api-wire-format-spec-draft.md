@@ -520,9 +520,10 @@ with the enclave's ML-DSA-65 key. Added 2026-06 (PR #122); allocated from the pr
 `block_hash`. The 16-byte ASCII prefix `2D_BLOCK_ROOT_V1` domain-separates block-root signatures from
 `AuthorizationTicket` signatures (§8 `SIGN_AUTHORIZATION_TICKET`), which are produced over the
 structurally distinct canonical ticket hash (`compute_canonical_ticket_hash` = abi.encode + keccak256;
-see `authorization-tickets-precompile-spec-draft.md`). The two preimages cannot collide, so neither
-signature validates under the other's verifier (a `ticket_hash` can never be replayed as a block root,
-and vice-versa). The 2D verifier MUST reproduce this exact block-root preimage.
+see `authorization-tickets-precompile-spec-draft.md`). Because the domains differ, a cross-domain
+preimage collision is computationally infeasible under Keccak's preimage/collision resistance, so
+neither signature validates under the other's verifier (a `ticket_hash` cannot be passed off as a
+block-root preimage, or vice-versa). The 2D verifier MUST reproduce this exact block-root preimage.
 
 **Error Response:** standard Error `{1: code, 2: reason}`.
 
