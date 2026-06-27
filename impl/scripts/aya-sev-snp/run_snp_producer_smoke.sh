@@ -28,7 +28,17 @@ SCRIPT_DIR="/root/2d-hsm/impl/scripts/aya-sev-snp"
 SMOKE_DIR="/root/producer_smoke"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
 GUEST_CID=42
-VM_PIDFILE=/tmp/snp_producer_smoke_vm.pid
+# Pidfile in a FIXED root-owned private runtime dir (mode 0700) — never world-writable /tmp and never
+# a user-controlled XDG path, so a non-root user cannot plant/symlink the pidfile the kill below
+# trusts. Create then VERIFY it is root-owned 0700 (mkdir -m does not fix a pre-existing dir); bail
+# fail-closed otherwise. This smoke runs as root on a dedicated staging host (see --help).
+RUNTIME_DIR=/run/2d-hsm-snp-smoke
+install -d -m 700 -o root -g root "$RUNTIME_DIR" 2>/dev/null || mkdir -p "$RUNTIME_DIR"
+if [ "$(stat -c '%u:%a' "$RUNTIME_DIR" 2>/dev/null)" != "0:700" ]; then
+  echo "FATAL: $RUNTIME_DIR is not a root-owned 0700 dir; refusing (untrusted pidfile)" >&2
+  exit 1
+fi
+VM_PIDFILE="$RUNTIME_DIR/vm.pid"
 VM_PID=""
 RELAY_PID=""
 # Tear down via tracked PIDs (the VM is setsid-launched, so VM_PID is its process
@@ -45,7 +55,13 @@ trap cleanup EXIT
 
 echo "=== Tear down a prior run of THIS smoke (tracked pid-file, not global pkill) ==="
 if [ -f "$VM_PIDFILE" ]; then
-  kill -- -"$(cat "$VM_PIDFILE")" 2>/dev/null || true
+  prev_pid=$(cat "$VM_PIDFILE" 2>/dev/null || true)
+  # Only signal a prior run if the stored PID is numeric AND its process is actually this
+  # smoke's guest VM (run-guest-vm.sh / qemu) — never blind-kill an arbitrary/recycled PID group.
+  if printf '%s' "$prev_pid" | grep -qE '^[0-9]+$' \
+     && tr '\0' ' ' <"/proc/$prev_pid/cmdline" 2>/dev/null | grep -qE 'run-guest-vm\.sh|qemu-system'; then
+    kill -- -"$prev_pid" 2>/dev/null || true
+  fi
   rm -f "$VM_PIDFILE"
 fi
 sleep 1

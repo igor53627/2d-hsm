@@ -493,6 +493,58 @@ Future work (measurement transitions after hard forks, live tip tracking) may ad
 
 ---
 
+### Command: SIGN_BLOCK_ROOT (message_type = 0x50)
+
+Block-producer **hot-path** signing (TASK-122 AC#3): signs a single canonical 32-byte `block_hash`
+with the enclave's ML-DSA-65 key. Added 2026-06 (PR #122); allocated from the producer band
+`0x50..0x7F`.
+
+**Request:**
+```cbor
+{
+  1: 1,                    ; protocol version
+  2: bytes                 ; block_hash (exactly 32 bytes)
+}
+```
+
+**Success Response:**
+```cbor
+{
+  1: 1,
+  2: bytes,                ; signature (ML-DSA-65, 3309 bytes)
+  3: bytes                 ; signed_hash (32 bytes) = keccak256("2D_BLOCK_ROOT_V1" || block_hash)
+}
+```
+
+**Domain separation:** the enclave signs `keccak256("2D_BLOCK_ROOT_V1" || block_hash)`, NOT the raw
+`block_hash`. The 16-byte ASCII prefix `2D_BLOCK_ROOT_V1` makes a block-root signature unusable as an
+`AuthorizationTicket` signature and vice-versa (a `ticket_hash` can never be replayed as a block
+root). The 2D verifier MUST reproduce this exact preimage.
+
+**Error Response:** standard Error `{1: code, 2: reason}`.
+
+**Critical Security Invariants (enclave MUST enforce):**
+- **Arming required (network second factor).** Block-root signing is production signing, so the
+  enclave **must** be `Armed` (via `ARM_FOR_PRODUCTION` with a validated `RecentChainProof`, §9)
+  before it signs. An unarmed enclave — even one with an installed PQ signer — **must refuse**, with
+  `reason` naming `ARM_FOR_PRODUCTION`. The stateless dispatch path (no `EnclaveState`) hard-rejects.
+- `pq_signing_ready` must be true (an operational ML-DSA-65 key is installed); else
+  `PqSigningUnavailable`.
+- The host supplies only the 32-byte `block_hash`; the enclave fixes the domain prefix and signs the
+  derived hash.
+
+**Deferred (cross-repo 2D TASK-203/204):** per-block CONTENT validation (state_root / chain
+consistency / binding the `block_hash` to a height) is out of scope for v1 — arming is the
+AUTHORIZATION gate; content validation is follow-up. v1 signs whatever 32-byte hash the armed host
+submits (a signing oracle bounded by the arming gate, not a validator).
+
+**Reference encoding:** `encode_sign_block_root_request` / `decode_sign_block_root_response` in
+`wire.rs`; handler `handle_sign_block_root` (stateful dispatch, `Armed`-gated; stateless dispatch
+hard-rejects). Golden frames: `testvectors/producer/req_sign_block_root_v1.bin` +
+`resp_sign_block_root_v1.bin`.
+
+---
+
 ## 9. RecentChainProof — cryptographic MVP (TASK-3, 2026-06-02)
 
 This section defines **Producer Chain Attestation** (Ed25519). It is independent of **TEE remote attestation** in `GET_MEASUREMENT` (§2.3).
@@ -594,8 +646,9 @@ and opcode inside the CBOR payload, so it can evolve without a frame-version bum
   commit; same enclave-initiated/NOT-serve-dispatchable contract — `decode_wire_command` rejects an
   inbound `0x45` with a wire error)**. NB the outer `0x44`/`0x45` frame bytes are a DISJOINT namespace
   from the inner `AgentError` codes `0x44 AGENT_CAP_EXCEEDED` / `0x45 AGENT_NOT_CONFIGURED` (inner CBOR
-  status keys, never outer frame types). `0x42..0x43` and `0x46..0x4F` unallocated. `0x50..0x7F` left
-  for future producer/other families.
+  status keys, never outer frame types). `0x42..0x43` and `0x46..0x4F` unallocated. `0x50`
+  (`SignBlockRoot`, producer block-root PQ signing — see §8 `SIGN_BLOCK_ROOT`); `0x51..0x7F`
+  reserved for future producer families.
 - **Why not a frame-version bump or a wide outer range:** producer frames
   (`0x01/0x10/0x20/0x30`) stay byte-identical and still decode (success criterion:
   "existing producer commands remain wire-compatible"), and inner opcodes are CBOR
