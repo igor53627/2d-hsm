@@ -41,6 +41,7 @@ fi
 VM_PIDFILE="$RUNTIME_DIR/vm.pid"
 VM_PID=""
 RELAY_PID=""
+vm_start=""  # recorded at launch; init here so cleanup() (EXIT trap) can reference it under set -u
 # Echo field 22 (starttime, clock ticks since boot) of /proc/$1/stat, or nothing if unreadable.
 # starttime is fixed at fork and survives exec, so it pins identity across run-guest-vm.sh's exec
 # into qemu and distinguishes a reused PID. comm (field 2) can contain spaces and ')', so strip
